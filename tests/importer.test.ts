@@ -5,6 +5,7 @@ import path from "node:path";
 import { randomBytes } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { cleanupDecryptedWorkDir, ensureManagedWorkDir } from "../src/server/cleanup";
+import type { ArchiveRepository } from "../src/server/db/repository";
 import { MemoryArchiveRepository } from "../src/server/db/memoryRepository";
 import { SqliteArchiveRepository } from "../src/server/db/sqliteRepository";
 import { createCrypt15Fixture, decryptCrypt15 } from "../src/server/import/decrypt";
@@ -263,6 +264,38 @@ describe("WhatsApp import MVP", () => {
     }
   });
 
+  it("hides event-only chats by default while preserving opt-in access and filtered pagination", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-store-event-only-"));
+    let sqliteRepository: SqliteArchiveRepository | null = null;
+    try {
+      const memoryRepository = new MemoryArchiveRepository();
+      sqliteRepository = new SqliteArchiveRepository(path.join(tempDir, "archive.sqlite"));
+
+      for (const repository of [memoryRepository, sqliteRepository]) {
+        await seedEventOnlyChatScenario(repository);
+
+        const defaultChats = await repository.listChats({ limit: 10, offset: 0 });
+        const includedChats = await repository.listChats({ limit: 10, offset: 0, includeEventOnly: true });
+        const searchedEvent = await repository.listChats({ limit: 10, offset: 0, search: "Only Events", includeEventOnly: true });
+        const defaultEventSearch = await repository.listChats({ limit: 10, offset: 0, search: "Only Events" });
+        const statusEvents = await repository.listChats({ limit: 10, offset: 0, type: "status", includeEventOnly: true });
+        const firstPage = await repository.listChats({ limit: 1, offset: 0 });
+        const secondPage = await repository.listChats({ limit: 1, offset: 1 });
+
+        expect(defaultChats.map((chat) => chat.displayName)).toEqual(["Visible Latest", "Visible Earlier"]);
+        expect(includedChats.map((chat) => chat.displayName)).toContain("Only Events");
+        expect(searchedEvent[0]?.displayName).toBe("Only Events");
+        expect(defaultEventSearch).toHaveLength(0);
+        expect(statusEvents[0]?.displayName).toBe("Status Events");
+        expect(firstPage[0]?.displayName).toBe("Visible Latest");
+        expect(secondPage[0]?.displayName).toBe("Visible Earlier");
+      }
+    } finally {
+      await sqliteRepository?.close();
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it("skips malformed message rows with privacy-safe warnings", async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-store-malformed-"));
     try {
@@ -384,3 +417,75 @@ describe("WhatsApp import MVP", () => {
     }
   });
 });
+
+async function seedEventOnlyChatScenario(repository: ArchiveRepository): Promise<void> {
+  const runId = await repository.startImportRun({ fixture: "event-only-chat-list" });
+  await repository.upsertChats(runId, [
+    {
+      sourceChatId: "event-only@s.whatsapp.net",
+      jid: "event-only@s.whatsapp.net",
+      displayName: "Only Events",
+      chatType: "dm"
+    },
+    {
+      sourceChatId: "visible-latest@s.whatsapp.net",
+      jid: "visible-latest@s.whatsapp.net",
+      displayName: "Visible Latest",
+      chatType: "dm"
+    },
+    {
+      sourceChatId: "visible-earlier@s.whatsapp.net",
+      jid: "visible-earlier@s.whatsapp.net",
+      displayName: "Visible Earlier",
+      chatType: "dm"
+    },
+    {
+      sourceChatId: "status-events@status",
+      jid: "status-events@status",
+      displayName: "Status Events",
+      chatType: "status"
+    }
+  ]);
+  await repository.upsertMessages([
+    makeSyntheticMessage("event-only@s.whatsapp.net", "event-only-1", 1710000004000, "system", "system"),
+    makeSyntheticMessage("visible-latest@s.whatsapp.net", "visible-latest-1", 1710000003000, "text", "incoming", "Visible synthetic message"),
+    makeSyntheticMessage("visible-earlier@s.whatsapp.net", "visible-earlier-1", 1710000002000, "text", "outgoing", "Earlier synthetic message"),
+    makeSyntheticMessage("status-events@status", "status-events-1", 1710000001000, "status", "incoming", "Status event")
+  ]);
+  await repository.refreshChatStats();
+  await repository.completeImportRun(runId, { contacts: 0, chats: 4, participants: 0, messages: 4, skipped: 0, warnings: 0 }, 0);
+}
+
+function makeSyntheticMessage(
+  chatSourceId: string,
+  id: string,
+  timestampMs: number,
+  messageType: string,
+  direction: "incoming" | "outgoing" | "system" | "unknown",
+  body: string | null = null
+) {
+  return {
+    sourceMessageId: id,
+    sourceMessageKey: id,
+    sourceTable: "synthetic",
+    sourceRowId: id,
+    chatSourceId,
+    senderSourceJid: direction === "incoming" ? "synthetic-sender@s.whatsapp.net" : null,
+    timestampMs,
+    sentAtIso: new Date(timestampMs).toISOString(),
+    fromMe: direction === "outgoing" ? true : direction === "incoming" ? false : null,
+    direction,
+    messageType,
+    rawTypeCode: messageType,
+    body,
+    caption: null,
+    hasMedia: false,
+    mediaMimeType: null,
+    mediaName: null,
+    quotedSourceMessageId: null,
+    isDeleted: false,
+    isForwarded: false,
+    isStarred: false,
+    rawMetadata: null
+  };
+}

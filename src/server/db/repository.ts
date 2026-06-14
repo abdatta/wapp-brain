@@ -7,6 +7,7 @@ import type {
   MessageListItem,
   MessageRecord,
   ParticipantRecord,
+  ChatListOptions,
   StatusSummary
 } from "../../shared/types";
 
@@ -21,7 +22,7 @@ export interface ArchiveRepository {
   upsertMessages(messages: MessageRecord[]): Promise<number>;
   refreshChatStats(): Promise<void>;
   getStatus(): Promise<StatusSummary>;
-  listChats(options: { search?: string; limit: number; offset: number; type?: string }): Promise<ChatListItem[]>;
+  listChats(options: ChatListOptions): Promise<ChatListItem[]>;
   listMessages(
     chatId: number,
     options: { limit: number; offset: number; sender?: string; query?: string; order?: "asc" | "desc" }

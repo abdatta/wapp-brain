@@ -42,6 +42,17 @@ The UI SHALL render message records with a conversation layout that distinguishe
 - **WHEN** messages span multiple days
 - **THEN** the UI groups them chronologically and displays compact date separators between day groups
 
+### Requirement: Collapse status controls by default
+The UI SHALL render the status area as a collapsed sidebar section by default, with status details and maintenance actions hidden until the user expands the section.
+
+#### Scenario: Status section opens collapsed
+- **WHEN** the app loads
+- **THEN** the status section header is visible and status metrics, warnings, initialization, and cleanup controls are hidden
+
+#### Scenario: User expands status controls
+- **WHEN** the user activates the status section header
+- **THEN** status metrics, warnings, initialization, and cleanup controls become visible
+
 ### Requirement: Open selected chats at the newest messages
 The UI SHALL load the newest message window for a selected chat and position the message pane at the bottom after the first page renders.
 

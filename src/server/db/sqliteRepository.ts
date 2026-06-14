@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type {
   ChatListItem,
+  ChatListOptions,
   ChatRecord,
   ContactRecord,
   ImportRunSummary,
@@ -567,7 +568,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     };
   }
 
-  async listChats(options: { search?: string; limit: number; offset: number; type?: string }): Promise<ChatListItem[]> {
+  async listChats(options: ChatListOptions): Promise<ChatListItem[]> {
     const where: string[] = [];
     const params: unknown[] = [];
     if (options.search) {
@@ -577,6 +578,22 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     if (options.type && options.type !== "all") {
       where.push("chat_type = ?");
       params.push(options.type);
+    }
+    if (!options.includeEventOnly) {
+      where.push(`EXISTS (
+        SELECT 1
+        FROM messages visible_messages
+        WHERE visible_messages.chat_id = chats.id
+          AND visible_messages.message_type NOT IN ('system', 'status')
+          AND (
+            visible_messages.direction IN ('incoming', 'outgoing')
+            OR NULLIF(TRIM(COALESCE(visible_messages.body, '')), '') IS NOT NULL
+            OR NULLIF(TRIM(COALESCE(visible_messages.caption, '')), '') IS NOT NULL
+            OR visible_messages.has_media = 1
+            OR visible_messages.is_deleted = 1
+            OR visible_messages.message_type = 'call'
+          )
+      )`);
     }
     params.push(options.limit, options.offset);
     const rows = this.db

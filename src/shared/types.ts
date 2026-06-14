@@ -113,6 +113,14 @@ export interface ChatListItem {
   lastMessageAt: string | null;
 }
 
+export interface ChatListOptions {
+  search?: string;
+  limit: number;
+  offset: number;
+  type?: string;
+  includeEventOnly?: boolean;
+}
+
 export interface MessageListItem {
   id: number;
   sourceMessageId: string;

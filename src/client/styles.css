@@ -61,6 +61,7 @@ button {
 .toastLine,
 .importFooter,
 .checkRow,
+.filterToggle,
 .messageMeta,
 .messageFlags {
   display: flex;
@@ -157,6 +158,22 @@ h1 {
   font-weight: 700;
   font-size: 14px;
   margin-bottom: 12px;
+}
+
+.panelToggle {
+  width: 100%;
+  min-height: 34px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #dfe8e4;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.panelToggle .panelTitle {
+  margin-bottom: 0;
 }
 
 .statusGrid {
@@ -277,6 +294,11 @@ h1 {
   margin-top: 9px;
 }
 
+.statusPanel.collapsed,
+.importPanel.collapsed {
+  padding-bottom: 12px;
+}
+
 .importPanel label > span {
   display: block;
   margin-bottom: 5px;
@@ -326,6 +348,18 @@ h1 {
 
 .checkRow span {
   margin: 0;
+}
+
+.filterToggle {
+  gap: 8px;
+  margin-top: 12px;
+  color: #aab5b1;
+  font-size: 13px;
+}
+
+.filterToggle input {
+  width: 16px;
+  height: 16px;
 }
 
 .searchBox,
@@ -450,6 +484,9 @@ h1 {
   min-height: 0;
   overflow: auto;
   padding: 18px 22px 28px;
+  background:
+    linear-gradient(180deg, rgba(18, 20, 24, 0.24), rgba(18, 20, 24, 0)),
+    #0f1413;
 }
 
 .dayGroup {
@@ -463,33 +500,58 @@ h1 {
   top: 0;
   justify-self: center;
   z-index: 1;
-  border-radius: 8px;
-  background: #242a31;
-  color: #aeb9b5;
+  border-radius: 7px;
+  background: #202b2b;
+  color: #bed0cb;
   font-size: 12px;
-  padding: 6px 10px;
+  padding: 5px 10px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.22);
 }
 
 .messageBubble {
-  width: min(680px, 88%);
+  width: fit-content;
+  max-width: min(680px, 82%);
   border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 8px;
-  padding: 9px 11px;
-  background: #1a1e24;
+  border-radius: 8px 8px 8px 2px;
+  padding: 7px 9px 6px;
+  background: #202c33;
   color: #edf4f1;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.22);
 }
 
 .messageBubble.outgoing {
   justify-self: end;
-  background: #16372b;
-  border-color: rgba(93, 211, 153, 0.18);
+  border-radius: 8px 8px 2px 8px;
+  background: #1f4f3a;
+  border-color: rgba(117, 211, 154, 0.18);
 }
 
-.messageBubble.system,
 .messageBubble.unknown {
   justify-self: center;
-  width: min(560px, 92%);
-  background: #20242a;
+  max-width: min(520px, 90%);
+  border-radius: 8px;
+  background: #222a30;
+}
+
+.systemChip {
+  justify-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: min(540px, 92%);
+  border-radius: 7px;
+  background: #1b2928;
+  color: #bdd0cb;
+  font-size: 12px;
+  line-height: 1.35;
+  padding: 6px 9px;
+  text-align: center;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.18);
+}
+
+.systemChip time {
+  color: #8fa19c;
+  white-space: nowrap;
 }
 
 .messageMeta {
@@ -534,6 +596,19 @@ h1 {
   text-align: center;
 }
 
+.olderMessageStatus {
+  min-height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  justify-self: center;
+  width: min(280px, 92%);
+  margin: 0 auto 14px;
+  color: #9faca8;
+  font-size: 12px;
+}
+
 .emptyThread,
 .emptyState {
   color: #9fa9a5;
@@ -567,11 +642,6 @@ h1 {
   margin-top: 8px;
   background: #222831;
   color: #dfe8e4;
-}
-
-.messageLoad {
-  max-width: 260px;
-  margin: 14px auto 0;
 }
 
 .skeletonRow,
@@ -638,6 +708,6 @@ h1 {
   }
 
   .messageBubble {
-    width: 96%;
+    max-width: 92%;
   }
 }

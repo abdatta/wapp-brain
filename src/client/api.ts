@@ -1,4 +1,4 @@
-import type { ChatListItem, ImportRequest, ImportTotals, MessageListItem, MessageListOrder, StatusSummary } from "../shared/types";
+import type { ChatListItem, ChatListOptions, ImportRequest, ImportTotals, MessageListItem, MessageListOrder, StatusSummary } from "../shared/types";
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -37,10 +37,11 @@ export function cleanupTempFiles(): Promise<{ ok: boolean; summary: { removedFil
   });
 }
 
-export function listChats(params: { search?: string; type?: string; limit?: number; offset?: number }): Promise<ChatListItem[]> {
+export function listChats(params: Partial<ChatListOptions>): Promise<ChatListItem[]> {
   const query = new URLSearchParams();
   if (params.search) query.set("search", params.search);
   if (params.type) query.set("type", params.type);
+  if (params.includeEventOnly) query.set("includeEventOnly", "true");
   query.set("limit", String(params.limit ?? 60));
   query.set("offset", String(params.offset ?? 0));
   return request<ChatListItem[]>(`/api/chats?${query}`);

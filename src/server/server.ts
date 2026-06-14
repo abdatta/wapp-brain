@@ -75,6 +75,7 @@ app.get("/api/chats", async (req, res) => {
       await repository.listChats({
         search: stringQuery(req.query.search),
         type: stringQuery(req.query.type),
+        includeEventOnly: booleanQuery(req.query.includeEventOnly),
         limit,
         offset
       })
@@ -125,6 +126,10 @@ app.listen(config.app.port, config.app.host, () => {
 
 function stringQuery(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function booleanQuery(value: unknown): boolean {
+  return value === true || value === "true" || value === "1";
 }
 
 function clampNumber(value: unknown, min: number, max: number, fallback: number): number {

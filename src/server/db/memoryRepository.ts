@@ -3,6 +3,7 @@ import type {
 } from "./repository";
 import type {
   ChatListItem,
+  ChatListOptions,
   ChatRecord,
   ContactRecord,
   ImportRunSummary,
@@ -141,11 +142,12 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     };
   }
 
-  async listChats(options: { search?: string; limit: number; offset: number; type?: string }): Promise<ChatListItem[]> {
+  async listChats(options: ChatListOptions): Promise<ChatListItem[]> {
     const search = options.search?.toLowerCase();
     return [...this.chats.values()]
       .filter((chat) => !search || chat.displayName?.toLowerCase().includes(search) || chat.jid.toLowerCase().includes(search))
       .filter((chat) => !options.type || options.type === "all" || chat.chatType === options.type)
+      .filter((chat) => options.includeEventOnly || this.hasVisibleExchange(chat.sourceChatId))
       .sort((a, b) => (b.lastMessageAt ?? "").localeCompare(a.lastMessageAt ?? ""))
       .slice(options.offset, options.offset + options.limit)
       .map((chat) => ({
@@ -200,8 +202,27 @@ export class MemoryArchiveRepository implements ArchiveRepository {
         };
       });
   }
+
+  private hasVisibleExchange(chatSourceId: string): boolean {
+    return [...this.messages.values()].some((message) => message.chatSourceId === chatSourceId && isVisibleExchange(message));
+  }
 }
 
 function emptyTotals(): ImportTotals {
   return { contacts: 0, chats: 0, participants: 0, messages: 0, skipped: 0, warnings: 0 };
+}
+
+function isVisibleExchange(message: MessageRecord): boolean {
+  if (message.messageType === "system" || message.messageType === "status") {
+    return false;
+  }
+  return (
+    message.direction === "incoming" ||
+    message.direction === "outgoing" ||
+    Boolean(message.body?.trim()) ||
+    Boolean(message.caption?.trim()) ||
+    message.hasMedia ||
+    message.isDeleted ||
+    message.messageType === "call"
+  );
 }

@@ -1,6 +1,8 @@
 import {
   AlertTriangle,
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
   Database,
   Download,
   Eye,
@@ -15,7 +17,7 @@ import {
   Trash2,
   Upload
 } from "lucide-react";
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import type { ChatListItem, ImportRequest, MessageListItem, StatusSummary } from "../shared/types";
 import { cleanupTempFiles, getStatus, initDatabase, listChats, listMessages, runImport } from "./api";
@@ -30,6 +32,7 @@ export function App() {
   const [chatOffset, setChatOffset] = useState(0);
   const [chatSearch, setChatSearch] = useState("");
   const [chatType, setChatType] = useState("all");
+  const [includeEventOnly, setIncludeEventOnly] = useState(false);
   const [selectedChat, setSelectedChat] = useState<ChatListItem | null>(null);
   const [messages, setMessages] = useState<MessageListItem[]>([]);
   const [messageOffset, setMessageOffset] = useState(0);
@@ -40,6 +43,8 @@ export function App() {
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [importPanelOpen, setImportPanelOpen] = useState(true);
+  const [importPanelTouched, setImportPanelTouched] = useState(false);
   const [form, setForm] = useState<ImportRequest>({
     msgstorePath: "",
     waPath: "",
@@ -48,6 +53,10 @@ export function App() {
     keyPath: "",
     keepDecrypted: false
   });
+  const messageListRef = useRef<HTMLDivElement | null>(null);
+  const loadingMessagesRef = useRef(false);
+  const scrollActionRef = useRef<"bottom" | "preserve" | null>(null);
+  const previousScrollHeightRef = useRef(0);
 
   useEffect(() => {
     void refreshStatus();
@@ -55,15 +64,38 @@ export function App() {
 
   useEffect(() => {
     void loadChats(true);
-  }, [chatSearch, chatType]);
+  }, [chatSearch, chatType, includeEventOnly]);
+
+  useEffect(() => {
+    if (status && !importPanelTouched) {
+      setImportPanelOpen(!hasArchiveData(status));
+    }
+  }, [status, importPanelTouched]);
 
   useEffect(() => {
     if (selectedChat) {
       setMessageOffset(0);
       setMessageHasMore(false);
+      setMessages([]);
+      scrollActionRef.current = "bottom";
       void loadMessages(selectedChat, true);
     }
   }, [selectedChat?.id, messageQuery]);
+
+  useLayoutEffect(() => {
+    const list = messageListRef.current;
+    const action = scrollActionRef.current;
+    if (!list || !action) {
+      return;
+    }
+    if (action === "bottom") {
+      list.scrollTop = list.scrollHeight;
+    } else {
+      const heightDelta = list.scrollHeight - previousScrollHeightRef.current;
+      list.scrollTop += heightDelta;
+    }
+    scrollActionRef.current = null;
+  }, [messages.length]);
 
   async function refreshStatus() {
     try {
@@ -79,7 +111,7 @@ export function App() {
     setLoadingChats(true);
     try {
       const offset = reset ? 0 : chatOffset;
-      const next = await listChats({ search: chatSearch, type: chatType, limit: CHAT_LIMIT, offset });
+      const next = await listChats({ search: chatSearch, type: chatType, includeEventOnly, limit: CHAT_LIMIT, offset });
       setChats((current) => (reset ? next : [...current, ...next]));
       setChatOffset(offset + next.length);
       if (reset && selectedChat && !next.some((chat) => chat.id === selectedChat.id)) {
@@ -94,9 +126,17 @@ export function App() {
   }
 
   async function loadMessages(chat: ChatListItem, reset = false) {
+    if (loadingMessagesRef.current) {
+      return;
+    }
+    loadingMessagesRef.current = true;
     setLoadingMessages(true);
     try {
       const offset = reset ? 0 : messageOffset;
+      if (!reset) {
+        previousScrollHeightRef.current = messageListRef.current?.scrollHeight ?? 0;
+        scrollActionRef.current = "preserve";
+      }
       const next = await listMessages(chat.id, { limit: MESSAGE_LIMIT, offset, query: messageQuery, order: "desc" });
       setMessages((current) => sortMessagesChronologically(reset ? next : [...current, ...next]));
       setMessageOffset(offset + next.length);
@@ -104,7 +144,18 @@ export function App() {
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not load messages.");
     } finally {
+      loadingMessagesRef.current = false;
       setLoadingMessages(false);
+    }
+  }
+
+  function handleMessageScroll() {
+    if (!selectedChat || !messageHasMore || loadingMessagesRef.current) {
+      return;
+    }
+    const list = messageListRef.current;
+    if (list && list.scrollTop < 96) {
+      void loadMessages(selectedChat, false);
     }
   }
 
@@ -139,6 +190,8 @@ export function App() {
         keepDecrypted: form.keepDecrypted
       });
       setForm((current) => ({ ...current, key: "" }));
+      setImportPanelOpen(false);
+      setImportPanelTouched(true);
       setNotice(`Import complete: ${result.totals.messages.toLocaleString()} messages.`);
       await refreshStatus();
       await loadChats(true);
@@ -201,71 +254,86 @@ export function App() {
             onCleanup={() => void handleCleanup()}
           />
 
-          <form className="importPanel" onSubmit={(event) => void handleImport(event)}>
-            <div className="panelTitle">
-              <Upload size={16} />
-              <span>Import</span>
-            </div>
-            <label>
-              <span>msgstore</span>
-              <input
-                value={form.msgstorePath}
-                onChange={(event) => setForm((current) => ({ ...current, msgstorePath: event.target.value }))}
-                placeholder="C:\\path\\msgstore.db.crypt15"
-                autoComplete="off"
-              />
-            </label>
-            <label>
-              <span>wa.db</span>
-              <input
-                value={form.waPath ?? ""}
-                onChange={(event) => setForm((current) => ({ ...current, waPath: event.target.value }))}
-                placeholder="C:\\path\\wa.db"
-                autoComplete="off"
-              />
-            </label>
-            <label>
-              <span>media</span>
-              <input
-                value={form.mediaPath ?? ""}
-                onChange={(event) => setForm((current) => ({ ...current, mediaPath: event.target.value }))}
-                placeholder="C:\\path\\WhatsApp\\Media"
-                autoComplete="off"
-              />
-            </label>
-            <label>
-              <span>key</span>
-              <input
-                value={form.key ?? ""}
-                onChange={(event) => setForm((current) => ({ ...current, key: event.target.value }))}
-                placeholder="64-character key"
-                type="password"
-                autoComplete="off"
-              />
-            </label>
-            <label>
-              <span>key file</span>
-              <input
-                value={form.keyPath ?? ""}
-                onChange={(event) => setForm((current) => ({ ...current, keyPath: event.target.value }))}
-                placeholder="C:\\path\\encrypted_backup.key"
-                autoComplete="off"
-              />
-            </label>
-            <div className="importFooter">
-              <label className="checkRow">
-                <input
-                  type="checkbox"
-                  checked={Boolean(form.keepDecrypted)}
-                  onChange={(event) => setForm((current) => ({ ...current, keepDecrypted: event.target.checked }))}
-                />
-                <span>Keep decrypted DB</span>
-              </label>
-              <button className="primaryButton" type="submit" disabled={Boolean(busy) || !form.msgstorePath}>
-                {busy === "Importing archive" ? <Loader2 className="spin" size={16} /> : <Download size={16} />}
-                Import
-              </button>
-            </div>
+          <form className={`importPanel ${importPanelOpen ? "" : "collapsed"}`} onSubmit={(event) => void handleImport(event)}>
+            <button
+              className="panelToggle"
+              type="button"
+              aria-expanded={importPanelOpen}
+              onClick={() => {
+                setImportPanelTouched(true);
+                setImportPanelOpen((current) => !current);
+              }}
+            >
+              <span className="panelTitle">
+                <Upload size={16} />
+                <span>{hasArchiveData(status) ? "Import / re-import" : "Import"}</span>
+              </span>
+              {importPanelOpen ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+            </button>
+            {importPanelOpen && (
+              <>
+                <label>
+                  <span>msgstore</span>
+                  <input
+                    value={form.msgstorePath}
+                    onChange={(event) => setForm((current) => ({ ...current, msgstorePath: event.target.value }))}
+                    placeholder="C:\\path\\msgstore.db.crypt15"
+                    autoComplete="off"
+                  />
+                </label>
+                <label>
+                  <span>wa.db</span>
+                  <input
+                    value={form.waPath ?? ""}
+                    onChange={(event) => setForm((current) => ({ ...current, waPath: event.target.value }))}
+                    placeholder="C:\\path\\wa.db"
+                    autoComplete="off"
+                  />
+                </label>
+                <label>
+                  <span>media</span>
+                  <input
+                    value={form.mediaPath ?? ""}
+                    onChange={(event) => setForm((current) => ({ ...current, mediaPath: event.target.value }))}
+                    placeholder="C:\\path\\WhatsApp\\Media"
+                    autoComplete="off"
+                  />
+                </label>
+                <label>
+                  <span>key</span>
+                  <input
+                    value={form.key ?? ""}
+                    onChange={(event) => setForm((current) => ({ ...current, key: event.target.value }))}
+                    placeholder="64-character key"
+                    type="password"
+                    autoComplete="off"
+                  />
+                </label>
+                <label>
+                  <span>key file</span>
+                  <input
+                    value={form.keyPath ?? ""}
+                    onChange={(event) => setForm((current) => ({ ...current, keyPath: event.target.value }))}
+                    placeholder="C:\\path\\encrypted_backup.key"
+                    autoComplete="off"
+                  />
+                </label>
+                <div className="importFooter">
+                  <label className="checkRow">
+                    <input
+                      type="checkbox"
+                      checked={Boolean(form.keepDecrypted)}
+                      onChange={(event) => setForm((current) => ({ ...current, keepDecrypted: event.target.checked }))}
+                    />
+                    <span>Keep decrypted DB</span>
+                  </label>
+                  <button className="primaryButton" type="submit" disabled={Boolean(busy) || !form.msgstorePath}>
+                    {busy === "Importing archive" ? <Loader2 className="spin" size={16} /> : <Download size={16} />}
+                    Import
+                  </button>
+                </div>
+              </>
+            )}
           </form>
 
           <div className="filterPanel">
@@ -280,6 +348,17 @@ export function App() {
                 </button>
               ))}
             </div>
+            <label className="filterToggle">
+              <input
+                type="checkbox"
+                checked={includeEventOnly}
+                onChange={(event) => {
+                  setIncludeEventOnly(event.target.checked);
+                  setChatOffset(0);
+                }}
+              />
+              <span>Show event-only chats</span>
+            </label>
           </div>
 
           <div className="chatList" aria-live="polite">
@@ -336,7 +415,13 @@ export function App() {
                 </div>
               </div>
 
-              <div className="messageList">
+              <div className="messageList" ref={messageListRef} onScroll={handleMessageScroll}>
+                {messages.length > 0 && messageHasMore && (
+                  <div className="olderMessageStatus">
+                    {loadingMessages ? <Loader2 className="spin" size={14} /> : null}
+                    <span>{loadingMessages ? "Loading older messages" : "Scroll up for older messages"}</span>
+                  </div>
+                )}
                 {groupedMessages.map((group) => (
                   <div key={group.day} className="dayGroup">
                     <div className="dayMarker">{group.day}</div>
@@ -345,17 +430,12 @@ export function App() {
                     ))}
                   </div>
                 ))}
-                {loadingMessages && <SkeletonMessages />}
+                {loadingMessages && messages.length === 0 && <SkeletonMessages />}
                 {!loadingMessages && messages.length === 0 && <EmptyState icon={<MessageCircle size={22} />} text="No messages loaded" />}
                 {messages.length > 0 && (
                   <div className="messageWindowNote">
                     Showing {messages.length.toLocaleString()} newest matching messages in chronological order.
                   </div>
-                )}
-                {messages.length > 0 && messageHasMore && (
-                  <button className="loadButton messageLoad" onClick={() => void loadMessages(selectedChat, false)} disabled={loadingMessages} type="button">
-                    Load older messages
-                  </button>
                 )}
               </div>
             </>
@@ -390,52 +470,60 @@ function StatusPanel({
   onCleanup: () => void;
 }) {
   const latest = status?.latestImport;
+  const [statusPanelOpen, setStatusPanelOpen] = useState(false);
   return (
-    <section className="statusPanel">
-      <div className="panelTitle">
-        <Database size={16} />
-        <span>Status</span>
-        {busy && <Loader2 className="spin" size={16} />}
-      </div>
-      <div className="statusGrid">
-        <Metric label="DB" value={status?.database.initialized ? "Ready" : "Not ready"} />
-        <Metric label="Store" value={status?.database.adapter?.toUpperCase() ?? "SQLite"} />
-        <Metric label="Chats" value={status?.counts.chats.toLocaleString() ?? "0"} />
-        <Metric label="Contacts" value={status?.counts.contacts.toLocaleString() ?? "0"} />
-        <Metric label="Messages" value={status?.counts.messages.toLocaleString() ?? "0"} />
-        <Metric label="Warnings" value={status?.counts.warnings.toLocaleString() ?? "0"} />
-      </div>
-      <div className="statusLine">
-        {statusError ??
-          status?.database.error ??
-          (latest
-            ? `${latest.status} | ${formatDate(latest.finishedAt ?? latest.startedAt)}`
-            : status?.database.location
-              ? `${status.database.adapter ?? "local"} | ${status.database.location}`
-              : "No import yet")}
-      </div>
-      {Boolean(status?.latestWarnings.length) && (
-        <div className="warningList">
-          {status?.latestWarnings.map((warning) => (
-            <div key={warning.id ?? warning.code} className={`warningItem ${warning.severity}`}>
-              <span>{warning.code}</span>
-              <p>{warning.message}</p>
+    <section className={`statusPanel ${statusPanelOpen ? "" : "collapsed"}`}>
+      <button className="panelToggle" type="button" aria-expanded={statusPanelOpen} onClick={() => setStatusPanelOpen((current) => !current)}>
+        <span className="panelTitle">
+          <Database size={16} />
+          <span>Status</span>
+          {busy && <Loader2 className="spin" size={16} />}
+        </span>
+        {statusPanelOpen ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+      </button>
+      {statusPanelOpen && (
+        <>
+          <div className="statusGrid">
+            <Metric label="DB" value={status?.database.initialized ? "Ready" : "Not ready"} />
+            <Metric label="Store" value={status?.database.adapter?.toUpperCase() ?? "SQLite"} />
+            <Metric label="Chats" value={status?.counts.chats.toLocaleString() ?? "0"} />
+            <Metric label="Contacts" value={status?.counts.contacts.toLocaleString() ?? "0"} />
+            <Metric label="Messages" value={status?.counts.messages.toLocaleString() ?? "0"} />
+            <Metric label="Warnings" value={status?.counts.warnings.toLocaleString() ?? "0"} />
+          </div>
+          <div className="statusLine">
+            {statusError ??
+              status?.database.error ??
+              (latest
+                ? `${latest.status} | ${formatDate(latest.finishedAt ?? latest.startedAt)}`
+                : status?.database.location
+                  ? `${status.database.adapter ?? "local"} | ${status.database.location}`
+                  : "No import yet")}
+          </div>
+          {Boolean(status?.latestWarnings.length) && (
+            <div className="warningList">
+              {status?.latestWarnings.map((warning) => (
+                <div key={warning.id ?? warning.code} className={`warningItem ${warning.severity}`}>
+                  <span>{warning.code}</span>
+                  <p>{warning.message}</p>
+                </div>
+              ))}
             </div>
-          ))}
-        </div>
+          )}
+          <div className="privacyLine">
+            <FileKey2 size={15} />
+            <span>Keys stay runtime-only; imported data stays in the local archive file.</span>
+          </div>
+          <button className="secondaryButton" onClick={onInit} disabled={Boolean(busy)} type="button">
+            <Database size={16} />
+            Initialize
+          </button>
+          <button className="secondaryButton subtleButton" onClick={onCleanup} disabled={Boolean(busy)} type="button">
+            {busy === "Cleaning temp files" ? <Loader2 className="spin" size={16} /> : <Trash2 size={16} />}
+            Clean Temp Files
+          </button>
+        </>
       )}
-      <div className="privacyLine">
-        <FileKey2 size={15} />
-        <span>Keys stay runtime-only; imported data stays in the local archive file.</span>
-      </div>
-      <button className="secondaryButton" onClick={onInit} disabled={Boolean(busy)} type="button">
-        <Database size={16} />
-        Initialize
-      </button>
-      <button className="secondaryButton subtleButton" onClick={onCleanup} disabled={Boolean(busy)} type="button">
-        {busy === "Cleaning temp files" ? <Loader2 className="spin" size={16} /> : <Trash2 size={16} />}
-        Clean Temp Files
-      </button>
     </section>
   );
 }
@@ -449,8 +537,21 @@ function Metric({ label, value }: { label: string; value: string }) {
   );
 }
 
+function hasArchiveData(status: StatusSummary | null): boolean {
+  return Boolean(status?.latestImport || status?.counts.messages || status?.counts.chats);
+}
+
 function MessageBubble({ message, isGroup }: { message: MessageListItem; isGroup: boolean }) {
   const text = message.body || message.caption;
+  const placeholder = messagePlaceholder(message);
+  if (isSystemEvent(message)) {
+    return (
+      <article className="systemChip">
+        <span>{text || placeholder}</span>
+        <time>{formatTime(message.sentAt)}</time>
+      </article>
+    );
+  }
   return (
     <article className={`messageBubble ${message.direction}`}>
       <div className="messageMeta">
@@ -460,7 +561,7 @@ function MessageBubble({ message, isGroup }: { message: MessageListItem; isGroup
       {text ? (
         <p>{text}</p>
       ) : (
-        <p className="placeholderText">{message.isDeleted ? "Deleted message" : `${message.messageType} message`}</p>
+        <p className="placeholderText">{placeholder}</p>
       )}
       {(message.hasMedia || message.isForwarded || message.isStarred) && (
         <div className="messageFlags">
@@ -471,6 +572,28 @@ function MessageBubble({ message, isGroup }: { message: MessageListItem; isGroup
       )}
     </article>
   );
+}
+
+function isSystemEvent(message: MessageListItem): boolean {
+  return message.direction === "system" || message.messageType === "system" || message.messageType === "status";
+}
+
+function messagePlaceholder(message: MessageListItem): string {
+  if (message.isDeleted) return "Deleted message";
+  if (message.messageType === "call") return "Call";
+  if (message.messageType === "system") return "System event";
+  if (message.messageType === "status") return "Status event";
+  if (message.hasMedia) return `${humanizeMessageType(message.messageType)} message`;
+  if (message.messageType.startsWith("unknown")) return "Unsupported message";
+  return `${humanizeMessageType(message.messageType)} message`;
+}
+
+function humanizeMessageType(value: string): string {
+  return value
+    .split("_")
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
 }
 
 function EmptyState({ icon, text }: { icon: ReactNode; text: string }) {
