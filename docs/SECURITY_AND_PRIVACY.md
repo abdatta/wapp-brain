@@ -12,6 +12,7 @@ Do not upload:
 - database files
 - backup/decryption keys
 - logs containing private data
+- generated GBrain/wiki files, summaries, embeddings, or indexes
 
 ## Secret Handling
 
@@ -33,7 +34,7 @@ Default logs must not include:
 - contact dumps
 - full private file paths when avoidable
 
-The CLI writes debug logs under `.wapp-store/logs`. Keep those logs metadata-oriented and assume they may still be sensitive.
+The CLI writes debug logs under `.wapp-brain/logs`. Keep those logs metadata-oriented and assume they may still be sensitive.
 
 ## Git Hygiene
 
@@ -48,10 +49,14 @@ Ignored sensitive paths include:
 - `key`
 - `*.key`
 - local SQLite archives and sidecars
+- generated GBrain/wiki files, summaries, embeddings, and indexes
 - media folders
 - exports
-- `.wapp-store/`
+- `.wapp-brain/`
+- `.gbrain/`
 - `fixtures/generated/`
+
+Repo-local private data should live under `.wapp-brain/` by default. That includes WhatsApp SQL data, decrypted working files, generated GBrain/wiki pages, summaries, embeddings, retrieval indexes, and debug logs.
 
 ## Local Network Exposure
 

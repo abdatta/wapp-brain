@@ -27,6 +27,12 @@ user files/key
   -> React viewer
 ```
 
+## Private Workspace Boundary
+
+The public repo contains the engine: importer, local API/UI, schema, templates, tests, and docs.
+
+Repo-local private data lives under `.wapp-brain/` by default and stays gitignored. This includes WhatsApp SQL files, decrypted working files, the local archive, debug logs, generated GBrain/wiki pages, summaries, embeddings, and retrieval indexes.
+
 ## Important Modules
 
 - `src/server/server.ts` exposes the local API and serves built assets.

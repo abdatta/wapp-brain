@@ -121,7 +121,7 @@ if (fs.existsSync(distDir)) {
 }
 
 app.listen(config.app.port, config.app.host, () => {
-  console.log(`Wapp Store listening on http://${config.app.host}:${config.app.port}`);
+  console.log(`Wapp Brain listening on http://${config.app.host}:${config.app.port}`);
 });
 
 function stringQuery(value: unknown): string | undefined {

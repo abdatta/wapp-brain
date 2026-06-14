@@ -226,7 +226,7 @@ export function App() {
             <MessageCircle size={20} />
           </div>
           <div>
-            <h1>Wapp Store</h1>
+            <h1>Wapp Brain</h1>
             <p>Local WhatsApp archive</p>
           </div>
         </div>

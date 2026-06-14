@@ -9,7 +9,7 @@ const envSchema = z.object({
   ARCHIVE_DB_PATH: z.string().optional(),
   APP_HOST: z.string().default("127.0.0.1"),
   APP_PORT: z.coerce.number().int().positive().default(3600),
-  WAPP_WORK_DIR: z.string().default(".wapp-store")
+  WAPP_WORK_DIR: z.string().default(".wapp-brain")
 });
 
 const parsed = envSchema.parse(process.env);

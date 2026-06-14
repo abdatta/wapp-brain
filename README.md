@@ -1,6 +1,6 @@
-# Wapp Store
+# Wapp Brain
 
-Local-first WhatsApp archive importer and viewer for Android backup files.
+Local-first WhatsApp archive importer, live-store foundation, and second-brain workspace for Android backup files.
 
 For future-agent/project context, see the wiki in [docs/README.md](docs/README.md).
 
@@ -16,13 +16,14 @@ No WhatsApp Web scraping, cloud sync, account login, analytics, or external uplo
 
 ## Privacy Warnings
 
-WhatsApp databases, decrypted databases, media, archive files, and backup keys are highly sensitive.
+WhatsApp databases, decrypted databases, media, archive files, generated GBrain/wiki files, embeddings/indexes, and backup keys are highly sensitive.
 
 - Do not commit real `msgstore*`, `*.crypt*`, `wa.db`, decrypted `.db` files, archive `.sqlite` files, SQLite sidecars, keys, media, exports, logs, or `.env` files.
+- Do not commit generated second-brain/wiki files derived from WhatsApp data.
 - The app does not store backup keys in the archive.
 - The importer does not log message bodies or key material.
 - Decrypted databases are written only to the local work directory and are removed after import unless `--keep-decrypted` is used.
-- The local archive file contains private WhatsApp messages; protect `.wapp-store`, OS backups, and any manual exports.
+- The local archive file and generated brain files contain private WhatsApp-derived data; protect `.wapp-brain`, OS backups, and any manual exports.
 
 ## Requirements
 
@@ -42,8 +43,10 @@ Copy-Item .env.example .env
 By default, imports write to:
 
 ```text
-.wapp-store/archive.sqlite
+.wapp-brain/archive.sqlite
 ```
+
+Use `.wapp-brain/` as the repo-local private workspace for WhatsApp SQL data, decrypted working files, future generated GBrain/wiki pages, summaries, embeddings, and retrieval indexes. This directory is gitignored and should stay private.
 
 ## Install
 
@@ -69,7 +72,7 @@ The doctor command reports localhost binding, sensitive-file ignore coverage, wh
 
 ## Import Real Files
 
-The import CLI shows animated step status and progress bars where the importer can estimate work, including crypt15 verification/decryption and message batches. Every import also writes a unique verbose debug log under `.wapp-store/logs`.
+The import CLI shows animated step status and progress bars where the importer can estimate work, including crypt15 verification/decryption and message batches. Every import also writes a unique verbose debug log under `.wapp-brain/logs`.
 
 With a 64-character key:
 
@@ -88,7 +91,7 @@ Prefer `--key-file` over `--key` when possible so the raw key is not stored in y
 Optional media directory and archive destination:
 
 ```powershell
-npm run import -- --msgstore "C:\path\msgstore.db.crypt15" --wa "C:\path\wa.db" --media "C:\path\WhatsApp\Media" --archive ".wapp-store\archive.sqlite" --key-file "C:\path\encrypted_backup.key"
+npm run import -- --msgstore "C:\path\msgstore.db.crypt15" --wa "C:\path\wa.db" --media "C:\path\WhatsApp\Media" --archive ".wapp-brain\archive.sqlite" --key-file "C:\path\encrypted_backup.key"
 ```
 
 For a plaintext synthetic or already-decrypted `msgstore.db`, omit the key.
@@ -101,7 +104,7 @@ npm run inspect -- --msgstore "C:\path\msgstore.db.crypt15" --wa "C:\path\wa.db"
 
 Inspect validates/decrypts if needed, opens SQLite, reports schema compatibility and counts, and prints redacted warnings only. It does not print message bodies or raw rows.
 
-Use `--keep-decrypted` only if you intentionally want the decrypted msgstore left under `.wapp-store/decrypted`.
+Use `--keep-decrypted` only if you intentionally want the decrypted msgstore left under `.wapp-brain/decrypted`.
 
 Clean app-managed decrypted working files:
 

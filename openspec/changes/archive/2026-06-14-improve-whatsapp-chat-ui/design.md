@@ -1,6 +1,6 @@
 ## Context
 
-Wapp Store currently has a single React/Vite UI backed by local Express endpoints and a SQLite archive repository. The chat list returns all chats by default, including chats whose only records are WhatsApp system/status/event rows. The import form is always expanded in the sidebar, even after an archive has been initialized and imported. Message browsing already requests newest pages from `/api/chats/:id/messages?order=desc`, sorts those pages chronologically in the client, and exposes a manual "Load older messages" button.
+Wapp Brain currently has a single React/Vite UI backed by local Express endpoints and a SQLite archive repository. The chat list returns all chats by default, including chats whose only records are WhatsApp system/status/event rows. The import form is always expanded in the sidebar, even after an archive has been initialized and imported. Message browsing already requests newest pages from `/api/chats/:id/messages?order=desc`, sorts those pages chronologically in the client, and exposes a manual "Load older messages" button.
 
 This change keeps the local-first architecture intact. It improves the default browsing experience without moving message data outside the local process or adding remote services.
 

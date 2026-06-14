@@ -47,7 +47,7 @@ Likely work:
 
 ## Phase 4: Second Brain
 
-Goal: answer questions about the user's WhatsApp messages with citations.
+Goal: generate a private GBrain-style wiki and answer questions about the user's WhatsApp messages with citations.
 
 Minimum bar:
 - answer natural-language questions
@@ -64,5 +64,6 @@ Possible features:
 - topic maps
 - personal memory search
 - exportable cited reports
+- repo-local private wiki artifacts under `.wapp-brain/`
 
 Do not build this layer until the archive is trustworthy enough to cite from.

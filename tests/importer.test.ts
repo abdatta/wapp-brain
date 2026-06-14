@@ -16,7 +16,7 @@ import { openReadableSQLite } from "../src/server/import/sqlite";
 
 describe("WhatsApp import MVP", () => {
   it("cleans only app-managed decrypted working files", async () => {
-    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-store-cleanup-"));
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-cleanup-"));
     try {
       const empty = await cleanupDecryptedWorkDir(tempDir);
       expect(empty).toEqual({ removedFiles: 0, removedDirectories: 0 });
@@ -38,7 +38,7 @@ describe("WhatsApp import MVP", () => {
   });
 
   it("refuses cleanup for unmanaged decrypted directories", async () => {
-    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-store-unmanaged-"));
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-unmanaged-"));
     try {
       const decryptedDir = path.join(tempDir, "decrypted");
       await mkdir(decryptedDir, { recursive: true });
@@ -52,7 +52,7 @@ describe("WhatsApp import MVP", () => {
   });
 
   it("imports synthetic chats, contacts, participants, and messages idempotently", async () => {
-    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-store-import-"));
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-import-"));
     try {
       const fixture = await createSyntheticFixture(path.join(tempDir, "fixture"));
       const repository = new MemoryArchiveRepository();
@@ -81,7 +81,7 @@ describe("WhatsApp import MVP", () => {
   });
 
   it("persists imports idempotently in a local SQLite archive file", async () => {
-    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-store-sqlite-"));
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-sqlite-"));
     let repository: SqliteArchiveRepository | null = null;
     let reopened: SqliteArchiveRepository | null = null;
     try {
@@ -120,7 +120,7 @@ describe("WhatsApp import MVP", () => {
   });
 
   it("inspects supported archives without exposing message bodies", async () => {
-    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-store-inspect-"));
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-inspect-"));
     try {
       const fixture = await createSyntheticFixture(path.join(tempDir, "fixture"), { privacyCanary: true });
 
@@ -140,7 +140,7 @@ describe("WhatsApp import MVP", () => {
   });
 
   it("inspects unsupported archives with schema warnings but no row dumps", async () => {
-    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-store-inspect-unsupported-"));
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-inspect-unsupported-"));
     try {
       const msgstorePath = path.join(tempDir, "msgstore.db");
       const db = new Database(msgstorePath);
@@ -159,7 +159,7 @@ describe("WhatsApp import MVP", () => {
   });
 
   it("keeps import summaries free of message-body canaries", async () => {
-    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-store-privacy-"));
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-privacy-"));
     try {
       const fixture = await createSyntheticFixture(path.join(tempDir, "fixture"), { privacyCanary: true });
       const repository = new MemoryArchiveRepository();
@@ -176,7 +176,7 @@ describe("WhatsApp import MVP", () => {
   });
 
   it("imports a modern chat/jid/message schema with mapped group senders", async () => {
-    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-store-modern-"));
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-modern-"));
     try {
       const fixture = await createModernSyntheticFixture(path.join(tempDir, "fixture"));
       const repository = new MemoryArchiveRepository();
@@ -202,7 +202,7 @@ describe("WhatsApp import MVP", () => {
   });
 
   it("handles large-ish histories with idempotent reruns and newest paging", async () => {
-    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-store-large-"));
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-large-"));
     try {
       const fixture = await createSyntheticFixture(path.join(tempDir, "fixture"), { large: true });
       const repository = new MemoryArchiveRepository();
@@ -233,7 +233,7 @@ describe("WhatsApp import MVP", () => {
   });
 
   it("handles 1000+ chats with idempotent reruns and chat pagination", async () => {
-    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-store-many-chats-"));
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-many-chats-"));
     try {
       const fixture = await createSyntheticFixture(path.join(tempDir, "fixture"), { manyChats: 1005 });
       const repository = new MemoryArchiveRepository();
@@ -265,7 +265,7 @@ describe("WhatsApp import MVP", () => {
   });
 
   it("hides event-only chats by default while preserving opt-in access and filtered pagination", async () => {
-    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-store-event-only-"));
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-event-only-"));
     let sqliteRepository: SqliteArchiveRepository | null = null;
     try {
       const memoryRepository = new MemoryArchiveRepository();
@@ -297,7 +297,7 @@ describe("WhatsApp import MVP", () => {
   });
 
   it("skips malformed message rows with privacy-safe warnings", async () => {
-    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-store-malformed-"));
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-malformed-"));
     try {
       const msgstorePath = path.join(tempDir, "msgstore.db");
       const waPath = path.join(tempDir, "wa.db");
@@ -351,7 +351,7 @@ describe("WhatsApp import MVP", () => {
   });
 
   it("fails clearly for valid SQLite files without a supported WhatsApp schema", async () => {
-    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-store-unsupported-"));
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-unsupported-"));
     try {
       const msgstorePath = path.join(tempDir, "msgstore.db");
       const db = new Database(msgstorePath);
@@ -371,7 +371,7 @@ describe("WhatsApp import MVP", () => {
   });
 
   it("decrypts a synthetic crypt15 backup with a fake 64-character key", async () => {
-    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-store-crypt15-"));
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-crypt15-"));
     try {
       const fixture = await createSyntheticFixture(path.join(tempDir, "fixture"));
       const sqliteBytes = await readFile(fixture.msgstorePath);
@@ -399,7 +399,7 @@ describe("WhatsApp import MVP", () => {
   });
 
   it("rejects encrypted backups other than crypt15", async () => {
-    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-store-crypt14-reject-"));
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-crypt14-reject-"));
     try {
       const fixture = await createSyntheticFixture(path.join(tempDir, "fixture"));
       const encryptedPath = path.join(tempDir, "msgstore.db.crypt14");

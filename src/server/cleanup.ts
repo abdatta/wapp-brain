@@ -3,7 +3,7 @@ import path from "node:path";
 import { config } from "./config";
 import { PublicError } from "./privacy";
 
-const SENTINEL = ".wapp-store-managed";
+const SENTINEL = ".wapp-brain-managed";
 
 export interface CleanupSummary {
   removedFiles: number;
@@ -13,7 +13,7 @@ export interface CleanupSummary {
 export async function ensureManagedWorkDir(workDirPath = config.workDir): Promise<string> {
   const workDir = path.resolve(workDirPath);
   await mkdir(workDir, { recursive: true });
-  await writeFile(path.join(workDir, SENTINEL), "managed by Wapp Store\n", { flag: "w" });
+  await writeFile(path.join(workDir, SENTINEL), "managed by Wapp Brain\n", { flag: "w" });
   return workDir;
 }
 
@@ -35,7 +35,7 @@ export async function cleanupDecryptedWorkDir(workDirPath = config.workDir): Pro
   try {
     await stat(path.join(workDir, SENTINEL));
   } catch {
-    throw new PublicError("CLEANUP_NOT_MANAGED", "Cleanup is only available for a Wapp Store managed work directory.");
+    throw new PublicError("CLEANUP_NOT_MANAGED", "Cleanup is only available for a Wapp Brain managed work directory.");
   }
 
   const summary = await countTree(target);

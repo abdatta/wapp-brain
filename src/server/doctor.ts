@@ -24,7 +24,8 @@ const requiredIgnorePatterns = [
   "keys/",
   "media/",
   "exports/",
-  ".wapp-store/"
+  ".wapp-brain/",
+  ".gbrain/"
 ];
 
 export async function runDoctor(): Promise<DoctorCheck[]> {

@@ -480,8 +480,8 @@ function printHelp(): void {
 Notes:
   - Keys and message contents are never printed by the CLI.
   - Encrypted backups are crypt15-only; plaintext msgstore.db remains supported for fixtures or already-decrypted local files.
-  - By default, imports write to the local SQLite file configured by ARCHIVE_DB_PATH or .wapp-store/archive.sqlite.
-  - Each import writes a unique verbose debug log under .wapp-store/logs.
+  - By default, imports write to the local SQLite file configured by ARCHIVE_DB_PATH or .wapp-brain/archive.sqlite.
+  - Each import writes a unique verbose debug log under .wapp-brain/logs.
   - inspect reports schema compatibility and counts without message bodies.
   - Use --keep-decrypted only if you intentionally want the decrypted msgstore left in the local work directory.
   - cleanup removes app-managed decrypted working files only.`);
