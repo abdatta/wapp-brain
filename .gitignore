@@ -1,0 +1,43 @@
+.env
+.env.*
+!.env.example
+
+node_modules/
+dist/
+coverage/
+
+# Local WhatsApp inputs and derived sensitive data
+msgstore*
+*.crypt*
+wa.db
+*decrypted*.db
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3-journal
+*.db-shm
+*.db-wal
+*.db-journal
+encrypted_backup.key
+key
+*.key
+keys/
+media/
+Media/
+WhatsApp/
+exports/
+fixtures/generated/
+
+# Local app working directories
+.wapp-store/
+tmp/
+temp/
+logs/
+
+# OS/editor
+.DS_Store
+Thumbs.db

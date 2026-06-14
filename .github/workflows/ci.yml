@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    env:
+      ARCHIVE_DB_ADAPTER: sqlite
+      ARCHIVE_DB_PATH: .wapp-store/archive-ci.sqlite
+      APP_HOST: 127.0.0.1
+      APP_PORT: 3017
+      WAPP_WORK_DIR: .wapp-store
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Unit and parser tests
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Dependency audit
+        run: npm audit --audit-level=moderate
