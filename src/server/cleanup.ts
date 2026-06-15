@@ -18,9 +18,26 @@ export async function ensureManagedWorkDir(workDirPath = config.workDir): Promis
 }
 
 export async function cleanupDecryptedWorkDir(workDirPath = config.workDir): Promise<CleanupSummary> {
+  return cleanupManagedSubdir(workDirPath, "decrypted");
+}
+
+export async function cleanupImportStagingWorkDir(workDirPath = config.workDir): Promise<CleanupSummary> {
+  return cleanupManagedSubdir(workDirPath, "import-staging");
+}
+
+export async function cleanupSensitiveWorkDirs(workDirPath = config.workDir): Promise<CleanupSummary> {
+  const decrypted = await cleanupDecryptedWorkDir(workDirPath);
+  const staging = await cleanupImportStagingWorkDir(workDirPath);
+  return {
+    removedFiles: decrypted.removedFiles + staging.removedFiles,
+    removedDirectories: decrypted.removedDirectories + staging.removedDirectories
+  };
+}
+
+async function cleanupManagedSubdir(workDirPath: string, subdir: "decrypted" | "import-staging"): Promise<CleanupSummary> {
   const workDir = path.resolve(workDirPath);
-  const target = path.resolve(workDir, "decrypted");
-  assertSafeManagedTarget(workDir, target);
+  const target = path.resolve(workDir, subdir);
+  assertSafeManagedTarget(workDir, target, subdir);
 
   let targetExists = true;
   try {
@@ -43,9 +60,9 @@ export async function cleanupDecryptedWorkDir(workDirPath = config.workDir): Pro
   return summary;
 }
 
-function assertSafeManagedTarget(workDir: string, target: string): void {
+function assertSafeManagedTarget(workDir: string, target: string, subdir: "decrypted" | "import-staging"): void {
   const relative = path.relative(workDir, target);
-  if (relative.startsWith("..") || path.isAbsolute(relative) || path.basename(target) !== "decrypted") {
+  if (relative.startsWith("..") || path.isAbsolute(relative) || path.basename(target) !== subdir) {
     throw new PublicError("CLEANUP_UNSAFE_TARGET", "Cleanup target was not inside the managed work directory.");
   }
   if (target === path.parse(target).root || workDir === path.parse(workDir).root) {

@@ -232,6 +232,43 @@ describe("WhatsApp import MVP", () => {
     }
   });
 
+  it("yields during message batch import so UI polling can observe progress", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-import-yield-"));
+    try {
+      const fixture = await createSyntheticFixture(path.join(tempDir, "fixture"), { large: true });
+      const repository = new MemoryArchiveRepository();
+      let timerScheduled = false;
+      let importFinished = false;
+      let timerFiredBeforeImportFinished = false;
+
+      await runImport(
+        repository,
+        {
+          msgstorePath: fixture.msgstorePath,
+          waPath: fixture.waPath
+        },
+        {
+          onProgress: (event) => {
+            if (event.type === "message-progress" && event.processedMessages > 0 && !timerScheduled) {
+              timerScheduled = true;
+              setImmediate(() => {
+                if (!importFinished) {
+                  timerFiredBeforeImportFinished = true;
+                }
+              });
+            }
+          }
+        }
+      );
+      importFinished = true;
+
+      expect(timerScheduled).toBe(true);
+      expect(timerFiredBeforeImportFinished).toBe(true);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it("handles 1000+ chats with idempotent reruns and chat pagination", async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-many-chats-"));
     try {

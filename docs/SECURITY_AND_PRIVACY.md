@@ -13,6 +13,8 @@ Do not upload:
 - backup/decryption keys
 - logs containing private data
 - generated GBrain/wiki files, summaries, embeddings, or indexes
+- live WhatsApp linked-device auth/session state
+- live sync checkpoints, gap windows, event receipts, or raw protocol payloads
 
 ## Secret Handling
 
@@ -25,6 +27,8 @@ The app should:
 - remove decrypted databases by default
 - warn when `--keep-decrypted` is used
 
+The UI import wizard verifies keys locally before import. Raw key text is used for the local verification/import request and is not persisted in the archive. Selected backup files, optional key files, and temporary import rollback snapshots are staged under `.wapp-brain/import-staging/` and should be treated as sensitive local data until the job or cleanup removes them.
+
 ## Logging
 
 Default logs must not include:
@@ -33,8 +37,24 @@ Default logs must not include:
 - raw database rows
 - contact dumps
 - full private file paths when avoidable
+- live auth state, QR/pairing secrets, or raw WhatsApp Web payloads
 
 The CLI writes debug logs under `.wapp-brain/logs`. Keep those logs metadata-oriented and assume they may still be sensitive.
+
+## Live Maintainer
+
+Live sync is explicit opt-in. Backup import does not pair with WhatsApp, connect to WhatsApp Web, or create live credentials.
+
+The live maintainer:
+- refuses pairing/start until an imported archive baseline exists and is recent enough for bounded recovery
+- stores auth/session files under `.wapp-brain/live`
+- uses a code-level WhatsApp Web client rather than browser automation
+- keeps per-chat checkpoints and gap reports in the local archive
+- refuses known-vulnerable live client versions during doctor/start checks
+- reports uncertain gaps when WhatsApp Web cannot prove history continuity
+- runs with app-level read-only guards that block known send, read-receipt, presence, delete, edit, reaction, group, chat-modify, and profile-update methods
+
+Pairing codes and linked-device credentials are account access material. Do not paste them into logs, issues, or commits.
 
 ## Git Hygiene
 
@@ -57,6 +77,8 @@ Ignored sensitive paths include:
 - `fixtures/generated/`
 
 Repo-local private data should live under `.wapp-brain/` by default. That includes WhatsApp SQL data, decrypted working files, generated GBrain/wiki pages, summaries, embeddings, retrieval indexes, and debug logs.
+
+`npm run cleanup` removes app-managed decrypted working files and import staging files. `npm run doctor` warns when import staging files are still present after a cancelled or interrupted UI import. Do not run cleanup while an import is active, because active staging files and rollback snapshots are part of the local job.
 
 ## Local Network Exposure
 

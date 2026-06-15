@@ -1,10 +1,8 @@
 import { randomBytes } from "node:crypto";
 import { createWriteStream, type WriteStream } from "node:fs";
-import { mkdir, stat } from "node:fs/promises";
+import { mkdir, rm, stat } from "node:fs/promises";
 import path from "node:path";
-import * as cliProgress from "cli-progress";
-import ora, { type Ora } from "ora";
-import { cleanupDecryptedWorkDir } from "./cleanup";
+import { cleanupSensitiveWorkDirs } from "./cleanup";
 import { config } from "./config";
 import { archiveAdapterLabel, createArchiveRepository, initializeArchiveDatabase } from "./db/archive";
 import { SqliteArchiveRepository } from "./db/sqliteRepository";
@@ -12,7 +10,10 @@ import { runDoctor } from "./doctor";
 import { inspectArchive } from "./import/inspect";
 import { runImport } from "./import/importer";
 import { createSyntheticFixture } from "./import/fixtures";
-import type { ImportProgressEvent } from "./import/progress";
+import { BaileysLiveWhatsAppClient, runBaileysProof } from "./live/baileysClient";
+import { assertLiveBaselineReady } from "./live/baseline";
+import { LiveMaintainer, liveOptionsFromConfig } from "./live/maintainer";
+import { ImportTerminalProgress, type ImportProgressEvent } from "./import/progress";
 import { publicErrorMessage, redactForDisplay, safeBasename } from "./privacy";
 
 type Args = Record<string, string | boolean>;
@@ -40,7 +41,7 @@ async function main(): Promise<void> {
   }
 
   if (command === "cleanup") {
-    const summary = await cleanupDecryptedWorkDir();
+    const summary = await cleanupSensitiveWorkDirs();
     console.log(
       `Cleanup complete: removed_files=${summary.removedFiles} removed_directories=${summary.removedDirectories}`
     );
@@ -87,7 +88,109 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === "live-status") {
+    const repository = createArchiveRepository();
+    try {
+      console.log(JSON.stringify(await repository.getLiveStatus(), null, 2));
+    } finally {
+      await repository.close?.();
+    }
+    return;
+  }
+
+  if (command === "live-gaps") {
+    const repository = createArchiveRepository();
+    try {
+      console.log(JSON.stringify(await repository.listLiveGaps(["open", "retrying", "uncertain", "needs_user_action"]), null, 2));
+    } finally {
+      await repository.close?.();
+    }
+    return;
+  }
+
+  if (command === "live-retry-gap") {
+    const id = numberArg(args.id ?? args._);
+    if (!id) {
+      throw new Error("Missing --id for live gap retry.");
+    }
+    const repository = createArchiveRepository();
+    try {
+      await repository.updateLiveGapStatus(id, "open", "User requested retry from CLI.");
+      console.log(`Gap ${id} scheduled for retry.`);
+    } finally {
+      await repository.close?.();
+    }
+    return;
+  }
+
+  if (command === "live-cleanup-state" || command === "live-unlink") {
+    await rm(config.live.authDir, { recursive: true, force: true });
+    console.log(`Live auth state removed from ${displayPath(config.live.authDir)}.`);
+    return;
+  }
+
+  if (command === "live-proof") {
+    const repository = createArchiveRepository();
+    try {
+      await assertLiveBaselineReady(repository, config.live.maxBackfillPerChatDays);
+    } finally {
+      await repository.close?.();
+    }
+    const result = await runBaileysProof({
+      phoneNumber: stringArg(args.phone),
+      timeoutMs: numberArg(args.timeout) ?? 60_000
+    });
+    console.log(`Baileys proof complete: connected=${result.connected} messages_upsert=${result.receivedMessagesUpsert} history_sync=${result.receivedHistorySync}`);
+    console.log(`Result written to ${displayPath(config.live.spikePath)}.`);
+    for (const note of result.notes) {
+      console.log(note);
+    }
+    return;
+  }
+
+  if (command === "live-start") {
+    await runLiveStartCommand(args);
+    return;
+  }
+
   printHelp();
+}
+
+async function runLiveStartCommand(args: Args): Promise<void> {
+  const repository = createArchiveRepository();
+  const options = liveOptionsFromConfig();
+  await assertLiveBaselineReady(repository, options.maxBackfillPerChatDays);
+  const client = new BaileysLiveWhatsAppClient({
+    authDir: options.authDir,
+    phoneNumber: stringArg(args.phone),
+    connectTimeoutMs: numberArg(args.timeout)
+  });
+  const maintainer = new LiveMaintainer(repository, client, options);
+  let stopping = false;
+  const stop = async () => {
+    if (stopping) return;
+    stopping = true;
+    await maintainer.stop();
+    await repository.close?.();
+    process.exit(0);
+  };
+  process.once("SIGINT", () => void stop());
+  process.once("SIGTERM", () => void stop());
+  try {
+    const runId = await maintainer.start();
+    console.log(`Live maintainer started: run=${runId}`);
+    console.log("Press Ctrl+C to stop.");
+    if (Boolean(args.once)) {
+      await maintainer.runRecoveryOnce();
+      await stop();
+      return;
+    }
+    await new Promise(() => undefined);
+  } catch (error) {
+    await maintainer.fail(error);
+    await repository.close?.();
+    throw error;
+  }
 }
 
 async function runImportCommand(args: Args): Promise<void> {
@@ -101,7 +204,7 @@ async function runImportCommand(args: Args): Promise<void> {
   const archivePath = stringArg(args.archive) ?? stringArg(args["archive-db"]) ?? stringArg(args.db);
   const keyPath = stringArg(args["key-file"]);
   const logger = await createCliLogger("import");
-  const progress = new ImportCliProgress();
+  const progress = new ImportTerminalProgress();
   const repository = archivePath ? new SqliteArchiveRepository(path.resolve(archivePath)) : createArchiveRepository();
   const logPathForDisplay = displayPath(logger.logPath);
 
@@ -154,7 +257,7 @@ async function runImportCommand(args: Args): Promise<void> {
   }
 }
 
-function createProgressHandler(progress: ImportCliProgress, logger: CliLogger): (event: ImportProgressEvent) => void {
+function createProgressHandler(progress: ImportTerminalProgress, logger: CliLogger): (event: ImportProgressEvent) => void {
   let lastFileLogAt = 0;
   let lastMessageLogAt = 0;
   return (event) => {
@@ -176,165 +279,6 @@ function createProgressHandler(progress: ImportCliProgress, logger: CliLogger): 
     }
     logger.debug("progress", event);
   };
-}
-
-type FileProgressPhase = Extract<ImportProgressEvent, { type: "file-progress" }>["phase"];
-
-class ImportCliProgress {
-  private spinner: Ora = ora({ text: "Starting import.", stream: process.stderr });
-  private fileBar: cliProgress.SingleBar | null = null;
-  private messageBar: cliProgress.SingleBar | null = null;
-  private filePhase: FileProgressPhase | null = null;
-  private lastFileUpdateAt = 0;
-  private lastMessageUpdateAt = 0;
-
-  handle(event: ImportProgressEvent): void {
-    switch (event.type) {
-      case "step":
-        if (event.step !== "messages") {
-          this.stopMessageBar();
-        }
-        if (event.step !== "decrypting") {
-          this.stopFileBar();
-        }
-        this.setSpinner(event.message);
-        break;
-      case "file-progress":
-        this.handleFileProgress(event);
-        break;
-      case "message-progress":
-        this.handleMessageProgress(event);
-        break;
-      case "warnings":
-        if (event.count > 0) {
-          this.setSpinner(`Recorded ${event.count.toLocaleString()} import warning(s).`);
-        }
-        break;
-      case "complete":
-        this.complete(event.totals);
-        break;
-    }
-  }
-
-  complete(totals: { messages: number; warnings: number }): void {
-    this.stopFileBar();
-    this.stopMessageBar();
-    if (this.spinner.isSpinning) {
-      this.spinner.succeed(`Import complete: ${totals.messages.toLocaleString()} messages, ${totals.warnings.toLocaleString()} warning(s).`);
-    }
-  }
-
-  fail(message: string): void {
-    this.stopFileBar();
-    this.stopMessageBar();
-    if (this.spinner.isSpinning) {
-      this.spinner.fail(message);
-    } else {
-      process.stderr.write(`Import failed: ${message}\n`);
-    }
-  }
-
-  private handleFileProgress(event: Extract<ImportProgressEvent, { type: "file-progress" }>): void {
-    const now = Date.now();
-    const done = event.processedBytes >= event.totalBytes;
-    if (!done && now - this.lastFileUpdateAt < 100) {
-      return;
-    }
-    this.lastFileUpdateAt = now;
-    if (this.filePhase !== event.phase) {
-      this.stopFileBar();
-      this.stopMessageBar();
-      if (this.spinner.isSpinning) {
-        this.spinner.stop();
-      }
-      this.filePhase = event.phase;
-      this.fileBar = new cliProgress.SingleBar(
-        {
-          format: "{task} |{bar}| {percentage}% | {done}/{size} | ETA {eta_formatted}",
-          barsize: 28,
-          clearOnComplete: false,
-          hideCursor: true,
-          stream: process.stderr
-        },
-        cliProgress.Presets.shades_classic
-      );
-      this.fileBar.start(event.totalBytes, 0, {
-        task: event.message,
-        done: "0 B",
-        size: formatBytes(event.totalBytes)
-      });
-    }
-    this.fileBar?.update(event.processedBytes, {
-      task: event.message,
-      done: formatBytes(event.processedBytes),
-      size: formatBytes(event.totalBytes)
-    });
-    if (done) {
-      this.stopFileBar();
-      this.setSpinner(event.phase === "verify" ? "Encrypted backup verified." : "Encrypted payload decrypted.");
-    }
-  }
-
-  private handleMessageProgress(event: Extract<ImportProgressEvent, { type: "message-progress" }>): void {
-    const now = Date.now();
-    const total = event.totalMessages;
-    if (total == null || total <= 0) {
-      if (now - this.lastMessageUpdateAt >= 1000 || event.processedMessages === 0) {
-        this.setSpinner(`Imported ${event.persistedMessages.toLocaleString()} messages...`);
-        this.lastMessageUpdateAt = now;
-      }
-      return;
-    }
-    const done = event.processedMessages >= total;
-    if (!done && now - this.lastMessageUpdateAt < 100) {
-      return;
-    }
-    this.lastMessageUpdateAt = now;
-    this.stopFileBar();
-    if (!this.messageBar) {
-      if (this.spinner.isSpinning) {
-        this.spinner.stop();
-      }
-      this.messageBar = new cliProgress.SingleBar(
-        {
-          format: "Importing messages |{bar}| {percentage}% | {value}/{total} | ETA {eta_formatted}",
-          barsize: 28,
-          clearOnComplete: false,
-          hideCursor: true,
-          stream: process.stderr
-        },
-        cliProgress.Presets.shades_classic
-      );
-      this.messageBar.start(total, 0);
-    }
-    this.messageBar.update(Math.min(event.processedMessages, total));
-    if (done) {
-      this.stopMessageBar();
-      this.setSpinner(`Persisted ${event.persistedMessages.toLocaleString()} messages.`);
-    }
-  }
-
-  private setSpinner(message: string): void {
-    this.spinner.text = message;
-    if (!this.spinner.isSpinning) {
-      this.spinner.start();
-    }
-  }
-
-  private stopFileBar(): void {
-    if (this.fileBar) {
-      this.fileBar.stop();
-      this.fileBar = null;
-      this.filePhase = null;
-    }
-  }
-
-  private stopMessageBar(): void {
-    if (this.messageBar) {
-      this.messageBar.stop();
-      this.messageBar = null;
-    }
-  }
 }
 
 interface CliLogger {
@@ -417,20 +361,6 @@ function sanitizeLogValue(value: unknown): unknown {
   return value;
 }
 
-function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes <= 0) {
-    return "0 B";
-  }
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let value = bytes;
-  let unitIndex = 0;
-  while (value >= 1024 && unitIndex < units.length - 1) {
-    value /= 1024;
-    unitIndex += 1;
-  }
-  return `${value >= 10 || unitIndex === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unitIndex]}`;
-}
-
 function displayPath(filePath: string): string {
   const relative = path.relative(process.cwd(), filePath);
   return relative && !relative.startsWith("..") ? relative : filePath;
@@ -476,6 +406,12 @@ function printHelp(): void {
   npm run generate-fixtures -- --dir fixtures/generated/basic
   npm run inspect -- --msgstore <msgstore.db|msgstore.db.crypt15> [--wa <wa.db>] [--key <64-hex-key> | --key-file <encrypted_backup.key>]
   npm run import -- --msgstore <msgstore.db.crypt15> [--wa <wa.db>] [--media <WhatsApp/Media>] [--archive <archive.sqlite>] [--key <64-hex-key> | --key-file <encrypted_backup.key>]
+  tsx src/server/cli.ts live-proof [--phone <countrycode-number>] [--timeout <ms>]
+  tsx src/server/cli.ts live-start [--phone <countrycode-number>] [--once]
+  tsx src/server/cli.ts live-status
+  tsx src/server/cli.ts live-gaps
+  tsx src/server/cli.ts live-retry-gap --id <gap-id>
+  tsx src/server/cli.ts live-unlink
 
 Notes:
   - Keys and message contents are never printed by the CLI.
@@ -483,8 +419,9 @@ Notes:
   - By default, imports write to the local SQLite file configured by ARCHIVE_DB_PATH or .wapp-brain/archive.sqlite.
   - Each import writes a unique verbose debug log under .wapp-brain/logs.
   - inspect reports schema compatibility and counts without message bodies.
+  - live-* commands are explicit opt-in and store auth/session state only under .wapp-brain/live.
   - Use --keep-decrypted only if you intentionally want the decrypted msgstore left in the local work directory.
-  - cleanup removes app-managed decrypted working files only.`);
+  - cleanup removes app-managed decrypted working files and import staging files.`);
 }
 
 main().catch((error) => {

@@ -1,4 +1,20 @@
-import type { ChatListItem, ChatListOptions, ImportRequest, ImportTotals, MessageListItem, MessageListOrder, StatusSummary } from "../shared/types";
+import type {
+  ChatListItem,
+  ChatListOptions,
+  ImportJobSummary,
+  ImportMode,
+  ImportRequest,
+  ImportStagingFileKind,
+  ImportStagingSessionSummary,
+  ImportTotals,
+  ImportVerificationSummary,
+  LiveGapWindowRecord,
+  LiveMaintainerStatusSummary,
+  LivePairingSummary,
+  MessageListItem,
+  MessageListOrder,
+  StatusSummary
+} from "../shared/types";
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -35,6 +51,107 @@ export function cleanupTempFiles(): Promise<{ ok: boolean; summary: { removedFil
     method: "POST",
     body: "{}"
   });
+}
+
+export function createImportSession(): Promise<{ ok: boolean; session: ImportStagingSessionSummary }> {
+  return request<{ ok: boolean; session: ImportStagingSessionSummary }>("/api/import/staging", { method: "POST", body: "{}" });
+}
+
+export async function uploadImportFile(
+  sessionId: string,
+  kind: ImportStagingFileKind,
+  file: File,
+  relativePath?: string
+): Promise<{ ok: boolean; session: ImportStagingSessionSummary }> {
+  const query = new URLSearchParams({ name: file.name });
+  if (relativePath) query.set("relativePath", relativePath);
+  const response = await fetch(`/api/import/staging/${sessionId}/${kind}?${query}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/octet-stream" },
+    body: file
+  });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    throw new Error(payload?.error ?? "Could not stage selected file.");
+  }
+  return payload as { ok: boolean; session: ImportStagingSessionSummary };
+}
+
+export function cancelImportSession(sessionId: string): Promise<{ ok: boolean }> {
+  return request<{ ok: boolean }>(`/api/import/staging/${sessionId}`, { method: "DELETE", body: "{}" });
+}
+
+export function verifyImportKey(requestBody: {
+  sessionId?: string | null;
+  msgstorePath?: string | null;
+  key?: string | null;
+  keyPath?: string | null;
+  useStagedKey?: boolean;
+}): Promise<{ ok: boolean; verification: ImportVerificationSummary }> {
+  return request<{ ok: boolean; verification: ImportVerificationSummary }>("/api/import/verify-key", {
+    method: "POST",
+    body: JSON.stringify(requestBody)
+  });
+}
+
+export function startImportJob(requestBody: {
+  sessionId?: string | null;
+  mode: ImportMode;
+  key?: string | null;
+  keepDecrypted?: boolean;
+  paths?: Partial<Pick<ImportRequest, "msgstorePath" | "waPath" | "mediaPath" | "keyPath">>;
+}): Promise<{ ok: boolean; job: ImportJobSummary }> {
+  return request<{ ok: boolean; job: ImportJobSummary }>("/api/import/jobs", {
+    method: "POST",
+    body: JSON.stringify(requestBody)
+  });
+}
+
+export function getImportJob(jobId: string): Promise<ImportJobSummary> {
+  return request<ImportJobSummary>(`/api/import/jobs/${jobId}`);
+}
+
+export function getCurrentImportJob(): Promise<{ job: ImportJobSummary | null }> {
+  return request<{ job: ImportJobSummary | null }>("/api/import/jobs/current");
+}
+
+export function cancelImportJob(jobId: string): Promise<{ ok: boolean; job: ImportJobSummary }> {
+  return request<{ ok: boolean; job: ImportJobSummary }>(`/api/import/jobs/${jobId}`, { method: "DELETE", body: "{}" });
+}
+
+export function getLiveStatus(): Promise<LiveMaintainerStatusSummary> {
+  return request<LiveMaintainerStatusSummary>("/api/live/status");
+}
+
+export function listLiveGaps(): Promise<LiveGapWindowRecord[]> {
+  return request<LiveGapWindowRecord[]>("/api/live/gaps");
+}
+
+export function retryLiveGap(id: number): Promise<{ ok: boolean; live: LiveMaintainerStatusSummary }> {
+  return request<{ ok: boolean; live: LiveMaintainerStatusSummary }>(`/api/live/gaps/${id}/retry`, { method: "POST", body: "{}" });
+}
+
+export function unlinkLiveSession(): Promise<{ ok: boolean; live: LiveMaintainerStatusSummary }> {
+  return request<{ ok: boolean; live: LiveMaintainerStatusSummary }>("/api/live/unlink", { method: "POST", body: "{}" });
+}
+
+export function stopLiveSession(): Promise<{ ok: boolean; live: LiveMaintainerStatusSummary }> {
+  return request<{ ok: boolean; live: LiveMaintainerStatusSummary }>("/api/live/stop", { method: "POST", body: "{}" });
+}
+
+export function linkLiveSession(phoneNumber?: string | null): Promise<{ ok: boolean; live: LiveMaintainerStatusSummary; pairing: LivePairingSummary }> {
+  return request<{ ok: boolean; live: LiveMaintainerStatusSummary; pairing: LivePairingSummary }>("/api/live/link", {
+    method: "POST",
+    body: JSON.stringify({ phoneNumber: phoneNumber ?? null })
+  });
+}
+
+export function resumeLiveSession(): Promise<{ ok: boolean; live: LiveMaintainerStatusSummary; pairing: LivePairingSummary }> {
+  return request<{ ok: boolean; live: LiveMaintainerStatusSummary; pairing: LivePairingSummary }>("/api/live/resume", { method: "POST", body: "{}" });
+}
+
+export function getLivePairing(): Promise<LivePairingSummary> {
+  return request<LivePairingSummary>("/api/live/pairing");
 }
 
 export function listChats(params: Partial<ChatListOptions>): Promise<ChatListItem[]> {

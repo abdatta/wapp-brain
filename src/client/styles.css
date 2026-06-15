@@ -146,10 +146,119 @@ h1 {
 }
 
 .statusPanel,
+.livePanel,
 .importPanel,
 .filterPanel {
   padding: 16px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.onboardingPanel {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  margin: 12px;
+  padding: 16px;
+  border: 1px solid rgba(126, 221, 181, 0.2);
+  border-radius: 8px;
+  background:
+    linear-gradient(145deg, rgba(63, 119, 98, 0.42), rgba(35, 38, 54, 0.74)),
+    #171b20;
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.24);
+}
+
+.premiumSheen {
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: linear-gradient(110deg, transparent 0%, rgba(255, 255, 255, 0.08) 38%, transparent 72%);
+  transform: translateX(-100%);
+  animation: premiumSweep 5s ease-in-out infinite;
+}
+
+.eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #98e9c2;
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.onboardingHeader h2 {
+  margin-top: 8px;
+  font-size: 20px;
+  line-height: 1.12;
+}
+
+.onboardingHeader p,
+.wizardHeader p,
+.filePickRow p,
+.keyBox p,
+.jobStatus p {
+  color: #b4c1bd;
+  line-height: 1.4;
+  font-size: 13px;
+}
+
+.phaseRail {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  margin-top: 14px;
+}
+
+.phaseStep {
+  min-width: 0;
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  background: rgba(14, 17, 21, 0.54);
+  color: #9facaa;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.phaseStep.active {
+  color: #ecfff6;
+  border-color: rgba(125, 224, 178, 0.36);
+  background: rgba(64, 127, 94, 0.28);
+}
+
+.phaseStep.done {
+  color: #aaf0cb;
+}
+
+.setupReason,
+.wizardError,
+.verifySuccess,
+.warningSummary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  border-radius: 8px;
+  padding: 9px 10px;
+  font-size: 12px;
+}
+
+.setupReason,
+.wizardError,
+.warningSummary {
+  color: #f1d698;
+  background: rgba(112, 79, 28, 0.22);
+  border: 1px solid rgba(240, 189, 94, 0.25);
+}
+
+.verifySuccess {
+  color: #aff0cf;
+  background: rgba(42, 98, 70, 0.18);
+  border: 1px solid rgba(103, 211, 157, 0.22);
 }
 
 .panelTitle {
@@ -253,6 +362,7 @@ h1 {
 
 .secondaryButton,
 .primaryButton,
+.heroAction,
 .loadButton {
   min-height: 38px;
   border: 0;
@@ -276,14 +386,31 @@ h1 {
   color: #b7c2bd;
 }
 
+.heroAction {
+  width: 100%;
+  min-height: 44px;
+  margin-top: 14px;
+  border-radius: 8px;
+  background: linear-gradient(135deg, #d9fff0, #63d89f 48%, #7ab8ff);
+  color: #07110d;
+  font-weight: 900;
+  box-shadow: 0 12px 34px rgba(82, 203, 149, 0.22);
+}
+
 .primaryButton {
   padding: 0 14px;
   background: #4fc28f;
   color: #07110d;
 }
 
+.fullButton {
+  width: 100%;
+  margin-top: 14px;
+}
+
 .primaryButton:disabled,
 .secondaryButton:disabled,
+.heroAction:disabled,
 .loadButton:disabled {
   opacity: 0.55;
   cursor: not-allowed;
@@ -295,8 +422,119 @@ h1 {
 }
 
 .statusPanel.collapsed,
+.livePanel.collapsed,
 .importPanel.collapsed {
   padding-bottom: 12px;
+}
+
+.healthDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #8f9b97;
+}
+
+.healthDot.healthy {
+  background: #67d39d;
+}
+
+.healthDot.disconnected {
+  background: #9aa3a0;
+}
+
+.healthDot.needs_user_action {
+  background: #f0bd5e;
+}
+
+.healthDot.ready {
+  background: #7ab8ff;
+}
+
+.gapList {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.baselineNotice {
+  display: grid;
+  gap: 3px;
+  margin-top: 10px;
+  border-radius: 8px;
+  padding: 9px;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.baselineNotice.ready {
+  border: 1px solid rgba(103, 211, 157, 0.22);
+  background: rgba(42, 98, 70, 0.16);
+  color: #bcebd2;
+}
+
+.baselineNotice.blocked {
+  border: 1px solid rgba(240, 189, 94, 0.26);
+  background: rgba(112, 79, 28, 0.18);
+  color: #f0d696;
+}
+
+.baselineNotice span:last-child {
+  color: #aeb9b4;
+}
+
+.gapItem {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border: 1px solid rgba(240, 189, 94, 0.22);
+  border-radius: 8px;
+  background: #1b2026;
+  padding: 8px;
+}
+
+.gapItem strong,
+.gapItem span {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.gapItem strong {
+  color: #e4ece8;
+  font-size: 12px;
+}
+
+.gapItem span {
+  margin-top: 3px;
+  color: #aeb9b4;
+  font-size: 11px;
+}
+
+.miniButton {
+  flex: 0 0 auto;
+  width: 30px;
+  height: 30px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  background: #242931;
+  color: #dfe8e4;
+  display: grid;
+  place-items: center;
+}
+
+.dangerButton {
+  color: #ffd0c7;
+  background: #2a2022;
+}
+
+.textButton {
+  min-height: 34px;
+  border: 0;
+  background: transparent;
+  color: #9feac8;
+  padding: 0;
+  font-weight: 800;
 }
 
 .importPanel label > span {
@@ -663,6 +901,343 @@ h1 {
   margin: 10px 0;
 }
 
+.modalBackdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+  background: rgba(4, 7, 10, 0.66);
+  backdrop-filter: blur(14px);
+}
+
+.wizardModal,
+.pairingModal {
+  width: min(820px, 100%);
+  max-height: min(820px, 92vh);
+  overflow: auto;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  background:
+    linear-gradient(150deg, rgba(42, 69, 66, 0.62), rgba(20, 23, 29, 0.92) 34%),
+    #12161b;
+  box-shadow: 0 34px 90px rgba(0, 0, 0, 0.46);
+}
+
+.pairingModal {
+  width: min(560px, 100%);
+}
+
+.wizardHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 20px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.wizardHeader h2 {
+  margin-top: 8px;
+  font-size: 24px;
+}
+
+.wizardSteps {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  padding: 14px 20px 0;
+}
+
+.wizardStep {
+  min-width: 0;
+  min-height: 42px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-radius: 8px;
+  background: #171c22;
+  color: #9facaa;
+  padding: 0 10px;
+}
+
+.wizardStep span {
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: #262d35;
+  font-size: 12px;
+}
+
+.wizardStep strong {
+  font-size: 13px;
+}
+
+.wizardStep.active {
+  color: #f0fff8;
+  background: rgba(65, 130, 96, 0.28);
+  outline: 1px solid rgba(125, 224, 178, 0.28);
+}
+
+.wizardBody {
+  display: grid;
+  gap: 12px;
+  padding: 20px;
+}
+
+.filePickRow {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  min-height: 74px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  background: rgba(17, 21, 26, 0.78);
+  padding: 12px;
+}
+
+.fileIcon {
+  width: 42px;
+  height: 42px;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  background: #20302d;
+  color: #99eac7;
+}
+
+.filePickRow strong,
+.keyBox strong,
+.jobStatus strong {
+  display: block;
+  color: #eff8f4;
+}
+
+.filePickRow p {
+  margin-top: 3px;
+  overflow-wrap: anywhere;
+}
+
+.fileButton {
+  position: relative;
+  overflow: hidden;
+  min-height: 34px;
+  min-width: 72px;
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  background: #d8f6e7;
+  color: #0d1914;
+  font-weight: 900;
+}
+
+.fileButton input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.manualPathGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.wizardField span {
+  display: block;
+  margin-bottom: 6px;
+  color: #9ba7a2;
+  font-size: 12px;
+}
+
+.wizardField input {
+  width: 100%;
+  min-height: 38px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  background: #101419;
+  color: #edf5f1;
+  outline: 0;
+  padding: 0 10px;
+}
+
+.keyBox,
+.jobStatus {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  border: 1px solid rgba(126, 221, 181, 0.18);
+  border-radius: 8px;
+  background: rgba(34, 54, 48, 0.36);
+  padding: 13px;
+}
+
+.wizardCheck {
+  color: #c7d3ce;
+}
+
+.modeGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.modeCard {
+  min-height: 140px;
+  text-align: left;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 8px;
+  background: #171c22;
+  color: #edf4f1;
+  padding: 14px;
+}
+
+.modeCard strong,
+.modeCard span {
+  display: block;
+}
+
+.modeCard strong {
+  margin-top: 10px;
+}
+
+.modeCard span {
+  margin-top: 8px;
+  color: #aeb9b4;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.modeCard.selected {
+  border-color: rgba(125, 224, 178, 0.42);
+  background: rgba(48, 98, 73, 0.28);
+}
+
+.modeCard.danger.selected {
+  border-color: rgba(245, 117, 100, 0.42);
+  background: rgba(116, 48, 40, 0.24);
+}
+
+.wizardActions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.wizardSecondaryActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.wizardSecondaryActions .secondaryButton {
+  width: auto;
+  margin-top: 0;
+  padding: 0 12px;
+}
+
+.progressStack {
+  display: grid;
+  gap: 12px;
+}
+
+.progressBarBlock {
+  display: grid;
+  gap: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  background: rgba(17, 21, 26, 0.78);
+  padding: 12px;
+}
+
+.progressBarBlock > div:first-child {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: #aeb9b4;
+  font-size: 12px;
+}
+
+.progressBarBlock > div:first-child > * {
+  min-width: 0;
+}
+
+.progressBarBlock strong {
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.progressTrack {
+  height: 9px;
+  overflow: hidden;
+  border-radius: 99px;
+  background: #222933;
+}
+
+.progressTrack div {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #7ce0b0, #7ab8ff);
+  transition: width 0.28s ease;
+}
+
+.progressTrack.indeterminate div {
+  width: 38% !important;
+  background: linear-gradient(90deg, rgba(124, 224, 176, 0.2), #7ce0b0, #7ab8ff, rgba(122, 184, 255, 0.2));
+  animation: progressDrift 1.2s ease-in-out infinite;
+}
+
+.pairingBody {
+  display: grid;
+  gap: 14px;
+  padding: 20px;
+}
+
+.qrImage,
+.qrPlaceholder {
+  width: min(320px, 100%);
+  aspect-ratio: 1;
+  justify-self: center;
+  border-radius: 8px;
+}
+
+.qrImage {
+  padding: 12px;
+  background: #ffffff;
+}
+
+.qrPlaceholder {
+  display: grid;
+  place-items: center;
+  background: #171c22;
+  color: #aeb9b4;
+}
+
+.pairingCode {
+  display: grid;
+  gap: 6px;
+  text-align: center;
+}
+
+.pairingCode span {
+  color: #aeb9b4;
+  font-size: 12px;
+}
+
+.pairingCode strong {
+  font: 900 30px ui-monospace, SFMono-Regular, Consolas, monospace;
+  letter-spacing: 0;
+  color: #eff8f4;
+}
+
 .spin {
   animation: spin 0.8s linear infinite;
 }
@@ -676,6 +1251,23 @@ h1 {
 @keyframes shimmer {
   to {
     background-position: -220% 0;
+  }
+}
+
+@keyframes premiumSweep {
+  45%,
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+@keyframes progressDrift {
+  0% {
+    transform: translateX(-115%);
+  }
+
+  100% {
+    transform: translateX(270%);
   }
 }
 
@@ -709,5 +1301,30 @@ h1 {
 
   .messageBubble {
     max-width: 92%;
+  }
+
+  .wizardSteps,
+  .manualPathGrid,
+  .modeGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .filePickRow {
+    grid-template-columns: 36px minmax(0, 1fr);
+  }
+
+  .fileButton {
+    grid-column: 1 / -1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
   }
 }

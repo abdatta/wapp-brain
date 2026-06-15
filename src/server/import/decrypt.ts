@@ -82,6 +82,7 @@ export interface DecryptOptions {
   outputDir: string;
   keepDecrypted?: boolean;
   onProgress?: ImportProgressHandler;
+  signal?: AbortSignal;
 }
 
 export interface DecryptResult {
@@ -97,6 +98,7 @@ interface Crypt15Header {
 }
 
 export async function prepareMsgstore(options: DecryptOptions): Promise<DecryptResult> {
+  throwIfAborted(options.signal);
   if (!fs.existsSync(options.encryptedPath)) {
     throw new PublicError("INPUT_MISSING", "msgstore file was not found.");
   }
@@ -117,6 +119,7 @@ export async function prepareMsgstore(options: DecryptOptions): Promise<DecryptR
 }
 
 export async function decryptCrypt15(options: DecryptOptions): Promise<DecryptResult> {
+  throwIfAborted(options.signal);
   await mkdir(options.outputDir, { recursive: true });
   const rootKey = await loadCrypt15RootKey(options.key, options.keyPath);
   const derivedKey = deriveCrypt15BackupKey(rootKey);
@@ -136,8 +139,10 @@ export async function decryptCrypt15(options: DecryptOptions): Promise<DecryptRe
     header.dataOffset,
     normalEncryptedEnd,
     normalAuthTag,
-    options.onProgress
+    options.onProgress,
+    options.signal
   );
+  throwIfAborted(options.signal);
   const isNormalBackup = normalMd5.equals(normalChecksum);
   const authTag = isNormalBackup ? normalAuthTag : footer.subarray(16, 32);
   const encryptedEnd = isNormalBackup ? normalEncryptedEnd : stats.size - 16;
@@ -160,14 +165,17 @@ export async function decryptCrypt15(options: DecryptOptions): Promise<DecryptRe
       derivedKey,
       header.iv,
       authTag,
-      options.onProgress
+      options.onProgress,
+      options.signal
     );
+    throwIfAborted(options.signal);
     options.onProgress?.({
       type: "step",
       step: "decrypting",
       message: "Materializing decrypted SQLite database."
     });
-    await materializeSqlite(rawPath, sqlitePath);
+    await materializeSqlite(rawPath, sqlitePath, options.onProgress, options.signal);
+    throwIfAborted(options.signal);
     await assertSqliteMagic(sqlitePath, "CRYPT15_SQLITE_INVALID");
   } catch (error) {
     await rm(rawPath, { force: true });
@@ -289,13 +297,15 @@ async function md5Range(
   start: number,
   end: number,
   authTag: Buffer,
-  onProgress?: ImportProgressHandler
+  onProgress?: ImportProgressHandler,
+  signal?: AbortSignal
 ): Promise<Buffer> {
   const hash = createHash("md5").update(headerBytes);
   const totalBytes = Math.max(0, end - start);
   let processedBytes = 0;
   await pipeline(createReadStream(filePath, { start, end: end - 1 }), async function (source) {
     for await (const chunk of source) {
+      throwIfAborted(signal);
       const buffer = chunk as Buffer;
       hash.update(buffer);
       processedBytes += buffer.length;
@@ -320,7 +330,8 @@ async function decryptRangeToFile(
   key: Buffer,
   iv: Buffer,
   authTag: Buffer,
-  onProgress?: ImportProgressHandler
+  onProgress?: ImportProgressHandler,
+  signal?: AbortSignal
 ): Promise<void> {
   const decipher = createDecipheriv("aes-256-gcm", key, iv);
   decipher.setAuthTag(authTag);
@@ -330,6 +341,7 @@ async function decryptRangeToFile(
     createReadStream(inputPath, { start, end: end - 1 }),
     async function* (source) {
       for await (const chunk of source) {
+        throwIfAborted(signal);
         const buffer = chunk as Buffer;
         processedBytes += buffer.length;
         onProgress?.({
@@ -347,17 +359,68 @@ async function decryptRangeToFile(
   );
 }
 
-async function materializeSqlite(rawPath: string, sqlitePath: string): Promise<void> {
+async function materializeSqlite(rawPath: string, sqlitePath: string, onProgress?: ImportProgressHandler, signal?: AbortSignal): Promise<void> {
   const head = await readHead(rawPath, 16);
+  const rawSize = (await stat(rawPath)).size;
   if (head.subarray(0, SQLITE_MAGIC.length).equals(SQLITE_MAGIC)) {
-    await pipeline(createReadStream(rawPath), createWriteStream(sqlitePath));
+    await copyWithProgress(rawPath, sqlitePath, rawSize, "Materializing decrypted SQLite database.", onProgress, signal);
     return;
   }
   try {
-    await pipeline(createReadStream(rawPath), createInflate(), createWriteStream(sqlitePath));
+    let processedBytes = 0;
+    await pipeline(
+      createReadStream(rawPath),
+      async function* (source) {
+        for await (const chunk of source) {
+          throwIfAborted(signal);
+          const buffer = chunk as Buffer;
+          processedBytes += buffer.length;
+          onProgress?.({
+            type: "file-progress",
+            phase: "materialize",
+            message: "Inflating decrypted SQLite database.",
+            processedBytes,
+            totalBytes: rawSize
+          });
+          yield buffer;
+        }
+      },
+      createInflate(),
+      createWriteStream(sqlitePath)
+    );
   } catch {
     throw new PublicError("CRYPT15_DECOMPRESS_FAILED", "Decrypted backup was not a recognized SQLite database.");
   }
+}
+
+async function copyWithProgress(
+  inputPath: string,
+  outputPath: string,
+  totalBytes: number,
+  message: string,
+  onProgress?: ImportProgressHandler,
+  signal?: AbortSignal
+): Promise<void> {
+  let processedBytes = 0;
+  await pipeline(
+    createReadStream(inputPath),
+    async function* (source) {
+      for await (const chunk of source) {
+        throwIfAborted(signal);
+        const buffer = chunk as Buffer;
+        processedBytes += buffer.length;
+        onProgress?.({
+          type: "file-progress",
+          phase: "materialize",
+          message,
+          processedBytes,
+          totalBytes
+        });
+        yield buffer;
+      }
+    },
+    createWriteStream(outputPath)
+  );
 }
 
 async function assertSqliteMagic(filePath: string, code = "CRYPT_SQLITE_INVALID"): Promise<void> {
@@ -382,6 +445,12 @@ function cryptoSafeSuffix(inputPath: string): string {
   const base = path.basename(inputPath).replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 32);
   const random = randomBytes(6).toString("hex");
   return `${base}-${random}`;
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw new PublicError("IMPORT_CANCELLED", "Import stopped by user request.");
+  }
 }
 
 export function createCrypt15Fixture(rootKey: Buffer, sqliteBytes: Buffer): Buffer {

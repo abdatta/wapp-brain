@@ -11,10 +11,23 @@ npm run doctor
 
 Use `npm run build` when frontend, production serving, or TypeScript compilation behavior changed.
 
+Live maintainer commands are explicit opt-in and should not be run with real accounts during automated tests:
+
+```powershell
+npm run live:proof -- --phone <countrycode-number>
+npm run live:start -- --phone <countrycode-number>
+npm run live:status
+npm run live:gaps
+```
+
 ## Current Test Coverage
 
 The test suite covers:
 - cleanup safety
+- import staging cleanup
+- guided onboarding state derivation
+- UI import API key verification, progress polling, refresh reattachment, cancellation, rollback, and privacy-safe progress logging
+- shared terminal progress rendering for CLI and UI import jobs
 - synthetic legacy imports
 - file-backed SQLite persistence
 - idempotent re-imports
@@ -28,6 +41,12 @@ The test suite covers:
 - malformed message skips
 - unsupported schema failure
 - synthetic crypt15 decryption
+- live dependency safety checks
+- live schema additivity
+- live event idempotency
+- per-chat gap detection
+- bounded recovery outcomes
+- live API state controls
 
 ## Fixture Policy
 
@@ -41,9 +60,20 @@ npm run generate-fixtures -- --dir fixtures/generated/basic
 
 Generated fixtures are ignored by git and can be deleted at any time.
 
+Live maintainer tests use synthetic protocol-shaped events and fake clients. They verify idempotency, per-chat gap detection, bounded recovery outcomes, and privacy-safe diagnostics without connecting to WhatsApp.
+
 ## Manual Acceptance
 
 The local UI should make it easy to verify:
+- first-run guided setup shows backup import as the only primary action
+- import/re-import opens the wizard rather than inline path fields
+- key verification succeeds/fails before merge/replace is shown
+- replace mode requires explicit confirmation
+- import progress shows file and message progress
+- refreshing during a running import reopens the progress screen
+- stopping an import warns first, cancels the job, and restores the pre-import archive state
+- baseline-ready live sync shows link, not stop/unlink
+- active, paused, and disconnected live states show distinct actions
 - chats imported
 - names look reasonable
 - messages are in expected order

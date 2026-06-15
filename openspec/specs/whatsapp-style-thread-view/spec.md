@@ -5,23 +5,23 @@ Define the local archive thread browsing experience, including collapsed import 
 ## Requirements
 
 ### Requirement: Collapse import controls after archive data exists
-The UI SHALL collapse upload/import fields by default when status data shows that the local archive already contains imported data or a previous import run.
+The UI SHALL render import and re-import as a guided action entry point rather than inline raw path fields. When archive data exists, the archive browser remains the primary workspace and import/re-import opens the guided import wizard.
 
 #### Scenario: Archive with data opens in browse mode
 - **WHEN** the app loads and `/api/status` reports existing archive data or a previous import run
-- **THEN** the import fields are hidden behind an explicit import/re-import control
+- **THEN** the import fields are hidden behind an explicit import/re-import action that opens the guided import wizard
 
-#### Scenario: Empty archive shows import fields
+#### Scenario: Empty archive shows onboarding import action
 - **WHEN** the app loads and `/api/status` reports no archive data and no previous import run
-- **THEN** the import fields are visible so the user can perform the first import
+- **THEN** the app shows a first-run onboarding surface with import backup as the primary action rather than raw path fields
 
-#### Scenario: User expands import controls
-- **WHEN** the import fields are collapsed and the user activates the import/re-import control
-- **THEN** the upload/import fields become visible without clearing any already entered values
+#### Scenario: User opens import wizard
+- **WHEN** the user activates the import/re-import action
+- **THEN** the guided import wizard opens without clearing any already selected wizard state for the current session
 
-#### Scenario: Successful import collapses controls
+#### Scenario: Successful import returns to browse mode
 - **WHEN** an import completes successfully
-- **THEN** the import fields collapse and the archive browsing controls remain available
+- **THEN** the wizard completes, archive browsing controls remain available, and onboarding advances to the next setup action
 
 ### Requirement: Render messages in a WhatsApp-like thread
 The UI SHALL render message records with a conversation layout that distinguishes incoming, outgoing, system, and unknown messages in a WhatsApp-like style.

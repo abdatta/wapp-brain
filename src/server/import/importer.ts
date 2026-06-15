@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
+import { setImmediate } from "node:timers/promises";
 import type { ImportRequest, ImportTotals, MessageRecord } from "../../shared/types";
 import { config } from "../config";
 import { ensureManagedWorkDir } from "../cleanup";
@@ -15,6 +16,7 @@ const MESSAGE_BATCH_SIZE = 750;
 
 export interface RunImportOptions {
   onProgress?: ImportProgressHandler;
+  signal?: AbortSignal;
 }
 
 export async function runImport(
@@ -22,6 +24,7 @@ export async function runImport(
   request: ImportRequest,
   options: RunImportOptions = {}
 ): Promise<ImportTotals> {
+  throwIfAborted(options.signal);
   options.onProgress?.({ type: "step", step: "validating", message: "Validating local input files." });
   validateLocalPath(request.msgstorePath, "msgstore");
   if (request.waPath) {
@@ -43,6 +46,7 @@ export async function runImport(
   };
   options.onProgress?.({ type: "step", step: "initializing", message: "Opening the local archive database." });
   const runId = await repository.startImportRun(sourceSummary);
+  throwIfAborted(options.signal);
   const totals: ImportTotals = { contacts: 0, chats: 0, participants: 0, messages: 0, skipped: 0, warnings: 0 };
   let warningCount = 0;
   let prepared: Awaited<ReturnType<typeof prepareMsgstore>> | null = null;
@@ -51,6 +55,7 @@ export async function runImport(
 
   try {
     await ensureManagedWorkDir();
+    throwIfAborted(options.signal);
     const outputDir = path.resolve(config.workDir, "decrypted");
     await mkdir(outputDir, { recursive: true });
     options.onProgress?.({ type: "step", step: "preparing", message: "Preparing msgstore input." });
@@ -60,12 +65,15 @@ export async function runImport(
       keyPath: request.keyPath,
       outputDir,
       keepDecrypted: request.keepDecrypted,
-      onProgress: options.onProgress
+      onProgress: options.onProgress,
+      signal: options.signal
     });
+    throwIfAborted(options.signal);
     options.onProgress?.({ type: "step", step: "opening", message: "Opening readable WhatsApp databases." });
     msgstoreDb = openReadableSQLite(prepared.sqlitePath, "msgstore");
     waDb = request.waPath ? openReadableSQLite(request.waPath, "wa.db") : null;
 
+    throwIfAborted(options.signal);
     options.onProgress?.({ type: "step", step: "parsing", message: "Inspecting WhatsApp schema and contacts." });
     const parsed = parseWhatsAppSource(msgstoreDb, waDb);
     let persistedWarningCount = parsed.warnings.length;
@@ -83,6 +91,7 @@ export async function runImport(
       );
     }
 
+    throwIfAborted(options.signal);
     options.onProgress?.({ type: "step", step: "contacts", message: "Importing contacts." });
     await repository.upsertContacts(runId, parsed.contacts);
     totals.contacts = parsed.contacts.length;
@@ -97,22 +106,27 @@ export async function runImport(
       persistedMessages: 0,
       totalMessages: parsed.messageCountEstimate
     });
+    await yieldToEventLoop(options.signal);
     const messageBatch: MessageRecord[] = [];
     let processedMessages = 0;
     for (const message of parsed.iterateMessages()) {
+      throwIfAborted(options.signal);
       messageBatch.push(message);
       processedMessages += 1;
       if (messageBatch.length >= MESSAGE_BATCH_SIZE) {
         totals.messages += await flushMessageBatch(repository, runId, messageBatch);
+        throwIfAborted(options.signal);
         options.onProgress?.({
           type: "message-progress",
           processedMessages,
           persistedMessages: totals.messages,
           totalMessages: parsed.messageCountEstimate
         });
+        await yieldToEventLoop(options.signal);
       }
     }
     totals.messages += await flushMessageBatch(repository, runId, messageBatch);
+    throwIfAborted(options.signal);
     totals.skipped = parsed.getSkippedRows();
     options.onProgress?.({
       type: "message-progress",
@@ -120,6 +134,7 @@ export async function runImport(
       persistedMessages: totals.messages,
       totalMessages: parsed.messageCountEstimate
     });
+    await yieldToEventLoop(options.signal);
     if (parsed.warnings.length > persistedWarningCount) {
       const newWarnings = parsed.warnings.slice(persistedWarningCount);
       await repository.addWarnings(runId, newWarnings);
@@ -132,6 +147,7 @@ export async function runImport(
       });
     }
 
+    throwIfAborted(options.signal);
     options.onProgress?.({ type: "step", step: "participants", message: "Importing inferred group participants." });
     const participants = parsed.getParticipants();
     await repository.upsertContacts(
@@ -146,6 +162,7 @@ export async function runImport(
 
     options.onProgress?.({ type: "step", step: "finalizing", message: "Refreshing chat statistics." });
     await repository.refreshChatStats();
+    throwIfAborted(options.signal);
     totals.warnings = warningCount;
     await repository.completeImportRun(runId, totals, warningCount);
     options.onProgress?.({ type: "complete", totals });
@@ -159,6 +176,18 @@ export async function runImport(
     waDb?.close();
     await prepared?.cleanup();
   }
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw new PublicError("IMPORT_CANCELLED", "Import stopped by user request.");
+  }
+}
+
+async function yieldToEventLoop(signal?: AbortSignal): Promise<void> {
+  throwIfAborted(signal);
+  await setImmediate();
+  throwIfAborted(signal);
 }
 
 async function flushMessageBatch(repository: ArchiveRepository, runId: string, batch: MessageRecord[]): Promise<number> {

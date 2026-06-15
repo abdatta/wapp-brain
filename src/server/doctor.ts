@@ -1,8 +1,10 @@
 import fs from "node:fs";
 import net from "node:net";
+import path from "node:path";
 import { config } from "./config";
 import { publicErrorMessage } from "./privacy";
 import { isSqliteArchiveInitialized } from "./db/sqliteRepository";
+import { getLiveDependencyStatus } from "./live/dependency";
 
 export interface DoctorCheck {
   name: string;
@@ -34,6 +36,8 @@ export async function runDoctor(): Promise<DoctorCheck[]> {
   checks.push(checkGitIgnore());
   checks.push(await checkPort(config.app.host, config.app.port));
   checks.push(checkSqliteArchive());
+  checks.push(checkImportStaging());
+  checks.push(checkLiveDependency());
   return checks;
 }
 
@@ -81,6 +85,34 @@ function checkSqliteArchive(): DoctorCheck {
       message: publicErrorMessage(error)
     };
   }
+}
+
+function checkImportStaging(): DoctorCheck {
+  const stagingPath = path.join(config.workDir, "import-staging");
+  if (!fs.existsSync(stagingPath)) {
+    return { name: "Import staging", status: "pass", message: "No staged import files are present." };
+  }
+  return {
+    name: "Import staging",
+    status: "warn",
+    message: "Sensitive staged import files are present; run npm run cleanup after any cancelled import."
+  };
+}
+
+function checkLiveDependency(): DoctorCheck {
+  const status = getLiveDependencyStatus();
+  if (!status.installed) {
+    return {
+      name: "Live WhatsApp dependency",
+      status: "warn",
+      message: status.message
+    };
+  }
+  return {
+    name: "Live WhatsApp dependency",
+    status: status.safe ? "pass" : "fail",
+    message: status.message
+  };
 }
 
 function checkPort(host: string, port: number): Promise<DoctorCheck> {

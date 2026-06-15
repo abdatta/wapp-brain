@@ -7,6 +7,7 @@ The app is a Node.js/TypeScript project with:
 - React/Vite client.
 - SQLite local archive through `better-sqlite3`.
 - CLI commands for initialization, import, inspect, cleanup, fixtures, and doctor checks.
+- Optional live WhatsApp maintainer using a code-level WhatsApp Web client adapter.
 
 Default local endpoints:
 - Vite dev UI: `http://127.0.0.1:5900`
@@ -27,6 +28,19 @@ user files/key
   -> React viewer
 ```
 
+Optional live maintenance flow:
+
+```text
+explicit linked-device pairing
+  -> local WhatsApp Web protocol client
+  -> live/offline/history events
+  -> live normalizer
+  -> ArchiveRepository upserts
+  -> per-chat checkpoints and gap windows
+  -> bounded recovery planner
+  -> local API/UI health and alerts
+```
+
 ## Private Workspace Boundary
 
 The public repo contains the engine: importer, local API/UI, schema, templates, tests, and docs.
@@ -41,6 +55,7 @@ Repo-local private data lives under `.wapp-brain/` by default and stays gitignor
 - `src/server/import/decrypt.ts` prepares plaintext or crypt15 msgstore inputs.
 - `src/server/import/parser.ts` converts WhatsApp-like schemas into normalized records.
 - `src/server/import/importer.ts` orchestrates import runs and message batching.
+- `src/server/live/*` owns the optional live maintainer adapter, normalization, gap auditing, and bounded recovery.
 - `src/server/db/repository.ts` defines the storage interface.
 - `src/server/db/sqliteRepository.ts` owns the archive schema and SQL.
 - `src/client/App.tsx` is the primary local UI.
@@ -60,8 +75,15 @@ The archive stores:
 - `chats`
 - `chat_participants`
 - `messages`
+- `live_sessions`
+- `live_sync_runs`
+- `live_chat_checkpoints`
+- `live_gap_windows`
+- `live_event_receipts`
 
 Messages and entities use stable source-derived keys where possible so repeated imports can update existing rows instead of duplicating them.
+
+Live sync is modeled as a separate source feeding the same normalized archive. Import runs remain distinct from live sync runs, while contacts, chats, and messages still converge through stable source-derived keys.
 
 ## Future Postgres/Supabase Notes
 

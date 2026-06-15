@@ -1,5 +1,6 @@
 import type {
-  ArchiveRepository
+  ArchiveRepository,
+  ArchiveRestorePoint
 } from "./repository";
 import type {
   ChatListItem,
@@ -9,11 +10,23 @@ import type {
   ImportRunSummary,
   ImportTotals,
   ImportWarning,
+  LiveChatCheckpointRecord,
+  LiveEventReceiptRecord,
+  LiveGapStatus,
+  LiveGapWindowRecord,
+  LiveMaintainerStatusSummary,
+  LiveMessageUpdateRecord,
+  LiveMessageUpdateResult,
+  LiveSessionSummary,
+  LiveSyncRunSummary,
+  LiveSyncTotals,
   MessageListItem,
   MessageRecord,
   ParticipantRecord,
   StatusSummary
 } from "../../shared/types";
+import { config } from "../config";
+import { baselineFromStatus } from "../live/baseline";
 
 export class MemoryArchiveRepository implements ArchiveRepository {
   private importRuns = new Map<string, ImportRunSummary>();
@@ -22,11 +35,60 @@ export class MemoryArchiveRepository implements ArchiveRepository {
   private chats = new Map<string, ChatRecord & { id: number; messageCount: number; participantCount: number; lastMessageAt: string | null }>();
   private participants = new Map<string, ParticipantRecord>();
   private messages = new Map<string, MessageRecord & { id: number }>();
+  private liveSession: LiveSessionSummary | null = null;
+  private liveRuns = new Map<string, LiveSyncRunSummary>();
+  private liveCheckpoints = new Map<string, LiveChatCheckpointRecord>();
+  private liveGaps = new Map<number, LiveGapWindowRecord & { id: number; createdAt: string; updatedAt: string }>();
+  private liveReceipts = new Map<string, LiveEventReceiptRecord>();
+  private liveUpdates = new Map<string, LiveMessageUpdateRecord>();
   private nextContactId = 1;
   private nextChatId = 1;
   private nextMessageId = 1;
+  private nextLiveGapId = 1;
 
-  async startImportRun(): Promise<string> {
+  async createRestorePoint(_label: string): Promise<ArchiveRestorePoint> {
+    const snapshot = {
+      importRuns: cloneMap(this.importRuns),
+      warnings: structuredClone(this.warnings),
+      contacts: cloneMap(this.contacts),
+      chats: cloneMap(this.chats),
+      participants: cloneMap(this.participants),
+      messages: cloneMap(this.messages),
+      liveSession: structuredClone(this.liveSession),
+      liveRuns: cloneMap(this.liveRuns),
+      liveCheckpoints: cloneMap(this.liveCheckpoints),
+      liveGaps: cloneMap(this.liveGaps),
+      liveReceipts: cloneMap(this.liveReceipts),
+      liveUpdates: cloneMap(this.liveUpdates),
+      nextContactId: this.nextContactId,
+      nextChatId: this.nextChatId,
+      nextMessageId: this.nextMessageId,
+      nextLiveGapId: this.nextLiveGapId
+    };
+    return {
+      restore: async () => {
+        this.importRuns = cloneMap(snapshot.importRuns);
+        this.warnings = structuredClone(snapshot.warnings);
+        this.contacts = cloneMap(snapshot.contacts);
+        this.chats = cloneMap(snapshot.chats);
+        this.participants = cloneMap(snapshot.participants);
+        this.messages = cloneMap(snapshot.messages);
+        this.liveSession = structuredClone(snapshot.liveSession);
+        this.liveRuns = cloneMap(snapshot.liveRuns);
+        this.liveCheckpoints = cloneMap(snapshot.liveCheckpoints);
+        this.liveGaps = cloneMap(snapshot.liveGaps);
+        this.liveReceipts = cloneMap(snapshot.liveReceipts);
+        this.liveUpdates = cloneMap(snapshot.liveUpdates);
+        this.nextContactId = snapshot.nextContactId;
+        this.nextChatId = snapshot.nextChatId;
+        this.nextMessageId = snapshot.nextMessageId;
+        this.nextLiveGapId = snapshot.nextLiveGapId;
+      },
+      dispose: async () => undefined
+    };
+  }
+
+  async startImportRun(_sourceSummary: Record<string, unknown> = {}): Promise<string> {
     const id = crypto.randomUUID();
     this.importRuns.set(id, {
       id,
@@ -126,7 +188,184 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     }
   }
 
+  async clearArchiveData(): Promise<void> {
+    this.importRuns.clear();
+    this.warnings = [];
+    this.contacts.clear();
+    this.chats.clear();
+    this.participants.clear();
+    this.messages.clear();
+    this.liveRuns.clear();
+    this.liveCheckpoints.clear();
+    this.liveGaps.clear();
+    this.liveReceipts.clear();
+    this.liveUpdates.clear();
+    this.liveSession = null;
+    this.nextContactId = 1;
+    this.nextChatId = 1;
+    this.nextMessageId = 1;
+    this.nextLiveGapId = 1;
+  }
+
   async getStatus(): Promise<StatusSummary> {
+    const latestImport = [...this.importRuns.values()].sort((a, b) => b.startedAt.localeCompare(a.startedAt))[0] ?? null;
+    return {
+      database: { configured: true, initialized: true, adapter: "memory" },
+      counts: {
+        chats: this.chats.size,
+        contacts: this.contacts.size,
+        participants: this.participants.size,
+        messages: this.messages.size,
+        warnings: this.warnings.length
+      },
+      latestImport,
+      latestWarnings: this.warnings.slice(-8).reverse(),
+      live: await this.getLiveStatus()
+    };
+  }
+
+  async upsertLiveSession(session: Partial<LiveSessionSummary> & { id: string; status: LiveSessionSummary["status"]; clientName: string }): Promise<void> {
+    const now = new Date().toISOString();
+    this.liveSession = {
+      id: session.id,
+      status: session.status,
+      clientName: session.clientName,
+      linkedDeviceJid: session.linkedDeviceJid ?? this.liveSession?.linkedDeviceJid ?? null,
+      lastConnectedAt: session.lastConnectedAt ?? this.liveSession?.lastConnectedAt ?? null,
+      lastDisconnectedAt: session.lastDisconnectedAt ?? this.liveSession?.lastDisconnectedAt ?? null,
+      lastError: session.lastError ?? this.liveSession?.lastError ?? null,
+      createdAt: session.createdAt ?? this.liveSession?.createdAt ?? now,
+      updatedAt: now
+    };
+  }
+
+  async startLiveSyncRun(): Promise<string> {
+    const id = crypto.randomUUID();
+    this.liveRuns.set(id, {
+      id,
+      status: "running",
+      startedAt: new Date().toISOString(),
+      finishedAt: null,
+      totals: emptyLiveTotals(),
+      warningCount: 0
+    });
+    return id;
+  }
+
+  async completeLiveSyncRun(runId: string, totals: LiveSyncTotals, warningCount: number): Promise<void> {
+    const run = this.liveRuns.get(runId);
+    if (run) {
+      run.status = "completed";
+      run.finishedAt = new Date().toISOString();
+      run.totals = totals;
+      run.warningCount = warningCount;
+    }
+  }
+
+  async failLiveSyncRun(runId: string, _code: string, message: string, totals = emptyLiveTotals(), warningCount = 0): Promise<void> {
+    const run = this.liveRuns.get(runId);
+    if (run) {
+      run.status = "failed";
+      run.finishedAt = new Date().toISOString();
+      run.totals = totals;
+      run.warningCount = warningCount;
+      run.errorMessage = message;
+    }
+  }
+
+  async upsertLiveCheckpoint(checkpoint: LiveChatCheckpointRecord): Promise<void> {
+    this.liveCheckpoints.set(checkpoint.chatSourceId, { ...checkpoint });
+  }
+
+  async listLiveCheckpoints(): Promise<LiveChatCheckpointRecord[]> {
+    return [...this.liveCheckpoints.values()];
+  }
+
+  async upsertLiveGap(gap: LiveGapWindowRecord): Promise<number> {
+    const now = new Date().toISOString();
+    const id = gap.id ?? this.nextLiveGapId++;
+    this.liveGaps.set(id, {
+      ...gap,
+      id,
+      createdAt: gap.createdAt ?? this.liveGaps.get(id)?.createdAt ?? now,
+      updatedAt: now
+    });
+    return id;
+  }
+
+  async updateLiveGapStatus(id: number, status: LiveGapStatus, notes?: string | null): Promise<void> {
+    const gap = this.liveGaps.get(id);
+    if (gap) {
+      gap.status = status;
+      gap.notes = notes ?? gap.notes ?? null;
+      gap.updatedAt = new Date().toISOString();
+    }
+  }
+
+  async listLiveGaps(statuses?: LiveGapStatus[]): Promise<LiveGapWindowRecord[]> {
+    const allowed = statuses?.length ? new Set(statuses) : null;
+    return [...this.liveGaps.values()].filter((gap) => !allowed || allowed.has(gap.status));
+  }
+
+  async recordLiveEventReceipt(receipt: LiveEventReceiptRecord): Promise<void> {
+    this.liveReceipts.set(receipt.eventKey, { ...receipt, processedAt: receipt.processedAt ?? new Date().toISOString() });
+  }
+
+  async hasLiveEventReceipt(eventKey: string): Promise<boolean> {
+    return this.liveReceipts.has(eventKey);
+  }
+
+  async applyLiveMessageUpdates(updates: Array<Omit<LiveMessageUpdateRecord, "applied">>): Promise<LiveMessageUpdateResult> {
+    let applied = 0;
+    let pending = 0;
+    for (const update of updates) {
+      const message = this.messages.get(update.sourceMessageKey);
+      if (message) {
+        if (update.updateType === "delete") {
+          message.isDeleted = true;
+          message.body = null;
+          message.caption = null;
+        }
+        if (update.updateType === "edit" && typeof update.metadata?.body === "string") {
+          message.body = update.metadata.body;
+        }
+        applied += 1;
+      } else {
+        pending += 1;
+      }
+      this.liveUpdates.set(update.eventKey, { ...update, applied: Boolean(message) });
+    }
+    return { applied, pending };
+  }
+
+  async getLiveStatus(): Promise<LiveMaintainerStatusSummary> {
+    const currentRun = [...this.liveRuns.values()].filter((run) => run.status === "running").sort((a, b) => b.startedAt.localeCompare(a.startedAt))[0] ?? null;
+    const openGaps = await this.listLiveGaps(["open", "retrying", "uncertain", "needs_user_action"]);
+    return {
+      enabled: Boolean(this.liveSession),
+      baseline: baselineFromStatus(await this.getStatusWithoutLive(), this.latestChatMessageAt(), config.live.maxBackfillPerChatDays),
+      session: this.liveSession,
+      currentRun,
+      totals: currentRun?.totals ?? emptyLiveTotals(),
+      openGapCount: openGaps.length,
+      chatHealth: [...this.liveCheckpoints.values()].map((checkpoint) => {
+        const chat = this.chats.get(checkpoint.chatSourceId);
+        const chatOpenGaps = openGaps.filter((gap) => gap.chatSourceId === checkpoint.chatSourceId);
+        return {
+          chatSourceId: checkpoint.chatSourceId,
+          chatDisplayName: chat?.displayName ?? null,
+          health: checkpoint.health,
+          latestArchivedAt: checkpoint.latestArchivedAtMs ? new Date(checkpoint.latestArchivedAtMs).toISOString() : null,
+          latestLiveAt: checkpoint.latestLiveAtMs ? new Date(checkpoint.latestLiveAtMs).toISOString() : null,
+          oldestVerifiedAt: checkpoint.oldestVerifiedAtMs ? new Date(checkpoint.oldestVerifiedAtMs).toISOString() : null,
+          openGapCount: chatOpenGaps.length,
+          nextRecoveryAt: checkpoint.nextRecoveryAt ?? null
+        };
+      })
+    };
+  }
+
+  private async getStatusWithoutLive(): Promise<StatusSummary> {
     const latestImport = [...this.importRuns.values()].sort((a, b) => b.startedAt.localeCompare(a.startedAt))[0] ?? null;
     return {
       database: { configured: true, initialized: true, adapter: "memory" },
@@ -140,6 +379,15 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       latestImport,
       latestWarnings: this.warnings.slice(-8).reverse()
     };
+  }
+
+  private latestChatMessageAt(): string | null {
+    const latest = [...this.chats.values()]
+      .map((chat) => chat.lastMessageAt)
+      .filter((value): value is string => Boolean(value))
+      .sort()
+      .at(-1);
+    return latest ?? null;
   }
 
   async listChats(options: ChatListOptions): Promise<ChatListItem[]> {
@@ -210,6 +458,14 @@ export class MemoryArchiveRepository implements ArchiveRepository {
 
 function emptyTotals(): ImportTotals {
   return { contacts: 0, chats: 0, participants: 0, messages: 0, skipped: 0, warnings: 0 };
+}
+
+function emptyLiveTotals(): LiveSyncTotals {
+  return { contacts: 0, chats: 0, participants: 0, messages: 0, updates: 0, gapsOpened: 0, gapsClosed: 0, warnings: 0 };
+}
+
+function cloneMap<K, V>(map: Map<K, V>): Map<K, V> {
+  return new Map(structuredClone([...map]));
 }
 
 function isVisibleExchange(message: MessageRecord): boolean {

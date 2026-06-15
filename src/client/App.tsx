@@ -1,26 +1,71 @@
 import {
   AlertTriangle,
+  ArrowRight,
   CheckCircle2,
   ChevronDown,
   ChevronRight,
+  Circle,
   Database,
   Download,
   Eye,
   FileKey2,
+  FolderOpen,
   HardDrive,
+  KeyRound,
+  Link2,
   Loader2,
   MessageCircle,
   Moon,
+  Pause,
+  Play,
+  QrCode,
   RefreshCcw,
   Search,
   ShieldCheck,
+  Signal,
+  Sparkles,
+  Square,
   Trash2,
+  Unlink,
   Upload
 } from "lucide-react";
-import { FormEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import type { ChatListItem, ImportRequest, MessageListItem, StatusSummary } from "../shared/types";
-import { cleanupTempFiles, getStatus, initDatabase, listChats, listMessages, runImport } from "./api";
+import type {
+  ChatListItem,
+  ImportJobSummary,
+  ImportMode,
+  ImportProgressEvent,
+  ImportStagingFileKind,
+  ImportStagingSessionSummary,
+  ImportVerificationSummary,
+  LiveGapWindowRecord,
+  LivePairingSummary,
+  MessageListItem,
+  StatusSummary
+} from "../shared/types";
+import {
+  cancelImportJob,
+  cancelImportSession,
+  cleanupTempFiles,
+  createImportSession,
+  getCurrentImportJob,
+  getImportJob,
+  getLivePairing,
+  getStatus,
+  initDatabase,
+  linkLiveSession,
+  listChats,
+  listLiveGaps,
+  listMessages,
+  resumeLiveSession,
+  retryLiveGap,
+  startImportJob,
+  stopLiveSession,
+  unlinkLiveSession,
+  uploadImportFile,
+  verifyImportKey
+} from "./api";
 
 const CHAT_LIMIT = 60;
 const MESSAGE_LIMIT = 150;
@@ -28,6 +73,7 @@ const MESSAGE_LIMIT = 150;
 export function App() {
   const [status, setStatus] = useState<StatusSummary | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
+  const [liveGaps, setLiveGaps] = useState<LiveGapWindowRecord[]>([]);
   const [chats, setChats] = useState<ChatListItem[]>([]);
   const [chatOffset, setChatOffset] = useState(0);
   const [chatSearch, setChatSearch] = useState("");
@@ -43,16 +89,10 @@ export function App() {
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [importPanelOpen, setImportPanelOpen] = useState(true);
-  const [importPanelTouched, setImportPanelTouched] = useState(false);
-  const [form, setForm] = useState<ImportRequest>({
-    msgstorePath: "",
-    waPath: "",
-    mediaPath: "",
-    key: "",
-    keyPath: "",
-    keepDecrypted: false
-  });
+  const [importWizardOpen, setImportWizardOpen] = useState(false);
+  const [activeImportJob, setActiveImportJob] = useState<ImportJobSummary | null>(null);
+  const [pairingOpen, setPairingOpen] = useState(false);
+  const [pairing, setPairing] = useState<LivePairingSummary | null>(null);
   const messageListRef = useRef<HTMLDivElement | null>(null);
   const loadingMessagesRef = useRef(false);
   const scrollActionRef = useRef<"bottom" | "preserve" | null>(null);
@@ -60,17 +100,12 @@ export function App() {
 
   useEffect(() => {
     void refreshStatus();
+    void reattachActiveImport();
   }, []);
 
   useEffect(() => {
     void loadChats(true);
   }, [chatSearch, chatType, includeEventOnly]);
-
-  useEffect(() => {
-    if (status && !importPanelTouched) {
-      setImportPanelOpen(!hasArchiveData(status));
-    }
-  }, [status, importPanelTouched]);
 
   useEffect(() => {
     if (selectedChat) {
@@ -81,6 +116,29 @@ export function App() {
       void loadMessages(selectedChat, true);
     }
   }, [selectedChat?.id, messageQuery]);
+
+  useEffect(() => {
+    if (!pairingOpen) {
+      return;
+    }
+    let cancelled = false;
+    const timer = window.setInterval(() => {
+      getLivePairing()
+        .then((next) => {
+          if (!cancelled) {
+            setPairing(next);
+            if (next.state === "connected") {
+              void refreshStatus();
+            }
+          }
+        })
+        .catch(() => undefined);
+    }, 1200);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [pairingOpen]);
 
   useLayoutEffect(() => {
     const list = messageListRef.current;
@@ -102,6 +160,7 @@ export function App() {
       setStatusError(null);
       const next = await getStatus();
       setStatus(next);
+      setLiveGaps(await listLiveGaps().catch(() => []));
     } catch (err) {
       setStatusError(err instanceof Error ? err.message : "Status unavailable.");
     }
@@ -175,33 +234,6 @@ export function App() {
     }
   }
 
-  async function handleImport(event: FormEvent) {
-    event.preventDefault();
-    setBusy("Importing archive");
-    setError(null);
-    setNotice(null);
-    try {
-      const result = await runImport({
-        msgstorePath: form.msgstorePath,
-        waPath: form.waPath || null,
-        mediaPath: form.mediaPath || null,
-        key: form.key || null,
-        keyPath: form.keyPath || null,
-        keepDecrypted: form.keepDecrypted
-      });
-      setForm((current) => ({ ...current, key: "" }));
-      setImportPanelOpen(false);
-      setImportPanelTouched(true);
-      setNotice(`Import complete: ${result.totals.messages.toLocaleString()} messages.`);
-      await refreshStatus();
-      await loadChats(true);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Import failed.");
-    } finally {
-      setBusy(null);
-    }
-  }
-
   async function handleCleanup() {
     setBusy("Cleaning temp files");
     setError(null);
@@ -214,6 +246,120 @@ export function App() {
     } finally {
       setBusy(null);
     }
+  }
+
+  async function reattachActiveImport() {
+    try {
+      const result = await getCurrentImportJob();
+      if (result.job && (result.job.status === "queued" || result.job.status === "running" || result.job.status === "cancelling")) {
+        setActiveImportJob(result.job);
+        setImportWizardOpen(true);
+      }
+    } catch {
+      // The app can still browse the archive if no resumable import job is available.
+    }
+  }
+
+  async function handleRetryGap(id: number) {
+    setBusy("Retrying live gap");
+    setError(null);
+    setNotice(null);
+    try {
+      const result = await retryLiveGap(id);
+      setStatus((current) => (current ? { ...current, live: result.live } : current));
+      setLiveGaps(await listLiveGaps());
+      setNotice(`Live gap ${id} scheduled for retry.`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not retry live gap.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleUnlinkLive() {
+    if (!window.confirm("Unlinking removes local live credentials. You will need to scan or pair WhatsApp again.")) {
+      return;
+    }
+    setBusy("Unlinking live session");
+    setError(null);
+    setNotice(null);
+    try {
+      const result = await unlinkLiveSession();
+      setStatus((current) => (current ? { ...current, live: result.live } : current));
+      await refreshStatus();
+      setLiveGaps(await listLiveGaps());
+      setNotice("Live session state removed.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not unlink live session.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleStopLive() {
+    setBusy("Pausing live sync");
+    setError(null);
+    setNotice(null);
+    try {
+      const result = await stopLiveSession();
+      setStatus((current) => (current ? { ...current, live: result.live } : current));
+      await refreshStatus();
+      setNotice("Live sync paused. Your linked device state is kept locally.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not pause live sync.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleLinkLive() {
+    setBusy("Starting live link");
+    setError(null);
+    setNotice(null);
+    try {
+      const result = await linkLiveSession();
+      setStatus((current) => (current ? { ...current, live: result.live } : current));
+      setPairing(result.pairing);
+      setPairingOpen(true);
+      setNotice("Live pairing started locally.");
+      await refreshStatus();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not start live pairing.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleResumeLive() {
+    setBusy("Resuming live sync");
+    setError(null);
+    setNotice(null);
+    try {
+      const result = await resumeLiveSession();
+      setStatus((current) => (current ? { ...current, live: result.live } : current));
+      setPairing(result.pairing);
+      setPairingOpen(true);
+      setNotice("Live sync resume started.");
+      await refreshStatus();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not resume live sync.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleImportFinished(job: ImportJobSummary) {
+    setActiveImportJob(job.status === "completed" ? null : job);
+    setNotice(job.totals ? `Import complete: ${job.totals.messages.toLocaleString()} messages.` : "Import complete.");
+    await refreshStatus();
+    await loadChats(true);
+  }
+
+  async function handleImportStopped(job: ImportJobSummary) {
+    setActiveImportJob(null);
+    setNotice(job.error ?? "Import stopped and rolled back.");
+    await refreshStatus();
+    await loadChats(true);
   }
 
   const groupedMessages = useMemo(() => groupMessagesByDay(messages), [messages]);
@@ -246,6 +392,17 @@ export function App() {
 
       <main className="workspace">
         <aside className="sidebar">
+          <OnboardingPanel
+            status={status}
+            busy={busy}
+            onImport={() => setImportWizardOpen(true)}
+            onLink={() => void handleLinkLive()}
+            onResume={() => void handleResumeLive()}
+            onReviewGaps={() => {
+              const gap = document.querySelector(".gapList");
+              gap?.scrollIntoView({ behavior: "smooth", block: "start" });
+            }}
+          />
           <StatusPanel
             status={status}
             statusError={statusError}
@@ -253,88 +410,19 @@ export function App() {
             onInit={() => void handleInit()}
             onCleanup={() => void handleCleanup()}
           />
+          <LivePanel
+            status={status}
+            gaps={liveGaps}
+            busy={busy}
+            onImport={() => setImportWizardOpen(true)}
+            onLink={() => void handleLinkLive()}
+            onRetryGap={(id) => void handleRetryGap(id)}
+            onPause={() => void handleStopLive()}
+            onResume={() => void handleResumeLive()}
+            onUnlink={() => void handleUnlinkLive()}
+          />
 
-          <form className={`importPanel ${importPanelOpen ? "" : "collapsed"}`} onSubmit={(event) => void handleImport(event)}>
-            <button
-              className="panelToggle"
-              type="button"
-              aria-expanded={importPanelOpen}
-              onClick={() => {
-                setImportPanelTouched(true);
-                setImportPanelOpen((current) => !current);
-              }}
-            >
-              <span className="panelTitle">
-                <Upload size={16} />
-                <span>{hasArchiveData(status) ? "Import / re-import" : "Import"}</span>
-              </span>
-              {importPanelOpen ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
-            </button>
-            {importPanelOpen && (
-              <>
-                <label>
-                  <span>msgstore</span>
-                  <input
-                    value={form.msgstorePath}
-                    onChange={(event) => setForm((current) => ({ ...current, msgstorePath: event.target.value }))}
-                    placeholder="C:\\path\\msgstore.db.crypt15"
-                    autoComplete="off"
-                  />
-                </label>
-                <label>
-                  <span>wa.db</span>
-                  <input
-                    value={form.waPath ?? ""}
-                    onChange={(event) => setForm((current) => ({ ...current, waPath: event.target.value }))}
-                    placeholder="C:\\path\\wa.db"
-                    autoComplete="off"
-                  />
-                </label>
-                <label>
-                  <span>media</span>
-                  <input
-                    value={form.mediaPath ?? ""}
-                    onChange={(event) => setForm((current) => ({ ...current, mediaPath: event.target.value }))}
-                    placeholder="C:\\path\\WhatsApp\\Media"
-                    autoComplete="off"
-                  />
-                </label>
-                <label>
-                  <span>key</span>
-                  <input
-                    value={form.key ?? ""}
-                    onChange={(event) => setForm((current) => ({ ...current, key: event.target.value }))}
-                    placeholder="64-character key"
-                    type="password"
-                    autoComplete="off"
-                  />
-                </label>
-                <label>
-                  <span>key file</span>
-                  <input
-                    value={form.keyPath ?? ""}
-                    onChange={(event) => setForm((current) => ({ ...current, keyPath: event.target.value }))}
-                    placeholder="C:\\path\\encrypted_backup.key"
-                    autoComplete="off"
-                  />
-                </label>
-                <div className="importFooter">
-                  <label className="checkRow">
-                    <input
-                      type="checkbox"
-                      checked={Boolean(form.keepDecrypted)}
-                      onChange={(event) => setForm((current) => ({ ...current, keepDecrypted: event.target.checked }))}
-                    />
-                    <span>Keep decrypted DB</span>
-                  </label>
-                  <button className="primaryButton" type="submit" disabled={Boolean(busy) || !form.msgstorePath}>
-                    {busy === "Importing archive" ? <Loader2 className="spin" size={16} /> : <Download size={16} />}
-                    Import
-                  </button>
-                </div>
-              </>
-            )}
-          </form>
+          <ImportLauncher status={status} onOpen={() => setImportWizardOpen(true)} />
 
           <div className="filterPanel">
             <div className="searchBox">
@@ -452,6 +540,783 @@ export function App() {
           )}
         </section>
       </main>
+      {importWizardOpen && (
+        <ImportWizard
+          status={status}
+          initialJob={activeImportJob}
+          onClose={() => setImportWizardOpen(false)}
+          onComplete={(job) => void handleImportFinished(job)}
+          onStopped={(job) => void handleImportStopped(job)}
+        />
+      )}
+      {pairingOpen && <PairingModal pairing={pairing} onClose={() => setPairingOpen(false)} onRetry={() => void handleLinkLive()} />}
+    </div>
+  );
+}
+
+function LivePanel({
+  status,
+  gaps,
+  busy,
+  onImport,
+  onLink,
+  onRetryGap,
+  onPause,
+  onResume,
+  onUnlink
+}: {
+  status: StatusSummary | null;
+  gaps: LiveGapWindowRecord[];
+  busy: string | null;
+  onImport: () => void;
+  onLink: () => void;
+  onRetryGap: (id: number) => void;
+  onPause: () => void;
+  onResume: () => void;
+  onUnlink: () => void;
+}) {
+  const live = status?.live;
+  const [livePanelOpen, setLivePanelOpen] = useState(false);
+  const setup = status?.setup;
+  const state = setup?.state ?? "empty_archive";
+  const baselineReady = Boolean(live?.baseline.ready);
+  const hasLiveSession = Boolean(live?.session && live.session.status !== "not_configured");
+  const health = live?.openGapCount ? "needs_user_action" : live?.session?.status === "connected" ? "healthy" : baselineReady ? "ready" : "disconnected";
+  return (
+    <section className={`livePanel ${livePanelOpen ? "" : "collapsed"}`}>
+      <button className="panelToggle" type="button" aria-expanded={livePanelOpen} onClick={() => setLivePanelOpen((current) => !current)}>
+        <span className="panelTitle">
+          <Signal size={16} />
+          <span>Live Sync</span>
+          <span className={`healthDot ${health}`} />
+        </span>
+        {livePanelOpen ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+      </button>
+      {livePanelOpen && (
+        <>
+          <div className="statusGrid">
+            <Metric label="State" value={state.replaceAll("_", " ")} />
+            <Metric label="Open gaps" value={String(live?.openGapCount ?? 0)} />
+            <Metric label="Messages" value={live?.totals.messages.toLocaleString() ?? "0"} />
+            <Metric label="Updates" value={live?.totals.updates.toLocaleString() ?? "0"} />
+          </div>
+          <div className="statusLine">
+            {setup?.description ??
+              live?.baseline.warning ??
+              live?.session?.lastError ??
+              (live?.currentRun ? `running | ${formatDate(live.currentRun.startedAt)}` : "Import a backup, then link WhatsApp from this app.")}
+          </div>
+          {live?.baseline && (
+            <div className={`baselineNotice ${baselineReady ? "ready" : "blocked"}`}>
+              <span>{baselineReady ? "Imported archive baseline is ready." : live.baseline.warning}</span>
+              <span>
+                {live.baseline.messageCount.toLocaleString()} messages
+                {live.baseline.latestMessageAt ? ` | latest ${formatDate(live.baseline.latestMessageAt)}` : ""}
+              </span>
+            </div>
+          )}
+          {gaps.length > 0 && (
+            <div className="gapList">
+              {gaps.slice(0, 5).map((gap) => (
+                <div className={`gapItem ${gap.status}`} key={gap.id ?? `${gap.chatSourceId}-${gap.startAtMs}`}>
+                  <div>
+                    <strong>{gap.chatSourceId}</strong>
+                    <span>
+                      {gap.status.replaceAll("_", " ")} | {formatDate(msToIso(gap.startAtMs))} - {formatDate(msToIso(gap.endAtMs))}
+                    </span>
+                  </div>
+                  {gap.id && (
+                    <button className="miniButton" type="button" disabled={Boolean(busy)} onClick={() => onRetryGap(gap.id!)}>
+                      <RefreshCcw size={13} />
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+          {setup?.primaryAction === "import_backup" && (
+            <button className="primaryButton fullButton" onClick={onImport} disabled={Boolean(busy)} type="button">
+              <Upload size={16} />
+              Import backup
+            </button>
+          )}
+          {(setup?.primaryAction === "link_whatsapp" || setup?.primaryAction === "reconnect") && (
+            <button className="primaryButton fullButton" onClick={onLink} disabled={Boolean(busy) || !baselineReady} type="button">
+              <QrCode size={16} />
+              {setup.primaryAction === "reconnect" ? "Reconnect" : "Link WhatsApp"}
+            </button>
+          )}
+          {setup?.primaryAction === "resume_sync" && (
+            <button className="primaryButton fullButton" onClick={onResume} disabled={Boolean(busy)} type="button">
+              <Play size={16} />
+              Resume sync
+            </button>
+          )}
+          {live?.session?.status === "connected" && (
+            <button className="secondaryButton subtleButton" onClick={onPause} disabled={Boolean(busy)} type="button">
+              <Pause size={16} />
+              Pause sync
+            </button>
+          )}
+          {hasLiveSession && (
+            <button className="secondaryButton dangerButton" onClick={onUnlink} disabled={Boolean(busy)} type="button">
+              <Unlink size={16} />
+              Unlink device
+            </button>
+          )}
+        </>
+      )}
+    </section>
+  );
+}
+
+function OnboardingPanel({
+  status,
+  busy,
+  onImport,
+  onLink,
+  onResume,
+  onReviewGaps
+}: {
+  status: StatusSummary | null;
+  busy: string | null;
+  onImport: () => void;
+  onLink: () => void;
+  onResume: () => void;
+  onReviewGaps: () => void;
+}) {
+  const setup = status?.setup;
+  const action = setup?.primaryAction ?? "import_backup";
+  const primary = {
+    import_backup: { label: "Import backup", icon: <Upload size={17} />, onClick: onImport },
+    link_whatsapp: { label: "Link WhatsApp", icon: <QrCode size={17} />, onClick: onLink },
+    monitor_sync: { label: "View live health", icon: <Signal size={17} />, onClick: onReviewGaps },
+    resume_sync: { label: "Resume sync", icon: <Play size={17} />, onClick: onResume },
+    reconnect: { label: "Reconnect", icon: <Link2 size={17} />, onClick: onLink },
+    review_gaps: { label: "Review gaps", icon: <AlertTriangle size={17} />, onClick: onReviewGaps }
+  }[action];
+  return (
+    <section className={`onboardingPanel ${setup?.state ?? "loading"}`}>
+      <div className="premiumSheen" />
+      <div className="onboardingHeader">
+        <span className="eyebrow">
+          <Sparkles size={14} />
+          Guided setup
+        </span>
+        <h2>{setup?.label ?? "Checking local archive"}</h2>
+        <p>{setup?.description ?? "Reading local status from 127.0.0.1."}</p>
+      </div>
+      <div className="phaseRail" aria-label="Setup progress">
+        <PhaseStep label="Backup" active={setup?.phase === "backup"} done={Boolean(status?.latestImport)} />
+        <PhaseStep label="Archive" active={setup?.phase === "archive"} done={Boolean(status?.counts.messages)} />
+        <PhaseStep label="Live Sync" active={setup?.phase === "live"} done={status?.setup?.state === "syncing"} />
+      </div>
+      {setup?.blockingReason && (
+        <div className="setupReason">
+          <AlertTriangle size={15} />
+          <span>{setup.blockingReason}</span>
+        </div>
+      )}
+      <button className="heroAction" onClick={primary.onClick} disabled={Boolean(busy) || !setup} type="button">
+        {busy ? <Loader2 className="spin" size={17} /> : primary.icon}
+        {primary.label}
+        <ArrowRight size={16} />
+      </button>
+    </section>
+  );
+}
+
+function PhaseStep({ label, active, done }: { label: string; active: boolean; done: boolean }) {
+  return (
+    <div className={`phaseStep ${active ? "active" : ""} ${done ? "done" : ""}`}>
+      {done ? <CheckCircle2 size={15} /> : <Circle size={15} />}
+      <span>{label}</span>
+    </div>
+  );
+}
+
+function ImportLauncher({ status, onOpen }: { status: StatusSummary | null; onOpen: () => void }) {
+  return (
+    <section className="importPanel collapsed">
+      <button className="panelToggle" type="button" onClick={onOpen}>
+        <span className="panelTitle">
+          <Upload size={16} />
+          <span>{hasArchiveData(status) ? "Import / re-import" : "Import backup"}</span>
+        </span>
+        <ChevronRight size={16} />
+      </button>
+    </section>
+  );
+}
+
+function ImportWizard({
+  status,
+  initialJob,
+  onClose,
+  onComplete,
+  onStopped
+}: {
+  status: StatusSummary | null;
+  initialJob: ImportJobSummary | null;
+  onClose: () => void;
+  onComplete: (job: ImportJobSummary) => void;
+  onStopped: (job: ImportJobSummary) => void;
+}) {
+  const [step, setStep] = useState<"files" | "key" | "mode" | "import">(initialJob ? "import" : "files");
+  const [session, setSession] = useState<ImportStagingSessionSummary | null>(null);
+  const [manualOpen, setManualOpen] = useState(false);
+  const [paths, setPaths] = useState({ msgstorePath: "", waPath: "", mediaPath: "", keyPath: "" });
+  const [key, setKey] = useState("");
+  const [useStagedKey, setUseStagedKey] = useState(false);
+  const [verification, setVerification] = useState<ImportVerificationSummary | null>(null);
+  const [mode, setMode] = useState<ImportMode>(hasArchiveData(status) ? "merge" : "merge");
+  const [replaceConfirm, setReplaceConfirm] = useState("");
+  const [keepDecrypted, setKeepDecrypted] = useState(false);
+  const [job, setJob] = useState<ImportJobSummary | null>(initialJob);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (initialJob) {
+      setJob(initialJob);
+      setStep("import");
+    }
+  }, [initialJob?.id]);
+
+  useEffect(() => {
+    if (initialJob) {
+      return;
+    }
+    let cancelled = false;
+    createImportSession()
+      .then((result) => {
+        if (!cancelled) setSession(result.session);
+      })
+      .catch((err) => {
+        if (!cancelled) setError(err instanceof Error ? err.message : "Could not create import session.");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [initialJob]);
+
+  useEffect(() => {
+    if (!job || job.status === "completed" || job.status === "failed" || job.status === "cancelled") {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      getImportJob(job.id)
+        .then((next) => {
+          setJob(next);
+          if (next.status === "completed") {
+            onComplete(next);
+          } else if (next.status === "cancelled") {
+            onStopped(next);
+          }
+        })
+        .catch((err) => setError(err instanceof Error ? err.message : "Could not read import progress."));
+    }, 300);
+    return () => window.clearInterval(timer);
+  }, [job?.id, job?.status, onComplete, onStopped]);
+
+  const hasSelectedBackup = Boolean(session?.files.msgstore || paths.msgstorePath.trim());
+  const needsReplaceConfirmation = hasArchiveData(status) && mode === "replace";
+  const canStart = verification?.ok && (!needsReplaceConfirmation || replaceConfirm.trim().toLowerCase() === "replace");
+
+  async function upload(kind: ImportStagingFileKind, fileList: FileList | null) {
+    if (!session || !fileList?.length) return;
+    setBusy(`Uploading ${kind}`);
+    setError(null);
+    try {
+      let next = session;
+      const files = Array.from(fileList);
+      for (const file of files) {
+        const relative = (file as File & { webkitRelativePath?: string }).webkitRelativePath;
+        next = (await uploadImportFile(session.id, kind, file, relative)).session;
+      }
+      setSession(next);
+      if (kind === "key") setUseStagedKey(true);
+      setVerification(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not stage selected file.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function verify() {
+    setBusy("Verifying key");
+    setError(null);
+    try {
+      const result = await verifyImportKey({
+        sessionId: session?.id ?? null,
+        msgstorePath: paths.msgstorePath || null,
+        key: key || null,
+        keyPath: paths.keyPath || null,
+        useStagedKey
+      });
+      setVerification(result.verification);
+      if (result.verification.ok) setStep("mode");
+    } catch (err) {
+      setVerification(null);
+      setError(err instanceof Error ? err.message : "Key verification failed.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function start() {
+    setBusy("Starting import");
+    setError(null);
+    try {
+      const result = await startImportJob({
+        sessionId: session?.id ?? null,
+        mode,
+        key: key || null,
+        keepDecrypted,
+        paths: {
+          msgstorePath: paths.msgstorePath || undefined,
+          waPath: paths.waPath || undefined,
+          mediaPath: paths.mediaPath || undefined,
+          keyPath: paths.keyPath || undefined
+        }
+      });
+      setKey("");
+      setJob(result.job);
+      setStep("import");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not start import.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function stopImport() {
+    if (!job || (job.status !== "queued" && job.status !== "running" && job.status !== "cancelling")) {
+      return;
+    }
+    if (
+      !window.confirm(
+        "Stop this import and roll back any archive changes written by this job? Your selected staging files will be removed, and you can start again afterward."
+      )
+    ) {
+      return;
+    }
+    setBusy("Stopping import");
+    setError(null);
+    try {
+      const result = await cancelImportJob(job.id);
+      setJob(result.job);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not stop import.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function close() {
+    if (job && (job.status === "queued" || job.status === "running" || job.status === "cancelling")) {
+      if (!window.confirm("The import will keep running in the local server. Close the progress view anyway?")) {
+        return;
+      }
+    }
+    if (session && !job) {
+      await cancelImportSession(session.id).catch(() => undefined);
+    }
+    onClose();
+  }
+
+  return (
+    <div className="modalBackdrop" role="dialog" aria-modal="true" aria-labelledby="import-title">
+      <section className="wizardModal">
+        <div className="wizardHeader">
+          <div>
+            <span className="eyebrow">
+              <ShieldCheck size={14} />
+              Local import wizard
+            </span>
+            <h2 id="import-title">Load WhatsApp backup</h2>
+            <p>Pick files, verify the key locally, choose merge or replace, then watch the import phases.</p>
+          </div>
+          <button className="iconButton" onClick={() => void close()} type="button" aria-label="Close import wizard">
+            <Square size={15} />
+          </button>
+        </div>
+        <div className="wizardSteps">
+          {["files", "key", "mode", "import"].map((item, index) => (
+            <div className={`wizardStep ${step === item ? "active" : ""}`} key={item}>
+              <span>{index + 1}</span>
+              <strong>{item === "files" ? "Files" : item === "key" ? "Verify" : item === "mode" ? "Mode" : "Import"}</strong>
+            </div>
+          ))}
+        </div>
+        {error && (
+          <div className="wizardError">
+            <AlertTriangle size={16} />
+            <span>{error}</span>
+          </div>
+        )}
+        {step === "files" && (
+          <div className="wizardBody">
+            <FilePickRow
+              icon={<Database size={18} />}
+              title="Encrypted msgstore"
+              description="Required. Select msgstore.db.crypt15 or an already decrypted msgstore.db."
+              file={session?.files.msgstore}
+              accept=".crypt15,.db"
+              onPick={(files) => void upload("msgstore", files)}
+            />
+            <FilePickRow
+              icon={<HardDrive size={18} />}
+              title="Contacts database"
+              description="Optional. wa.db improves saved contact names."
+              file={session?.files.wa}
+              accept=".db"
+              onPick={(files) => void upload("wa", files)}
+            />
+            <FilePickRow
+              icon={<KeyRound size={18} />}
+              title="Backup key file"
+              description="Optional. You can also paste the 64-character key in the next step."
+              file={session?.files.key}
+              accept=".key,*"
+              onPick={(files) => void upload("key", files)}
+            />
+            <FilePickRow
+              icon={<FolderOpen size={18} />}
+              title="Media folder"
+              description="Optional. Used as local context only when media support needs it."
+              file={session?.files.media}
+              directory
+              onPick={(files) => void upload("media", files)}
+            />
+            <button className="textButton" type="button" onClick={() => setManualOpen((current) => !current)}>
+              {manualOpen ? "Hide advanced paths" : "Use advanced path fallback"}
+            </button>
+            {manualOpen && (
+              <div className="manualPathGrid">
+                <PathInput label="msgstore path" value={paths.msgstorePath} onChange={(value) => setPaths((current) => ({ ...current, msgstorePath: value }))} />
+                <PathInput label="wa.db path" value={paths.waPath} onChange={(value) => setPaths((current) => ({ ...current, waPath: value }))} />
+                <PathInput label="media folder path" value={paths.mediaPath} onChange={(value) => setPaths((current) => ({ ...current, mediaPath: value }))} />
+                <PathInput label="key file path" value={paths.keyPath} onChange={(value) => setPaths((current) => ({ ...current, keyPath: value }))} />
+              </div>
+            )}
+            <WizardActions
+              busy={busy}
+              primaryLabel="Verify key"
+              primaryIcon={<ArrowRight size={16} />}
+              primaryDisabled={!hasSelectedBackup || Boolean(busy)}
+              onPrimary={() => setStep("key")}
+              onBack={null}
+            />
+          </div>
+        )}
+        {step === "key" && (
+          <div className="wizardBody">
+            <div className="keyBox">
+              <FileKey2 size={20} />
+              <div>
+                <strong>Key verification happens locally</strong>
+                <p>The raw key is used only for this local operation and is not saved in the archive.</p>
+              </div>
+            </div>
+            <label className="wizardField">
+              <span>64-character backup key</span>
+              <input value={key} onChange={(event) => setKey(event.target.value)} type="password" autoComplete="off" placeholder="Paste key here" />
+            </label>
+            {session?.files.key && (
+              <label className="checkRow wizardCheck">
+                <input type="checkbox" checked={useStagedKey} onChange={(event) => setUseStagedKey(event.target.checked)} />
+                <span>Use selected key file: {session.files.key.name}</span>
+              </label>
+            )}
+            {verification && (
+              <div className="verifySuccess">
+                <CheckCircle2 size={16} />
+                <span>{verification.message}</span>
+              </div>
+            )}
+            <WizardActions
+              busy={busy}
+              primaryLabel="Verify locally"
+              primaryIcon={<ShieldCheck size={16} />}
+              primaryDisabled={Boolean(busy) || (!key && !useStagedKey && !paths.keyPath)}
+              onPrimary={() => void verify()}
+              onBack={() => setStep("files")}
+            />
+          </div>
+        )}
+        {step === "mode" && (
+          <div className="wizardBody">
+            <div className="modeGrid">
+              <button className={`modeCard ${mode === "merge" ? "selected" : ""}`} type="button" onClick={() => setMode("merge")}>
+                <Download size={18} />
+                <strong>Merge</strong>
+                <span>Keep existing archive records and idempotently add what this backup contains.</span>
+              </button>
+              <button className={`modeCard danger ${mode === "replace" ? "selected" : ""}`} type="button" onClick={() => setMode("replace")}>
+                <Trash2 size={18} />
+                <strong>Clear and replace</strong>
+                <span>Reset archive data and live recovery state, then import this backup as the new baseline.</span>
+              </button>
+            </div>
+            <label className="checkRow wizardCheck">
+              <input type="checkbox" checked={keepDecrypted} onChange={(event) => setKeepDecrypted(event.target.checked)} />
+              <span>Keep decrypted working database after import</span>
+            </label>
+            {needsReplaceConfirmation && (
+              <label className="wizardField">
+                <span>Type replace to confirm clearing {status?.counts.messages.toLocaleString() ?? "0"} archived messages</span>
+                <input value={replaceConfirm} onChange={(event) => setReplaceConfirm(event.target.value)} autoComplete="off" />
+              </label>
+            )}
+            <WizardActions
+              busy={busy}
+              primaryLabel="Start import"
+              primaryIcon={<Download size={16} />}
+              primaryDisabled={!canStart || Boolean(busy)}
+              onPrimary={() => void start()}
+              onBack={() => setStep("key")}
+            />
+          </div>
+        )}
+        {step === "import" && (
+          <div className="wizardBody">
+            <ImportProgress job={job} />
+            <WizardActions
+              busy={busy}
+              primaryLabel={job?.status === "completed" || job?.status === "cancelled" || job?.status === "failed" ? "Done" : job?.status === "cancelling" ? "Stopping" : "Importing"}
+              primaryIcon={job?.status === "completed" ? <CheckCircle2 size={16} /> : job?.status === "cancelled" || job?.status === "failed" ? <Square size={16} /> : <Loader2 className="spin" size={16} />}
+              primaryDisabled={job?.status !== "completed" && job?.status !== "cancelled" && job?.status !== "failed"}
+              onPrimary={onClose}
+              onBack={null}
+              dangerLabel={job?.status === "queued" || job?.status === "running" || job?.status === "cancelling" ? "Stop import" : null}
+              dangerIcon={job?.status === "cancelling" ? <Loader2 className="spin" size={16} /> : <Square size={16} />}
+              dangerDisabled={Boolean(busy) || job?.status === "cancelling"}
+              onDanger={() => void stopImport()}
+            />
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function FilePickRow({
+  icon,
+  title,
+  description,
+  file,
+  accept,
+  directory,
+  onPick
+}: {
+  icon: ReactNode;
+  title: string;
+  description: string;
+  file?: { name: string; size: number } | null;
+  accept?: string;
+  directory?: boolean;
+  onPick: (files: FileList | null) => void;
+}) {
+  return (
+    <div className="filePickRow">
+      <div className="fileIcon">{icon}</div>
+      <div>
+        <strong>{title}</strong>
+        <p>{file ? `${file.name} | ${formatBytes(file.size)}` : description}</p>
+      </div>
+      <label className="fileButton">
+        Pick
+        <input
+          type="file"
+          accept={accept}
+          multiple={directory}
+          {...(directory ? { webkitdirectory: "true" } : {})}
+          onChange={(event) => onPick(event.target.files)}
+        />
+      </label>
+    </div>
+  );
+}
+
+function PathInput({ label, value, onChange }: { label: string; value: string; onChange: (value: string) => void }) {
+  return (
+    <label className="wizardField">
+      <span>{label}</span>
+      <input value={value} onChange={(event) => onChange(event.target.value)} autoComplete="off" />
+    </label>
+  );
+}
+
+function WizardActions({
+  busy,
+  primaryLabel,
+  primaryIcon,
+  primaryDisabled,
+  onPrimary,
+  onBack,
+  dangerLabel = null,
+  dangerIcon = null,
+  dangerDisabled = false,
+  onDanger
+}: {
+  busy: string | null;
+  primaryLabel: string;
+  primaryIcon: ReactNode;
+  primaryDisabled: boolean;
+  onPrimary: () => void;
+  onBack: (() => void) | null;
+  dangerLabel?: string | null;
+  dangerIcon?: ReactNode;
+  dangerDisabled?: boolean;
+  onDanger?: (() => void) | null;
+}) {
+  return (
+    <div className="wizardActions">
+      <div className="wizardSecondaryActions">
+        {onBack && (
+          <button className="secondaryButton" type="button" onClick={onBack} disabled={Boolean(busy)}>
+            Back
+          </button>
+        )}
+        {dangerLabel && onDanger && (
+          <button className="secondaryButton dangerButton" type="button" onClick={onDanger} disabled={dangerDisabled}>
+            {dangerIcon}
+            {dangerLabel}
+          </button>
+        )}
+      </div>
+      <button className="primaryButton" type="button" onClick={onPrimary} disabled={primaryDisabled}>
+        {busy ? <Loader2 className="spin" size={16} /> : primaryIcon}
+        {primaryLabel}
+      </button>
+    </div>
+  );
+}
+
+function ImportProgress({ job }: { job: ImportJobSummary | null }) {
+  const events = job?.events ?? [];
+  const latestStep = [...events].reverse().find((event): event is Extract<ImportProgressEvent, { type: "step" }> => event.type === "step");
+  const latestFile = [...events].reverse().find((event): event is Extract<ImportProgressEvent, { type: "file-progress" }> => event.type === "file-progress");
+  const latestMessages = [...events].reverse().find((event): event is Extract<ImportProgressEvent, { type: "message-progress" }> => event.type === "message-progress");
+  const latestWarnings = [...events].reverse().find((event): event is Extract<ImportProgressEvent, { type: "warnings" }> => event.type === "warnings");
+  const filePct = latestFile ? progressPercent(latestFile.processedBytes, latestFile.totalBytes) : 0;
+  const fileDone = Boolean(latestFile && latestFile.processedBytes >= latestFile.totalBytes);
+  const messagePct = latestMessages?.totalMessages ? progressPercent(latestMessages.processedMessages, latestMessages.totalMessages) : 0;
+  const messagePreparing =
+    job?.status === "running" &&
+    !latestMessages &&
+    Boolean(latestStep && ["decrypting", "opening", "parsing", "contacts", "chats"].includes(latestStep.step));
+  const messageDetail = latestMessages
+    ? latestMessages.totalMessages
+      ? `${messagePct}% | ${latestMessages.processedMessages.toLocaleString()} / ${latestMessages.totalMessages.toLocaleString()} processed | ${latestMessages.persistedMessages.toLocaleString()} persisted`
+      : `${latestMessages.processedMessages.toLocaleString()} processed | ${latestMessages.persistedMessages.toLocaleString()} persisted`
+    : messagePreparing
+      ? "Preparing message import"
+      : "Waiting";
+  const statusTitle =
+    job?.status === "completed"
+      ? "Import complete"
+      : job?.status === "failed"
+        ? "Import failed"
+        : job?.status === "cancelled"
+          ? "Import stopped"
+          : job?.status === "cancelling"
+            ? "Stopping import"
+            : "Import running";
+  return (
+    <div className="progressStack">
+      <div className={`jobStatus ${job?.status ?? "queued"}`}>
+        {job?.status === "failed" ? <AlertTriangle size={18} /> : job?.status === "completed" || job?.status === "cancelled" ? <CheckCircle2 size={18} /> : <Loader2 className="spin" size={18} />}
+        <div>
+          <strong>{statusTitle}</strong>
+          <p>{job?.error ?? latestStep?.message ?? "Preparing local import job."}</p>
+        </div>
+      </div>
+      <ProgressBar
+        label={latestFile?.message ?? "File verification/decryption"}
+        value={filePct}
+        active={Boolean(latestFile && job?.status === "running" && !fileDone)}
+        detail={latestFile ? `${filePct}% | ${formatBytes(latestFile.processedBytes)} / ${formatBytes(latestFile.totalBytes)}` : "Waiting"}
+      />
+      <ProgressBar
+        label="Messages"
+        value={messagePct}
+        active={messagePreparing || Boolean(latestMessages && job?.status === "running")}
+        detail={messageDetail}
+      />
+      {latestWarnings && (
+        <div className="warningSummary">
+          <AlertTriangle size={15} />
+          <span>
+            {latestWarnings.count.toLocaleString()} warnings: {latestWarnings.codes.join(", ")}
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function progressPercent(value: number, total: number): number {
+  return total > 0 ? Math.min(100, Math.round((value / total) * 100)) : 0;
+}
+
+function ProgressBar({ label, value, detail, active = false }: { label: string; value: number; detail: string; active?: boolean }) {
+  return (
+    <div className={`progressBarBlock ${active ? "active" : ""}`}>
+      <div>
+        <span>{label}</span>
+        <strong>{detail}</strong>
+      </div>
+      <div className={`progressTrack ${active && value === 0 ? "indeterminate" : ""}`}>
+        <div style={{ width: `${Math.max(4, Math.min(100, value))}%` }} />
+      </div>
+    </div>
+  );
+}
+
+function PairingModal({ pairing, onClose, onRetry }: { pairing: LivePairingSummary | null; onClose: () => void; onRetry: () => void }) {
+  const expired = pairing?.expiresAt ? Date.now() > Date.parse(pairing.expiresAt) && pairing.state !== "connected" : false;
+  return (
+    <div className="modalBackdrop" role="dialog" aria-modal="true" aria-labelledby="pair-title">
+      <section className="pairingModal">
+        <div className="wizardHeader">
+          <div>
+            <span className="eyebrow">
+              <QrCode size={14} />
+              WhatsApp linked device
+            </span>
+            <h2 id="pair-title">{pairing?.state === "connected" ? "Linked" : "Link WhatsApp"}</h2>
+            <p>Open WhatsApp on your phone, then use Linked devices to scan or pair. The live client is read-only guarded.</p>
+          </div>
+          <button className="iconButton" onClick={onClose} type="button" aria-label="Close pairing">
+            <Square size={15} />
+          </button>
+        </div>
+        <div className="pairingBody">
+          {pairing?.qrDataUrl ? <img className="qrImage" src={pairing.qrDataUrl} alt="WhatsApp pairing QR" /> : <div className="qrPlaceholder"><Loader2 className="spin" size={26} /><span>Waiting for QR</span></div>}
+          {pairing?.pairingCode && (
+            <div className="pairingCode">
+              <span>Pairing code</span>
+              <strong>{pairing.pairingCode}</strong>
+            </div>
+          )}
+          <div className={`jobStatus ${pairing?.state ?? "idle"}`}>
+            {pairing?.state === "connected" ? <CheckCircle2 size={18} /> : expired || pairing?.state === "error" ? <AlertTriangle size={18} /> : <Loader2 className="spin" size={18} />}
+            <div>
+              <strong>{expired ? "QR expired" : pairing?.state?.replaceAll("_", " ") ?? "Starting"}</strong>
+              <p>{pairing?.lastError ?? "No sends, no read receipts, no chat modifications."}</p>
+            </div>
+          </div>
+          {expired && (
+            <button className="primaryButton fullButton" type="button" onClick={onRetry}>
+              <RefreshCcw size={16} />
+              Generate another QR
+            </button>
+          )}
+        </div>
+      </section>
     </div>
   );
 }
@@ -652,7 +1517,23 @@ function formatDate(value: string | null | undefined): string {
   return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", year: "numeric" }).format(new Date(value));
 }
 
+function msToIso(value: number | null | undefined): string | null {
+  return typeof value === "number" ? new Date(value).toISOString() : null;
+}
+
 function formatTime(value: string | null | undefined): string {
   if (!value) return "No time";
   return new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(new Date(value));
+}
+
+function formatBytes(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  let size = value;
+  let unitIndex = 0;
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+  return `${size >= 10 || unitIndex === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[unitIndex]}`;
 }

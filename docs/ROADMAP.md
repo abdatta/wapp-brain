@@ -21,18 +21,24 @@ Likely next improvements:
 
 Goal: keep the archive updated as new messages arrive.
 
-Likely approach:
-- use Baileys or a similar explicit WhatsApp client bridge
+Initial approach:
+- use Baileys behind a narrow code-level WhatsApp Web adapter
 - normalize live events into the same archive tables
 - make live ingestion resumable and idempotent
-- keep raw event metadata for replay/debugging
 - clearly separate backup import runs from live sync runs
+- track per-chat checkpoints, suspected gaps, and bounded recovery status
+- flag chats as uncertain or needs-user-action when WhatsApp Web cannot prove enough history
+
+Current limits:
+- the maintainer is opt-in and CLI-first for real pairing/running
+- on-demand history reliability must be verified with a real linked-device spike
+- media files are not downloaded by the live maintainer yet
+- browser automation clients are intentionally out of scope
 
 Open questions:
-- authentication/session storage and privacy
-- reconnection and missed-message recovery
-- duplicate detection between backup imports and live events
-- handling edits, deletes, reactions, receipts, and media
+- ideal backfill limits after real-device testing
+- whether auth state should move from private files to a SQLite-backed key store
+- how broadly to apply edits, reactions, and receipts in the UI
 
 ## Phase 3: Search And Retrieval
 
