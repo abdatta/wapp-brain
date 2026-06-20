@@ -5,7 +5,7 @@
 Historical import accepts:
 - `msgstore.db` for plaintext fixtures or already-decrypted databases.
 - `msgstore.db.crypt15` with a matching 64-character key or `encrypted_backup.key`.
-- Optional `wa.db` for contact/name enrichment.
+- Optional `wa.db` or `wa.db.crypt15` for contact/name enrichment.
 - Optional media directory path for context only.
 
 ## UI Import Wizard
@@ -14,7 +14,7 @@ The local web UI now treats backup load as a guided wizard instead of asking for
 
 The wizard flow is:
 - pick `msgstore.db.crypt15` or `msgstore.db` with a file picker
-- optionally pick `wa.db`, a key file, and media inputs
+- optionally pick `wa.db` or `wa.db.crypt15`, a key file, and media inputs
 - paste a 64-character key or use the selected key file
 - verify the key locally before import starts
 - choose merge or clear-and-replace
@@ -37,7 +37,7 @@ During large message imports, the importer yields between message batches after 
 ## What The Importer Preserves
 
 Where available, the importer stores:
-- contacts from `wa.db`
+- contacts from `wa.db` after opening plaintext input or decrypting `wa.db.crypt15`
 - chats and inferred chat type
 - inferred group participants from message senders
 - source message identity

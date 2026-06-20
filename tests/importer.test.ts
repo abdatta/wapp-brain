@@ -13,6 +13,7 @@ import { createModernSyntheticFixture, createSyntheticFixture } from "../src/ser
 import { inspectArchive } from "../src/server/import/inspect";
 import { runImport } from "../src/server/import/importer";
 import { openReadableSQLite } from "../src/server/import/sqlite";
+import { verifyImportKey } from "../src/server/import/staging";
 
 describe("WhatsApp import MVP", () => {
   it("cleans only app-managed decrypted working files", async () => {
@@ -430,6 +431,52 @@ describe("WhatsApp import MVP", () => {
         db.close();
         await result.cleanup();
       }
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("decrypts an encrypted wa.db.crypt15 sidecar before parsing contacts", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-wa-crypt15-"));
+    try {
+      const fixture = await createSyntheticFixture(path.join(tempDir, "fixture"));
+      const rootKey = randomBytes(32);
+      const encryptedWaPath = path.join(tempDir, "wa.db.crypt15");
+      await writeFile(encryptedWaPath, createCrypt15Fixture(rootKey, await readFile(fixture.waPath)));
+      const repository = new MemoryArchiveRepository();
+
+      const totals = await runImport(repository, {
+        msgstorePath: fixture.msgstorePath,
+        waPath: encryptedWaPath,
+        key: rootKey.toString("hex")
+      });
+      const chats = await repository.listChats({ limit: 20, offset: 0, search: "Avery Example" });
+
+      expect(totals.messages).toBe(7);
+      expect(totals.contacts).toBeGreaterThanOrEqual(4);
+      expect(chats[0]?.displayName).toBe("Avery Example");
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("verifies plaintext sidecars even when another input is encrypted", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-verify-sidecar-"));
+    try {
+      const fixture = await createSyntheticFixture(path.join(tempDir, "fixture"));
+      const rootKey = randomBytes(32);
+      const encryptedMsgstorePath = path.join(tempDir, "msgstore.db.crypt15");
+      const invalidWaPath = path.join(tempDir, "wa.db");
+      await writeFile(encryptedMsgstorePath, createCrypt15Fixture(rootKey, await readFile(fixture.msgstorePath)));
+      await writeFile(invalidWaPath, "not sqlite", "utf8");
+
+      await expect(
+        verifyImportKey({
+          msgstorePath: encryptedMsgstorePath,
+          waPath: invalidWaPath,
+          key: rootKey.toString("hex")
+        })
+      ).rejects.toThrow();
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }

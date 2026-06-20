@@ -6,6 +6,7 @@ import { cleanupSensitiveWorkDirs } from "./cleanup";
 import { config } from "./config";
 import { archiveAdapterLabel, createArchiveRepository, initializeArchiveDatabase } from "./db/archive";
 import { SqliteArchiveRepository } from "./db/sqliteRepository";
+import { configuredTraceRecorder, getTraceRecorderSummary } from "./diagnostics/traceRecorder";
 import { runDoctor } from "./doctor";
 import { inspectArchive } from "./import/inspect";
 import { runImport } from "./import/importer";
@@ -37,6 +38,11 @@ async function main(): Promise<void> {
     if (checks.some((check) => check.status === "fail")) {
       process.exitCode = 1;
     }
+    return;
+  }
+
+  if (command === "trace-status") {
+    console.log(JSON.stringify(getTraceRecorderSummary(), null, 2));
     return;
   }
 
@@ -242,6 +248,7 @@ async function runImportCommand(args: Args): Promise<void> {
     );
     progress.complete(totals);
     logger.info("import command completed", { totals });
+    await configuredTraceRecorder?.snapshotArchive("after-cli-import", archivePath ? path.resolve(archivePath) : config.archive.sqlitePath);
     console.log(
       `Import complete: chats=${totals.chats} contacts=${totals.contacts} participants=${totals.participants} messages=${totals.messages} skipped=${totals.skipped} warnings=${totals.warnings}`
     );
@@ -403,9 +410,10 @@ function printHelp(): void {
   npm run init-db
   npm run doctor
   npm run cleanup
+  npm run trace-status
   npm run generate-fixtures -- --dir fixtures/generated/basic
-  npm run inspect -- --msgstore <msgstore.db|msgstore.db.crypt15> [--wa <wa.db>] [--key <64-hex-key> | --key-file <encrypted_backup.key>]
-  npm run import -- --msgstore <msgstore.db.crypt15> [--wa <wa.db>] [--media <WhatsApp/Media>] [--archive <archive.sqlite>] [--key <64-hex-key> | --key-file <encrypted_backup.key>]
+  npm run inspect -- --msgstore <msgstore.db|msgstore.db.crypt15> [--wa <wa.db|wa.db.crypt15>] [--key <64-hex-key> | --key-file <encrypted_backup.key>]
+  npm run import -- --msgstore <msgstore.db.crypt15> [--wa <wa.db|wa.db.crypt15>] [--media <WhatsApp/Media>] [--archive <archive.sqlite>] [--key <64-hex-key> | --key-file <encrypted_backup.key>]
   tsx src/server/cli.ts live-proof [--phone <countrycode-number>] [--timeout <ms>]
   tsx src/server/cli.ts live-start [--phone <countrycode-number>] [--once]
   tsx src/server/cli.ts live-status
@@ -415,12 +423,13 @@ function printHelp(): void {
 
 Notes:
   - Keys and message contents are never printed by the CLI.
-  - Encrypted backups are crypt15-only; plaintext msgstore.db remains supported for fixtures or already-decrypted local files.
+  - Encrypted backups and contacts sidecars are crypt15-only; plaintext msgstore.db and wa.db remain supported for fixtures or already-decrypted local files.
   - By default, imports write to the local SQLite file configured by ARCHIVE_DB_PATH or .wapp-brain/archive.sqlite.
   - Each import writes a unique verbose debug log under .wapp-brain/logs.
+  - Set WAPP_TRACE_NAME=<name> to record exact local diagnostic traces under .wapp-brain/traces.
   - inspect reports schema compatibility and counts without message bodies.
   - live-* commands are explicit opt-in and store auth/session state only under .wapp-brain/live.
-  - Use --keep-decrypted only if you intentionally want the decrypted msgstore left in the local work directory.
+  - Use --keep-decrypted only if you intentionally want decrypted databases left in the local work directory.
   - cleanup removes app-managed decrypted working files and import staging files.`);
 }
 

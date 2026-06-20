@@ -3,7 +3,7 @@ import path from "node:path";
 import type { ImportRequest, ImportWarning } from "../../shared/types";
 import { ensureManagedWorkDir } from "../cleanup";
 import { config } from "../config";
-import { prepareMsgstore } from "./decrypt";
+import { prepareMsgstore, prepareSidecarDatabase } from "./decrypt";
 import { parseWhatsAppSource } from "./parser";
 import { openReadableSQLite } from "./sqlite";
 
@@ -33,8 +33,19 @@ export async function inspectArchive(request: ImportRequest): Promise<InspectSum
     outputDir,
     keepDecrypted: request.keepDecrypted
   });
+  const preparedWa = request.waPath
+    ? await prepareSidecarDatabase({
+        encryptedPath: request.waPath,
+        key: request.key,
+        keyPath: request.keyPath,
+        outputDir,
+        keepDecrypted: request.keepDecrypted,
+        label: "contacts database",
+        outputPrefix: "wa"
+      })
+    : null;
   const msgstoreDb = openReadableSQLite(prepared.sqlitePath, "msgstore");
-  const waDb = request.waPath ? openReadableSQLite(request.waPath, "wa.db") : null;
+  const waDb = preparedWa ? openReadableSQLite(preparedWa.sqlitePath, "wa.db") : null;
   try {
     const parsed = parseWhatsAppSource(msgstoreDb, waDb);
     const tables = Object.entries(parsed.schemaReport)
@@ -43,8 +54,8 @@ export async function inspectArchive(request: ImportRequest): Promise<InspectSum
     return {
       supported: parsed.supported,
       schemaKind: inferSchemaKind(parsed.schemaReport, parsed.supported),
-      encryptedInput: /\.crypt15$/i.test(request.msgstorePath),
-      decryptedDuringInspect: prepared.createdByDecryption,
+      encryptedInput: /\.crypt15$/i.test(request.msgstorePath) || (request.waPath ? /\.crypt15$/i.test(request.waPath) : false),
+      decryptedDuringInspect: prepared.createdByDecryption || Boolean(preparedWa?.createdByDecryption),
       counts: {
         tables: tables.length,
         contacts: parsed.contacts.length,
@@ -58,6 +69,7 @@ export async function inspectArchive(request: ImportRequest): Promise<InspectSum
     msgstoreDb.close();
     waDb?.close();
     await prepared.cleanup();
+    await preparedWa?.cleanup();
   }
 }
 

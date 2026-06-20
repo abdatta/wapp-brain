@@ -24,12 +24,17 @@ export function openReadableSQLite(filePath: string, kind: string): Database.Dat
   }
   try {
     const db = new Database(filePath, { readonly: true, fileMustExist: true });
-    const quickCheck = db.prepare("PRAGMA quick_check").pluck().get();
-    if (quickCheck !== "ok") {
+    try {
+      const quickCheck = db.prepare("PRAGMA quick_check").pluck().get();
+      if (quickCheck === "ok") {
+        return db;
+      }
+    } catch (error) {
       db.close();
-      throw new PublicError("SQLITE_CHECK_FAILED", `${kind} did not pass SQLite quick_check.`);
+      throw error;
     }
-    return db;
+    db.close();
+    throw new PublicError("SQLITE_CHECK_FAILED", `${kind} did not pass SQLite quick_check.`);
   } catch (error) {
     if (error instanceof PublicError) {
       throw error;

@@ -32,7 +32,16 @@ export interface LiveConnectionUpdate {
 
 export interface LiveMessageEvent {
   eventKey: string;
-  eventType: "messages.upsert" | "messaging-history.set" | "messages.update" | "message-receipt.update" | "call";
+  eventType:
+    | "messages.upsert"
+    | "messaging-history.set"
+    | "contacts.upsert"
+    | "contacts.update"
+    | "chats.upsert"
+    | "chats.update"
+    | "messages.update"
+    | "message-receipt.update"
+    | "call";
   mode: "notify" | "append" | "history" | "update";
   occurredAtMs?: number | null;
   contacts?: ContactRecord[];

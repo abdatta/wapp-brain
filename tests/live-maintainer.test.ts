@@ -10,7 +10,7 @@ import { auditChatGaps, computeArchiveWatermarks } from "../src/server/live/audi
 import { assertLiveBaselineReady, getLiveBaselineSummary } from "../src/server/live/baseline";
 import { getLiveDependencyStatus, isSafeBaileysVersion } from "../src/server/live/dependency";
 import { LiveMaintainer } from "../src/server/live/maintainer";
-import { normalizeBaileysMessage } from "../src/server/live/normalize";
+import { normalizeBaileysMessage, normalizeBaileysMessagesWithJidResolver } from "../src/server/live/normalize";
 import { recoverDueGaps } from "../src/server/live/recovery";
 import type {
   LiveConnectionUpdate,
@@ -97,6 +97,43 @@ describe("live WhatsApp maintainer", () => {
     expect(JSON.stringify(message?.rawMetadata)).not.toContain("hello live world");
   });
 
+  it("canonicalizes live LID chats to phone JIDs when Baileys has a mapping", async () => {
+    const event = await normalizeBaileysMessagesWithJidResolver(
+      [
+        {
+          key: { remoteJid: "244543240839423@lid", id: "LID123", fromMe: false },
+          messageTimestamp: 1781452800,
+          message: { conversation: "hello from lid" }
+        }
+      ],
+      "wa-web:messages.upsert",
+      async (jid) => (jid === "244543240839423@lid" ? "919051167186:0@s.whatsapp.net" : jid)
+    );
+
+    expect(event.chats?.[0]?.sourceChatId).toBe("919051167186@s.whatsapp.net");
+    expect(event.messages?.[0]?.chatSourceId).toBe("919051167186@s.whatsapp.net");
+    expect(event.messages?.[0]?.sourceMessageKey).toBe("wa-web|919051167186@s.whatsapp.net||0|LID123");
+  });
+
+  it("strips live device suffixes before deriving archive chat keys", async () => {
+    const event = await normalizeBaileysMessagesWithJidResolver(
+      [
+        {
+          key: { remoteJid: "12136968563:0@s.whatsapp.net", id: "DEVICE123", fromMe: false, participant: "" },
+          messageTimestamp: 1781571116,
+          message: { conversation: "hello" }
+        }
+      ],
+      "wa-web:messages.upsert",
+      (jid) => jid
+    );
+
+    expect(event.chats?.[0]?.sourceChatId).toBe("12136968563@s.whatsapp.net");
+    expect(event.messages?.[0]?.chatSourceId).toBe("12136968563@s.whatsapp.net");
+    expect(event.messages?.[0]?.senderSourceJid).toBe("12136968563@s.whatsapp.net");
+    expect(event.messages?.[0]?.sourceMessageKey).toBe("wa-web|12136968563@s.whatsapp.net||0|DEVICE123");
+  });
+
   it("ingests duplicate live events idempotently through the maintainer", async () => {
     const repository = new MemoryArchiveRepository();
     const client = new FakeLiveClient();
@@ -115,6 +152,59 @@ describe("live WhatsApp maintainer", () => {
     expect(status.counts.messages).toBe(1);
     expect(messages[0]?.sourceMessageId).toBe("m1");
     expect(status.live?.session?.status).toBe("stopped");
+  });
+
+  it("uses Baileys push names for ID-only live DM chats", async () => {
+    const repository = new MemoryArchiveRepository();
+    const client = new FakeLiveClient();
+    const maintainer = new LiveMaintainer(repository, client, testOptions());
+    const event = await normalizeBaileysMessagesWithJidResolver(
+      [
+        {
+          key: { remoteJid: "15550000001@s.whatsapp.net", id: "PUSH1", fromMe: false },
+          messageTimestamp: 1712000001,
+          pushName: "Avery",
+          message: { conversation: "hello" }
+        }
+      ],
+      "wa-web:messages.upsert",
+      (jid) => jid
+    );
+
+    await maintainer.start();
+    await client.emit(event);
+    await maintainer.stop();
+
+    const chats = await repository.listChats({ limit: 10, offset: 0, includeEventOnly: true });
+
+    expect(chats[0]?.displayName).toBe("Avery");
+  });
+
+  it("does not overwrite imported DM names with Baileys push names", async () => {
+    const repository = new MemoryArchiveRepository();
+    const client = new FakeLiveClient();
+    const maintainer = new LiveMaintainer(repository, client, testOptions());
+    await seedChat(repository, "15550000002@s.whatsapp.net", "Saved Contact", 1712000000000);
+    const event = await normalizeBaileysMessagesWithJidResolver(
+      [
+        {
+          key: { remoteJid: "15550000002@s.whatsapp.net", id: "PUSH2", fromMe: false },
+          messageTimestamp: 1712000002,
+          pushName: "Push Name",
+          message: { conversation: "hello again" }
+        }
+      ],
+      "wa-web:messages.upsert",
+      (jid) => jid
+    );
+
+    await maintainer.start();
+    await client.emit(event);
+    await maintainer.stop();
+
+    const chats = await repository.listChats({ limit: 10, offset: 0, includeEventOnly: true });
+
+    expect(chats.find((chat) => chat.sourceChatId === "15550000002@s.whatsapp.net")?.displayName).toBe("Saved Contact");
   });
 
   it("applies delete updates and keeps update-before-base-message as pending", async () => {

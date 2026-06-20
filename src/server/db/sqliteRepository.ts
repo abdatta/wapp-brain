@@ -425,6 +425,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       }
     });
     transaction();
+    this.propagateContactNamesToDmChats([...unique.values()]);
 
     return this.getContactIds([...unique.keys()]);
   }
@@ -1197,6 +1198,43 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     return getIds(this.db, "contacts", "source_jid", jids);
   }
 
+  private propagateContactNamesToDmChats(contacts: ContactRecord[]): void {
+    const updateDisplayName = this.db.prepare(
+      `UPDATE chats
+       SET display_name = ?, updated_at = ?
+       WHERE source_chat_id = ?
+         AND chat_type IN ('dm', 'unknown')`
+    );
+    const updatePushNameFallback = this.db.prepare(
+      `UPDATE chats
+       SET display_name = ?, updated_at = ?
+       WHERE source_chat_id = ?
+         AND chat_type IN ('dm', 'unknown')
+         AND (
+           display_name IS NULL
+           OR TRIM(display_name) = ''
+           OR display_name = jid
+           OR display_name = source_chat_id
+           OR display_name = ?
+         )`
+    );
+    const transaction = this.db.transaction(() => {
+      for (const contact of contacts) {
+        const displayName = contact.displayName?.trim();
+        const pushName = contact.pushName?.trim();
+        if (!contact.sourceJid) {
+          continue;
+        }
+        if (displayName) {
+          updateDisplayName.run(displayName, currentIso(), contact.sourceJid);
+        } else if (pushName) {
+          updatePushNameFallback.run(pushName, currentIso(), contact.sourceJid, localPartFromJid(contact.sourceJid));
+        }
+      }
+    });
+    transaction();
+  }
+
   private getChatIds(sourceChatIds: string[]): Map<string, number> {
     return getIds(this.db, "chats", "source_chat_id", sourceChatIds);
   }
@@ -1439,6 +1477,10 @@ function isoFromMs(ms: number | null | undefined): string | null {
 
 function nullableNumber(value: number | null | undefined): number | null {
   return value == null ? null : Number(value);
+}
+
+function localPartFromJid(jid: string): string {
+  return jid.split("@")[0]?.split(":")[0] ?? jid;
 }
 
 interface SqliteImportRunRow {

@@ -1,10 +1,12 @@
 import express from "express";
+import type { Response } from "express";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { config } from "./config";
 import { cleanupSensitiveWorkDirs } from "./cleanup";
 import { createArchiveRepository, initializeArchiveDatabase } from "./db/archive";
+import { configuredTraceRecorder, getTraceRecorderSummary } from "./diagnostics/traceRecorder";
 import { BaileysLiveWhatsAppClient } from "./live/baileysClient";
 import { runImport } from "./import/importer";
 import {
@@ -23,7 +25,8 @@ import { liveOptionsFromConfig } from "./live/maintainer";
 import { LiveMaintainer } from "./live/maintainer";
 import { isLocalDatabaseError, publicErrorMessage } from "./privacy";
 import { withGuidedSetup } from "./onboarding";
-import type { LivePairingSummary } from "../shared/types";
+import type { ArchiveChangeEvent, LivePairingSummary } from "../shared/types";
+import type { LiveMessageEvent } from "./live/types";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -35,6 +38,8 @@ const repository = createArchiveRepository();
 let activeMaintainer: LiveMaintainer | null = null;
 let activeClient: BaileysLiveWhatsAppClient | null = null;
 let livePairing: LivePairingSummary = idlePairing();
+let archiveEventId = 0;
+const archiveEventClients = new Set<Response>();
 
 app.get("/api/status", async (_req, res) => {
   try {
@@ -133,6 +138,24 @@ app.get("/api/live/pairing", (_req, res) => {
   res.json(livePairing);
 });
 
+app.get("/api/archive/events", (req, res) => {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no"
+  });
+  res.write(`event: ready\ndata: ${JSON.stringify({ ok: true })}\n\n`);
+  archiveEventClients.add(res);
+  req.on("close", () => {
+    archiveEventClients.delete(res);
+  });
+});
+
+app.get("/api/diagnostics/trace", (_req, res) => {
+  res.json(getTraceRecorderSummary());
+});
+
 app.post("/api/init-db", async (_req, res) => {
   try {
     await initializeArchiveDatabase();
@@ -155,6 +178,13 @@ app.post("/api/import", async (req, res) => {
       keyPath: req.body?.keyPath ? String(req.body.keyPath) : null,
       keepDecrypted: Boolean(req.body?.keepDecrypted),
       mode: req.body?.mode === "replace" ? "replace" : "merge"
+    });
+    await configuredTraceRecorder?.snapshotArchive("after-api-import", config.archive.sqlitePath);
+    broadcastArchiveChanged({
+      source: "import",
+      chatSourceIds: [],
+      messageCount: totals.messages,
+      contactCount: totals.contacts
     });
     res.json({ ok: true, totals });
   } catch (error) {
@@ -206,6 +236,7 @@ app.post("/api/import/verify-key", async (req, res) => {
       verification: await verifyImportKey({
         sessionId: req.body?.sessionId ? String(req.body.sessionId) : null,
         msgstorePath: req.body?.msgstorePath ? String(req.body.msgstorePath) : null,
+        waPath: req.body?.waPath ? String(req.body.waPath) : null,
         key: req.body?.key ? String(req.body.key) : null,
         keyPath: req.body?.keyPath ? String(req.body.keyPath) : null,
         useStagedKey: Boolean(req.body?.useStagedKey)
@@ -230,6 +261,15 @@ app.post("/api/import/jobs", async (req, res) => {
           waPath: req.body?.paths?.waPath ? String(req.body.paths.waPath) : undefined,
           mediaPath: req.body?.paths?.mediaPath ? String(req.body.paths.mediaPath) : undefined,
           keyPath: req.body?.paths?.keyPath ? String(req.body.paths.keyPath) : undefined
+        }
+      }, {
+        onArchiveChanged: (summary) => {
+          broadcastArchiveChanged({
+            source: summary.source,
+            chatSourceIds: [],
+            messageCount: summary.messageCount,
+            contactCount: summary.contactCount
+          });
         }
       })
     });
@@ -380,7 +420,16 @@ async function startLiveMaintainer(phoneNumber: string | null): Promise<void> {
       lastError: update.lastError ?? null
     };
   });
-  activeMaintainer = new LiveMaintainer(repository, activeClient, options);
+  activeMaintainer = new LiveMaintainer(repository, activeClient, options, {
+    onArchiveChanged: (event) => {
+      broadcastArchiveChanged({
+        source: "live",
+        chatSourceIds: chatSourceIdsFromLiveEvent(event),
+        messageCount: event.messages?.length ?? 0,
+        contactCount: event.contacts?.length ?? 0
+      });
+    }
+  });
   void activeMaintainer.start().catch(async (error: unknown) => {
     livePairing = {
       ...livePairing,
@@ -408,6 +457,29 @@ async function stopActiveMaintainer(): Promise<void> {
     state: "stopped",
     updatedAt: new Date().toISOString()
   };
+}
+
+function broadcastArchiveChanged(input: Omit<ArchiveChangeEvent, "id" | "type" | "updatedAt">): void {
+  const event: ArchiveChangeEvent = {
+    id: ++archiveEventId,
+    type: "archive-updated",
+    updatedAt: new Date().toISOString(),
+    ...input,
+    chatSourceIds: [...new Set(input.chatSourceIds)]
+  };
+  const payload = `id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
+  for (const client of archiveEventClients) {
+    client.write(payload);
+  }
+}
+
+function chatSourceIdsFromLiveEvent(event: LiveMessageEvent): string[] {
+  return [
+    ...(event.chats ?? []).map((chat) => chat.sourceChatId),
+    ...(event.messages ?? []).map((message) => message.chatSourceId),
+    ...(event.updates ?? []).map((update) => update.chatSourceId),
+    ...(event.contacts ?? []).map((contact) => contact.sourceJid)
+  ].filter(Boolean);
 }
 
 function idlePairing(): LivePairingSummary {

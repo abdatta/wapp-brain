@@ -30,7 +30,7 @@ WhatsApp databases, decrypted databases, media, archive files, generated GBrain/
 - Node.js 22+
 - Your own Android WhatsApp files:
   - `msgstore.db.crypt15`
-  - `wa.db` if you want contact names
+  - `wa.db` or `wa.db.crypt15` if you want contact names
   - `encrypted_backup.key` or the matching 64-character crypt15 backup key
   - optionally your local `WhatsApp/Media` folder for import context
 
@@ -77,7 +77,7 @@ The import CLI shows animated step status and progress bars where the importer c
 With a 64-character key:
 
 ```powershell
-npm run import -- --msgstore "C:\path\msgstore.db.crypt15" --wa "C:\path\wa.db" --key "<64-character-key>"
+npm run import -- --msgstore "C:\path\msgstore.db.crypt15" --wa "C:\path\wa.db.crypt15" --key "<64-character-key>"
 ```
 
 With a key file:
@@ -190,7 +190,7 @@ See [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) for the adapter boundary and 
 
 ## Decryption Notes
 
-Encrypted backup support is intentionally crypt15-only. `crypt15` support requires a user-supplied 64-character key or `encrypted_backup.key`. A WhatsApp backup password alone is not enough for local decryption.
+Encrypted backup support is intentionally crypt15-only. `crypt15` support for `msgstore.db.crypt15` and `wa.db.crypt15` requires a user-supplied 64-character key or `encrypted_backup.key`. A WhatsApp backup password alone is not enough for local decryption.
 
 The local decryptor follows the commonly documented crypt15 envelope used by open-source tools such as [wa-crypt-tools](https://github.com/ElDavoo/wa-crypt-tools): protobuf header, AES-256-GCM, authentication tag, checksum, and zlib decompression. Unsupported or changed envelopes fail before import.
 

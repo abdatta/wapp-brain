@@ -19,7 +19,8 @@ const envSchema = z.object({
   LIVE_MAX_BACKFILL_PER_CHAT_DAYS: z.coerce.number().int().positive().default(14),
   LIVE_MAX_CONCURRENT_CHAT_BACKFILLS: z.coerce.number().int().positive().default(1),
   LIVE_MIN_BACKFILL_DELAY_MS: z.coerce.number().int().positive().default(3000),
-  LIVE_MAX_GAP_RETRIES: z.coerce.number().int().positive().default(5)
+  LIVE_MAX_GAP_RETRIES: z.coerce.number().int().positive().default(5),
+  WAPP_TRACE_NAME: z.string().optional()
 });
 
 const parsed = envSchema.parse(process.env);
@@ -44,6 +45,10 @@ export const config = {
     maxConcurrentChatBackfills: parsed.LIVE_MAX_CONCURRENT_CHAT_BACKFILLS,
     minBackfillDelayMs: parsed.LIVE_MIN_BACKFILL_DELAY_MS,
     maxGapRetries: parsed.LIVE_MAX_GAP_RETRIES
+  },
+  diagnostics: {
+    traceName: parsed.WAPP_TRACE_NAME?.trim() || null,
+    traceRootDir: path.join(workDir, "traces")
   },
   workDir
 };

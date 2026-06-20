@@ -394,3 +394,13 @@ export interface LiveMessageUpdateResult {
   applied: number;
   pending: number;
 }
+
+export interface ArchiveChangeEvent {
+  id: number;
+  type: "archive-updated";
+  source: "import" | "live" | "manual";
+  chatSourceIds: string[];
+  messageCount: number;
+  contactCount: number;
+  updatedAt: string;
+}

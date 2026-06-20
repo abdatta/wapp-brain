@@ -84,6 +84,7 @@ export function cancelImportSession(sessionId: string): Promise<{ ok: boolean }>
 export function verifyImportKey(requestBody: {
   sessionId?: string | null;
   msgstorePath?: string | null;
+  waPath?: string | null;
   key?: string | null;
   keyPath?: string | null;
   useStagedKey?: boolean;

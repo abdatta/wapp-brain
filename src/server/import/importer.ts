@@ -6,8 +6,9 @@ import type { ImportRequest, ImportTotals, MessageRecord } from "../../shared/ty
 import { config } from "../config";
 import { ensureManagedWorkDir } from "../cleanup";
 import type { ArchiveRepository } from "../db/repository";
+import { configuredTraceRecorder } from "../diagnostics/traceRecorder";
 import { PublicError, publicErrorMessage, safeBasename } from "../privacy";
-import { prepareMsgstore } from "./decrypt";
+import { prepareMsgstore, prepareSidecarDatabase } from "./decrypt";
 import { parseWhatsAppSource } from "./parser";
 import type { ImportProgressHandler } from "./progress";
 import { openReadableSQLite } from "./sqlite";
@@ -24,6 +25,12 @@ export async function runImport(
   request: ImportRequest,
   options: RunImportOptions = {}
 ): Promise<ImportTotals> {
+  await configuredTraceRecorder?.record("import.start", {
+    request: {
+      ...request,
+      key: request.key ? { present: true, length: request.key.length } : null
+    }
+  });
   throwIfAborted(options.signal);
   options.onProgress?.({ type: "step", step: "validating", message: "Validating local input files." });
   validateLocalPath(request.msgstorePath, "msgstore");
@@ -42,6 +49,7 @@ export async function runImport(
     wa: safeBasename(request.waPath),
     media: request.mediaPath ? safeBasename(request.mediaPath) : null,
     encrypted: /\.crypt15$/i.test(request.msgstorePath),
+    waEncrypted: request.waPath ? /\.crypt15$/i.test(request.waPath) : false,
     keepDecrypted: Boolean(request.keepDecrypted)
   };
   options.onProgress?.({ type: "step", step: "initializing", message: "Opening the local archive database." });
@@ -50,6 +58,7 @@ export async function runImport(
   const totals: ImportTotals = { contacts: 0, chats: 0, participants: 0, messages: 0, skipped: 0, warnings: 0 };
   let warningCount = 0;
   let prepared: Awaited<ReturnType<typeof prepareMsgstore>> | null = null;
+  let preparedWa: Awaited<ReturnType<typeof prepareSidecarDatabase>> | null = null;
   let msgstoreDb: ReturnType<typeof openReadableSQLite> | null = null;
   let waDb: ReturnType<typeof openReadableSQLite> | null = null;
 
@@ -68,14 +77,38 @@ export async function runImport(
       onProgress: options.onProgress,
       signal: options.signal
     });
+    if (request.waPath) {
+      throwIfAborted(options.signal);
+      options.onProgress?.({ type: "step", step: "preparing", message: "Preparing contacts database input." });
+      preparedWa = await prepareSidecarDatabase({
+        encryptedPath: request.waPath,
+        key: request.key,
+        keyPath: request.keyPath,
+        outputDir,
+        keepDecrypted: request.keepDecrypted,
+        label: "contacts database",
+        outputPrefix: "wa",
+        onProgress: options.onProgress,
+        signal: options.signal
+      });
+    }
     throwIfAborted(options.signal);
     options.onProgress?.({ type: "step", step: "opening", message: "Opening readable WhatsApp databases." });
     msgstoreDb = openReadableSQLite(prepared.sqlitePath, "msgstore");
-    waDb = request.waPath ? openReadableSQLite(request.waPath, "wa.db") : null;
+    waDb = preparedWa ? openReadableSQLite(preparedWa.sqlitePath, "wa.db") : null;
 
     throwIfAborted(options.signal);
     options.onProgress?.({ type: "step", step: "parsing", message: "Inspecting WhatsApp schema and contacts." });
     const parsed = parseWhatsAppSource(msgstoreDb, waDb);
+    await configuredTraceRecorder?.record("import.parsed", {
+      runId,
+      supported: parsed.supported,
+      schemaReport: parsed.schemaReport,
+      messageCountEstimate: parsed.messageCountEstimate,
+      contacts: parsed.contacts,
+      chats: parsed.chats,
+      warnings: parsed.warnings
+    });
     let persistedWarningCount = parsed.warnings.length;
     warningCount = persistedWarningCount;
     await repository.addWarnings(runId, parsed.warnings);
@@ -150,6 +183,7 @@ export async function runImport(
     throwIfAborted(options.signal);
     options.onProgress?.({ type: "step", step: "participants", message: "Importing inferred group participants." });
     const participants = parsed.getParticipants();
+    await configuredTraceRecorder?.record("import.participants", { runId, participants });
     await repository.upsertContacts(
       runId,
       participants.map((participant) => ({
@@ -165,16 +199,25 @@ export async function runImport(
     throwIfAborted(options.signal);
     totals.warnings = warningCount;
     await repository.completeImportRun(runId, totals, warningCount);
+    await configuredTraceRecorder?.record("import.complete", { runId, totals, warningCount });
     options.onProgress?.({ type: "complete", totals });
     return totals;
   } catch (error) {
     const message = publicErrorMessage(error);
+    await configuredTraceRecorder?.record("import.failed", {
+      runId,
+      code: error instanceof PublicError ? error.code : "IMPORT_FAILED",
+      message,
+      totals,
+      warningCount
+    });
     await repository.failImportRun(runId, error instanceof PublicError ? error.code : "IMPORT_FAILED", message, totals, warningCount);
     throw error;
   } finally {
     msgstoreDb?.close();
     waDb?.close();
     await prepared?.cleanup();
+    await preparedWa?.cleanup();
   }
 }
 
@@ -194,6 +237,7 @@ async function flushMessageBatch(repository: ArchiveRepository, runId: string, b
   if (batch.length === 0) {
     return 0;
   }
+  await configuredTraceRecorder?.record("import.message_batch", { runId, messages: batch });
   const chats = new Map(
     batch.map((message) => [
       message.chatSourceId,

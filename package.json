@@ -10,6 +10,7 @@
     "server": "tsx src/server/server.ts",
     "doctor": "tsx src/server/cli.ts doctor",
     "cleanup": "tsx src/server/cli.ts cleanup",
+    "trace-status": "tsx src/server/cli.ts trace-status",
     "init-db": "tsx src/server/cli.ts init-db",
     "inspect": "tsx src/server/cli.ts inspect",
     "import": "tsx src/server/cli.ts import",

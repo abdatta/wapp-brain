@@ -18,7 +18,7 @@ Default local endpoints:
 ```text
 user files/key
   -> validation
-  -> decrypt or open msgstore
+  -> decrypt or open msgstore and optional contacts sidecar
   -> SQLite schema inspection
   -> defensive WhatsApp parser
   -> normalized records
@@ -52,7 +52,7 @@ Repo-local private data lives under `.wapp-brain/` by default and stays gitignor
 - `src/server/server.ts` exposes the local API and serves built assets.
 - `src/server/cli.ts` handles command-line workflows, progress bars, and debug logs.
 - `src/server/config.ts` reads `.env` settings.
-- `src/server/import/decrypt.ts` prepares plaintext or crypt15 msgstore inputs.
+- `src/server/import/decrypt.ts` prepares plaintext or crypt15 SQLite inputs, including msgstore and contacts sidecar databases.
 - `src/server/import/parser.ts` converts WhatsApp-like schemas into normalized records.
 - `src/server/import/importer.ts` orchestrates import runs and message batching.
 - `src/server/live/*` owns the optional live maintainer adapter, normalization, gap auditing, and bounded recovery.

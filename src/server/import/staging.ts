@@ -6,7 +6,8 @@ import type { Readable } from "node:stream";
 import { config } from "../config";
 import { ensureManagedWorkDir } from "../cleanup";
 import type { ArchiveRepository } from "../db/repository";
-import { prepareMsgstore } from "./decrypt";
+import { configuredTraceRecorder } from "../diagnostics/traceRecorder";
+import { prepareMsgstore, prepareSidecarDatabase } from "./decrypt";
 import { openReadableSQLite } from "./sqlite";
 import { runImport } from "./importer";
 import { ImportTerminalProgress } from "./progress";
@@ -39,6 +40,10 @@ interface StartImportJobInput {
   key?: string | null;
   keepDecrypted?: boolean;
   paths?: Partial<Pick<ImportRequest, "msgstorePath" | "waPath" | "mediaPath" | "keyPath">>;
+}
+
+interface StartImportJobCallbacks {
+  onArchiveChanged?: (summary: { source: "import"; messageCount: number; contactCount: number }) => void | Promise<void>;
 }
 
 interface ImportJobState extends ImportJobSummary {
@@ -150,43 +155,67 @@ export async function cancelImportStagingSession(sessionId: string): Promise<voi
 export async function verifyImportKey(input: {
   sessionId?: string | null;
   msgstorePath?: string | null;
+  waPath?: string | null;
   key?: string | null;
   keyPath?: string | null;
   useStagedKey?: boolean;
 }): Promise<ImportVerificationSummary> {
   const session = input.sessionId ? requireSession(input.sessionId) : null;
   const msgstorePath = session?.files.msgstore?.path ?? input.msgstorePath;
+  const waPath = session?.files.wa?.path ?? input.waPath;
   const keyPath = input.useStagedKey ? session?.files.key?.path : input.keyPath;
   if (!msgstorePath) {
     throw new PublicError("IMPORT_VERIFY_MISSING_BACKUP", "Select a msgstore backup before verifying the key.");
   }
-  const encrypted = /\.crypt15$/i.test(msgstorePath);
-  if (!encrypted) {
-    const db = openReadableSQLite(msgstorePath, "msgstore");
-    db.close();
-    return { ok: true, encrypted: false, message: "Plain SQLite msgstore opened successfully. No backup key is required." };
+  const encryptedInputs = [
+    { path: msgstorePath, label: "msgstore" },
+    ...(waPath ? [{ path: waPath, label: "contacts database" }] : [])
+  ].filter((inputFile) => /\.crypt15$/i.test(inputFile.path));
+  const plaintextInputs = [
+    { path: msgstorePath, label: "msgstore" },
+    ...(waPath ? [{ path: waPath, label: "wa.db" }] : [])
+  ].filter((inputFile) => !/\.crypt15$/i.test(inputFile.path));
+  if (encryptedInputs.length === 0) {
+    openPlaintextInputs(plaintextInputs);
+    return { ok: true, encrypted: false, message: "Plain SQLite databases opened successfully. No backup key is required." };
   }
   const verifyDir = path.join(session?.root ?? path.resolve(config.workDir, "import-staging", "manual"), "verify");
   await mkdir(verifyDir, { recursive: true });
-  let prepared: Awaited<ReturnType<typeof prepareMsgstore>> | null = null;
+  const prepared: Array<Awaited<ReturnType<typeof prepareMsgstore>>> = [];
   try {
-    prepared = await prepareMsgstore({
-      encryptedPath: msgstorePath,
-      key: input.key ?? null,
-      keyPath: keyPath ?? null,
-      outputDir: verifyDir,
-      keepDecrypted: false
-    });
-    const db = openReadableSQLite(prepared.sqlitePath, "decrypted msgstore");
-    db.close();
-    return { ok: true, encrypted: true, message: "Backup key verified locally against the encrypted backup." };
+    for (const inputFile of encryptedInputs) {
+      const next =
+        inputFile.label === "msgstore"
+          ? await prepareMsgstore({
+              encryptedPath: inputFile.path,
+              key: input.key ?? null,
+              keyPath: keyPath ?? null,
+              outputDir: verifyDir,
+              keepDecrypted: false
+            })
+          : await prepareSidecarDatabase({
+              encryptedPath: inputFile.path,
+              key: input.key ?? null,
+              keyPath: keyPath ?? null,
+              outputDir: verifyDir,
+              keepDecrypted: false,
+              label: inputFile.label,
+              outputPrefix: "wa"
+            });
+      prepared.push(next);
+      const db = openReadableSQLite(next.sqlitePath, `decrypted ${inputFile.label}`);
+      db.close();
+    }
+    openPlaintextInputs(plaintextInputs);
+    const labels = encryptedInputs.map((inputFile) => inputFile.label).join(" and ");
+    return { ok: true, encrypted: true, message: `Backup key verified locally against the encrypted ${labels}.` };
   } finally {
-    await prepared?.cleanup();
+    await Promise.all(prepared.map((result) => result.cleanup()));
     await rm(verifyDir, { recursive: true, force: true });
   }
 }
 
-export function startImportJob(repository: ArchiveRepository, input: StartImportJobInput): ImportJobSummary {
+export function startImportJob(repository: ArchiveRepository, input: StartImportJobInput, callbacks: StartImportJobCallbacks = {}): ImportJobSummary {
   const active = findActiveJob();
   if (active) {
     throw new PublicError("IMPORT_JOB_ACTIVE", "An import is already running. Reopen the progress screen to monitor or stop it.");
@@ -217,7 +246,7 @@ export function startImportJob(repository: ArchiveRepository, input: StartImport
     lastMessageLogAt: 0
   };
   jobs.set(job.id, job);
-  void runJob(repository, job, request, session?.id ?? null);
+  void runJob(repository, job, request, session?.id ?? null, callbacks);
   return publicJob(job);
 }
 
@@ -255,7 +284,13 @@ export function cancelImportJob(jobId: string): ImportJobSummary {
   return publicJob(job);
 }
 
-async function runJob(repository: ArchiveRepository, job: ImportJobState, request: ImportRequest, sessionId: string | null): Promise<void> {
+async function runJob(
+  repository: ArchiveRepository,
+  job: ImportJobState,
+  request: ImportRequest,
+  sessionId: string | null,
+  callbacks: StartImportJobCallbacks
+): Promise<void> {
   let restorePoint: Awaited<ReturnType<ArchiveRepository["createRestorePoint"]>> | null = null;
   try {
     restorePoint = await repository.createRestorePoint(`import-${job.id}`);
@@ -276,6 +311,8 @@ async function runJob(repository: ArchiveRepository, job: ImportJobState, reques
     job.status = "completed";
     job.finishedAt = new Date().toISOString();
     job.totals = totals;
+    await configuredTraceRecorder?.snapshotArchive(`after-import-job-${job.id}`, config.archive.sqlitePath);
+    await callbacks.onArchiveChanged?.({ source: "import", messageCount: totals.messages, contactCount: totals.contacts });
     logJob(job, "info", `completed messages=${totals.messages.toLocaleString()} warnings=${totals.warnings.toLocaleString()}`);
     if (sessionId) {
       await cancelImportStagingSession(sessionId);
@@ -296,6 +333,13 @@ async function runJob(repository: ArchiveRepository, job: ImportJobState, reques
     }
   } finally {
     await restorePoint?.dispose();
+  }
+}
+
+function openPlaintextInputs(inputs: Array<{ path: string; label: string }>): void {
+  for (const input of inputs) {
+    const db = openReadableSQLite(input.path, input.label);
+    db.close();
   }
 }
 

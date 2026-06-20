@@ -1,0 +1,4 @@
+interface:
+  display_name: "Add Wapp Todo"
+  short_description: "Capture Wapp Brain ideas as behavior-focused todo notes."
+  default_prompt: "Add this idea to the Wapp Brain behavior backlog:"

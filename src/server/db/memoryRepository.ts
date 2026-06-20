@@ -135,6 +135,14 @@ export class MemoryArchiveRepository implements ArchiveRepository {
         displayName: contact.displayName || existing?.displayName || null,
         id: existing?.id ?? this.nextContactId++
       });
+      const chat = this.chats.get(contact.sourceJid);
+      const displayName = contact.displayName?.trim();
+      const pushName = contact.pushName?.trim();
+      if (chat && displayName && (chat.chatType === "dm" || chat.chatType === "unknown")) {
+        chat.displayName = displayName;
+      } else if (chat && pushName && (chat.chatType === "dm" || chat.chatType === "unknown") && isIdentityDisplayName(chat)) {
+        chat.displayName = pushName;
+      }
     }
     return new Map([...this.contacts].map(([jid, contact]) => [jid, contact.id]));
   }
@@ -481,4 +489,16 @@ function isVisibleExchange(message: MessageRecord): boolean {
     message.isDeleted ||
     message.messageType === "call"
   );
+}
+
+function isIdentityDisplayName(chat: ChatRecord & { displayName?: string | null }): boolean {
+  const displayName = chat.displayName?.trim();
+  if (!displayName) {
+    return true;
+  }
+  return displayName === chat.jid || displayName === chat.sourceChatId || displayName === localPartFromJid(chat.sourceChatId);
+}
+
+function localPartFromJid(jid: string): string {
+  return jid.split("@")[0]?.split(":")[0] ?? jid;
 }

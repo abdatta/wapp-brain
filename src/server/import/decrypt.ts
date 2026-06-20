@@ -81,6 +81,9 @@ export interface DecryptOptions {
   keyPath?: string | null;
   outputDir: string;
   keepDecrypted?: boolean;
+  label?: string;
+  outputPrefix?: string;
+  unsupportedMessage?: string;
   onProgress?: ImportProgressHandler;
   signal?: AbortSignal;
 }
@@ -98,24 +101,40 @@ interface Crypt15Header {
 }
 
 export async function prepareMsgstore(options: DecryptOptions): Promise<DecryptResult> {
+  return prepareEncryptedSqlite({
+    ...options,
+    label: "msgstore",
+    outputPrefix: "msgstore",
+    unsupportedMessage: "Only msgstore.db.crypt15 encrypted backups are supported right now."
+  });
+}
+
+export async function prepareSidecarDatabase(options: DecryptOptions): Promise<DecryptResult> {
+  return prepareEncryptedSqlite({
+    ...options,
+    label: options.label ?? "sidecar database",
+    outputPrefix: options.outputPrefix ?? "sidecar",
+    unsupportedMessage: options.unsupportedMessage ?? "Only .crypt15 encrypted SQLite sidecar databases are supported right now."
+  });
+}
+
+export async function prepareEncryptedSqlite(options: DecryptOptions): Promise<DecryptResult> {
   throwIfAborted(options.signal);
   if (!fs.existsSync(options.encryptedPath)) {
-    throw new PublicError("INPUT_MISSING", "msgstore file was not found.");
+    throw new PublicError("INPUT_MISSING", `${options.label ?? "SQLite input"} file was not found.`);
   }
   const lowerPath = options.encryptedPath.toLowerCase();
   if (lowerPath.endsWith(".crypt15")) {
     return decryptCrypt15(options);
   }
   if (/\.(crypt\d+|mcrypt\d+)$/i.test(options.encryptedPath)) {
-    throw new PublicError("CRYPT_UNSUPPORTED", "Only msgstore.db.crypt15 encrypted backups are supported right now.");
+    throw new PublicError("CRYPT_UNSUPPORTED", options.unsupportedMessage ?? "Only .crypt15 encrypted SQLite backups are supported right now.");
   }
-  {
-    return {
-      sqlitePath: options.encryptedPath,
-      createdByDecryption: false,
-      cleanup: async () => undefined
-    };
-  }
+  return {
+    sqlitePath: options.encryptedPath,
+    createdByDecryption: false,
+    cleanup: async () => undefined
+  };
 }
 
 export async function decryptCrypt15(options: DecryptOptions): Promise<DecryptResult> {
@@ -147,15 +166,17 @@ export async function decryptCrypt15(options: DecryptOptions): Promise<DecryptRe
   const authTag = isNormalBackup ? normalAuthTag : footer.subarray(16, 32);
   const encryptedEnd = isNormalBackup ? normalEncryptedEnd : stats.size - 16;
 
+  const label = options.label ?? "backup";
+  const outputPrefix = (options.outputPrefix ?? "sqlite").replace(/[^A-Za-z0-9_.-]/g, "_") || "sqlite";
   const suffix = cryptoSafeSuffix(options.encryptedPath);
-  const rawPath = path.join(options.outputDir, `msgstore-${suffix}.raw`);
-  const sqlitePath = path.join(options.outputDir, `msgstore-${suffix}.db`);
+  const rawPath = path.join(options.outputDir, `${outputPrefix}-${suffix}.raw`);
+  const sqlitePath = path.join(options.outputDir, `${outputPrefix}-${suffix}.db`);
 
   try {
     options.onProgress?.({
       type: "step",
       step: "decrypting",
-      message: "Decrypting crypt15 payload."
+      message: `Decrypting ${label} crypt15 payload.`
     });
     await decryptRangeToFile(
       options.encryptedPath,
@@ -172,7 +193,7 @@ export async function decryptCrypt15(options: DecryptOptions): Promise<DecryptRe
     options.onProgress?.({
       type: "step",
       step: "decrypting",
-      message: "Materializing decrypted SQLite database."
+      message: `Materializing decrypted ${label} SQLite database.`
     });
     await materializeSqlite(rawPath, sqlitePath, options.onProgress, options.signal);
     throwIfAborted(options.signal);

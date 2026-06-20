@@ -32,6 +32,7 @@ import {
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import type {
+  ArchiveChangeEvent,
   ChatListItem,
   ImportJobSummary,
   ImportMode,
@@ -118,6 +119,47 @@ export function App() {
   }, [selectedChat?.id, messageQuery]);
 
   useEffect(() => {
+    const events = new EventSource("/api/archive/events");
+    let refreshTimer: number | null = null;
+
+    const scheduleRefresh = (change: ArchiveChangeEvent) => {
+      if (refreshTimer != null) {
+        return;
+      }
+      refreshTimer = window.setTimeout(() => {
+        refreshTimer = null;
+        void refreshStatus();
+        void loadChats(true);
+        const currentSelectedChat = selectedChat;
+        const selectedChatChanged = currentSelectedChat
+          ? change.chatSourceIds.length === 0 || change.chatSourceIds.includes(currentSelectedChat.sourceChatId)
+          : false;
+        if (currentSelectedChat && selectedChatChanged) {
+          setMessageOffset(0);
+          setMessageHasMore(false);
+          scrollActionRef.current = "bottom";
+          void loadMessages(currentSelectedChat, true);
+        }
+      }, 150);
+    };
+
+    events.addEventListener("archive-updated", (event) => {
+      try {
+        scheduleRefresh(JSON.parse((event as MessageEvent).data) as ArchiveChangeEvent);
+      } catch {
+        // Ignore malformed local stream messages; the browser will keep the stream alive.
+      }
+    });
+
+    return () => {
+      if (refreshTimer != null) {
+        window.clearTimeout(refreshTimer);
+      }
+      events.close();
+    };
+  }, [selectedChat?.sourceChatId, messageQuery, chatSearch, chatType, includeEventOnly]);
+
+  useEffect(() => {
     if (!pairingOpen) {
       return;
     }
@@ -173,9 +215,14 @@ export function App() {
       const next = await listChats({ search: chatSearch, type: chatType, includeEventOnly, limit: CHAT_LIMIT, offset });
       setChats((current) => (reset ? next : [...current, ...next]));
       setChatOffset(offset + next.length);
-      if (reset && selectedChat && !next.some((chat) => chat.id === selectedChat.id)) {
-        setSelectedChat(null);
-        setMessages([]);
+      if (reset && selectedChat) {
+        const refreshedSelectedChat = next.find((chat) => chat.id === selectedChat.id);
+        if (refreshedSelectedChat) {
+          setSelectedChat(refreshedSelectedChat);
+        } else {
+          setSelectedChat(null);
+          setMessages([]);
+        }
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not load chats.");
@@ -851,6 +898,7 @@ function ImportWizard({
       const result = await verifyImportKey({
         sessionId: session?.id ?? null,
         msgstorePath: paths.msgstorePath || null,
+        waPath: paths.waPath || null,
         key: key || null,
         keyPath: paths.keyPath || null,
         useStagedKey
@@ -969,9 +1017,9 @@ function ImportWizard({
             <FilePickRow
               icon={<HardDrive size={18} />}
               title="Contacts database"
-              description="Optional. wa.db improves saved contact names."
+              description="Optional. wa.db or wa.db.crypt15 improves saved contact names."
               file={session?.files.wa}
-              accept=".db"
+              accept=".crypt15,.db"
               onPick={(files) => void upload("wa", files)}
             />
             <FilePickRow
@@ -996,7 +1044,7 @@ function ImportWizard({
             {manualOpen && (
               <div className="manualPathGrid">
                 <PathInput label="msgstore path" value={paths.msgstorePath} onChange={(value) => setPaths((current) => ({ ...current, msgstorePath: value }))} />
-                <PathInput label="wa.db path" value={paths.waPath} onChange={(value) => setPaths((current) => ({ ...current, waPath: value }))} />
+                <PathInput label="wa.db or wa.db.crypt15 path" value={paths.waPath} onChange={(value) => setPaths((current) => ({ ...current, waPath: value }))} />
                 <PathInput label="media folder path" value={paths.mediaPath} onChange={(value) => setPaths((current) => ({ ...current, mediaPath: value }))} />
                 <PathInput label="key file path" value={paths.keyPath} onChange={(value) => setPaths((current) => ({ ...current, keyPath: value }))} />
               </div>

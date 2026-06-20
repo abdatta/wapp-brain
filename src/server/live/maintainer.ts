@@ -1,9 +1,14 @@
 import type { ArchiveRepository } from "../db/repository";
 import { config } from "../config";
+import { configuredTraceRecorder } from "../diagnostics/traceRecorder";
 import { assertLiveDependencySafe } from "./dependency";
 import { auditChatGaps, auditMessageEventCheckpoint, computeArchiveWatermarks } from "./auditor";
 import { recoverDueGaps } from "./recovery";
 import { addEventToTotals, emptyLiveTotals, type LiveMaintainerOptions, type LiveMessageEvent, type LiveWhatsAppClient } from "./types";
+
+export interface LiveMaintainerCallbacks {
+  onArchiveChanged?: (event: LiveMessageEvent) => void | Promise<void>;
+}
 
 export class LiveMaintainer {
   private runId: string | null = null;
@@ -14,7 +19,8 @@ export class LiveMaintainer {
   constructor(
     private readonly repository: ArchiveRepository,
     private readonly client: LiveWhatsAppClient,
-    private readonly options: LiveMaintainerOptions
+    private readonly options: LiveMaintainerOptions,
+    private readonly callbacks: LiveMaintainerCallbacks = {}
   ) {}
 
   async start(): Promise<string> {
@@ -27,6 +33,7 @@ export class LiveMaintainer {
     });
     this.runId = await this.repository.startLiveSyncRun({ client: this.client.name });
     this.client.onConnectionUpdate(async (update) => {
+      await configuredTraceRecorder?.record("live.connection_update", { runId: this.runId, update });
       await this.repository.upsertLiveSession({
         id: "default",
         status: update.state,
@@ -77,11 +84,13 @@ export class LiveMaintainer {
   }
 
   private async ingestEvent(event: LiveMessageEvent): Promise<void> {
+    await configuredTraceRecorder?.record("live.ingest_event.start", { runId: this.runId, event });
     if (await this.repository.hasLiveEventReceipt(event.eventKey)) {
+      await configuredTraceRecorder?.record("live.ingest_event.skipped_duplicate", { runId: this.runId, eventKey: event.eventKey });
       return;
     }
-    if (event.contacts?.length) await this.repository.upsertContacts(this.runId ?? "live", event.contacts);
     if (event.chats?.length) await this.repository.upsertChats(this.runId ?? "live", event.chats);
+    if (event.contacts?.length) await this.repository.upsertContacts(this.runId ?? "live", event.contacts);
     if (event.participants?.length) await this.repository.upsertParticipants(event.participants);
     if (event.messages?.length) await this.repository.upsertMessages(event.messages);
     if (event.updates?.length) await this.repository.applyLiveMessageUpdates(event.updates);
@@ -96,6 +105,9 @@ export class LiveMaintainer {
     await this.repository.refreshChatStats();
     await this.updateCheckpoints(event);
     this.totals = addEventToTotals(this.totals, event);
+    await configuredTraceRecorder?.record("live.ingest_event.complete", { runId: this.runId, eventKey: event.eventKey, totals: this.totals });
+    await configuredTraceRecorder?.snapshotArchive(`after-live-event-${event.eventKey.replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 80)}`, config.archive.sqlitePath);
+    await this.callbacks.onArchiveChanged?.(event);
   }
 
   private async updateCheckpoints(event: LiveMessageEvent): Promise<void> {
@@ -125,6 +137,7 @@ export class LiveMaintainer {
 
   async fail(error: unknown): Promise<void> {
     const message = error instanceof Error ? error.message : "Live maintainer failed.";
+    await configuredTraceRecorder?.record("live.failed", { runId: this.runId, message });
     await this.repository.upsertLiveSession({ id: "default", status: "error", clientName: this.client.name, lastError: message.slice(0, 500) });
     if (this.runId && !this.stopping) {
       await this.repository.failLiveSyncRun(this.runId, "LIVE_MAINTAINER_FAILED", message, this.totals, this.totals.warnings);

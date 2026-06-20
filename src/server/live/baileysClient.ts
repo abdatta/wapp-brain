@@ -3,8 +3,14 @@ import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import QRCode from "qrcode";
 import { config } from "../config";
+import { configuredTraceRecorder } from "../diagnostics/traceRecorder";
 import { assertLiveDependencySafe } from "./dependency";
-import { normalizeBaileysMessages } from "./normalize";
+import {
+  normalizeBaileysChatsWithJidResolver,
+  normalizeBaileysContactsWithJidResolver,
+  normalizeBaileysMessagesWithJidResolver,
+  type LiveJidResolver
+} from "./normalize";
 import type { LiveConnectionUpdate, LiveHistoryRequest, LiveHistoryResult, LiveMessageEvent, LiveProofResult, LiveWhatsAppClient } from "./types";
 
 type Handler<T> = (value: T) => void | Promise<void>;
@@ -56,9 +62,11 @@ export class BaileysLiveWhatsAppClient implements LiveWhatsAppClient {
     if (this.options.readOnly !== false) {
       installReadOnlySocketGuards(socket);
     }
+    const resolveLiveJid = createLiveJidResolver(socket);
     this.socket = socket;
     socket.ev.on("creds.update", saveCreds);
     socket.ev.on("connection.update", async (update: any) => {
+      await configuredTraceRecorder?.record("baileys.raw_event", { name: "connection.update", event: update });
       if (update.qr) {
         await this.emitConnection({ state: "pairing", qrDataUrl: await QRCode.toDataURL(update.qr) });
       }
@@ -72,12 +80,50 @@ export class BaileysLiveWhatsAppClient implements LiveWhatsAppClient {
       }
     });
     socket.ev.on("messages.upsert", async (event: { type?: string; messages?: unknown[] }) => {
-      const normalized = normalizeBaileysMessages((event.messages ?? []) as any[], "wa-web:messages.upsert");
+      await configuredTraceRecorder?.record("baileys.raw_event", { name: "messages.upsert", event });
+      const normalized = await normalizeBaileysMessagesWithJidResolver((event.messages ?? []) as any[], "wa-web:messages.upsert", resolveLiveJid);
       normalized.mode = event.type === "append" ? "append" : "notify";
+      await configuredTraceRecorder?.record("baileys.normalized_event", { name: "messages.upsert", event: normalized });
       await this.emitEvent(normalized);
     });
-    socket.ev.on("messaging-history.set", async (event: { messages?: unknown[] }) => {
-      await this.emitEvent(normalizeBaileysMessages((event.messages ?? []) as any[], "wa-web:history-sync"));
+    socket.ev.on("messaging-history.set", async (event: { messages?: unknown[]; lidPnMappings?: Array<{ lid: string; pn: string }> }) => {
+      await configuredTraceRecorder?.record("baileys.raw_event", { name: "messaging-history.set", event });
+      await storeLidPnMappings(socket, event.lidPnMappings);
+      const normalized = await normalizeBaileysMessagesWithJidResolver((event.messages ?? []) as any[], "wa-web:history-sync", resolveLiveJid);
+      const contacts = await normalizeBaileysContactsWithJidResolver(((event as { contacts?: unknown[] }).contacts ?? []) as any[], "contacts.upsert", resolveLiveJid);
+      const chats = await normalizeBaileysChatsWithJidResolver(((event as { chats?: unknown[] }).chats ?? []) as any[], "chats.upsert", resolveLiveJid);
+      normalized.contacts = mergeBySourceJid(normalized.contacts ?? [], contacts.contacts ?? []);
+      normalized.chats = mergeBySourceChatId(normalized.chats ?? [], chats.chats ?? []);
+      await configuredTraceRecorder?.record("baileys.normalized_event", { name: "messaging-history.set", event: normalized });
+      await this.emitEvent(normalized);
+    });
+    socket.ev.on("contacts.upsert", async (contacts: unknown[]) => {
+      await configuredTraceRecorder?.record("baileys.raw_event", { name: "contacts.upsert", event: contacts });
+      const normalized = await normalizeBaileysContactsWithJidResolver(contacts as any[], "contacts.upsert", resolveLiveJid);
+      await configuredTraceRecorder?.record("baileys.normalized_event", { name: "contacts.upsert", event: normalized });
+      await this.emitEvent(normalized);
+    });
+    socket.ev.on("contacts.update", async (contacts: unknown[]) => {
+      await configuredTraceRecorder?.record("baileys.raw_event", { name: "contacts.update", event: contacts });
+      const normalized = await normalizeBaileysContactsWithJidResolver(contacts as any[], "contacts.update", resolveLiveJid);
+      await configuredTraceRecorder?.record("baileys.normalized_event", { name: "contacts.update", event: normalized });
+      await this.emitEvent(normalized);
+    });
+    socket.ev.on("chats.upsert", async (chats: unknown[]) => {
+      await configuredTraceRecorder?.record("baileys.raw_event", { name: "chats.upsert", event: chats });
+      const normalized = await normalizeBaileysChatsWithJidResolver(chats as any[], "chats.upsert", resolveLiveJid);
+      await configuredTraceRecorder?.record("baileys.normalized_event", { name: "chats.upsert", event: normalized });
+      await this.emitEvent(normalized);
+    });
+    socket.ev.on("chats.update", async (chats: unknown[]) => {
+      await configuredTraceRecorder?.record("baileys.raw_event", { name: "chats.update", event: chats });
+      const normalized = await normalizeBaileysChatsWithJidResolver(chats as any[], "chats.update", resolveLiveJid);
+      await configuredTraceRecorder?.record("baileys.normalized_event", { name: "chats.update", event: normalized });
+      await this.emitEvent(normalized);
+    });
+    socket.ev.on("lid-mapping.update", async (mapping: { lid: string; pn: string }) => {
+      await configuredTraceRecorder?.record("baileys.raw_event", { name: "lid-mapping.update", event: mapping });
+      await storeLidPnMappings(socket, [mapping]);
     });
 
     if (this.options.phoneNumber && !socket.authState?.creds?.registered) {
@@ -351,6 +397,59 @@ function installReadOnlySocketGuards(socket: Record<string, unknown>): void {
       };
     }
   }
+}
+
+function mergeBySourceJid<T extends { sourceJid: string }>(left: T[], right: T[]): T[] {
+  return [...new Map([...left, ...right].map((item) => [item.sourceJid, item])).values()];
+}
+
+function mergeBySourceChatId<T extends { sourceChatId: string }>(left: T[], right: T[]): T[] {
+  return [...new Map([...left, ...right].map((item) => [item.sourceChatId, item])).values()];
+}
+
+function createLiveJidResolver(socket: any): LiveJidResolver {
+  const resolved = new Map<string, string>();
+  return async (jid: string) => {
+    if (!isLidJid(jid)) {
+      await configuredTraceRecorder?.record("baileys.jid_resolved", { input: jid, output: jid, source: "non-lid" });
+      return jid;
+    }
+    const cached = resolved.get(jid);
+    if (cached) {
+      await configuredTraceRecorder?.record("baileys.jid_resolved", { input: jid, output: cached, source: "cache" });
+      return cached;
+    }
+    const store = socket.signalRepository?.lidMapping;
+    if (typeof store?.getPNForLID !== "function") {
+      await configuredTraceRecorder?.record("baileys.jid_resolved", { input: jid, output: jid, source: "missing-store" });
+      return jid;
+    }
+    const phoneJid = await store.getPNForLID(jid);
+    if (phoneJid) {
+      resolved.set(jid, phoneJid);
+      await configuredTraceRecorder?.record("baileys.jid_resolved", { input: jid, output: phoneJid, source: "signal-repository" });
+      return phoneJid;
+    }
+    await configuredTraceRecorder?.record("baileys.jid_resolved", { input: jid, output: jid, source: "unmapped" });
+    return jid;
+  };
+}
+
+async function storeLidPnMappings(socket: any, mappings: Array<{ lid: string; pn: string }> | null | undefined): Promise<void> {
+  if (!mappings?.length) {
+    return;
+  }
+  const store = socket.signalRepository?.lidMapping;
+  if (typeof store?.storeLIDPNMappings === "function") {
+    await store.storeLIDPNMappings(mappings);
+    await configuredTraceRecorder?.record("baileys.lid_mappings_stored", { mappings });
+  } else {
+    await configuredTraceRecorder?.record("baileys.lid_mappings_store_missing", { mappings });
+  }
+}
+
+function isLidJid(jid: string): boolean {
+  return jid.endsWith("@lid") || jid.endsWith("@hosted.lid");
 }
 
 function safeError(error: unknown): string {

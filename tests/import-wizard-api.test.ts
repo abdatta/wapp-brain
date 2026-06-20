@@ -29,6 +29,8 @@ describe("import wizard local API", () => {
       const rootKey = randomBytes(32);
       const encryptedPath = path.join(tempDir, "msgstore.db.crypt15");
       await writeFile(encryptedPath, createCrypt15Fixture(rootKey, await readFile(fixture.msgstorePath)));
+      const encryptedWaPath = path.join(tempDir, "wa.db.crypt15");
+      await writeFile(encryptedWaPath, createCrypt15Fixture(rootKey, await readFile(fixture.waPath)));
 
       const port = 5600 + Math.floor(Math.random() * 1000);
       const child = spawn(process.execPath, ["--import", "tsx", "src/server/server.ts"], {
@@ -54,10 +56,10 @@ describe("import wizard local API", () => {
         const created = await fetchJson<{ session: ImportStagingSessionSummary }>(`${base}/api/import/staging`, { method: "POST" });
         let session = created.session;
         session = (await uploadFile(`${base}/api/import/staging/${session.id}/msgstore?name=msgstore.db.crypt15`, encryptedPath)).session;
-        session = (await uploadFile(`${base}/api/import/staging/${session.id}/wa?name=wa.db`, fixture.waPath)).session;
+        session = (await uploadFile(`${base}/api/import/staging/${session.id}/wa?name=wa.db.crypt15`, encryptedWaPath)).session;
 
         expect(session.files.msgstore?.name).toBe("msgstore.db.crypt15");
-        expect(session.files.wa?.name).toBe("wa.db");
+        expect(session.files.wa?.name).toBe("wa.db.crypt15");
 
         const failedVerify = await fetch(`${base}/api/import/verify-key`, {
           method: "POST",
