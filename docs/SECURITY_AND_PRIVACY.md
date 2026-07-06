@@ -12,7 +12,7 @@ Do not upload:
 - database files
 - backup/decryption keys
 - logs containing private data
-- generated GBrain/wiki files, summaries, embeddings, or indexes
+- generated second-brain wiki files, summaries, embeddings, or indexes
 - live WhatsApp linked-device auth/session state
 - live sync checkpoints, gap windows, event receipts, or raw protocol payloads
 
@@ -40,6 +40,16 @@ Default logs must not include:
 - live auth state, QR/pairing secrets, or raw WhatsApp Web payloads
 
 The CLI writes debug logs under `.wapp-brain/logs`. Keep those logs metadata-oriented and assume they may still be sensitive.
+
+## Second-Brain Memory
+
+Generated memory is derived WhatsApp data and is private by default.
+
+The memory store writes under `.wapp-brain/memory/` unless explicitly configured otherwise. Markdown pages are Obsidian-compatible plain files, but opening them in Obsidian or syncing that folder is a user-controlled privacy decision.
+
+Remote model use is disabled by default. Codex-backed memory generation requires explicit opt-in through the memory provider controls. When enabled, only selected evidence packs are sent to the provider, and default logs still must not include prompts, message bodies, raw model output, or OAuth tokens.
+
+Dry-run evidence previews can contain message bodies. They are written only under the private memory directory and should be treated like the archive itself.
 
 ## Live Maintainer
 
@@ -69,14 +79,15 @@ Ignored sensitive paths include:
 - `key`
 - `*.key`
 - local SQLite archives and sidecars
-- generated GBrain/wiki files, summaries, embeddings, and indexes
+- generated second-brain wiki files, summaries, embeddings, and indexes
 - media folders
 - exports
 - `.wapp-brain/`
-- `.gbrain/`
+- `.wapp-brain/memory/`
+- `.second-brain/`
 - `fixtures/generated/`
 
-Repo-local private data should live under `.wapp-brain/` by default. That includes WhatsApp SQL data, decrypted working files, generated GBrain/wiki pages, summaries, embeddings, retrieval indexes, and debug logs.
+Repo-local private data should live under `.wapp-brain/` by default. That includes WhatsApp SQL data, decrypted working files, generated second-brain wiki pages, summaries, embeddings, retrieval indexes, provider sessions, evidence previews, and debug logs.
 
 `npm run cleanup` removes app-managed decrypted working files and import staging files. `npm run doctor` warns when import staging files are still present after a cancelled or interrupted UI import. Do not run cleanup while an import is active, because active staging files and rollback snapshots are part of the local job.
 

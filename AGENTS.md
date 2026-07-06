@@ -1,6 +1,6 @@
 # Agent Guide
 
-Wapp Brain is a local-first WhatsApp archive and second-brain engine. It imports user-supplied Android backup data into a local SQLite archive, provides a local UI for browsing chats/messages, and is intended to grow into live ingestion plus a GBrain-style private wiki and cited second brain.
+Wapp Brain is a local-first WhatsApp archive and second-brain engine. It imports user-supplied Android backup data into a local SQLite archive, provides a local UI for browsing chats/messages, and is intended to grow into live ingestion plus a private second-brain wiki with citations.
 
 ## North Star
 
@@ -13,14 +13,14 @@ Build a trustworthy local archive of the user's WhatsApp messages, then layer se
 - Do not use WhatsApp Web scraping for backup import.
 - Do not bypass protections or recover data without user-supplied files and keys.
 - Do not log backup keys, message bodies, decrypted DB contents, or raw row dumps by default.
-- Never commit real WhatsApp files, keys, media, generated archives, generated brain/wiki files, `.env`, `.wapp-brain/`, or `.gbrain/`.
+- Never commit real WhatsApp files, keys, media, generated archives, generated brain/wiki files, `.env`, `.wapp-brain/`, or `.second-brain/`.
 - Treat remote Postgres, Supabase, hosted vector databases, and hosted LLM workflows as privacy-sensitive opt-ins.
 
 ## Local Data
 
 - Default private workspace: `.wapp-brain/`.
 - Default SQLite archive: `.wapp-brain/archive.sqlite`.
-- Store repo-local private data there: WhatsApp SQL files, decrypted working files, debug logs, generated GBrain/wiki pages, summaries, embeddings, and retrieval indexes.
+- Store repo-local private data there: WhatsApp SQL files, decrypted working files, debug logs, generated second-brain wiki pages, summaries, embeddings, and retrieval indexes.
 
 ## Implementation Notes
 

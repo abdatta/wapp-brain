@@ -16,6 +16,8 @@ import { assertLiveBaselineReady } from "./live/baseline";
 import { LiveMaintainer, liveOptionsFromConfig } from "./live/maintainer";
 import { ImportTerminalProgress, type ImportProgressEvent } from "./import/progress";
 import { publicErrorMessage, redactForDisplay, safeBasename } from "./privacy";
+import { queryMemory, resolveMemoryCitation, runMemoryConsolidation, validateMemoryStore } from "./memory/consolidation";
+import { connectCodexProvider, disableRemoteMemoryProvider, enableCodexProvider, getMemoryProviderStatus } from "./memory/provider";
 
 type Args = Record<string, string | boolean>;
 
@@ -159,6 +161,64 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === "memory-status") {
+    const repository = createArchiveRepository();
+    try {
+      console.log(JSON.stringify(await repository.getMemoryStatus(await getMemoryProviderStatus()), null, 2));
+    } finally {
+      await repository.close?.();
+    }
+    return;
+  }
+
+  if (command === "memory-provider") {
+    await runMemoryProviderCommand(args);
+    return;
+  }
+
+  if (command === "memory-rem" || command === "memory-consolidate") {
+    await runMemoryConsolidationCommand(args, command === "memory-rem" ? "rem" : "manual");
+    return;
+  }
+
+  if (command === "memory-query") {
+    const query = stringArg(args.query) ?? stringArg(args._);
+    if (!query) {
+      throw new Error("Missing --query for memory-query.");
+    }
+    const repository = createArchiveRepository();
+    try {
+      console.log(JSON.stringify(await queryMemory(repository, query), null, 2));
+    } finally {
+      await repository.close?.();
+    }
+    return;
+  }
+
+  if (command === "memory-citation") {
+    const citation = stringArg(args.citation) ?? stringArg(args._);
+    if (!citation) {
+      throw new Error("Missing --citation for memory-citation.");
+    }
+    const repository = createArchiveRepository();
+    try {
+      console.log(JSON.stringify(await resolveMemoryCitation(repository, citation), null, 2));
+    } finally {
+      await repository.close?.();
+    }
+    return;
+  }
+
+  if (command === "memory-validate") {
+    const repository = createArchiveRepository();
+    try {
+      console.log(JSON.stringify(await validateMemoryStore(repository), null, 2));
+    } finally {
+      await repository.close?.();
+    }
+    return;
+  }
+
   printHelp();
 }
 
@@ -261,6 +321,49 @@ async function runImportCommand(args: Args): Promise<void> {
   } finally {
     await repository.close?.();
     await logger.close();
+  }
+}
+
+async function runMemoryProviderCommand(args: Args): Promise<void> {
+  const action = stringArg(args.action) ?? stringArg(args._) ?? "status";
+  if (action === "enable-codex") {
+    console.log(JSON.stringify(await enableCodexProvider(), null, 2));
+    return;
+  }
+  if (action === "disable") {
+    console.log(JSON.stringify(await disableRemoteMemoryProvider(), null, 2));
+    return;
+  }
+  if (action === "login") {
+    console.log(JSON.stringify(await connectCodexProvider(), null, 2));
+    return;
+  }
+  console.log(JSON.stringify(await getMemoryProviderStatus(), null, 2));
+}
+
+async function runMemoryConsolidationCommand(args: Args, kind: "rem" | "manual"): Promise<void> {
+  const repository = createArchiveRepository();
+  try {
+    const result = await runMemoryConsolidation(repository, {
+      kind: Boolean(args.rebuild) ? "rebuild" : kind,
+      startAtMs: numberArg(args["start-ms"]) ?? null,
+      endAtMs: numberArg(args["end-ms"]) ?? null,
+      chatSourceIds: stringArg(args.chats)?.split(",").map((chat) => chat.trim()).filter(Boolean),
+      dryRun: Boolean(args["dry-run"]),
+      force: Boolean(args.force),
+      provider: args.provider === "codex" ? "codex" : "local"
+    });
+    console.log(
+      `Memory ${result.dryRun ? "dry run" : "run"} ${result.run.status}: run=${result.run.id} pages=${result.pages.length} messages=${result.run.messageCount} citations=${result.run.citationCount}`
+    );
+    if (result.previewPath) {
+      console.log(`Evidence preview written under private memory dir: ${displayPath(result.previewPath)}`);
+    }
+    if (result.issues.length) {
+      console.log(`Validation issues: ${result.issues.map((issue) => issue.code).join(", ")}`);
+    }
+  } finally {
+    await repository.close?.();
   }
 }
 
@@ -420,6 +523,13 @@ function printHelp(): void {
   tsx src/server/cli.ts live-gaps
   tsx src/server/cli.ts live-retry-gap --id <gap-id>
   tsx src/server/cli.ts live-unlink
+  tsx src/server/cli.ts memory-status
+  tsx src/server/cli.ts memory-provider [status|enable-codex|login|disable]
+  tsx src/server/cli.ts memory-rem [--dry-run] [--provider local|codex] [--force]
+  tsx src/server/cli.ts memory-consolidate [--start-ms <ms>] [--end-ms <ms>] [--chats <source-chat-id,...>] [--dry-run] [--force]
+  tsx src/server/cli.ts memory-query --query <text>
+  tsx src/server/cli.ts memory-citation --citation <label-or-source-message-key>
+  tsx src/server/cli.ts memory-validate
 
 Notes:
   - Keys and message contents are never printed by the CLI.
@@ -429,6 +539,7 @@ Notes:
   - Set WAPP_TRACE_NAME=<name> to record exact local diagnostic traces under .wapp-brain/traces.
   - inspect reports schema compatibility and counts without message bodies.
   - live-* commands are explicit opt-in and store auth/session state only under .wapp-brain/live.
+  - memory-* commands write private generated Markdown, sidecars, and provider session state under .wapp-brain/memory by default.
   - Use --keep-decrypted only if you intentionally want decrypted databases left in the local work directory.
   - cleanup removes app-managed decrypted working files and import staging files.`);
 }

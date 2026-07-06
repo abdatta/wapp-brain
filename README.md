@@ -16,7 +16,7 @@ No WhatsApp Web scraping, cloud sync, account login, analytics, or external uplo
 
 ## Privacy Warnings
 
-WhatsApp databases, decrypted databases, media, archive files, generated GBrain/wiki files, embeddings/indexes, and backup keys are highly sensitive.
+WhatsApp databases, decrypted databases, media, archive files, generated second-brain wiki files, embeddings/indexes, and backup keys are highly sensitive.
 
 - Do not commit real `msgstore*`, `*.crypt*`, `wa.db`, decrypted `.db` files, archive `.sqlite` files, SQLite sidecars, keys, media, exports, logs, or `.env` files.
 - Do not commit generated second-brain/wiki files derived from WhatsApp data.
@@ -46,7 +46,7 @@ By default, imports write to:
 .wapp-brain/archive.sqlite
 ```
 
-Use `.wapp-brain/` as the repo-local private workspace for WhatsApp SQL data, decrypted working files, future generated GBrain/wiki pages, summaries, embeddings, and retrieval indexes. This directory is gitignored and should stay private.
+Use `.wapp-brain/` as the repo-local private workspace for WhatsApp SQL data, decrypted working files, future generated second-brain wiki pages, summaries, embeddings, and retrieval indexes. This directory is gitignored and should stay private.
 
 ## Install
 
@@ -136,6 +136,26 @@ Open [http://127.0.0.1:3600](http://127.0.0.1:3600).
 The server binds to `127.0.0.1` by default.
 
 For large chats, the viewer loads the newest message window first and displays that loaded window in chronological order. Use **Load older messages** to page back through the conversation without sending the whole chat to the browser at once.
+
+## Second-Brain Memory
+
+Memory generation is local-first. The default REM command writes Obsidian-compatible Markdown pages and citation sidecars under `.wapp-brain/memory/`:
+
+```powershell
+npm run memory:rem -- --dry-run
+npm run memory:rem
+npm run memory:query -- --query "topic"
+npm run memory:validate
+```
+
+Codex-backed generation is explicit opt-in:
+
+```powershell
+tsx src/server/cli.ts memory-provider enable-codex
+tsx src/server/cli.ts memory-provider login
+```
+
+Do not sync or commit `.wapp-brain/memory/` unless you intentionally want to export private WhatsApp-derived memory.
 
 ## Synthetic Test Data
 

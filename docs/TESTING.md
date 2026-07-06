@@ -20,6 +20,23 @@ npm run live:status
 npm run live:gaps
 ```
 
+Memory commands are local-first by default:
+
+```powershell
+tsx src/server/cli.ts memory-status
+tsx src/server/cli.ts memory-rem --dry-run
+tsx src/server/cli.ts memory-rem
+tsx src/server/cli.ts memory-query --query "topic"
+tsx src/server/cli.ts memory-validate
+```
+
+Codex-backed generation is opt-in:
+
+```powershell
+tsx src/server/cli.ts memory-provider enable-codex
+tsx src/server/cli.ts memory-provider login
+```
+
 ## Current Test Coverage
 
 The test suite covers:
@@ -47,6 +64,13 @@ The test suite covers:
 - per-chat gap detection
 - bounded recovery outcomes
 - live API state controls
+- second-brain memory schema additivity
+- Obsidian-friendly Markdown page generation
+- citation sidecar writes and citation resolution
+- dry-run evidence previews without durable page commits
+- provider-disabled refusal for Codex generation
+- layered memory query across committed pages and short-term messages
+- stale citation marking after archive replacement
 
 ## Fixture Policy
 
@@ -81,3 +105,7 @@ The local UI should make it easy to verify:
 - timestamps are plausible
 - warnings are visible but privacy-safe
 - re-running import does not duplicate rows
+- running memory REM creates Markdown under `.wapp-brain/memory/pages`
+- memory pages include YAML front matter and citation labels
+- memory query can find committed memory and current short-term messages
+- citation inspection can reopen nearby local messages

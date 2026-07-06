@@ -14,6 +14,15 @@ import type {
   LiveSessionSummary,
   LiveSyncRunSummary,
   LiveSyncTotals,
+  MemoryCitationRecord,
+  MemoryEvidenceMessage,
+  MemoryEvidencePackRecord,
+  MemoryPageRevisionRecord,
+  MemoryProviderStatus,
+  MemoryRunSummary,
+  MemorySourceWindowRecord,
+  MemoryStatusSummary,
+  MemoryValidationIssue,
   MessageListItem,
   MessageRecord,
   ParticipantRecord,
@@ -52,6 +61,38 @@ export interface ArchiveRepository {
     chatId: number,
     options: { limit: number; offset: number; sender?: string; query?: string; order?: "asc" | "desc" }
   ): Promise<MessageListItem[]>;
+  getMemoryStatus(provider: MemoryProviderStatus): Promise<MemoryStatusSummary>;
+  startMemoryRun(input: {
+    kind: MemoryRunSummary["kind"];
+    sourceStartAtMs?: number | null;
+    sourceEndAtMs?: number | null;
+    sourceSummary?: Record<string, unknown> | null;
+  }): Promise<string>;
+  completeMemoryRun(runId: string, totals: { pages: number; citations: number; messages: number; warnings: number }): Promise<void>;
+  failMemoryRun(runId: string, status: "failed" | "blocked", message: string, warningCount?: number): Promise<void>;
+  getMemoryRun(runId: string): Promise<MemoryRunSummary | null>;
+  listMemoryRuns(limit: number): Promise<MemoryRunSummary[]>;
+  tryAcquireMemoryLock(runId: string, ttlMs: number): Promise<boolean>;
+  releaseMemoryLock(runId: string): Promise<void>;
+  createMemorySourceWindow(input: Omit<MemorySourceWindowRecord, "id" | "createdAt">): Promise<MemorySourceWindowRecord>;
+  getCommittedMemoryWindow(sourceHash: string): Promise<MemorySourceWindowRecord | null>;
+  commitMemorySourceWindow(windowId: string): Promise<void>;
+  listMemoryEvidenceMessages(options: {
+    startAtMs?: number | null;
+    endAtMs?: number | null;
+    chatSourceIds?: string[];
+    limit: number;
+  }): Promise<MemoryEvidenceMessage[]>;
+  getLatestCommittedMemoryEndAtMs(chatSourceId?: string | null): Promise<number | null>;
+  recordMemoryEvidencePack(pack: MemoryEvidencePackRecord): Promise<void>;
+  commitMemoryPageRevision(revision: MemoryPageRevisionRecord, citations: MemoryCitationRecord[]): Promise<void>;
+  listMemoryPageRevisions(options?: { query?: string; limit?: number }): Promise<MemoryPageRevisionRecord[]>;
+  listMemoryCitations(revisionId?: string): Promise<MemoryCitationRecord[]>;
+  recordMemoryValidationIssues(issues: MemoryValidationIssue[]): Promise<void>;
+  listMemoryValidationIssues(runId?: string): Promise<MemoryValidationIssue[]>;
+  markStaleMemoryForMissingMessages(): Promise<number>;
+  resolveMemoryCitation(citationLabelOrMessageKey: string): Promise<MemoryCitationRecord | null>;
+  listNearbyMemoryMessages(messageId: number, radius: number): Promise<MemoryEvidenceMessage[]>;
   close?(): Promise<void>;
 }
 

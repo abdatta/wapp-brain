@@ -5,6 +5,7 @@ import { config } from "./config";
 import { publicErrorMessage } from "./privacy";
 import { isSqliteArchiveInitialized } from "./db/sqliteRepository";
 import { getLiveDependencyStatus } from "./live/dependency";
+import { getMemoryProviderStatus } from "./memory/provider";
 
 export interface DoctorCheck {
   name: string;
@@ -27,7 +28,8 @@ const requiredIgnorePatterns = [
   "media/",
   "exports/",
   ".wapp-brain/",
-  ".gbrain/"
+  ".wapp-brain/memory/",
+  ".second-brain/"
 ];
 
 export async function runDoctor(): Promise<DoctorCheck[]> {
@@ -38,6 +40,7 @@ export async function runDoctor(): Promise<DoctorCheck[]> {
   checks.push(checkSqliteArchive());
   checks.push(checkImportStaging());
   checks.push(checkLiveDependency());
+  checks.push(await checkMemoryStore());
   return checks;
 }
 
@@ -112,6 +115,30 @@ function checkLiveDependency(): DoctorCheck {
     name: "Live WhatsApp dependency",
     status: status.safe ? "pass" : "fail",
     message: status.message
+  };
+}
+
+async function checkMemoryStore(): Promise<DoctorCheck> {
+  const provider = await getMemoryProviderStatus();
+  const rootIsPrivate = path.resolve(config.memory.rootDir).startsWith(path.resolve(config.workDir));
+  if (!rootIsPrivate && !path.resolve(config.memory.rootDir).includes(".second-brain")) {
+    return {
+      name: "Second-brain memory",
+      status: "warn",
+      message: "Memory root is outside the default private workspace; use only an intentional local vault path."
+    };
+  }
+  if (provider.provider === "codex" && provider.remoteModelEnabled && !provider.codexPackageAvailable) {
+    return {
+      name: "Second-brain memory",
+      status: "warn",
+      message: "Codex provider is enabled, but the optional gpt-oauth-client package is not available."
+    };
+  }
+  return {
+    name: "Second-brain memory",
+    status: "pass",
+    message: provider.message
   };
 }
 

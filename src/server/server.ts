@@ -23,6 +23,8 @@ import {
 import { assertLiveBaselineReady } from "./live/baseline";
 import { liveOptionsFromConfig } from "./live/maintainer";
 import { LiveMaintainer } from "./live/maintainer";
+import { queryMemory, resolveMemoryCitation, runMemoryConsolidation, validateMemoryStore } from "./memory/consolidation";
+import { disableRemoteMemoryProvider, enableCodexProvider, getMemoryProviderStatus } from "./memory/provider";
 import { isLocalDatabaseError, publicErrorMessage } from "./privacy";
 import { withGuidedSetup } from "./onboarding";
 import type { ArchiveChangeEvent, LivePairingSummary } from "../shared/types";
@@ -154,6 +156,78 @@ app.get("/api/archive/events", (req, res) => {
 
 app.get("/api/diagnostics/trace", (_req, res) => {
   res.json(getTraceRecorderSummary());
+});
+
+app.get("/api/memory/status", async (_req, res) => {
+  try {
+    res.json(await repository.getMemoryStatus(await getMemoryProviderStatus()));
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+app.post("/api/memory/runs", async (req, res) => {
+  try {
+    res.json({
+      ok: true,
+      result: await runMemoryConsolidation(repository, {
+        kind: req.body?.kind === "manual" || req.body?.kind === "rebuild" ? req.body.kind : "rem",
+        startAtMs: numberBody(req.body?.startAtMs),
+        endAtMs: numberBody(req.body?.endAtMs),
+        chatSourceIds: Array.isArray(req.body?.chatSourceIds) ? req.body.chatSourceIds.filter((item: unknown): item is string => typeof item === "string") : undefined,
+        dryRun: Boolean(req.body?.dryRun),
+        force: Boolean(req.body?.force),
+        provider: req.body?.provider === "codex" ? "codex" : "local"
+      })
+    });
+  } catch (error) {
+    res.status(400).json({ ok: false, error: publicErrorMessage(error) });
+  }
+});
+
+app.post("/api/memory/query", async (req, res) => {
+  try {
+    const query = typeof req.body?.query === "string" ? req.body.query.trim() : "";
+    if (!query) {
+      res.status(400).json({ error: "Missing memory query." });
+      return;
+    }
+    res.json(await queryMemory(repository, query));
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+app.get("/api/memory/citations/:citation", async (req, res) => {
+  try {
+    res.json(await resolveMemoryCitation(repository, req.params.citation));
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+app.post("/api/memory/validate", async (_req, res) => {
+  try {
+    res.json(await validateMemoryStore(repository));
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+app.post("/api/memory/provider/enable-codex", async (_req, res) => {
+  try {
+    res.json(await enableCodexProvider());
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+app.post("/api/memory/provider/disable", async (_req, res) => {
+  try {
+    res.json(await disableRemoteMemoryProvider());
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
 });
 
 app.post("/api/init-db", async (_req, res) => {
@@ -457,6 +531,11 @@ async function stopActiveMaintainer(): Promise<void> {
     state: "stopped",
     updatedAt: new Date().toISOString()
   };
+}
+
+function numberBody(value: unknown): number | null {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? Math.floor(number) : null;
 }
 
 function broadcastArchiveChanged(input: Omit<ArchiveChangeEvent, "id" | "type" | "updatedAt">): void {

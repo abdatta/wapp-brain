@@ -91,6 +91,23 @@ The recovery planner works per chat rather than using one global watermark. If o
 
 Live sync is disabled until an imported backup baseline exists. If the latest archived message is older than the configured recovery window, the user must import a fresher backup before linking live sync. The UI surfaces this as a guided setup state rather than showing live controls that cannot safely run yet.
 
+## Second-Brain Memory Data
+
+Memory consolidation is derived from archive messages. It does not replace the raw archive.
+
+The memory layer stores:
+- memory runs with status, totals, and source bounds
+- source windows with deterministic hashes for idempotent REM reruns
+- evidence packs with local citation labels
+- page revisions and current/stale page state
+- citation edges back to exact archive messages
+- validation issues for unsupported or stale claims
+- a job lock so scheduled/manual runs cannot overlap
+
+Generated Markdown pages live under `.wapp-brain/memory/pages/` by default. Citation sidecars live under `.wapp-brain/memory/citations/`, and dry-run evidence previews live under `.wapp-brain/memory/runs/`. These files are private WhatsApp-derived data.
+
+The default REM command consolidates completed messages up to the previous local day and leaves newer messages as short-term context. Query reads combine committed pages with short-term archive messages newer than the latest committed window.
+
 ## Media Status
 
 Media is not imported as files yet.

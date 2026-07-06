@@ -147,6 +147,7 @@ h1 {
 
 .statusPanel,
 .livePanel,
+.memoryPanel,
 .importPanel,
 .filterPanel {
   padding: 16px;
@@ -245,6 +246,75 @@ h1 {
   border-radius: 8px;
   padding: 9px 10px;
   font-size: 12px;
+}
+
+.memoryActions,
+.memorySearch {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.providerRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 10px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  color: #b4c1bd;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.memoryResults {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.memoryResults p {
+  white-space: pre-wrap;
+  color: #cbd8d3;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.memoryEvidence {
+  display: grid;
+  gap: 4px;
+  padding: 9px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  background: rgba(18, 20, 24, 0.58);
+}
+
+.memoryEvidence strong {
+  color: #ecfff6;
+  font-size: 12px;
+}
+
+.memoryEvidence span {
+  color: #aebbb7;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.citationContext {
+  display: grid;
+  gap: 5px;
+  padding: 10px;
+  border-radius: 8px;
+  background: rgba(125, 224, 178, 0.08);
+  color: #cfe5dd;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.citationContext.stale {
+  background: rgba(240, 177, 88, 0.1);
 }
 
 .setupReason,

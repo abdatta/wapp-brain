@@ -41,11 +41,24 @@ explicit linked-device pairing
   -> local API/UI health and alerts
 ```
 
+Second-brain memory flow:
+
+```text
+archive messages
+  -> completed source window selection
+  -> evidence packs with stable citation labels
+  -> local extractive or explicitly opted-in Codex generation
+  -> citation validation
+  -> SQLite memory ledger
+  -> Obsidian-compatible Markdown under .wapp-brain/memory/pages
+  -> local query over long-term pages plus short-term messages
+```
+
 ## Private Workspace Boundary
 
 The public repo contains the engine: importer, local API/UI, schema, templates, tests, and docs.
 
-Repo-local private data lives under `.wapp-brain/` by default and stays gitignored. This includes WhatsApp SQL files, decrypted working files, the local archive, debug logs, generated GBrain/wiki pages, summaries, embeddings, and retrieval indexes.
+Repo-local private data lives under `.wapp-brain/` by default and stays gitignored. This includes WhatsApp SQL files, decrypted working files, the local archive, debug logs, generated second-brain wiki pages, summaries, embeddings, and retrieval indexes.
 
 ## Important Modules
 
@@ -56,6 +69,7 @@ Repo-local private data lives under `.wapp-brain/` by default and stays gitignor
 - `src/server/import/parser.ts` converts WhatsApp-like schemas into normalized records.
 - `src/server/import/importer.ts` orchestrates import runs and message batching.
 - `src/server/live/*` owns the optional live maintainer adapter, normalization, gap auditing, and bounded recovery.
+- `src/server/memory/*` owns private second-brain consolidation, provider status, citation validation, Markdown artifact writes, and layered memory query.
 - `src/server/db/repository.ts` defines the storage interface.
 - `src/server/db/sqliteRepository.ts` owns the archive schema and SQL.
 - `src/client/App.tsx` is the primary local UI.
@@ -80,10 +94,20 @@ The archive stores:
 - `live_chat_checkpoints`
 - `live_gap_windows`
 - `live_event_receipts`
+- `memory_runs`
+- `memory_source_windows`
+- `memory_evidence_packs`
+- `memory_pages`
+- `memory_page_revisions`
+- `memory_citations`
+- `memory_validation_issues`
+- `memory_job_locks`
 
 Messages and entities use stable source-derived keys where possible so repeated imports can update existing rows instead of duplicating them.
 
 Live sync is modeled as a separate source feeding the same normalized archive. Import runs remain distinct from live sync runs, while contacts, chats, and messages still converge through stable source-derived keys.
+
+Second-brain memory is derived data. SQLite stores the run ledger, source windows, page revisions, citations, validation issues, and job lock. Markdown pages and citation sidecars are written under `.wapp-brain/memory/` by default. Pages use YAML front matter, stable IDs, tags, aliases, and plain Markdown so the folder can be opened by Obsidian or another local Markdown tool later without coupling the core app to that tool.
 
 ## Future Postgres/Supabase Notes
 

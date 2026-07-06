@@ -12,4 +12,4 @@ Start here:
 - [Limitations](LIMITATIONS.md)
 - [Live WhatsApp Maintainer](LIVE_WHATSAPP_MAINTAINER.md)
 
-The short version: Wapp Brain imports a user-supplied WhatsApp Android archive into a local SQLite database, provides a local UI for browsing it, and is intended to grow into a live-updated WhatsApp memory store and GBrain-style second-brain system with cited answers.
+The short version: Wapp Brain imports a user-supplied WhatsApp Android archive into a local SQLite database, provides a local UI for browsing it, and is intended to grow into a live-updated WhatsApp memory store and private second-brain wiki with cited answers.

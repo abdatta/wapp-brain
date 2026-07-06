@@ -20,11 +20,22 @@ const envSchema = z.object({
   LIVE_MAX_CONCURRENT_CHAT_BACKFILLS: z.coerce.number().int().positive().default(1),
   LIVE_MIN_BACKFILL_DELAY_MS: z.coerce.number().int().positive().default(3000),
   LIVE_MAX_GAP_RETRIES: z.coerce.number().int().positive().default(5),
+  WAPP_MEMORY_DIR: z.string().optional(),
+  WAPP_MEMORY_PROVIDER: z.enum(["local", "codex"]).default("local"),
+  WAPP_MEMORY_REMOTE_MODEL_ENABLED: z
+    .string()
+    .optional()
+    .transform((value) => value === "1" || value === "true"),
+  WAPP_MEMORY_CODEX_SESSION_PATH: z.string().optional(),
+  WAPP_MEMORY_DEFAULT_CUTOFF_HOUR: z.coerce.number().int().min(0).max(23).default(0),
+  WAPP_MEMORY_MAX_EVIDENCE_MESSAGES: z.coerce.number().int().positive().default(400),
+  WAPP_MEMORY_MAX_QUERY_MESSAGES: z.coerce.number().int().positive().default(40),
   WAPP_TRACE_NAME: z.string().optional()
 });
 
 const parsed = envSchema.parse(process.env);
 const workDir = parsed.WAPP_WORK_DIR;
+const memoryRootDir = parsed.WAPP_MEMORY_DIR ?? path.join(workDir, "memory");
 
 export const config = {
   archive: {
@@ -45,6 +56,19 @@ export const config = {
     maxConcurrentChatBackfills: parsed.LIVE_MAX_CONCURRENT_CHAT_BACKFILLS,
     minBackfillDelayMs: parsed.LIVE_MIN_BACKFILL_DELAY_MS,
     maxGapRetries: parsed.LIVE_MAX_GAP_RETRIES
+  },
+  memory: {
+    rootDir: memoryRootDir,
+    pagesDir: path.join(memoryRootDir, "pages"),
+    citationsDir: path.join(memoryRootDir, "citations"),
+    runsDir: path.join(memoryRootDir, "runs"),
+    providerConfigPath: path.join(memoryRootDir, "provider.json"),
+    codexSessionPath: parsed.WAPP_MEMORY_CODEX_SESSION_PATH ?? path.join(memoryRootDir, "codex-session.json"),
+    provider: parsed.WAPP_MEMORY_PROVIDER,
+    remoteModelEnabled: Boolean(parsed.WAPP_MEMORY_REMOTE_MODEL_ENABLED),
+    defaultCutoffHour: parsed.WAPP_MEMORY_DEFAULT_CUTOFF_HOUR,
+    maxEvidenceMessages: parsed.WAPP_MEMORY_MAX_EVIDENCE_MESSAGES,
+    maxQueryMessages: parsed.WAPP_MEMORY_MAX_QUERY_MESSAGES
   },
   diagnostics: {
     traceName: parsed.WAPP_TRACE_NAME?.trim() || null,

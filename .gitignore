@@ -34,7 +34,8 @@ fixtures/generated/
 
 # Local app working directories
 .wapp-brain/
-.gbrain/
+.wapp-brain/memory/
+.second-brain/
 tmp/
 temp/
 logs/

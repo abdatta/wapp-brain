@@ -2,7 +2,7 @@
 
 Wapp Brain is a local-first WhatsApp archive and second-brain engine.
 
-The project exists because the user wants a durable, queryable, private store of their WhatsApp messages. It starts with Android backup import, then grows into live updates and a GBrain-style second-brain layer.
+The project exists because the user wants a durable, queryable, private store of their WhatsApp messages. It starts with Android backup import, then grows into live updates and a private second-brain wiki layer.
 
 ## App Scope
 
@@ -33,5 +33,5 @@ The app should be useful before it is ambitious. Each phase should make the arch
 2. Local archive validation and browsing.
 3. Live message ingestion through Baileys or a similar explicit client bridge.
 4. Rich local search and retrieval.
-5. GBrain-style second-brain/wiki generation and question answering with citations to exact source messages.
+5. Second-brain wiki generation and question answering with citations to exact source messages.
 6. Optional remote sync/service backends only after explicit privacy review and user opt-in.

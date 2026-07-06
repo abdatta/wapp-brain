@@ -53,7 +53,15 @@ Likely work:
 
 ## Phase 4: Second Brain
 
-Goal: generate a private GBrain-style wiki and answer questions about the user's WhatsApp messages with citations.
+Goal: generate a private second-brain wiki and answer questions about the user's WhatsApp messages with citations.
+
+Current foundation:
+- local memory runs and source-window ledger
+- Obsidian-compatible Markdown pages under `.wapp-brain/memory/pages`
+- citation sidecars and SQLite citation maps back to exact messages
+- manual and scheduler-ready REM commands
+- local retrieval across committed memory plus short-term current messages
+- explicit Codex provider opt-in for future high-reasoning generation
 
 Minimum bar:
 - answer natural-language questions
@@ -70,6 +78,6 @@ Possible features:
 - topic maps
 - personal memory search
 - exportable cited reports
-- repo-local private wiki artifacts under `.wapp-brain/`
+- repo-local private wiki artifacts under `.wapp-brain/memory/`
 
-Do not build this layer until the archive is trustworthy enough to cite from.
+Continue improving this layer only while preserving exact source citations and local-first defaults.

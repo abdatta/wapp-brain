@@ -42,6 +42,8 @@ import type {
   ImportVerificationSummary,
   LiveGapWindowRecord,
   LivePairingSummary,
+  MemoryCitationResolution,
+  MemoryQueryResult,
   MessageListItem,
   StatusSummary
 } from "../shared/types";
@@ -50,6 +52,8 @@ import {
   cancelImportSession,
   cleanupTempFiles,
   createImportSession,
+  disableMemoryProvider,
+  enableCodexMemoryProvider,
   getCurrentImportJob,
   getImportJob,
   getLivePairing,
@@ -59,8 +63,11 @@ import {
   listChats,
   listLiveGaps,
   listMessages,
+  queryMemory,
+  resolveMemoryCitation,
   resumeLiveSession,
   retryLiveGap,
+  startMemoryRun,
   startImportJob,
   stopLiveSession,
   unlinkLiveSession,
@@ -94,6 +101,9 @@ export function App() {
   const [activeImportJob, setActiveImportJob] = useState<ImportJobSummary | null>(null);
   const [pairingOpen, setPairingOpen] = useState(false);
   const [pairing, setPairing] = useState<LivePairingSummary | null>(null);
+  const [memoryQuery, setMemoryQuery] = useState("");
+  const [memoryResult, setMemoryResult] = useState<MemoryQueryResult | null>(null);
+  const [memoryCitation, setMemoryCitation] = useState<MemoryCitationResolution | null>(null);
   const messageListRef = useRef<HTMLDivElement | null>(null);
   const loadingMessagesRef = useRef(false);
   const scrollActionRef = useRef<"bottom" | "preserve" | null>(null);
@@ -409,6 +419,83 @@ export function App() {
     await loadChats(true);
   }
 
+  async function handleMemoryRun(dryRun = false) {
+    setBusy(dryRun ? "Previewing memory" : "Running memory REM");
+    setError(null);
+    setNotice(null);
+    try {
+      const result = await startMemoryRun({ kind: "rem", dryRun, provider: "local" });
+      setNotice(
+        dryRun
+          ? `Memory evidence preview ready for ${result.result.run.messageCount.toLocaleString()} messages.`
+          : `Memory run ${result.result.run.status}: ${result.result.run.pageCount.toLocaleString()} pages, ${result.result.run.citationCount.toLocaleString()} citations.`
+      );
+      await refreshStatus();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Memory run failed.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleMemoryQuery() {
+    if (!memoryQuery.trim()) {
+      return;
+    }
+    setBusy("Searching memory");
+    setError(null);
+    try {
+      setMemoryResult(await queryMemory(memoryQuery));
+      setMemoryCitation(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Memory query failed.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleOpenMemoryCitation(citation: string) {
+    setBusy("Opening citation");
+    setError(null);
+    try {
+      setMemoryCitation(await resolveMemoryCitation(citation));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not open citation.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleEnableCodexMemory() {
+    setBusy("Enabling Codex memory");
+    setError(null);
+    setNotice(null);
+    try {
+      await enableCodexMemoryProvider();
+      await refreshStatus();
+      setNotice("Codex memory provider enabled. Run CLI login before remote generation if no session exists.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not enable Codex memory.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handleDisableMemoryProvider() {
+    setBusy("Disabling remote memory");
+    setError(null);
+    setNotice(null);
+    try {
+      await disableMemoryProvider();
+      await refreshStatus();
+      setNotice("Remote memory provider disabled.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not disable remote memory.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
   const groupedMessages = useMemo(() => groupMessagesByDay(messages), [messages]);
 
   return (
@@ -467,6 +554,20 @@ export function App() {
             onPause={() => void handleStopLive()}
             onResume={() => void handleResumeLive()}
             onUnlink={() => void handleUnlinkLive()}
+          />
+          <MemoryPanel
+            status={status}
+            busy={busy}
+            query={memoryQuery}
+            result={memoryResult}
+            citation={memoryCitation}
+            onQueryChange={setMemoryQuery}
+            onRun={() => void handleMemoryRun(false)}
+            onPreview={() => void handleMemoryRun(true)}
+            onQuery={() => void handleMemoryQuery()}
+            onOpenCitation={(citation) => void handleOpenMemoryCitation(citation)}
+            onEnableCodex={() => void handleEnableCodexMemory()}
+            onDisableProvider={() => void handleDisableMemoryProvider()}
           />
 
           <ImportLauncher status={status} onOpen={() => setImportWizardOpen(true)} />
@@ -710,6 +811,131 @@ function LivePanel({
               <Unlink size={16} />
               Unlink device
             </button>
+          )}
+        </>
+      )}
+    </section>
+  );
+}
+
+function MemoryPanel({
+  status,
+  busy,
+  query,
+  result,
+  citation,
+  onQueryChange,
+  onRun,
+  onPreview,
+  onQuery,
+  onOpenCitation,
+  onEnableCodex,
+  onDisableProvider
+}: {
+  status: StatusSummary | null;
+  busy: string | null;
+  query: string;
+  result: MemoryQueryResult | null;
+  citation: MemoryCitationResolution | null;
+  onQueryChange: (value: string) => void;
+  onRun: () => void;
+  onPreview: () => void;
+  onQuery: () => void;
+  onOpenCitation: (citation: string) => void;
+  onEnableCodex: () => void;
+  onDisableProvider: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const memory = status?.memory;
+  const provider = memory?.provider;
+  const active = memory?.activeRun;
+  return (
+    <section className={`memoryPanel ${open ? "" : "collapsed"}`}>
+      <button className="panelToggle" type="button" aria-expanded={open} onClick={() => setOpen((current) => !current)}>
+        <span className="panelTitle">
+          <Sparkles size={16} />
+          <span>Second Brain</span>
+          {active && <Loader2 className="spin" size={16} />}
+        </span>
+        {open ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+      </button>
+      {open && (
+        <>
+          <div className="statusGrid">
+            <Metric label="Pages" value={memory?.pageCount.toLocaleString() ?? "0"} />
+            <Metric label="Citations" value={memory?.citationCount.toLocaleString() ?? "0"} />
+            <Metric label="Stale" value={memory?.stalePageCount.toLocaleString() ?? "0"} />
+            <Metric label="Provider" value={provider?.provider ?? "local"} />
+          </div>
+          <div className="statusLine">
+            {memory?.latestRun
+              ? `${memory.latestRun.status} | ${formatDate(memory.latestRun.finishedAt ?? memory.latestRun.startedAt)} | .wapp-brain/memory/pages`
+              : "No memory run yet. Pages will be Markdown with Obsidian-friendly front matter."}
+          </div>
+          <div className="memoryActions">
+            <button className="primaryButton fullButton" onClick={onRun} disabled={Boolean(busy) || !status?.counts.messages} type="button">
+              {busy === "Running memory REM" ? <Loader2 className="spin" size={16} /> : <Moon size={16} />}
+              Run REM
+            </button>
+            <button className="secondaryButton subtleButton" onClick={onPreview} disabled={Boolean(busy) || !status?.counts.messages} type="button">
+              <Eye size={16} />
+              Preview evidence
+            </button>
+          </div>
+          <div className="providerRow">
+            <span>{provider?.message ?? "Local memory provider ready."}</span>
+            {provider?.remoteModelEnabled ? (
+              <button className="miniButton" onClick={onDisableProvider} disabled={Boolean(busy)} type="button">
+                Off
+              </button>
+            ) : (
+              <button className="miniButton" onClick={onEnableCodex} disabled={Boolean(busy)} type="button">
+                Codex
+              </button>
+            )}
+          </div>
+          <div className="memorySearch">
+            <div className="searchBox">
+              <Search size={16} />
+              <input
+                value={query}
+                onChange={(event) => onQueryChange(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") onQuery();
+                }}
+                placeholder="Ask local memory"
+              />
+            </div>
+            <button className="secondaryButton" onClick={onQuery} disabled={Boolean(busy) || !query.trim()} type="button">
+              <Search size={16} />
+              Search
+            </button>
+          </div>
+          {result && (
+            <div className="memoryResults">
+              <p>{result.answer}</p>
+              {result.evidence.slice(0, 5).map((item, index) => (
+                <div className={`memoryEvidence ${item.layer}`} key={`${item.layer}-${index}`}>
+                  <strong>{item.layer === "long_term" ? "Long-term" : "Short-term"} | {item.title}</strong>
+                  <span>{item.snippet}</span>
+                  {item.citation && (
+                    <button className="miniButton" type="button" onClick={() => onOpenCitation(item.citation!.sourceMessageKey)}>
+                      Open source
+                    </button>
+                  )}
+                </div>
+              ))}
+              {citation && (
+                <div className={`citationContext ${citation.stale ? "stale" : ""}`}>
+                  <strong>{citation.stale ? "Stale citation" : "Citation context"}</strong>
+                  {citation.nearbyMessages.map((message) => (
+                    <span key={message.sourceMessageKey}>
+                      {message.sentAt ? formatTime(message.sentAt) : "No time"} | {message.senderDisplayName ?? "Unknown"}: {message.text ?? `[${message.messageType}]`}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
           )}
         </>
       )}

@@ -20,6 +20,15 @@ import type {
   LiveSessionSummary,
   LiveSyncRunSummary,
   LiveSyncTotals,
+  MemoryCitationRecord,
+  MemoryEvidenceMessage,
+  MemoryEvidencePackRecord,
+  MemoryPageRevisionRecord,
+  MemoryProviderStatus,
+  MemoryRunSummary,
+  MemorySourceWindowRecord,
+  MemoryStatusSummary,
+  MemoryValidationIssue,
   MessageListItem,
   MessageRecord,
   ParticipantRecord,
@@ -27,6 +36,7 @@ import type {
 } from "../../shared/types";
 import { config } from "../config";
 import { baselineFromStatus } from "../live/baseline";
+import { getMemoryProviderStatus } from "../memory/provider";
 
 export class MemoryArchiveRepository implements ArchiveRepository {
   private importRuns = new Map<string, ImportRunSummary>();
@@ -41,6 +51,14 @@ export class MemoryArchiveRepository implements ArchiveRepository {
   private liveGaps = new Map<number, LiveGapWindowRecord & { id: number; createdAt: string; updatedAt: string }>();
   private liveReceipts = new Map<string, LiveEventReceiptRecord>();
   private liveUpdates = new Map<string, LiveMessageUpdateRecord>();
+  private memoryRuns = new Map<string, MemoryRunSummary>();
+  private memoryWindows = new Map<string, MemorySourceWindowRecord>();
+  private memoryPacks = new Map<string, MemoryEvidencePackRecord>();
+  private memoryRevisions = new Map<string, MemoryPageRevisionRecord>();
+  private memoryPages = new Map<string, { pageId: string; title: string; path: string; status: "current" | "stale"; currentRevisionId: string | null }>();
+  private memoryCitations: MemoryCitationRecord[] = [];
+  private memoryIssues: MemoryValidationIssue[] = [];
+  private memoryLockRunId: string | null = null;
   private nextContactId = 1;
   private nextChatId = 1;
   private nextMessageId = 1;
@@ -60,6 +78,14 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       liveGaps: cloneMap(this.liveGaps),
       liveReceipts: cloneMap(this.liveReceipts),
       liveUpdates: cloneMap(this.liveUpdates),
+      memoryRuns: cloneMap(this.memoryRuns),
+      memoryWindows: cloneMap(this.memoryWindows),
+      memoryPacks: cloneMap(this.memoryPacks),
+      memoryRevisions: cloneMap(this.memoryRevisions),
+      memoryPages: cloneMap(this.memoryPages),
+      memoryCitations: structuredClone(this.memoryCitations),
+      memoryIssues: structuredClone(this.memoryIssues),
+      memoryLockRunId: this.memoryLockRunId,
       nextContactId: this.nextContactId,
       nextChatId: this.nextChatId,
       nextMessageId: this.nextMessageId,
@@ -79,6 +105,14 @@ export class MemoryArchiveRepository implements ArchiveRepository {
         this.liveGaps = cloneMap(snapshot.liveGaps);
         this.liveReceipts = cloneMap(snapshot.liveReceipts);
         this.liveUpdates = cloneMap(snapshot.liveUpdates);
+        this.memoryRuns = cloneMap(snapshot.memoryRuns);
+        this.memoryWindows = cloneMap(snapshot.memoryWindows);
+        this.memoryPacks = cloneMap(snapshot.memoryPacks);
+        this.memoryRevisions = cloneMap(snapshot.memoryRevisions);
+        this.memoryPages = cloneMap(snapshot.memoryPages);
+        this.memoryCitations = structuredClone(snapshot.memoryCitations);
+        this.memoryIssues = structuredClone(snapshot.memoryIssues);
+        this.memoryLockRunId = snapshot.memoryLockRunId;
         this.nextContactId = snapshot.nextContactId;
         this.nextChatId = snapshot.nextChatId;
         this.nextMessageId = snapshot.nextMessageId;
@@ -228,7 +262,8 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       },
       latestImport,
       latestWarnings: this.warnings.slice(-8).reverse(),
-      live: await this.getLiveStatus()
+      live: await this.getLiveStatus(),
+      memory: await this.getMemoryStatus(await getMemoryProviderStatus())
     };
   }
 
@@ -459,8 +494,246 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       });
   }
 
+  async getMemoryStatus(provider: MemoryProviderStatus): Promise<MemoryStatusSummary> {
+    const currentPages = [...this.memoryPages.values()].filter((page) => page.status === "current");
+    const stalePages = [...this.memoryPages.values()].filter((page) => page.status === "stale");
+    const runs = [...this.memoryRuns.values()].sort((a, b) => b.startedAt.localeCompare(a.startedAt));
+    return {
+      enabled: true,
+      rootDir: config.memory.rootDir,
+      pageCount: currentPages.length,
+      citationCount: this.memoryCitations.length,
+      stalePageCount: stalePages.length,
+      latestRun: runs[0] ?? null,
+      activeRun: runs.find((run) => run.status === "running") ?? null,
+      latestCommittedAtMs: await this.getLatestCommittedMemoryEndAtMs(),
+      provider
+    };
+  }
+
+  async startMemoryRun(input: {
+    kind: MemoryRunSummary["kind"];
+    sourceStartAtMs?: number | null;
+    sourceEndAtMs?: number | null;
+    sourceSummary?: Record<string, unknown> | null;
+  }): Promise<string> {
+    const id = crypto.randomUUID();
+    this.memoryRuns.set(id, {
+      id,
+      status: "running",
+      kind: input.kind,
+      startedAt: new Date().toISOString(),
+      finishedAt: null,
+      sourceStartAtMs: input.sourceStartAtMs ?? null,
+      sourceEndAtMs: input.sourceEndAtMs ?? null,
+      pageCount: 0,
+      citationCount: 0,
+      messageCount: 0,
+      warningCount: 0,
+      errorMessage: null
+    });
+    return id;
+  }
+
+  async completeMemoryRun(runId: string, totals: { pages: number; citations: number; messages: number; warnings: number }): Promise<void> {
+    const run = this.memoryRuns.get(runId);
+    if (run) {
+      run.status = "completed";
+      run.finishedAt = new Date().toISOString();
+      run.pageCount = totals.pages;
+      run.citationCount = totals.citations;
+      run.messageCount = totals.messages;
+      run.warningCount = totals.warnings;
+    }
+  }
+
+  async failMemoryRun(runId: string, status: "failed" | "blocked", message: string, warningCount = 0): Promise<void> {
+    const run = this.memoryRuns.get(runId);
+    if (run) {
+      run.status = status;
+      run.finishedAt = new Date().toISOString();
+      run.errorMessage = message;
+      run.warningCount = warningCount;
+    }
+  }
+
+  async getMemoryRun(runId: string): Promise<MemoryRunSummary | null> {
+    return this.memoryRuns.get(runId) ?? null;
+  }
+
+  async listMemoryRuns(limit: number): Promise<MemoryRunSummary[]> {
+    return [...this.memoryRuns.values()].sort((a, b) => b.startedAt.localeCompare(a.startedAt)).slice(0, limit);
+  }
+
+  async tryAcquireMemoryLock(runId: string): Promise<boolean> {
+    if (this.memoryLockRunId && this.memoryLockRunId !== runId) {
+      return false;
+    }
+    this.memoryLockRunId = runId;
+    return true;
+  }
+
+  async releaseMemoryLock(runId: string): Promise<void> {
+    if (this.memoryLockRunId === runId) {
+      this.memoryLockRunId = null;
+    }
+  }
+
+  async createMemorySourceWindow(input: Omit<MemorySourceWindowRecord, "id" | "createdAt">): Promise<MemorySourceWindowRecord> {
+    const existing = [...this.memoryWindows.values()].find((window) => window.sourceHash === input.sourceHash);
+    if (existing) {
+      return existing;
+    }
+    const window: MemorySourceWindowRecord = {
+      ...input,
+      id: crypto.randomUUID(),
+      createdAt: new Date().toISOString()
+    };
+    this.memoryWindows.set(window.id, window);
+    return window;
+  }
+
+  async getCommittedMemoryWindow(sourceHash: string): Promise<MemorySourceWindowRecord | null> {
+    return [...this.memoryWindows.values()].find((window) => window.sourceHash === sourceHash && window.status === "committed") ?? null;
+  }
+
+  async commitMemorySourceWindow(windowId: string): Promise<void> {
+    const window = this.memoryWindows.get(windowId);
+    if (window) {
+      window.status = "committed";
+      window.committedAt = new Date().toISOString();
+    }
+  }
+
+  async listMemoryEvidenceMessages(options: {
+    startAtMs?: number | null;
+    endAtMs?: number | null;
+    chatSourceIds?: string[];
+    limit: number;
+  }): Promise<MemoryEvidenceMessage[]> {
+    const chatSet = options.chatSourceIds?.length ? new Set(options.chatSourceIds) : null;
+    return [...this.messages.values()]
+      .filter((message) => message.timestampMs != null)
+      .filter((message) => options.startAtMs == null || (message.timestampMs ?? 0) >= options.startAtMs)
+      .filter((message) => options.endAtMs == null || (message.timestampMs ?? 0) <= options.endAtMs)
+      .filter((message) => !chatSet || chatSet.has(message.chatSourceId))
+      .sort((a, b) => (a.timestampMs ?? 0) - (b.timestampMs ?? 0) || a.id - b.id)
+      .slice(0, options.limit)
+      .map((message, index) => this.toMemoryEvidence(message, index));
+  }
+
+  async getLatestCommittedMemoryEndAtMs(chatSourceId?: string | null): Promise<number | null> {
+    const windows = [...this.memoryWindows.values()].filter(
+      (window) => window.status === "committed" && (chatSourceId ? window.chatSourceIds.length === 0 || window.chatSourceIds.includes(chatSourceId) : true)
+    );
+    const latest = windows.map((window) => window.endAtMs ?? 0).sort((a, b) => b - a)[0];
+    return latest || null;
+  }
+
+  async recordMemoryEvidencePack(pack: MemoryEvidencePackRecord): Promise<void> {
+    this.memoryPacks.set(pack.id, structuredClone(pack));
+  }
+
+  async commitMemoryPageRevision(revision: MemoryPageRevisionRecord, citations: MemoryCitationRecord[]): Promise<void> {
+    for (const existing of this.memoryRevisions.values()) {
+      if (existing.pageId === revision.pageId && existing.status === "current") {
+        existing.status = "superseded";
+      }
+    }
+    this.memoryRevisions.set(revision.id, { ...revision, citationCount: citations.length });
+    this.memoryPages.set(revision.pageId, {
+      pageId: revision.pageId,
+      title: revision.title,
+      path: revision.path,
+      status: "current",
+      currentRevisionId: revision.id
+    });
+    this.memoryCitations.push(...citations.map((citation, index) => ({ ...citation, id: this.memoryCitations.length + index + 1 })));
+  }
+
+  async listMemoryPageRevisions(options: { query?: string; limit?: number } = {}): Promise<MemoryPageRevisionRecord[]> {
+    const query = options.query?.toLowerCase();
+    return [...this.memoryRevisions.values()]
+      .filter((revision) => revision.status === "current")
+      .filter((revision) => !query || revision.title.toLowerCase().includes(query) || revision.summary.toLowerCase().includes(query) || revision.markdown.toLowerCase().includes(query))
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .slice(0, options.limit ?? 50);
+  }
+
+  async listMemoryCitations(revisionId?: string): Promise<MemoryCitationRecord[]> {
+    return this.memoryCitations.filter((citation) => !revisionId || citation.revisionId === revisionId);
+  }
+
+  async recordMemoryValidationIssues(issues: MemoryValidationIssue[]): Promise<void> {
+    this.memoryIssues.push(...issues.map((issue, index) => ({ ...issue, id: this.memoryIssues.length + index + 1, createdAt: new Date().toISOString() })));
+  }
+
+  async listMemoryValidationIssues(runId?: string): Promise<MemoryValidationIssue[]> {
+    return this.memoryIssues.filter((issue) => !runId || issue.runId === runId);
+  }
+
+  async markStaleMemoryForMissingMessages(): Promise<number> {
+    const missingPageIds = new Set<string>();
+    for (const citation of this.memoryCitations) {
+      if (!this.messages.has(citation.sourceMessageKey)) {
+        const revision = this.memoryRevisions.get(citation.revisionId);
+        if (revision?.status === "current") {
+          missingPageIds.add(revision.pageId);
+        }
+      }
+    }
+    for (const pageId of missingPageIds) {
+      const page = this.memoryPages.get(pageId);
+      if (page) page.status = "stale";
+      for (const revision of this.memoryRevisions.values()) {
+        if (revision.pageId === pageId && revision.status === "current") {
+          revision.status = "stale";
+        }
+      }
+    }
+    return missingPageIds.size;
+  }
+
+  async resolveMemoryCitation(citationLabelOrMessageKey: string): Promise<MemoryCitationRecord | null> {
+    return [...this.memoryCitations].reverse().find(
+      (citation) => citation.citationLabel === citationLabelOrMessageKey || citation.sourceMessageKey === citationLabelOrMessageKey
+    ) ?? null;
+  }
+
+  async listNearbyMemoryMessages(messageId: number, radius: number): Promise<MemoryEvidenceMessage[]> {
+    const base = [...this.messages.values()].find((message) => message.id === messageId);
+    if (!base) {
+      return [];
+    }
+    return [...this.messages.values()]
+      .filter((message) => message.chatSourceId === base.chatSourceId && message.id >= messageId - radius && message.id <= messageId + radius)
+      .sort((a, b) => (a.timestampMs ?? 0) - (b.timestampMs ?? 0) || a.id - b.id)
+      .map((message, index) => this.toMemoryEvidence(message, index));
+  }
+
   private hasVisibleExchange(chatSourceId: string): boolean {
     return [...this.messages.values()].some((message) => message.chatSourceId === chatSourceId && isVisibleExchange(message));
+  }
+
+  private toMemoryEvidence(message: MessageRecord & { id: number }, index: number): MemoryEvidenceMessage {
+    const chat = this.chats.get(message.chatSourceId);
+    const sender = message.senderSourceJid ? this.contacts.get(message.senderSourceJid) : null;
+    return {
+      citationLabel: `m${index + 1}`,
+      messageId: message.id,
+      sourceMessageKey: message.sourceMessageKey,
+      sourceMessageId: message.sourceMessageId,
+      sourceChatId: message.chatSourceId,
+      chatId: chat?.id ?? 0,
+      chatDisplayName: chat?.displayName ?? null,
+      senderSourceJid: message.senderSourceJid ?? null,
+      senderDisplayName: sender?.displayName ?? message.senderSourceJid ?? null,
+      timestampMs: message.timestampMs ?? null,
+      sentAt: message.timestampMs ? new Date(message.timestampMs).toISOString() : null,
+      direction: message.direction,
+      messageType: message.messageType,
+      text: message.body ?? message.caption ?? null
+    };
   }
 }
 

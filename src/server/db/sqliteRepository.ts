@@ -21,6 +21,15 @@ import type {
   LiveSessionSummary,
   LiveSyncRunSummary,
   LiveSyncTotals,
+  MemoryCitationRecord,
+  MemoryEvidenceMessage,
+  MemoryEvidencePackRecord,
+  MemoryPageRevisionRecord,
+  MemoryProviderStatus,
+  MemoryRunSummary,
+  MemorySourceWindowRecord,
+  MemoryStatusSummary,
+  MemoryValidationIssue,
   MessageListItem,
   MessageRecord,
   ParticipantRecord,
@@ -28,6 +37,7 @@ import type {
 } from "../../shared/types";
 import { config } from "../config";
 import { baselineFromStatus } from "../live/baseline";
+import { getMemoryProviderStatus } from "../memory/provider";
 import type { ArchiveRepository, ArchiveRestorePoint } from "./repository";
 
 const TOOL_VERSION = "0.1.0";
@@ -44,9 +54,25 @@ const ARCHIVE_TABLES = [
   "live_chat_checkpoints",
   "live_gap_windows",
   "live_event_receipts",
-  "live_message_updates"
+  "live_message_updates",
+  "memory_runs",
+  "memory_source_windows",
+  "memory_evidence_packs",
+  "memory_pages",
+  "memory_page_revisions",
+  "memory_citations",
+  "memory_validation_issues",
+  "memory_job_locks"
 ] as const;
 const DELETE_TABLE_ORDER = [
+  "memory_job_locks",
+  "memory_validation_issues",
+  "memory_citations",
+  "memory_page_revisions",
+  "memory_pages",
+  "memory_evidence_packs",
+  "memory_source_windows",
+  "memory_runs",
   "live_message_updates",
   "live_event_receipts",
   "live_gap_windows",
@@ -250,6 +276,113 @@ const schemaStatements = [
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   )`,
 
+  `CREATE TABLE IF NOT EXISTS memory_runs (
+    id TEXT PRIMARY KEY,
+    status TEXT NOT NULL CHECK (status IN ('running','completed','failed','blocked')),
+    kind TEXT NOT NULL CHECK (kind IN ('rem','manual','rebuild','validate')),
+    started_at TEXT NOT NULL,
+    finished_at TEXT NULL,
+    source_start_at_ms INTEGER NULL,
+    source_end_at_ms INTEGER NULL,
+    source_summary_json TEXT NULL,
+    page_count INTEGER NOT NULL DEFAULT 0,
+    citation_count INTEGER NOT NULL DEFAULT 0,
+    message_count INTEGER NOT NULL DEFAULT 0,
+    warning_count INTEGER NOT NULL DEFAULT 0,
+    error_message TEXT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS memory_source_windows (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('open','committed','skipped','stale')),
+    start_at_ms INTEGER NULL,
+    end_at_ms INTEGER NULL,
+    chat_source_ids_json TEXT NOT NULL,
+    message_count INTEGER NOT NULL DEFAULT 0,
+    source_hash TEXT NOT NULL UNIQUE,
+    committed_at TEXT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    FOREIGN KEY (run_id) REFERENCES memory_runs(id) ON DELETE CASCADE
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS memory_evidence_packs (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    window_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('prepared','generated','validated','failed')),
+    sequence INTEGER NOT NULL,
+    message_count INTEGER NOT NULL DEFAULT 0,
+    citation_labels_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES memory_runs(id) ON DELETE CASCADE,
+    FOREIGN KEY (window_id) REFERENCES memory_source_windows(id) ON DELETE CASCADE
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS memory_pages (
+    page_id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    page_path TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('current','stale')),
+    current_revision_id TEXT NULL,
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS memory_page_revisions (
+    id TEXT PRIMARY KEY,
+    page_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    window_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    page_path TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    markdown TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('current','superseded','stale')),
+    source_start_at_ms INTEGER NULL,
+    source_end_at_ms INTEGER NULL,
+    citation_count INTEGER NOT NULL DEFAULT 0,
+    metadata_json TEXT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES memory_runs(id) ON DELETE CASCADE,
+    FOREIGN KEY (window_id) REFERENCES memory_source_windows(id) ON DELETE CASCADE
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS memory_citations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    revision_id TEXT NOT NULL,
+    claim_id TEXT NOT NULL,
+    citation_label TEXT NOT NULL,
+    message_id INTEGER NULL,
+    source_message_key TEXT NOT NULL,
+    source_message_id TEXT NOT NULL,
+    source_chat_id TEXT NOT NULL,
+    sender_source_jid TEXT NULL,
+    timestamp_ms INTEGER NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    FOREIGN KEY (revision_id) REFERENCES memory_page_revisions(id) ON DELETE CASCADE
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS memory_validation_issues (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    pack_id TEXT NULL,
+    page_id TEXT NULL,
+    severity TEXT NOT NULL CHECK (severity IN ('warning','error')),
+    code TEXT NOT NULL,
+    message TEXT NOT NULL,
+    context_json TEXT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    FOREIGN KEY (run_id) REFERENCES memory_runs(id) ON DELETE CASCADE
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS memory_job_locks (
+    name TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    acquired_at TEXT NOT NULL,
+    expires_at_ms INTEGER NOT NULL
+  )`,
+
   `CREATE INDEX IF NOT EXISTS idx_import_warnings_run ON import_warnings (import_run_id, severity, code)`,
   `CREATE INDEX IF NOT EXISTS idx_contacts_phone ON contacts (phone_number)`,
   `CREATE INDEX IF NOT EXISTS idx_chats_last_message ON chats (last_message_at_ms)`,
@@ -261,7 +394,13 @@ const schemaStatements = [
   `CREATE INDEX IF NOT EXISTS idx_live_runs_status ON live_sync_runs (status, started_at)`,
   `CREATE INDEX IF NOT EXISTS idx_live_gap_status ON live_gap_windows (status, chat_source_id, end_at_ms)`,
   `CREATE INDEX IF NOT EXISTS idx_live_receipts_chat ON live_event_receipts (chat_source_id, occurred_at_ms)`,
-  `CREATE INDEX IF NOT EXISTS idx_live_updates_pending ON live_message_updates (applied, chat_source_id, occurred_at_ms)`
+  `CREATE INDEX IF NOT EXISTS idx_live_updates_pending ON live_message_updates (applied, chat_source_id, occurred_at_ms)`,
+  `CREATE INDEX IF NOT EXISTS idx_memory_runs_status ON memory_runs (status, started_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_memory_windows_hash ON memory_source_windows (source_hash, status)`,
+  `CREATE INDEX IF NOT EXISTS idx_memory_windows_end ON memory_source_windows (status, end_at_ms)`,
+  `CREATE INDEX IF NOT EXISTS idx_memory_revisions_page ON memory_page_revisions (page_id, status, created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_memory_citations_message ON memory_citations (source_message_key, message_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_memory_issues_run ON memory_validation_issues (run_id, severity, code)`
 ];
 
 export function initializeSqliteArchive(dbPath = config.archive.sqlitePath): void {
@@ -727,7 +866,8 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       },
       latestImport,
       latestWarnings,
-      live: await this.getLiveStatus()
+      live: await this.getLiveStatus(),
+      memory: await this.getMemoryStatus(await getMemoryProviderStatus())
     };
   }
 
@@ -1190,6 +1330,393 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     }));
   }
 
+  async getMemoryStatus(provider: MemoryProviderStatus): Promise<MemoryStatusSummary> {
+    const counts = this.db
+      .prepare(
+        `SELECT
+          (SELECT COUNT(*) FROM memory_pages WHERE status = 'current') AS pages,
+          (SELECT COUNT(*) FROM memory_pages WHERE status = 'stale') AS stale_pages,
+          (SELECT COUNT(*) FROM memory_citations) AS citations`
+      )
+      .get() as Record<string, number>;
+    const latestRun = this.db
+      .prepare(`SELECT * FROM memory_runs ORDER BY started_at DESC LIMIT 1`)
+      .get() as SqliteMemoryRunRow | undefined;
+    const activeRun = this.db
+      .prepare(`SELECT * FROM memory_runs WHERE status = 'running' ORDER BY started_at DESC LIMIT 1`)
+      .get() as SqliteMemoryRunRow | undefined;
+    return {
+      enabled: true,
+      rootDir: config.memory.rootDir,
+      pageCount: Number(counts.pages ?? 0),
+      citationCount: Number(counts.citations ?? 0),
+      stalePageCount: Number(counts.stale_pages ?? 0),
+      latestRun: latestRun ? rowToMemoryRun(latestRun) : null,
+      activeRun: activeRun ? rowToMemoryRun(activeRun) : null,
+      latestCommittedAtMs: await this.getLatestCommittedMemoryEndAtMs(),
+      provider
+    };
+  }
+
+  async startMemoryRun(input: {
+    kind: MemoryRunSummary["kind"];
+    sourceStartAtMs?: number | null;
+    sourceEndAtMs?: number | null;
+    sourceSummary?: Record<string, unknown> | null;
+  }): Promise<string> {
+    const id = crypto.randomUUID();
+    this.db
+      .prepare(
+        `INSERT INTO memory_runs
+         (id, status, kind, started_at, source_start_at_ms, source_end_at_ms, source_summary_json)
+         VALUES (?, 'running', ?, ?, ?, ?, ?)`
+      )
+      .run(
+        id,
+        input.kind,
+        currentIso(),
+        input.sourceStartAtMs ?? null,
+        input.sourceEndAtMs ?? null,
+        stringifyJson(input.sourceSummary ?? null)
+      );
+    return id;
+  }
+
+  async completeMemoryRun(runId: string, totals: { pages: number; citations: number; messages: number; warnings: number }): Promise<void> {
+    this.db
+      .prepare(
+        `UPDATE memory_runs
+         SET status = 'completed', finished_at = ?, page_count = ?, citation_count = ?, message_count = ?, warning_count = ?
+         WHERE id = ?`
+      )
+      .run(currentIso(), totals.pages, totals.citations, totals.messages, totals.warnings, runId);
+  }
+
+  async failMemoryRun(runId: string, status: "failed" | "blocked", message: string, warningCount = 0): Promise<void> {
+    this.db
+      .prepare(
+        `UPDATE memory_runs
+         SET status = ?, finished_at = ?, error_message = ?, warning_count = ?
+         WHERE id = ?`
+      )
+      .run(status, currentIso(), message, warningCount, runId);
+  }
+
+  async getMemoryRun(runId: string): Promise<MemoryRunSummary | null> {
+    const row = this.db.prepare(`SELECT * FROM memory_runs WHERE id = ?`).get(runId) as SqliteMemoryRunRow | undefined;
+    return row ? rowToMemoryRun(row) : null;
+  }
+
+  async listMemoryRuns(limit: number): Promise<MemoryRunSummary[]> {
+    const rows = this.db.prepare(`SELECT * FROM memory_runs ORDER BY started_at DESC LIMIT ?`).all(limit) as SqliteMemoryRunRow[];
+    return rows.map(rowToMemoryRun);
+  }
+
+  async tryAcquireMemoryLock(runId: string, ttlMs: number): Promise<boolean> {
+    const now = Date.now();
+    const expiresAt = now + ttlMs;
+    const transaction = this.db.transaction(() => {
+      this.db.prepare(`DELETE FROM memory_job_locks WHERE name = 'memory' AND expires_at_ms < ?`).run(now);
+      const existing = this.db.prepare(`SELECT run_id FROM memory_job_locks WHERE name = 'memory'`).get() as { run_id: string } | undefined;
+      if (existing && existing.run_id !== runId) {
+        return false;
+      }
+      this.db
+        .prepare(
+          `INSERT INTO memory_job_locks (name, run_id, acquired_at, expires_at_ms)
+           VALUES ('memory', ?, ?, ?)
+           ON CONFLICT(name) DO UPDATE SET run_id = excluded.run_id, acquired_at = excluded.acquired_at, expires_at_ms = excluded.expires_at_ms`
+        )
+        .run(runId, currentIso(), expiresAt);
+      return true;
+    });
+    return transaction();
+  }
+
+  async releaseMemoryLock(runId: string): Promise<void> {
+    this.db.prepare(`DELETE FROM memory_job_locks WHERE name = 'memory' AND run_id = ?`).run(runId);
+  }
+
+  async createMemorySourceWindow(input: Omit<MemorySourceWindowRecord, "id" | "createdAt">): Promise<MemorySourceWindowRecord> {
+    const id = crypto.randomUUID();
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO memory_source_windows
+         (id, run_id, status, start_at_ms, end_at_ms, chat_source_ids_json, message_count, source_hash, committed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        id,
+        input.runId,
+        input.status,
+        input.startAtMs ?? null,
+        input.endAtMs ?? null,
+        stringifyJson(input.chatSourceIds) ?? "[]",
+        input.messageCount,
+        input.sourceHash,
+        input.committedAt ?? null
+      );
+    const row = this.db.prepare(`SELECT * FROM memory_source_windows WHERE source_hash = ?`).get(input.sourceHash) as SqliteMemoryWindowRow;
+    return rowToMemoryWindow(row);
+  }
+
+  async getCommittedMemoryWindow(sourceHash: string): Promise<MemorySourceWindowRecord | null> {
+    const row = this.db
+      .prepare(`SELECT * FROM memory_source_windows WHERE source_hash = ? AND status = 'committed' LIMIT 1`)
+      .get(sourceHash) as SqliteMemoryWindowRow | undefined;
+    return row ? rowToMemoryWindow(row) : null;
+  }
+
+  async commitMemorySourceWindow(windowId: string): Promise<void> {
+    this.db
+      .prepare(`UPDATE memory_source_windows SET status = 'committed', committed_at = ? WHERE id = ?`)
+      .run(currentIso(), windowId);
+  }
+
+  async listMemoryEvidenceMessages(options: {
+    startAtMs?: number | null;
+    endAtMs?: number | null;
+    chatSourceIds?: string[];
+    limit: number;
+  }): Promise<MemoryEvidenceMessage[]> {
+    const where = ["m.timestamp_ms IS NOT NULL"];
+    const params: unknown[] = [];
+    if (options.startAtMs != null) {
+      where.push("m.timestamp_ms >= ?");
+      params.push(options.startAtMs);
+    }
+    if (options.endAtMs != null) {
+      where.push("m.timestamp_ms <= ?");
+      params.push(options.endAtMs);
+    }
+    if (options.chatSourceIds?.length) {
+      const placeholders = options.chatSourceIds.map(() => "?").join(", ");
+      where.push(`chats.source_chat_id IN (${placeholders})`);
+      params.push(...options.chatSourceIds);
+    }
+    params.push(options.limit);
+    const rows = this.db
+      .prepare(
+        `SELECT m.id, m.source_message_key, m.source_message_id, chats.source_chat_id, m.chat_id,
+                COALESCE(NULLIF(chats.display_name, ''), chats.jid) AS chat_display_name,
+                m.sender_source_jid, COALESCE(c.display_name, m.sender_source_jid) AS sender_display_name,
+                m.timestamp_ms, m.sent_at, m.direction, m.message_type,
+                COALESCE(NULLIF(m.body, ''), NULLIF(m.caption, '')) AS text
+         FROM messages m
+         JOIN chats ON chats.id = m.chat_id
+         LEFT JOIN contacts c ON c.id = m.sender_contact_id
+         WHERE ${where.join(" AND ")}
+         ORDER BY m.timestamp_ms ASC, m.id ASC
+         LIMIT ?`
+      )
+      .all(...params) as SqliteMemoryEvidenceRow[];
+    return rows.map((row, index) => rowToMemoryEvidence(row, index));
+  }
+
+  async getLatestCommittedMemoryEndAtMs(chatSourceId?: string | null): Promise<number | null> {
+    const row = chatSourceId
+      ? (this.db
+          .prepare(
+            `SELECT MAX(end_at_ms) AS end_at_ms
+             FROM memory_source_windows
+             WHERE status = 'committed'
+               AND (chat_source_ids_json = '[]' OR chat_source_ids_json LIKE ?)`
+          )
+          .get(`%"${chatSourceId.replace(/"/g, '\\"')}"%`) as { end_at_ms: number | null })
+      : (this.db
+          .prepare(`SELECT MAX(end_at_ms) AS end_at_ms FROM memory_source_windows WHERE status = 'committed'`)
+          .get() as { end_at_ms: number | null });
+    return nullableNumber(row?.end_at_ms);
+  }
+
+  async recordMemoryEvidencePack(pack: MemoryEvidencePackRecord): Promise<void> {
+    this.db
+      .prepare(
+        `INSERT INTO memory_evidence_packs
+         (id, run_id, window_id, status, sequence, message_count, citation_labels_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET status = excluded.status, message_count = excluded.message_count, citation_labels_json = excluded.citation_labels_json`
+      )
+      .run(pack.id, pack.runId, pack.windowId, pack.status, pack.sequence, pack.messageCount, stringifyJson(pack.citationLabels) ?? "[]", pack.createdAt);
+  }
+
+  async commitMemoryPageRevision(revision: MemoryPageRevisionRecord, citations: MemoryCitationRecord[]): Promise<void> {
+    const transaction = this.db.transaction(() => {
+      this.db.prepare(`UPDATE memory_page_revisions SET status = 'superseded' WHERE page_id = ? AND status = 'current'`).run(revision.pageId);
+      this.db
+        .prepare(
+          `INSERT INTO memory_page_revisions
+           (id, page_id, run_id, window_id, title, page_path, summary, markdown, status, source_start_at_ms, source_end_at_ms, citation_count, metadata_json, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          revision.id,
+          revision.pageId,
+          revision.runId,
+          revision.windowId,
+          revision.title,
+          revision.path,
+          revision.summary,
+          revision.markdown,
+          revision.status,
+          revision.sourceStartAtMs ?? null,
+          revision.sourceEndAtMs ?? null,
+          citations.length,
+          stringifyJson(revision.metadata ?? null),
+          revision.createdAt
+        );
+      this.db
+        .prepare(
+          `INSERT INTO memory_pages (page_id, title, page_path, status, current_revision_id, updated_at)
+           VALUES (?, ?, ?, 'current', ?, ?)
+           ON CONFLICT(page_id) DO UPDATE SET
+             title = excluded.title,
+             page_path = excluded.page_path,
+             status = 'current',
+             current_revision_id = excluded.current_revision_id,
+             updated_at = excluded.updated_at`
+        )
+        .run(revision.pageId, revision.title, revision.path, revision.id, revision.createdAt);
+      const insertCitation = this.db.prepare(
+        `INSERT INTO memory_citations
+         (revision_id, claim_id, citation_label, message_id, source_message_key, source_message_id, source_chat_id, sender_source_jid, timestamp_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      );
+      for (const citation of citations) {
+        insertCitation.run(
+          revision.id,
+          citation.claimId,
+          citation.citationLabel,
+          citation.messageId ?? null,
+          citation.sourceMessageKey,
+          citation.sourceMessageId,
+          citation.sourceChatId,
+          citation.senderSourceJid ?? null,
+          citation.timestampMs ?? null
+        );
+      }
+    });
+    transaction();
+  }
+
+  async listMemoryPageRevisions(options: { query?: string; limit?: number } = {}): Promise<MemoryPageRevisionRecord[]> {
+    const params: unknown[] = [];
+    const where = ["r.status = 'current'"];
+    if (options.query) {
+      where.push("(r.title LIKE ? OR r.summary LIKE ? OR r.markdown LIKE ?)");
+      params.push(`%${options.query}%`, `%${options.query}%`, `%${options.query}%`);
+    }
+    params.push(options.limit ?? 50);
+    const rows = this.db
+      .prepare(
+        `SELECT r.*
+         FROM memory_page_revisions r
+         WHERE ${where.join(" AND ")}
+         ORDER BY r.created_at DESC
+         LIMIT ?`
+      )
+      .all(...params) as SqliteMemoryRevisionRow[];
+    return rows.map(rowToMemoryRevision);
+  }
+
+  async listMemoryCitations(revisionId?: string): Promise<MemoryCitationRecord[]> {
+    const rows = revisionId
+      ? (this.db.prepare(`SELECT * FROM memory_citations WHERE revision_id = ? ORDER BY id ASC`).all(revisionId) as SqliteMemoryCitationRow[])
+      : (this.db.prepare(`SELECT * FROM memory_citations ORDER BY id ASC`).all() as SqliteMemoryCitationRow[]);
+    return rows.map(rowToMemoryCitation);
+  }
+
+  async recordMemoryValidationIssues(issues: MemoryValidationIssue[]): Promise<void> {
+    if (!issues.length) {
+      return;
+    }
+    const insert = this.db.prepare(
+      `INSERT INTO memory_validation_issues (run_id, pack_id, page_id, severity, code, message, context_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    );
+    const transaction = this.db.transaction(() => {
+      for (const issue of issues) {
+        insert.run(
+          issue.runId,
+          issue.packId ?? null,
+          issue.pageId ?? null,
+          issue.severity,
+          issue.code,
+          issue.message,
+          stringifyJson(issue.context ?? null)
+        );
+      }
+    });
+    transaction();
+  }
+
+  async listMemoryValidationIssues(runId?: string): Promise<MemoryValidationIssue[]> {
+    const rows = runId
+      ? (this.db.prepare(`SELECT * FROM memory_validation_issues WHERE run_id = ? ORDER BY id ASC`).all(runId) as SqliteMemoryIssueRow[])
+      : (this.db.prepare(`SELECT * FROM memory_validation_issues ORDER BY id ASC`).all() as SqliteMemoryIssueRow[]);
+    return rows.map(rowToMemoryIssue);
+  }
+
+  async markStaleMemoryForMissingMessages(): Promise<number> {
+    const missing = this.db
+      .prepare(
+        `SELECT DISTINCT r.page_id
+         FROM memory_page_revisions r
+         JOIN memory_citations c ON c.revision_id = r.id
+         LEFT JOIN messages m ON m.source_message_key = c.source_message_key
+         WHERE r.status = 'current' AND m.id IS NULL`
+      )
+      .all() as Array<{ page_id: string }>;
+    if (!missing.length) {
+      return 0;
+    }
+    const updatePages = this.db.prepare(`UPDATE memory_pages SET status = 'stale', updated_at = ? WHERE page_id = ?`);
+    const updateRevisions = this.db.prepare(`UPDATE memory_page_revisions SET status = 'stale' WHERE page_id = ? AND status = 'current'`);
+    const now = currentIso();
+    const transaction = this.db.transaction(() => {
+      for (const row of missing) {
+        updatePages.run(now, row.page_id);
+        updateRevisions.run(row.page_id);
+      }
+    });
+    transaction();
+    return missing.length;
+  }
+
+  async resolveMemoryCitation(citationLabelOrMessageKey: string): Promise<MemoryCitationRecord | null> {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM memory_citations
+         WHERE citation_label = ? OR source_message_key = ?
+         ORDER BY id DESC
+         LIMIT 1`
+      )
+      .get(citationLabelOrMessageKey, citationLabelOrMessageKey) as SqliteMemoryCitationRow | undefined;
+    return row ? rowToMemoryCitation(row) : null;
+  }
+
+  async listNearbyMemoryMessages(messageId: number, radius: number): Promise<MemoryEvidenceMessage[]> {
+    const base = this.db.prepare(`SELECT chat_id FROM messages WHERE id = ?`).get(messageId) as { chat_id: number } | undefined;
+    if (!base) {
+      return [];
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT m.id, m.source_message_key, m.source_message_id, chats.source_chat_id, m.chat_id,
+                COALESCE(NULLIF(chats.display_name, ''), chats.jid) AS chat_display_name,
+                m.sender_source_jid, COALESCE(c.display_name, m.sender_source_jid) AS sender_display_name,
+                m.timestamp_ms, m.sent_at, m.direction, m.message_type,
+                COALESCE(NULLIF(m.body, ''), NULLIF(m.caption, '')) AS text
+         FROM messages m
+         JOIN chats ON chats.id = m.chat_id
+         LEFT JOIN contacts c ON c.id = m.sender_contact_id
+         WHERE m.chat_id = ? AND m.id BETWEEN ? AND ?
+         ORDER BY m.timestamp_ms ASC, m.id ASC`
+      )
+      .all(base.chat_id, messageId - radius, messageId + radius) as SqliteMemoryEvidenceRow[];
+    return rows.map((row, index) => rowToMemoryEvidence(row, index));
+  }
+
   async close(): Promise<void> {
     this.db.close();
   }
@@ -1362,6 +1889,14 @@ function parseJson(value: string | null | undefined): Record<string, unknown> | 
   return JSON.parse(value) as Record<string, unknown>;
 }
 
+function parseArray(value: string | null | undefined): string[] {
+  if (!value) {
+    return [];
+  }
+  const parsed = JSON.parse(value) as unknown;
+  return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : [];
+}
+
 function totalsOrEmpty(totals: ImportTotals | null | undefined): ImportTotals {
   return totals ?? { contacts: 0, chats: 0, participants: 0, messages: 0, skipped: 0, warnings: 0 };
 }
@@ -1449,6 +1984,105 @@ function rowToLiveGap(row: SqliteLiveGapRow): LiveGapWindowRecord {
     notes: row.notes,
     createdAt: row.created_at,
     updatedAt: row.updated_at
+  };
+}
+
+function rowToMemoryRun(row: SqliteMemoryRunRow): MemoryRunSummary {
+  return {
+    id: row.id,
+    status: row.status as MemoryRunSummary["status"],
+    kind: row.kind as MemoryRunSummary["kind"],
+    startedAt: row.started_at,
+    finishedAt: row.finished_at,
+    sourceStartAtMs: nullableNumber(row.source_start_at_ms),
+    sourceEndAtMs: nullableNumber(row.source_end_at_ms),
+    pageCount: Number(row.page_count ?? 0),
+    citationCount: Number(row.citation_count ?? 0),
+    messageCount: Number(row.message_count ?? 0),
+    warningCount: Number(row.warning_count ?? 0),
+    errorMessage: row.error_message
+  };
+}
+
+function rowToMemoryWindow(row: SqliteMemoryWindowRow): MemorySourceWindowRecord {
+  return {
+    id: row.id,
+    runId: row.run_id,
+    status: row.status as MemorySourceWindowRecord["status"],
+    startAtMs: nullableNumber(row.start_at_ms),
+    endAtMs: nullableNumber(row.end_at_ms),
+    chatSourceIds: parseArray(row.chat_source_ids_json),
+    messageCount: Number(row.message_count ?? 0),
+    sourceHash: row.source_hash,
+    committedAt: row.committed_at,
+    createdAt: row.created_at
+  };
+}
+
+function rowToMemoryEvidence(row: SqliteMemoryEvidenceRow, index: number): MemoryEvidenceMessage {
+  return {
+    citationLabel: `m${index + 1}`,
+    messageId: Number(row.id),
+    sourceMessageKey: row.source_message_key,
+    sourceMessageId: row.source_message_id,
+    sourceChatId: row.source_chat_id,
+    chatId: Number(row.chat_id),
+    chatDisplayName: row.chat_display_name,
+    senderSourceJid: row.sender_source_jid,
+    senderDisplayName: row.sender_display_name,
+    timestampMs: nullableNumber(row.timestamp_ms),
+    sentAt: row.sent_at,
+    direction: row.direction as MemoryEvidenceMessage["direction"],
+    messageType: row.message_type,
+    text: row.text
+  };
+}
+
+function rowToMemoryRevision(row: SqliteMemoryRevisionRow): MemoryPageRevisionRecord {
+  return {
+    id: row.id,
+    pageId: row.page_id,
+    runId: row.run_id,
+    windowId: row.window_id,
+    title: row.title,
+    path: row.page_path,
+    summary: row.summary,
+    markdown: row.markdown,
+    status: row.status as MemoryPageRevisionRecord["status"],
+    sourceStartAtMs: nullableNumber(row.source_start_at_ms),
+    sourceEndAtMs: nullableNumber(row.source_end_at_ms),
+    citationCount: Number(row.citation_count ?? 0),
+    createdAt: row.created_at,
+    metadata: parseJson(row.metadata_json)
+  };
+}
+
+function rowToMemoryCitation(row: SqliteMemoryCitationRow): MemoryCitationRecord {
+  return {
+    id: Number(row.id),
+    revisionId: row.revision_id,
+    claimId: row.claim_id,
+    citationLabel: row.citation_label,
+    messageId: row.message_id == null ? null : Number(row.message_id),
+    sourceMessageKey: row.source_message_key,
+    sourceMessageId: row.source_message_id,
+    sourceChatId: row.source_chat_id,
+    senderSourceJid: row.sender_source_jid,
+    timestampMs: nullableNumber(row.timestamp_ms)
+  };
+}
+
+function rowToMemoryIssue(row: SqliteMemoryIssueRow): MemoryValidationIssue {
+  return {
+    id: Number(row.id),
+    runId: row.run_id,
+    packId: row.pack_id,
+    pageId: row.page_id,
+    severity: row.severity as MemoryValidationIssue["severity"],
+    code: row.code,
+    message: row.message,
+    context: parseJson(row.context_json),
+    createdAt: row.created_at
   };
 }
 
@@ -1601,4 +2235,90 @@ interface SqliteLiveHealthRow {
   oldest_verified_at_ms: number | null;
   next_recovery_at: string | null;
   open_gap_count: number;
+}
+
+interface SqliteMemoryRunRow {
+  id: string;
+  status: string;
+  kind: string;
+  started_at: string;
+  finished_at: string | null;
+  source_start_at_ms: number | null;
+  source_end_at_ms: number | null;
+  page_count: number;
+  citation_count: number;
+  message_count: number;
+  warning_count: number;
+  error_message: string | null;
+}
+
+interface SqliteMemoryWindowRow {
+  id: string;
+  run_id: string;
+  status: string;
+  start_at_ms: number | null;
+  end_at_ms: number | null;
+  chat_source_ids_json: string | null;
+  message_count: number;
+  source_hash: string;
+  committed_at: string | null;
+  created_at: string;
+}
+
+interface SqliteMemoryEvidenceRow {
+  id: number;
+  source_message_key: string;
+  source_message_id: string;
+  source_chat_id: string;
+  chat_id: number;
+  chat_display_name: string | null;
+  sender_source_jid: string | null;
+  sender_display_name: string | null;
+  timestamp_ms: number | null;
+  sent_at: string | null;
+  direction: string;
+  message_type: string;
+  text: string | null;
+}
+
+interface SqliteMemoryRevisionRow {
+  id: string;
+  page_id: string;
+  run_id: string;
+  window_id: string;
+  title: string;
+  page_path: string;
+  summary: string;
+  markdown: string;
+  status: string;
+  source_start_at_ms: number | null;
+  source_end_at_ms: number | null;
+  citation_count: number;
+  metadata_json: string | null;
+  created_at: string;
+}
+
+interface SqliteMemoryCitationRow {
+  id: number;
+  revision_id: string;
+  claim_id: string;
+  citation_label: string;
+  message_id: number | null;
+  source_message_key: string;
+  source_message_id: string;
+  source_chat_id: string;
+  sender_source_jid: string | null;
+  timestamp_ms: number | null;
+}
+
+interface SqliteMemoryIssueRow {
+  id: number;
+  run_id: string;
+  pack_id: string | null;
+  page_id: string | null;
+  severity: string;
+  code: string;
+  message: string;
+  context_json: string | null;
+  created_at: string;
 }

@@ -11,6 +11,11 @@ import type {
   LiveGapWindowRecord,
   LiveMaintainerStatusSummary,
   LivePairingSummary,
+  MemoryConsolidationResult,
+  MemoryCitationResolution,
+  MemoryProviderStatus,
+  MemoryQueryResult,
+  MemoryStatusSummary,
   MessageListItem,
   MessageListOrder,
   StatusSummary
@@ -153,6 +158,41 @@ export function resumeLiveSession(): Promise<{ ok: boolean; live: LiveMaintainer
 
 export function getLivePairing(): Promise<LivePairingSummary> {
   return request<LivePairingSummary>("/api/live/pairing");
+}
+
+export function getMemoryStatus(): Promise<MemoryStatusSummary> {
+  return request<MemoryStatusSummary>("/api/memory/status");
+}
+
+export function startMemoryRun(requestBody: {
+  kind?: "rem" | "manual" | "rebuild";
+  dryRun?: boolean;
+  force?: boolean;
+  provider?: "local" | "codex";
+}): Promise<{ ok: boolean; result: MemoryConsolidationResult }> {
+  return request<{ ok: boolean; result: MemoryConsolidationResult }>("/api/memory/runs", {
+    method: "POST",
+    body: JSON.stringify(requestBody)
+  });
+}
+
+export function queryMemory(query: string): Promise<MemoryQueryResult> {
+  return request<MemoryQueryResult>("/api/memory/query", {
+    method: "POST",
+    body: JSON.stringify({ query })
+  });
+}
+
+export function resolveMemoryCitation(citation: string): Promise<MemoryCitationResolution> {
+  return request<MemoryCitationResolution>(`/api/memory/citations/${encodeURIComponent(citation)}`);
+}
+
+export function enableCodexMemoryProvider(): Promise<MemoryProviderStatus> {
+  return request<MemoryProviderStatus>("/api/memory/provider/enable-codex", { method: "POST", body: "{}" });
+}
+
+export function disableMemoryProvider(): Promise<MemoryProviderStatus> {
+  return request<MemoryProviderStatus>("/api/memory/provider/disable", { method: "POST", body: "{}" });
 }
 
 export function listChats(params: Partial<ChatListOptions>): Promise<ChatListItem[]> {
