@@ -1,5 +1,5 @@
 import http from "node:http";
-import { mkdir, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import QRCode from "qrcode";
 import { config } from "../config";
@@ -8,7 +8,14 @@ import { assertLiveDependencySafe } from "./dependency";
 import {
   normalizeBaileysChatsWithJidResolver,
   normalizeBaileysContactsWithJidResolver,
+  normalizeBaileysGroupParticipantsWithJidResolver,
+  normalizeBaileysGroupUpdatesWithJidResolver,
+  normalizeBaileysMessageDeletesWithJidResolver,
   normalizeBaileysMessagesWithJidResolver,
+  normalizeBaileysMessageUpdatesWithJidResolver,
+  normalizeBaileysReactionsWithJidResolver,
+  normalizeBaileysReceiptsWithJidResolver,
+  unescapeLiveKeyComponent,
   type LiveJidResolver
 } from "./normalize";
 import type { LiveConnectionUpdate, LiveHistoryRequest, LiveHistoryResult, LiveMessageEvent, LiveProofResult, LiveWhatsAppClient } from "./types";
@@ -30,6 +37,7 @@ export class BaileysLiveWhatsAppClient implements LiveWhatsAppClient {
   private reconnectTimer: NodeJS.Timeout | null = null;
   private reconnectAttempts = 0;
   private stopped = false;
+  private sawPairingQr = false;
 
   constructor(private readonly options: BaileysClientOptions) {}
 
@@ -49,6 +57,7 @@ export class BaileysLiveWhatsAppClient implements LiveWhatsAppClient {
       this.reconnectTimer = null;
     }
     await mkdir(this.options.authDir, { recursive: true });
+    await restoreCredsBackupIfCorrupt(this.options.authDir);
     const baileys = await import("@whiskeysockets/baileys");
     const pino = (await import("pino")).default;
     const { state, saveCreds } = await baileys.useMultiFileAuthState(this.options.authDir);
@@ -64,29 +73,68 @@ export class BaileysLiveWhatsAppClient implements LiveWhatsAppClient {
     }
     const resolveLiveJid = createLiveJidResolver(socket);
     this.socket = socket;
-    socket.ev.on("creds.update", saveCreds);
-    socket.ev.on("connection.update", async (update: any) => {
+    // A malformed or unexpected platform payload must never take down the
+    // process: normalization errors are traced and the event dropped.
+    const on = (name: string, handler: (payload: any) => void | Promise<void>): void => {
+      socket.ev.on(name as never, async (payload: any) => {
+        try {
+          await handler(payload);
+        } catch (error) {
+          await configuredTraceRecorder?.record("baileys.event_handler_failed", { name, message: safeError(error) });
+        }
+      });
+    };
+    on("creds.update", saveCreds);
+    on("connection.update", async (update: any) => {
       await configuredTraceRecorder?.record("baileys.raw_event", { name: "connection.update", event: update });
       if (update.qr) {
+        this.sawPairingQr = true;
         await this.emitConnection({ state: "pairing", qrDataUrl: await QRCode.toDataURL(update.qr) });
       }
       if (update.connection === "open") {
         this.reconnectAttempts = 0;
+        this.sawPairingQr = false;
         await this.emitConnection({ state: "connected", linkedDeviceJid: socket.user?.id ?? null });
+        // Baileys writes creds.json non-atomically; a kill mid-write truncates
+        // it and forces a full re-pair. Keep a known-good copy from the moment
+        // the session provably works.
+        await backupCredsIfValid(this.options.authDir);
       }
       if (update.connection === "close") {
+        const statusCode = (update.lastDisconnect?.error as { output?: { statusCode?: number } } | undefined)?.output?.statusCode;
+        if (statusCode === baileys.DisconnectReason.loggedOut) {
+          this.stopped = true;
+          await this.emitConnection({
+            state: "logged_out",
+            lastError: "WhatsApp unlinked this device. Re-pair from Linked devices to resume live sync."
+          });
+          return;
+        }
+        if (statusCode === baileys.DisconnectReason.restartRequired) {
+          // Expected protocol step: WhatsApp forces a stream restart right
+          // after a QR scan completes (and occasionally mid-session). This is
+          // not an error — reconnect immediately with the saved credentials.
+          await configuredTraceRecorder?.record("baileys.restart_required", { duringPairing: this.sawPairingQr });
+          await this.emitConnection(
+            this.sawPairingQr
+              ? { state: "pairing", lastError: null }
+              : { state: "disconnected", lastError: "Reconnecting to WhatsApp…" }
+          );
+          this.scheduleReconnect(500);
+          return;
+        }
         await this.emitConnection({ state: "disconnected", lastError: safeError(update.lastDisconnect?.error) });
         this.scheduleReconnect();
       }
     });
-    socket.ev.on("messages.upsert", async (event: { type?: string; messages?: unknown[] }) => {
+    on("messages.upsert", async (event: { type?: string; messages?: unknown[] }) => {
       await configuredTraceRecorder?.record("baileys.raw_event", { name: "messages.upsert", event });
       const normalized = await normalizeBaileysMessagesWithJidResolver((event.messages ?? []) as any[], "wa-web:messages.upsert", resolveLiveJid);
       normalized.mode = event.type === "append" ? "append" : "notify";
       await configuredTraceRecorder?.record("baileys.normalized_event", { name: "messages.upsert", event: normalized });
       await this.emitEvent(normalized);
     });
-    socket.ev.on("messaging-history.set", async (event: { messages?: unknown[]; lidPnMappings?: Array<{ lid: string; pn: string }> }) => {
+    on("messaging-history.set", async (event: { messages?: unknown[]; lidPnMappings?: Array<{ lid: string; pn: string }> }) => {
       await configuredTraceRecorder?.record("baileys.raw_event", { name: "messaging-history.set", event });
       await storeLidPnMappings(socket, event.lidPnMappings);
       const normalized = await normalizeBaileysMessagesWithJidResolver((event.messages ?? []) as any[], "wa-web:history-sync", resolveLiveJid);
@@ -97,33 +145,81 @@ export class BaileysLiveWhatsAppClient implements LiveWhatsAppClient {
       await configuredTraceRecorder?.record("baileys.normalized_event", { name: "messaging-history.set", event: normalized });
       await this.emitEvent(normalized);
     });
-    socket.ev.on("contacts.upsert", async (contacts: unknown[]) => {
+    on("contacts.upsert", async (contacts: unknown[]) => {
       await configuredTraceRecorder?.record("baileys.raw_event", { name: "contacts.upsert", event: contacts });
       const normalized = await normalizeBaileysContactsWithJidResolver(contacts as any[], "contacts.upsert", resolveLiveJid);
       await configuredTraceRecorder?.record("baileys.normalized_event", { name: "contacts.upsert", event: normalized });
       await this.emitEvent(normalized);
     });
-    socket.ev.on("contacts.update", async (contacts: unknown[]) => {
+    on("contacts.update", async (contacts: unknown[]) => {
       await configuredTraceRecorder?.record("baileys.raw_event", { name: "contacts.update", event: contacts });
       const normalized = await normalizeBaileysContactsWithJidResolver(contacts as any[], "contacts.update", resolveLiveJid);
       await configuredTraceRecorder?.record("baileys.normalized_event", { name: "contacts.update", event: normalized });
       await this.emitEvent(normalized);
     });
-    socket.ev.on("chats.upsert", async (chats: unknown[]) => {
+    on("chats.upsert", async (chats: unknown[]) => {
       await configuredTraceRecorder?.record("baileys.raw_event", { name: "chats.upsert", event: chats });
       const normalized = await normalizeBaileysChatsWithJidResolver(chats as any[], "chats.upsert", resolveLiveJid);
       await configuredTraceRecorder?.record("baileys.normalized_event", { name: "chats.upsert", event: normalized });
       await this.emitEvent(normalized);
     });
-    socket.ev.on("chats.update", async (chats: unknown[]) => {
+    on("chats.update", async (chats: unknown[]) => {
       await configuredTraceRecorder?.record("baileys.raw_event", { name: "chats.update", event: chats });
       const normalized = await normalizeBaileysChatsWithJidResolver(chats as any[], "chats.update", resolveLiveJid);
       await configuredTraceRecorder?.record("baileys.normalized_event", { name: "chats.update", event: normalized });
       await this.emitEvent(normalized);
     });
-    socket.ev.on("lid-mapping.update", async (mapping: { lid: string; pn: string }) => {
+    on("lid-mapping.update", async (mapping: { lid: string; pn: string }) => {
       await configuredTraceRecorder?.record("baileys.raw_event", { name: "lid-mapping.update", event: mapping });
       await storeLidPnMappings(socket, [mapping]);
+    });
+    on("messages.update", async (items: unknown[]) => {
+      await configuredTraceRecorder?.record("baileys.raw_event", { name: "messages.update", event: items });
+      const normalized = await normalizeBaileysMessageUpdatesWithJidResolver((items ?? []) as any[], resolveLiveJid);
+      if (normalized.updates?.length) {
+        await configuredTraceRecorder?.record("baileys.normalized_event", { name: "messages.update", event: normalized });
+        await this.emitEvent(normalized);
+      }
+    });
+    on("messages.delete", async (item: unknown) => {
+      await configuredTraceRecorder?.record("baileys.raw_event", { name: "messages.delete", event: item });
+      const normalized = await normalizeBaileysMessageDeletesWithJidResolver((item ?? {}) as any, resolveLiveJid);
+      if (normalized.updates?.length) {
+        await configuredTraceRecorder?.record("baileys.normalized_event", { name: "messages.delete", event: normalized });
+        await this.emitEvent(normalized);
+      }
+    });
+    on("messages.reaction", async (reactions: unknown[]) => {
+      await configuredTraceRecorder?.record("baileys.raw_event", { name: "messages.reaction", event: reactions });
+      const normalized = await normalizeBaileysReactionsWithJidResolver((reactions ?? []) as any[], resolveLiveJid);
+      if (normalized.updates?.length) {
+        await configuredTraceRecorder?.record("baileys.normalized_event", { name: "messages.reaction", event: normalized });
+        await this.emitEvent(normalized);
+      }
+    });
+    on("message-receipt.update", async (receipts: unknown[]) => {
+      await configuredTraceRecorder?.record("baileys.raw_event", { name: "message-receipt.update", event: receipts });
+      const normalized = await normalizeBaileysReceiptsWithJidResolver((receipts ?? []) as any[], resolveLiveJid);
+      if (normalized.updates?.length) {
+        await configuredTraceRecorder?.record("baileys.normalized_event", { name: "message-receipt.update", event: normalized });
+        await this.emitEvent(normalized);
+      }
+    });
+    on("groups.update", async (groups: unknown[]) => {
+      await configuredTraceRecorder?.record("baileys.raw_event", { name: "groups.update", event: groups });
+      const normalized = await normalizeBaileysGroupUpdatesWithJidResolver((groups ?? []) as any[], resolveLiveJid);
+      if (normalized.chats?.length) {
+        await configuredTraceRecorder?.record("baileys.normalized_event", { name: "groups.update", event: normalized });
+        await this.emitEvent(normalized);
+      }
+    });
+    on("group-participants.update", async (event: unknown) => {
+      await configuredTraceRecorder?.record("baileys.raw_event", { name: "group-participants.update", event });
+      const normalized = await normalizeBaileysGroupParticipantsWithJidResolver((event ?? {}) as any, resolveLiveJid, Date.now());
+      if (normalized.participants?.length) {
+        await configuredTraceRecorder?.record("baileys.normalized_event", { name: "group-participants.update", event: normalized });
+        await this.emitEvent(normalized);
+      }
     });
 
     if (this.options.phoneNumber && !socket.authState?.creds?.registered) {
@@ -143,12 +239,12 @@ export class BaileysLiveWhatsAppClient implements LiveWhatsAppClient {
     await this.emitConnection({ state: "stopped" });
   }
 
-  private scheduleReconnect(): void {
+  private scheduleReconnect(delayOverrideMs?: number): void {
     if (this.stopped || this.reconnectTimer) {
       return;
     }
     this.reconnectAttempts += 1;
-    const delayMs = Math.min(60_000, 1000 * 2 ** Math.min(this.reconnectAttempts, 6));
+    const delayMs = delayOverrideMs ?? Math.min(60_000, 1000 * 2 ** Math.min(this.reconnectAttempts, 6));
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       this.connect().catch((error: unknown) => {
@@ -163,7 +259,10 @@ export class BaileysLiveWhatsAppClient implements LiveWhatsAppClient {
       return { status: "unsupported", events: [], messageCount: 0, errorMessage: "Baileys on-demand history requires a live socket and anchor message." };
     }
     try {
-      await this.socket.fetchMessageHistory(request.count, decodeLiveMessageKey(request.anchorMessageKey), Math.floor(request.oldestMsgTimestampMs / 1000));
+      // Baileys forwards this verbatim into the wire field oldestMsgTimestampMs
+      // — it expects MILLISECONDS; dividing by 1000 sends a 1970-era anchor and
+      // the phone returns nothing.
+      await this.socket.fetchMessageHistory(request.count, decodeLiveMessageKey(request.anchorMessageKey), Math.floor(request.oldestMsgTimestampMs));
       return { status: "partial", events: [], messageCount: 0 };
     } catch (error) {
       return { status: "failed", events: [], messageCount: 0, errorMessage: safeError(error) };
@@ -410,6 +509,10 @@ function mergeBySourceChatId<T extends { sourceChatId: string }>(left: T[], righ
 function createLiveJidResolver(socket: any): LiveJidResolver {
   const resolved = new Map<string, string>();
   return async (jid: string) => {
+    if (typeof jid !== "string") {
+      await configuredTraceRecorder?.record("baileys.jid_resolved", { input: String(jid), output: null, source: "non-string" });
+      return null;
+    }
     if (!isLidJid(jid)) {
       await configuredTraceRecorder?.record("baileys.jid_resolved", { input: jid, output: jid, source: "non-lid" });
       return jid;
@@ -448,8 +551,46 @@ async function storeLidPnMappings(socket: any, mappings: Array<{ lid: string; pn
   }
 }
 
-function isLidJid(jid: string): boolean {
-  return jid.endsWith("@lid") || jid.endsWith("@hosted.lid");
+function isLidJid(jid: unknown): jid is string {
+  return typeof jid === "string" && (jid.endsWith("@lid") || jid.endsWith("@hosted.lid"));
+}
+
+// Returns true when creds.json parses and belongs to a paired session. Attempts
+// a restore from the known-good backup first, so a truncated creds.json (killed
+// mid-write) does not force a re-pair when the backup is intact.
+export async function ensureUsableLiveCreds(authDir: string): Promise<boolean> {
+  await restoreCredsBackupIfCorrupt(authDir);
+  return Boolean(await readParsedCreds(path.join(authDir, "creds.json")));
+}
+
+async function restoreCredsBackupIfCorrupt(authDir: string): Promise<void> {
+  const credsPath = path.join(authDir, "creds.json");
+  const backupPath = path.join(authDir, "creds.json.bak");
+  if (await readParsedCreds(credsPath)) {
+    return;
+  }
+  const backup = await readParsedCreds(backupPath);
+  if (backup) {
+    await copyFile(backupPath, credsPath);
+    await configuredTraceRecorder?.record("baileys.creds_restored_from_backup", { authDir: path.basename(authDir) });
+  }
+}
+
+async function backupCredsIfValid(authDir: string): Promise<void> {
+  const credsPath = path.join(authDir, "creds.json");
+  if (await readParsedCreds(credsPath)) {
+    await copyFile(credsPath, path.join(authDir, "creds.json.bak")).catch(() => undefined);
+  }
+}
+
+async function readParsedCreds(filePath: string): Promise<Record<string, unknown> | null> {
+  try {
+    const raw = await readFile(filePath, "utf8");
+    const parsed = JSON.parse(raw) as Record<string, unknown> | null;
+    return parsed && typeof parsed === "object" && parsed.me ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 function safeError(error: unknown): string {
@@ -462,9 +603,9 @@ function safeError(error: unknown): string {
 function decodeLiveMessageKey(sourceMessageKey: string): { remoteJid: string; id: string; participant?: string; fromMe?: boolean } {
   const [, chatSourceId, participant, fromMe, sourceMessageId] = sourceMessageKey.split("|");
   return {
-    remoteJid: chatSourceId,
-    id: sourceMessageId,
-    participant: participant || undefined,
+    remoteJid: unescapeLiveKeyComponent(chatSourceId),
+    id: unescapeLiveKeyComponent(sourceMessageId),
+    participant: participant ? unescapeLiveKeyComponent(participant) : undefined,
     fromMe: fromMe === "1" ? true : fromMe === "0" ? false : undefined
   };
 }

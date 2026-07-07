@@ -5,6 +5,7 @@ import type {
   ChatListItem,
   ChatListOptions,
   ChatRecord,
+  ChatSyncStateRecord,
   ContactRecord,
   ImportRunSummary,
   ImportTotals,
@@ -33,10 +34,12 @@ import type {
   MessageListItem,
   MessageRecord,
   ParticipantRecord,
+  RecoveryAnchorRecord,
   StatusSummary
 } from "../../shared/types";
 import { config } from "../config";
 import { baselineFromStatus } from "../live/baseline";
+import { liveKeyMessageId } from "../live/normalize";
 import { getMemoryProviderStatus } from "../memory/provider";
 import type { ArchiveRepository, ArchiveRestorePoint } from "./repository";
 
@@ -86,6 +89,22 @@ const DELETE_TABLE_ORDER = [
   "import_warnings",
   "import_runs"
 ] as const;
+
+const LIVE_SESSION_STATUSES = ["not_configured", "pairing", "connected", "disconnected", "stopped", "error", "logged_out"] as const;
+
+function liveSessionsTableDdl(tableName: string): string {
+  return `CREATE TABLE IF NOT EXISTS ${tableName} (
+    id TEXT PRIMARY KEY,
+    status TEXT NOT NULL CHECK (status IN (${LIVE_SESSION_STATUSES.map((status) => `'${status}'`).join(",")})),
+    client_name TEXT NOT NULL,
+    linked_device_jid TEXT NULL,
+    last_connected_at TEXT NULL,
+    last_disconnected_at TEXT NULL,
+    last_error TEXT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  )`;
+}
 
 const schemaStatements = [
   `CREATE TABLE IF NOT EXISTS import_runs (
@@ -138,6 +157,7 @@ const schemaStatements = [
     participant_count INTEGER NOT NULL DEFAULT 0,
     last_message_at TEXT NULL,
     last_message_at_ms INTEGER NULL,
+    platform_recency_ms INTEGER NULL,
     raw_metadata_json TEXT NULL,
     first_seen_import_id TEXT NULL,
     last_seen_import_id TEXT NULL,
@@ -189,17 +209,7 @@ const schemaStatements = [
     FOREIGN KEY (sender_contact_id) REFERENCES contacts(id) ON DELETE SET NULL
   )`,
 
-  `CREATE TABLE IF NOT EXISTS live_sessions (
-    id TEXT PRIMARY KEY,
-    status TEXT NOT NULL CHECK (status IN ('not_configured','pairing','connected','disconnected','stopped','error')),
-    client_name TEXT NOT NULL,
-    linked_device_jid TEXT NULL,
-    last_connected_at TEXT NULL,
-    last_disconnected_at TEXT NULL,
-    last_error TEXT NULL,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-  )`,
+  liveSessionsTableDdl("live_sessions"),
 
   `CREATE TABLE IF NOT EXISTS live_sync_runs (
     id TEXT PRIMARY KEY,
@@ -582,8 +592,8 @@ export class SqliteArchiveRepository implements ArchiveRepository {
 
     const upsert = this.db.prepare(
       `INSERT INTO chats
-       (source_chat_id, jid, display_name, chat_type, raw_metadata_json, first_seen_import_id, last_seen_import_id, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       (source_chat_id, jid, display_name, chat_type, platform_recency_ms, raw_metadata_json, first_seen_import_id, last_seen_import_id, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(source_chat_id) DO UPDATE SET
          jid = excluded.jid,
          display_name = CASE
@@ -593,6 +603,11 @@ export class SqliteArchiveRepository implements ArchiveRepository {
          chat_type = CASE
            WHEN excluded.chat_type = 'unknown' THEN chats.chat_type
            ELSE excluded.chat_type
+         END,
+         platform_recency_ms = CASE
+           WHEN excluded.platform_recency_ms IS NULL THEN chats.platform_recency_ms
+           WHEN chats.platform_recency_ms IS NULL THEN excluded.platform_recency_ms
+           ELSE MAX(chats.platform_recency_ms, excluded.platform_recency_ms)
          END,
          raw_metadata_json = COALESCE(excluded.raw_metadata_json, chats.raw_metadata_json),
          last_seen_import_id = excluded.last_seen_import_id,
@@ -605,6 +620,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
           chat.jid,
           chat.displayName ?? null,
           chat.chatType,
+          chat.platformRecencyMs ?? null,
           stringifyJson(chat.rawMetadata ?? null),
           runId,
           runId,
@@ -801,19 +817,34 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     return rows.length;
   }
 
-  async refreshChatStats(): Promise<void> {
-    this.db.exec(
-      `UPDATE chats
+  async refreshChatStats(chatSourceIds?: string[]): Promise<void> {
+    // Chat recency mirrors WhatsApp: only user-visible conversation messages
+    // advance a chat's position/date; system, status, and reaction events do not.
+    const statsSql = `UPDATE chats
        SET message_count = (SELECT COUNT(*) FROM messages WHERE messages.chat_id = chats.id),
            participant_count = (SELECT COUNT(*) FROM chat_participants WHERE chat_participants.chat_id = chats.id),
-           last_message_at_ms = (SELECT MAX(timestamp_ms) FROM messages WHERE messages.chat_id = chats.id),
+           last_message_at_ms = (
+             SELECT MAX(timestamp_ms) FROM messages
+             WHERE messages.chat_id = chats.id AND ${visibleExchangePredicate("messages")}
+           ),
            last_message_at = (
              SELECT sent_at FROM messages
-             WHERE messages.chat_id = chats.id
+             WHERE messages.chat_id = chats.id AND ${visibleExchangePredicate("messages")}
              ORDER BY timestamp_ms DESC, id DESC
              LIMIT 1
-           )`
-    );
+           )`;
+    if (!chatSourceIds) {
+      this.db.exec(statsSql);
+      return;
+    }
+    const unique = [...new Set(chatSourceIds)].filter(Boolean);
+    if (unique.length === 0) {
+      return;
+    }
+    const scoped = this.db.prepare(`${statsSql} WHERE chats.source_chat_id IN (${unique.map(() => "?").join(",")})`);
+    for (let index = 0; index < unique.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      scoped.run(...unique.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE));
+    }
   }
 
   async clearArchiveData(): Promise<void> {
@@ -986,11 +1017,87 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       );
   }
 
-  async listLiveCheckpoints(): Promise<LiveChatCheckpointRecord[]> {
+  async listLiveCheckpoints(chatSourceIds?: string[]): Promise<LiveChatCheckpointRecord[]> {
+    const unique = chatSourceIds ? [...new Set(chatSourceIds)].filter(Boolean) : null;
+    if (unique && unique.length === 0) {
+      return [];
+    }
+    const where = unique ? `WHERE chat_source_id IN (${unique.map(() => "?").join(",")})` : "";
     const rows = this.db
-      .prepare(`SELECT * FROM live_chat_checkpoints ORDER BY updated_at DESC`)
-      .all() as SqliteLiveCheckpointRow[];
+      .prepare(`SELECT * FROM live_chat_checkpoints ${where} ORDER BY updated_at DESC`)
+      .all(...(unique ?? [])) as SqliteLiveCheckpointRow[];
     return rows.map(rowToLiveCheckpoint);
+  }
+
+  async listChatSyncStates(chatSourceIds?: string[]): Promise<ChatSyncStateRecord[]> {
+    const unique = chatSourceIds ? [...new Set(chatSourceIds)].filter(Boolean) : null;
+    if (unique && unique.length === 0) {
+      return [];
+    }
+    const where = unique ? `WHERE chats.source_chat_id IN (${unique.map(() => "?").join(",")})` : "";
+    const rows = this.db
+      .prepare(
+        `SELECT chats.source_chat_id,
+                chats.platform_recency_ms,
+                latest.timestamp_ms AS latest_at_ms,
+                latest.source_message_id AS latest_message_id,
+                earliest.timestamp_ms AS earliest_at_ms,
+                earliest.source_message_id AS earliest_message_id
+         FROM chats
+         LEFT JOIN (
+           SELECT chat_id, timestamp_ms, source_message_id,
+                  ROW_NUMBER() OVER (PARTITION BY chat_id ORDER BY timestamp_ms DESC, id DESC) AS rn
+           FROM messages
+         ) latest ON latest.chat_id = chats.id AND latest.rn = 1
+         LEFT JOIN (
+           SELECT chat_id, timestamp_ms, source_message_id,
+                  ROW_NUMBER() OVER (PARTITION BY chat_id ORDER BY timestamp_ms ASC, id ASC) AS rn
+           FROM messages
+         ) earliest ON earliest.chat_id = chats.id AND earliest.rn = 1
+         ${where}`
+      )
+      .all(...(unique ?? [])) as Array<{
+      source_chat_id: string;
+      platform_recency_ms: number | null;
+      latest_at_ms: number | null;
+      latest_message_id: string | null;
+      earliest_at_ms: number | null;
+      earliest_message_id: string | null;
+    }>;
+    return rows.map((row) => ({
+      chatSourceId: row.source_chat_id,
+      latestArchivedAtMs: row.latest_at_ms == null ? null : Number(row.latest_at_ms),
+      latestArchivedMessageId: row.latest_message_id ?? null,
+      earliestArchivedAtMs: row.earliest_at_ms == null ? null : Number(row.earliest_at_ms),
+      earliestArchivedMessageId: row.earliest_message_id ?? null,
+      platformRecencyMs: row.platform_recency_ms == null ? null : Number(row.platform_recency_ms)
+    }));
+  }
+
+  async getRecoveryAnchor(chatSourceId: string, afterMs: number | null): Promise<RecoveryAnchorRecord | null> {
+    const row = this.db
+      .prepare(
+        `SELECT m.source_message_id, m.timestamp_ms, m.from_me, m.sender_source_jid
+         FROM messages m
+         JOIN chats c ON c.id = m.chat_id
+         WHERE c.source_chat_id = ?
+           AND m.timestamp_ms IS NOT NULL
+           AND (? IS NULL OR m.timestamp_ms > ?)
+         ORDER BY m.timestamp_ms ASC, m.id ASC
+         LIMIT 1`
+      )
+      .get(chatSourceId, afterMs ?? null, afterMs ?? null) as
+      | { source_message_id: string; timestamp_ms: number; from_me: number | null; sender_source_jid: string | null }
+      | undefined;
+    if (!row) {
+      return null;
+    }
+    return {
+      sourceMessageId: row.source_message_id,
+      timestampMs: Number(row.timestamp_ms),
+      fromMe: row.from_me == null ? null : Boolean(row.from_me),
+      senderSourceJid: row.sender_source_jid ?? null
+    };
   }
 
   async upsertLiveGap(gap: LiveGapWindowRecord): Promise<number> {
@@ -1093,7 +1200,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
        (event_key, chat_source_id, source_message_key, update_type, occurred_at_ms, applied, metadata_json, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(event_key) DO UPDATE SET
-         applied = excluded.applied,
+         applied = MAX(live_message_updates.applied, excluded.applied),
          metadata_json = COALESCE(excluded.metadata_json, live_message_updates.metadata_json),
          updated_at = excluded.updated_at`
     );
@@ -1103,17 +1210,38 @@ export class SqliteArchiveRepository implements ArchiveRepository {
            raw_metadata_json = COALESCE(raw_metadata_json, ?)
        WHERE source_message_key = ?`
     );
-    const applyEdit = this.db.prepare(`UPDATE messages SET body = ? WHERE source_message_key = ?`);
+    const applyEdit = this.db.prepare(
+      `UPDATE messages
+       SET body = ?,
+           raw_metadata_json = json_set(COALESCE(raw_metadata_json, '{}'), '$.edited', 1)
+       WHERE source_message_key = ?`
+    );
     const exists = this.db.prepare(`SELECT 1 AS found FROM messages WHERE source_message_key = ?`);
+    // Update targets may have been archived from backup (different key format) or
+    // with a different participant/fromMe composition; fall back to matching by
+    // chat + WhatsApp message id, which is stable across sources.
+    const fallbackKey = this.db.prepare(
+      `SELECT m.source_message_key AS key
+       FROM messages m
+       JOIN chats c ON c.id = m.chat_id
+       WHERE c.source_chat_id = ? AND m.source_message_id = ?
+       LIMIT 1`
+    );
     const transaction = this.db.transaction(() => {
       for (const update of updates) {
-        const hasBase = Boolean(exists.get(update.sourceMessageKey));
-        if (hasBase) {
+        let targetKey: string | null = update.sourceMessageKey;
+        if (!exists.get(targetKey)) {
+          const messageId = liveKeyMessageId(update.sourceMessageKey);
+          const fallback = messageId ? (fallbackKey.get(update.chatSourceId, messageId) as { key: string } | undefined) : undefined;
+          targetKey = fallback?.key ?? null;
+        }
+        const hasBase = Boolean(targetKey);
+        if (targetKey) {
           if (update.updateType === "delete") {
-            markDeleted.run(stringifyJson({ liveUpdate: "delete" }), update.sourceMessageKey);
+            markDeleted.run(stringifyJson({ liveUpdate: "delete" }), targetKey);
           }
           if (update.updateType === "edit" && typeof update.metadata?.body === "string") {
-            applyEdit.run(update.metadata.body, update.sourceMessageKey);
+            applyEdit.run(update.metadata.body, targetKey);
           }
           applied += 1;
         } else {
@@ -1135,6 +1263,55 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     return { applied, pending };
   }
 
+  async listPendingLiveMessageUpdates(limit = 500): Promise<LiveMessageUpdateRecord[]> {
+    const rows = this.db
+      .prepare(
+        `SELECT event_key, chat_source_id, source_message_key, update_type, occurred_at_ms, applied, metadata_json
+         FROM live_message_updates
+         WHERE applied = 0
+         ORDER BY updated_at ASC
+         LIMIT ?`
+      )
+      .all(Math.max(1, limit)) as Array<{
+      event_key: string;
+      chat_source_id: string;
+      source_message_key: string;
+      update_type: LiveMessageUpdateRecord["updateType"];
+      occurred_at_ms: number | null;
+      applied: number;
+      metadata_json: string | null;
+    }>;
+    return rows.map((row) => ({
+      eventKey: row.event_key,
+      chatSourceId: row.chat_source_id,
+      sourceMessageKey: row.source_message_key,
+      updateType: row.update_type,
+      occurredAtMs: row.occurred_at_ms == null ? null : Number(row.occurred_at_ms),
+      applied: Boolean(row.applied),
+      metadata: (parseJson(row.metadata_json) as Record<string, unknown> | null) ?? null
+    }));
+  }
+
+  async reconcileLiveState(): Promise<{ staleSessions: number; staleRuns: number }> {
+    const now = currentIso();
+    const sessions = this.db
+      .prepare(
+        `UPDATE live_sessions
+         SET status = 'stopped', last_error = NULL, updated_at = ?
+         WHERE status IN ('connected','pairing')`
+      )
+      .run(now);
+    const runs = this.db
+      .prepare(
+        `UPDATE live_sync_runs
+         SET status = 'failed', finished_at = ?, error_code = 'INTERRUPTED_BY_RESTART',
+             error_message = 'Live sync run was interrupted by a process restart.'
+         WHERE status = 'running'`
+      )
+      .run(now);
+    return { staleSessions: sessions.changes, staleRuns: runs.changes };
+  }
+
   async getLiveStatus(): Promise<LiveMaintainerStatusSummary> {
     const sessionRow = this.db
       .prepare(`SELECT * FROM live_sessions ORDER BY updated_at DESC LIMIT 1`)
@@ -1143,6 +1320,15 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       .prepare(`SELECT * FROM live_sync_runs WHERE status = 'running' ORDER BY started_at DESC LIMIT 1`)
       .get() as SqliteLiveRunRow | undefined;
     const openGaps = await this.listLiveGaps(["open", "retrying", "uncertain", "needs_user_action"]);
+    const gapGroupRows = this.db
+      .prepare(
+        `SELECT status, reason, COUNT(*) AS count
+         FROM live_gap_windows
+         WHERE status IN ('open','retrying','uncertain','needs_user_action')
+         GROUP BY status, reason
+         ORDER BY count DESC`
+      )
+      .all() as Array<{ status: LiveGapStatus; reason: LiveGapReason; count: number }>;
     const healthRows = this.db
       .prepare(
         `SELECT c.chat_source_id, chats.display_name, c.health, c.latest_archived_at_ms, c.latest_live_at_ms,
@@ -1163,6 +1349,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       currentRun: currentRunRow ? rowToLiveRun(currentRunRow) : null,
       totals: currentRunRow ? totalsOrEmptyLive(parseJson(currentRunRow.totals_json) as LiveSyncTotals | null) : emptyLiveTotals(),
       openGapCount: openGaps.length,
+      gapGroups: gapGroupRows.map((row) => ({ status: row.status, reason: row.reason, count: Number(row.count) })),
       chatHealth: healthRows.map((row) => ({
         chatSourceId: row.chat_source_id,
         chatDisplayName: row.display_name ?? null,
@@ -1248,15 +1435,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         SELECT 1
         FROM messages visible_messages
         WHERE visible_messages.chat_id = chats.id
-          AND visible_messages.message_type NOT IN ('system', 'status')
-          AND (
-            visible_messages.direction IN ('incoming', 'outgoing')
-            OR NULLIF(TRIM(COALESCE(visible_messages.body, '')), '') IS NOT NULL
-            OR NULLIF(TRIM(COALESCE(visible_messages.caption, '')), '') IS NOT NULL
-            OR visible_messages.has_media = 1
-            OR visible_messages.is_deleted = 1
-            OR visible_messages.message_type = 'call'
-          )
+          AND ${visibleExchangePredicate("visible_messages")}
       )`);
     }
     params.push(options.limit, options.offset);
@@ -1833,7 +2012,43 @@ function configureDatabase(db: Database.Database): void {
 }
 
 function ensureSchema(db: Database.Database): void {
+  migrateLiveSessionStatuses(db);
   db.exec(schemaStatements.join(";\n"));
+  migrateAdditiveColumns(db);
+}
+
+function migrateAdditiveColumns(db: Database.Database): void {
+  const additions: Array<{ table: string; column: string; ddl: string }> = [
+    { table: "chats", column: "platform_recency_ms", ddl: "ALTER TABLE chats ADD COLUMN platform_recency_ms INTEGER NULL" }
+  ];
+  for (const addition of additions) {
+    const columns = db.prepare(`SELECT name FROM pragma_table_info(?)`).all(addition.table) as Array<{ name: string }>;
+    if (!columns.some((column) => column.name === addition.column)) {
+      db.exec(addition.ddl);
+    }
+  }
+}
+
+// SQLite cannot alter CHECK constraints in place; rebuild live_sessions when an
+// older archive lacks a status value the app now uses.
+function migrateLiveSessionStatuses(db: Database.Database): void {
+  const existing = db
+    .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'live_sessions'`)
+    .get() as { sql: string } | undefined;
+  if (!existing?.sql || LIVE_SESSION_STATUSES.every((status) => existing.sql.includes(`'${status}'`))) {
+    return;
+  }
+  db.transaction(() => {
+    db.exec(liveSessionsTableDdl("live_sessions_migrated"));
+    db.exec(
+      `INSERT INTO live_sessions_migrated
+       (id, status, client_name, linked_device_jid, last_connected_at, last_disconnected_at, last_error, created_at, updated_at)
+       SELECT id, status, client_name, linked_device_jid, last_connected_at, last_disconnected_at, last_error, created_at, updated_at
+       FROM live_sessions`
+    );
+    db.exec(`DROP TABLE live_sessions`);
+    db.exec(`ALTER TABLE live_sessions_migrated RENAME TO live_sessions`);
+  })();
 }
 
 function isSchemaPresent(db: Database.Database): boolean {
@@ -2101,9 +2316,24 @@ function emptyStatus(initialized: boolean, error?: string): StatusSummary {
   };
 }
 
+// A "visible exchange" is a message a user would recognize as conversation:
+// used both to hide event-only chats and to compute WhatsApp-style recency.
+function visibleExchangePredicate(alias: string): string {
+  return `${alias}.message_type NOT IN ('system', 'status', 'reaction')
+          AND (
+            ${alias}.direction IN ('incoming', 'outgoing')
+            OR NULLIF(TRIM(COALESCE(${alias}.body, '')), '') IS NOT NULL
+            OR NULLIF(TRIM(COALESCE(${alias}.caption, '')), '') IS NOT NULL
+            OR ${alias}.has_media = 1
+            OR ${alias}.is_deleted = 1
+            OR ${alias}.message_type = 'call'
+          )`;
+}
+
 function currentIso(): string {
   return new Date().toISOString();
 }
+
 
 function isoFromMs(ms: number | null | undefined): string | null {
   return typeof ms === "number" && Number.isFinite(ms) ? new Date(ms).toISOString() : null;

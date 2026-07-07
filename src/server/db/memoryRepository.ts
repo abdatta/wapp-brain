@@ -6,6 +6,7 @@ import type {
   ChatListItem,
   ChatListOptions,
   ChatRecord,
+  ChatSyncStateRecord,
   ContactRecord,
   ImportRunSummary,
   ImportTotals,
@@ -32,10 +33,12 @@ import type {
   MessageListItem,
   MessageRecord,
   ParticipantRecord,
+  RecoveryAnchorRecord,
   StatusSummary
 } from "../../shared/types";
 import { config } from "../config";
 import { baselineFromStatus } from "../live/baseline";
+import { liveKeyMessageId } from "../live/normalize";
 import { getMemoryProviderStatus } from "../memory/provider";
 
 export class MemoryArchiveRepository implements ArchiveRepository {
@@ -189,6 +192,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
         ...chat,
         displayName: chat.displayName || existing?.displayName || chat.jid,
         chatType: chat.chatType === "unknown" && existing ? existing.chatType : chat.chatType,
+        platformRecencyMs: maxNullableMs(existing?.platformRecencyMs ?? null, chat.platformRecencyMs ?? null),
         id: existing?.id ?? this.nextChatId++,
         messageCount: existing?.messageCount ?? 0,
         participantCount: existing?.participantCount ?? 0,
@@ -217,12 +221,18 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     return messages.length;
   }
 
-  async refreshChatStats(): Promise<void> {
+  async refreshChatStats(chatSourceIds?: string[]): Promise<void> {
+    const scope = chatSourceIds ? new Set(chatSourceIds) : null;
     for (const chat of this.chats.values()) {
+      if (scope && !scope.has(chat.sourceChatId)) {
+        continue;
+      }
       const messages = [...this.messages.values()].filter((message) => message.chatSourceId === chat.sourceChatId);
       chat.messageCount = messages.length;
       chat.participantCount = [...this.participants.values()].filter((participant) => participant.chatSourceId === chat.sourceChatId).length;
+      // WhatsApp-style recency: only visible conversation messages move a chat.
       const last = messages
+        .filter(isVisibleExchange)
         .map((message) => message.timestampMs ?? 0)
         .filter(Boolean)
         .sort((a, b) => b - a)[0];
@@ -320,8 +330,47 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     this.liveCheckpoints.set(checkpoint.chatSourceId, { ...checkpoint });
   }
 
-  async listLiveCheckpoints(): Promise<LiveChatCheckpointRecord[]> {
-    return [...this.liveCheckpoints.values()];
+  async listLiveCheckpoints(chatSourceIds?: string[]): Promise<LiveChatCheckpointRecord[]> {
+    const scope = chatSourceIds ? new Set(chatSourceIds) : null;
+    return [...this.liveCheckpoints.values()].filter((checkpoint) => !scope || scope.has(checkpoint.chatSourceId));
+  }
+
+  async listChatSyncStates(chatSourceIds?: string[]): Promise<ChatSyncStateRecord[]> {
+    const scope = chatSourceIds ? new Set(chatSourceIds) : null;
+    return [...this.chats.values()]
+      .filter((chat) => !scope || scope.has(chat.sourceChatId))
+      .map((chat) => {
+        const messages = [...this.messages.values()]
+          .filter((message) => message.chatSourceId === chat.sourceChatId && message.timestampMs != null)
+          .sort((a, b) => (a.timestampMs ?? 0) - (b.timestampMs ?? 0));
+        const earliest = messages[0] ?? null;
+        const latest = messages[messages.length - 1] ?? null;
+        return {
+          chatSourceId: chat.sourceChatId,
+          latestArchivedAtMs: latest?.timestampMs ?? null,
+          latestArchivedMessageId: latest?.sourceMessageId ?? null,
+          earliestArchivedAtMs: earliest?.timestampMs ?? null,
+          earliestArchivedMessageId: earliest?.sourceMessageId ?? null,
+          platformRecencyMs: chat.platformRecencyMs ?? null
+        };
+      });
+  }
+
+  async getRecoveryAnchor(chatSourceId: string, afterMs: number | null): Promise<RecoveryAnchorRecord | null> {
+    const candidates = [...this.messages.values()]
+      .filter((message) => message.chatSourceId === chatSourceId && message.timestampMs != null)
+      .filter((message) => afterMs == null || (message.timestampMs ?? 0) > afterMs)
+      .sort((a, b) => (a.timestampMs ?? 0) - (b.timestampMs ?? 0));
+    const anchor = candidates[0];
+    if (!anchor) {
+      return null;
+    }
+    return {
+      sourceMessageId: anchor.sourceMessageId,
+      timestampMs: anchor.timestampMs ?? 0,
+      fromMe: anchor.fromMe,
+      senderSourceJid: anchor.senderSourceJid ?? null
+    };
   }
 
   async upsertLiveGap(gap: LiveGapWindowRecord): Promise<number> {
@@ -362,7 +411,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     let applied = 0;
     let pending = 0;
     for (const update of updates) {
-      const message = this.messages.get(update.sourceMessageKey);
+      const message = this.messages.get(update.sourceMessageKey) ?? this.findUpdateTarget(update);
       if (message) {
         if (update.updateType === "delete") {
           message.isDeleted = true;
@@ -371,14 +420,50 @@ export class MemoryArchiveRepository implements ArchiveRepository {
         }
         if (update.updateType === "edit" && typeof update.metadata?.body === "string") {
           message.body = update.metadata.body;
+          message.rawMetadata = { ...(message.rawMetadata ?? {}), edited: 1 };
         }
         applied += 1;
       } else {
         pending += 1;
       }
-      this.liveUpdates.set(update.eventKey, { ...update, applied: Boolean(message) });
+      const existing = this.liveUpdates.get(update.eventKey);
+      this.liveUpdates.set(update.eventKey, { ...update, applied: Boolean(message) || Boolean(existing?.applied) });
     }
     return { applied, pending };
+  }
+
+  async listPendingLiveMessageUpdates(limit = 500): Promise<LiveMessageUpdateRecord[]> {
+    return [...this.liveUpdates.values()].filter((update) => !update.applied).slice(0, Math.max(1, limit));
+  }
+
+  private findUpdateTarget(update: Omit<LiveMessageUpdateRecord, "applied">): (MessageRecord & { id: number }) | undefined {
+    const messageId = liveKeyMessageId(update.sourceMessageKey);
+    if (!messageId) {
+      return undefined;
+    }
+    return [...this.messages.values()].find(
+      (message) => message.chatSourceId === update.chatSourceId && message.sourceMessageId === messageId
+    );
+  }
+
+  async reconcileLiveState(): Promise<{ staleSessions: number; staleRuns: number }> {
+    let staleSessions = 0;
+    let staleRuns = 0;
+    if (this.liveSession && (this.liveSession.status === "connected" || this.liveSession.status === "pairing")) {
+      this.liveSession.status = "stopped";
+      this.liveSession.lastError = null;
+      this.liveSession.updatedAt = new Date().toISOString();
+      staleSessions += 1;
+    }
+    for (const run of this.liveRuns.values()) {
+      if (run.status === "running") {
+        run.status = "failed";
+        run.finishedAt = new Date().toISOString();
+        run.errorMessage = "Live sync run was interrupted by a process restart.";
+        staleRuns += 1;
+      }
+    }
+    return { staleSessions, staleRuns };
   }
 
   async getLiveStatus(): Promise<LiveMaintainerStatusSummary> {
@@ -391,6 +476,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       currentRun,
       totals: currentRun?.totals ?? emptyLiveTotals(),
       openGapCount: openGaps.length,
+      gapGroups: groupGaps(openGaps),
       chatHealth: [...this.liveCheckpoints.values()].map((checkpoint) => {
         const chat = this.chats.get(checkpoint.chatSourceId);
         const chatOpenGaps = openGaps.filter((gap) => gap.chatSourceId === checkpoint.chatSourceId);
@@ -749,8 +835,25 @@ function cloneMap<K, V>(map: Map<K, V>): Map<K, V> {
   return new Map(structuredClone([...map]));
 }
 
+function maxNullableMs(left: number | null, right: number | null): number | null {
+  if (left == null) return right;
+  if (right == null) return left;
+  return Math.max(left, right);
+}
+
+function groupGaps(gaps: LiveGapWindowRecord[]): Array<{ status: LiveGapStatus; reason: LiveGapWindowRecord["reason"]; count: number }> {
+  const groups = new Map<string, { status: LiveGapStatus; reason: LiveGapWindowRecord["reason"]; count: number }>();
+  for (const gap of gaps) {
+    const key = `${gap.status} ${gap.reason}`;
+    const group = groups.get(key) ?? { status: gap.status, reason: gap.reason, count: 0 };
+    group.count += 1;
+    groups.set(key, group);
+  }
+  return [...groups.values()].sort((a, b) => b.count - a.count);
+}
+
 function isVisibleExchange(message: MessageRecord): boolean {
-  if (message.messageType === "system" || message.messageType === "status") {
+  if (message.messageType === "system" || message.messageType === "status" || message.messageType === "reaction") {
     return false;
   }
   return (

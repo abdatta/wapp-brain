@@ -4,7 +4,7 @@ export type ImportRunStatus = "running" | "completed" | "failed";
 export type ImportMode = "merge" | "replace";
 export type ImportStagingFileKind = "msgstore" | "wa" | "media" | "key";
 export type ImportJobStatus = "queued" | "running" | "cancelling" | "completed" | "failed" | "cancelled";
-export type LiveConnectionState = "not_configured" | "pairing" | "connected" | "disconnected" | "stopped" | "error";
+export type LiveConnectionState = "not_configured" | "pairing" | "connected" | "disconnected" | "stopped" | "error" | "logged_out";
 export type LiveHealthState = "healthy" | "catching_up" | "uncertain" | "disconnected" | "needs_user_action";
 export type LiveGapStatus = "open" | "retrying" | "closed" | "uncertain" | "needs_user_action";
 export type LiveGapReason = "late_start" | "disconnect" | "watermark_mismatch" | "history_sync_stalled" | "manual_retry";
@@ -21,9 +21,10 @@ export type GuidedSetupState =
   | "syncing"
   | "paused"
   | "disconnected"
+  | "logged_out"
   | "needs_attention";
 
-export type GuidedSetupPrimaryAction = "import_backup" | "link_whatsapp" | "monitor_sync" | "resume_sync" | "reconnect" | "review_gaps";
+export type GuidedSetupPrimaryAction = "import_backup" | "link_whatsapp" | "monitor_sync" | "resume_sync" | "reconnect" | "repair_link" | "review_gaps";
 
 export interface StatusSummary {
   database: {
@@ -104,7 +105,24 @@ export interface ChatRecord {
   jid: string;
   displayName?: string | null;
   chatType: ChatType;
+  platformRecencyMs?: number | null;
   rawMetadata?: Record<string, unknown> | null;
+}
+
+export interface ChatSyncStateRecord {
+  chatSourceId: string;
+  latestArchivedAtMs: number | null;
+  latestArchivedMessageId: string | null;
+  earliestArchivedAtMs: number | null;
+  earliestArchivedMessageId: string | null;
+  platformRecencyMs: number | null;
+}
+
+export interface RecoveryAnchorRecord {
+  sourceMessageId: string;
+  timestampMs: number;
+  fromMe: boolean | null;
+  senderSourceJid: string | null;
 }
 
 export interface ParticipantRecord {
@@ -444,7 +462,7 @@ export interface ImportJobSummary {
 }
 
 export interface LivePairingSummary {
-  state: "idle" | "starting" | "pairing" | "connected" | "disconnected" | "stopped" | "error";
+  state: "idle" | "starting" | "pairing" | "connected" | "disconnected" | "stopped" | "error" | "logged_out";
   qrDataUrl: string | null;
   pairingCode: string | null;
   startedAt: string | null;
@@ -460,7 +478,14 @@ export interface LiveMaintainerStatusSummary {
   currentRun: LiveSyncRunSummary | null;
   totals: LiveSyncTotals;
   openGapCount: number;
+  gapGroups: LiveGapGroupSummary[];
   chatHealth: LiveChatHealthSummary[];
+}
+
+export interface LiveGapGroupSummary {
+  status: LiveGapStatus;
+  reason: LiveGapReason;
+  count: number;
 }
 
 export interface LiveBaselineSummary {

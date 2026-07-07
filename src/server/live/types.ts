@@ -20,6 +20,8 @@ export interface LiveMaintainerOptions {
   maxConcurrentChatBackfills: number;
   minBackfillDelayMs: number;
   maxGapRetries: number;
+  recoveryIntervalMs?: number;
+  auditSettleMs?: number;
 }
 
 export interface LiveConnectionUpdate {
@@ -40,7 +42,11 @@ export interface LiveMessageEvent {
     | "chats.upsert"
     | "chats.update"
     | "messages.update"
+    | "messages.delete"
+    | "messages.reaction"
     | "message-receipt.update"
+    | "groups.update"
+    | "group-participants.update"
     | "call";
   mode: "notify" | "append" | "history" | "update";
   occurredAtMs?: number | null;

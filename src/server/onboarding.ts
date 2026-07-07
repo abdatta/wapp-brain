@@ -13,7 +13,10 @@ export function deriveGuidedSetup(status: StatusSummary): GuidedSetupSummary {
   const sessionStatus = live?.session?.status ?? "not_configured";
   const hasArchiveMessages = status.counts.messages > 0;
   const hasImport = Boolean(status.latestImport);
-  const hasOpenGaps = Boolean(live?.openGapCount);
+  // Only actionable gaps drive attention; grouped uncertainty is informational.
+  const actionableGapCount = live?.gapGroups
+    ? live.gapGroups.filter((group) => group.status !== "uncertain").reduce((sum, group) => sum + group.count, 0)
+    : live?.openGapCount ?? 0;
 
   if (!hasArchiveMessages || !hasImport || baseline?.status === "missing_archive" || baseline?.status === "missing_messages") {
     return summary({
@@ -27,7 +30,23 @@ export function deriveGuidedSetup(status: StatusSummary): GuidedSetupSummary {
     });
   }
 
-  if (baseline && !baseline.ready && baseline.status === "too_old") {
+  if (sessionStatus === "logged_out") {
+    return summary({
+      state: "logged_out",
+      label: "Re-pair WhatsApp",
+      description: "WhatsApp unlinked this device. Your archive is intact; re-pair from Linked devices to resume live sync.",
+      primaryAction: "repair_link",
+      phase: "live",
+      canImport: true,
+      canLink: true,
+      canUnlink: true,
+      blockingReason: live?.session?.lastError ?? "The linked device was logged out remotely."
+    });
+  }
+
+  // A stale baseline blocks first-time linking only; an existing paired session
+  // resumes and represents long downtime as honest gaps instead.
+  if (baseline && !baseline.ready && baseline.status === "too_old" && sessionStatus === "not_configured") {
     return summary({
       state: "baseline_too_old",
       label: "Import a fresher backup",
@@ -39,21 +58,9 @@ export function deriveGuidedSetup(status: StatusSummary): GuidedSetupSummary {
     });
   }
 
-  if (hasOpenGaps) {
-    return summary({
-      state: "needs_attention",
-      label: "Review live sync gaps",
-      description: "Live sync is connected, but some chats still need recovery or a retry.",
-      primaryAction: "review_gaps",
-      phase: "live",
-      canImport: true,
-      canPause: sessionStatus === "connected",
-      canResume: sessionStatus === "stopped",
-      canUnlink: sessionStatus !== "not_configured",
-      blockingReason: `${live?.openGapCount ?? 0} live gap${live?.openGapCount === 1 ? "" : "s"} need attention.`
-    });
-  }
-
+  // Connection state always outranks gap review: a disconnected or pairing
+  // session is the thing the user must fix first, and gap counts must never
+  // mask it.
   if (sessionStatus === "pairing") {
     return summary({
       state: "linking",
@@ -64,6 +71,34 @@ export function deriveGuidedSetup(status: StatusSummary): GuidedSetupSummary {
       canImport: true,
       canLink: true,
       canUnlink: true
+    });
+  }
+
+  if (sessionStatus === "disconnected" || sessionStatus === "error") {
+    return summary({
+      state: "disconnected",
+      label: "Reconnect live sync",
+      description: live?.session?.lastError ?? "The linked live session is disconnected.",
+      primaryAction: "reconnect",
+      phase: "live",
+      canImport: true,
+      canLink: true,
+      canUnlink: true,
+      blockingReason: live?.session?.lastError ?? null
+    });
+  }
+
+  if (sessionStatus === "connected" && actionableGapCount > 0) {
+    return summary({
+      state: "needs_attention",
+      label: "Review live sync gaps",
+      description: "Live sync is connected, but some chats still need recovery or a retry.",
+      primaryAction: "review_gaps",
+      phase: "live",
+      canImport: true,
+      canPause: true,
+      canUnlink: true,
+      blockingReason: `${actionableGapCount} live gap${actionableGapCount === 1 ? "" : "s"} need attention.`
     });
   }
 
@@ -93,20 +128,6 @@ export function deriveGuidedSetup(status: StatusSummary): GuidedSetupSummary {
     });
   }
 
-  if (sessionStatus === "disconnected" || sessionStatus === "error") {
-    return summary({
-      state: "disconnected",
-      label: "Reconnect live sync",
-      description: live?.session?.lastError ?? "The linked live session is disconnected.",
-      primaryAction: "reconnect",
-      phase: "live",
-      canImport: true,
-      canLink: true,
-      canUnlink: true,
-      blockingReason: live?.session?.lastError ?? null
-    });
-  }
-
   return summary({
     state: "baseline_ready_unlinked",
     label: "Link WhatsApp live sync",
@@ -131,8 +152,13 @@ function summary(overrides: Partial<GuidedSetupSummary> & Pick<GuidedSetupSummar
 }
 
 export function activeLiveState(live: LiveMaintainerStatusSummary | null | undefined): "healthy" | "attention" | "blocked" | "idle" {
-  if (!live?.baseline.ready) return "blocked";
-  if (live.openGapCount > 0) return "attention";
-  if (live.session?.status === "connected") return "healthy";
+  const sessionStatus = live?.session?.status ?? "not_configured";
+  if (sessionStatus === "logged_out") return "attention";
+  if (!live?.baseline.ready && sessionStatus === "not_configured") return "blocked";
+  const actionableGaps = live?.gapGroups
+    ? live.gapGroups.filter((group) => group.status !== "uncertain").reduce((sum, group) => sum + group.count, 0)
+    : live?.openGapCount ?? 0;
+  if (actionableGaps > 0) return "attention";
+  if (sessionStatus === "connected") return "healthy";
   return "idle";
 }

@@ -13,10 +13,19 @@ Keep entries behavior-focused:
 
 | Item | Type | Status | Area |
 | --- | --- | --- | --- |
-| [Media Folder Import Reliability](./media-folder-import-reliability.md) | Bug / design follow-up | Needs investigation | Import |
-| [wa.db Contact Enrichment Not Reflected](./wa-db-contact-enrichment-not-reflected.md) | Bug | Needs reproduction | Import / contacts |
-| [Deleted Messages Not Marked On Originals](./deleted-messages-not-marked-on-originals.md) | Bug | Needs investigation | Message state |
-| [Inbox Sorting Includes System Updates](./inbox-sorting-includes-system-updates.md) | Bug / behavior alignment | Needs specification | Chat list |
-| [Live Sync Gap Count For Older Chats](./live-sync-gap-count-for-older-chats.md) | Investigation | Needs diagnosis | Live maintainer |
+| [Contact And Group Identity Integrity](./contact-and-group-identity-integrity.md) | Feature / bug cluster | Ready to propose | Contacts / identity |
+| [Autonomous Laptop Operation](./autonomous-laptop-operation.md) | Feature | Ready to propose | Lifecycle / alerting |
+| [Archive Full-Text And Semantic Search](./archive-full-text-and-semantic-search.md) | Feature | Needs specification | Search / retrieval |
+| [Self-Updating Memory Schedule](./self-updating-memory-schedule.md) | Feature | Needs specification | Second brain |
+| [Thread View Signal Vs Noise](./thread-view-signal-vs-noise.md) | Feature / behavior alignment | Needs specification | Thread view |
 | [MCP Chat Reader Server](./mcp-chat-reader-server.md) | Feature | Idea | AI access |
+| [Media Folder Import Reliability](./media-folder-import-reliability.md) | Bug / design follow-up | Needs investigation | Import |
 
+## Graduated / Absorbed
+
+| Former item | Where it went |
+| --- | --- |
+| Deleted Messages Not Marked On Originals | Absorbed by change `make-live-sync-trustworthy` (delete tombstone requirements) |
+| Live Sync Gap Count For Older Chats | Absorbed by change `make-live-sync-trustworthy` (evidence-based auditing, grouped uncertainty) |
+| wa.db Contact Enrichment Not Reflected | Folded into [Contact And Group Identity Integrity](./contact-and-group-identity-integrity.md) |
+| Inbox Sorting Includes System Updates | Implemented in change `make-live-sync-trustworthy` (WhatsApp-style conversation recency ordering) |

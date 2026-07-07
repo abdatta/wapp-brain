@@ -20,7 +20,9 @@ import {
   startImportJob,
   verifyImportKey
 } from "./import/staging";
-import { assertLiveBaselineReady } from "./live/baseline";
+import { closeLegacyWallClockGaps } from "./live/auditor";
+import { assertLiveBaselineExists } from "./live/baseline";
+import { ensureUsableLiveCreds } from "./live/baileysClient";
 import { liveOptionsFromConfig } from "./live/maintainer";
 import { LiveMaintainer } from "./live/maintainer";
 import { queryMemory, resolveMemoryCitation, runMemoryConsolidation, validateMemoryStore } from "./memory/consolidation";
@@ -117,7 +119,7 @@ app.post("/api/live/stop", async (_req, res) => {
 
 app.post("/api/live/link", async (req, res) => {
   try {
-    await assertLiveBaselineReady(repository, config.live.maxBackfillPerChatDays);
+    await assertLiveBaselineExists(repository, config.live.maxBackfillPerChatDays);
     const phoneNumber = typeof req.body?.phoneNumber === "string" && req.body.phoneNumber.trim() ? req.body.phoneNumber.trim() : null;
     await startLiveMaintainer(phoneNumber);
     res.json({ ok: true, pairing: livePairing, live: await repository.getLiveStatus() });
@@ -128,7 +130,8 @@ app.post("/api/live/link", async (req, res) => {
 
 app.post("/api/live/resume", async (_req, res) => {
   try {
-    await assertLiveBaselineReady(repository, config.live.maxBackfillPerChatDays);
+    // Resume never requires a fresh baseline: long downtime is represented as
+    // honest gaps/uncertainty by the evidence-based audit instead of a refusal.
     await startLiveMaintainer(null);
     res.json({ ok: true, pairing: livePairing, live: await repository.getLiveStatus() });
   } catch (error) {
@@ -437,9 +440,63 @@ if (fs.existsSync(distDir)) {
   });
 }
 
+// Correct stale connected/running state from a previous process before any
+// client can read live status, and clear pre-rewrite wall-clock gap noise even
+// when no live session can connect.
+try {
+  const reconciled = await repository.reconcileLiveState();
+  if (reconciled.staleSessions || reconciled.staleRuns) {
+    console.log(`Reconciled stale live state: ${reconciled.staleSessions} session(s), ${reconciled.staleRuns} run(s).`);
+  }
+  const legacyClosed = await closeLegacyWallClockGaps(repository);
+  if (legacyClosed) {
+    console.log(`Closed ${legacyClosed} legacy wall-clock live gap(s) superseded by evidence-based auditing.`);
+  }
+  // Recompute chat recency under the current visibility rules (fast, and keeps
+  // archives created before rule changes correctly ordered).
+  await repository.refreshChatStats();
+} catch (error) {
+  console.warn(`Live state reconciliation skipped: ${publicErrorMessage(error)}`);
+}
+
 app.listen(config.app.port, config.app.host, () => {
   console.log(`Wapp Brain listening on http://${config.app.host}:${config.app.port}`);
+  void autoResumeLiveSync();
 });
+
+async function autoResumeLiveSync(): Promise<void> {
+  if (!config.live.autoResume) {
+    return;
+  }
+  try {
+    const options = liveOptionsFromConfig();
+    if (!fs.existsSync(path.join(options.authDir, "creds.json"))) {
+      return;
+    }
+    const live = await repository.getLiveStatus();
+    const sessionStatus = live.session?.status ?? "not_configured";
+    if (sessionStatus === "not_configured" || sessionStatus === "logged_out") {
+      return;
+    }
+    // Never QR-churn in the background: if the stored credentials are corrupt
+    // or unpaired (and the backup cannot restore them), surface a re-link
+    // action instead of silently pretending to resume.
+    if (!(await ensureUsableLiveCreds(options.authDir))) {
+      await repository.upsertLiveSession({
+        id: "default",
+        status: "logged_out",
+        clientName: options.clientName,
+        lastError: "Stored linked-device credentials are missing or corrupted. Re-link WhatsApp to resume live sync."
+      });
+      console.warn("Live auto-resume skipped: stored credentials are unusable; re-link WhatsApp from the app.");
+      return;
+    }
+    console.log("Auto-resuming live WhatsApp sync from existing linked-device credentials.");
+    await startLiveMaintainer(null);
+  } catch (error) {
+    console.warn(`Live auto-resume failed: ${publicErrorMessage(error)}`);
+  }
+}
 
 function stringQuery(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
@@ -486,7 +543,15 @@ async function startLiveMaintainer(phoneNumber: string | null): Promise<void> {
   activeClient.onConnectionUpdate((update) => {
     livePairing = {
       ...livePairing,
-      state: update.state === "pairing" || update.state === "connected" || update.state === "disconnected" || update.state === "stopped" || update.state === "error" ? update.state : "pairing",
+      state:
+        update.state === "pairing" ||
+        update.state === "connected" ||
+        update.state === "disconnected" ||
+        update.state === "stopped" ||
+        update.state === "error" ||
+        update.state === "logged_out"
+          ? update.state
+          : "pairing",
       qrDataUrl: update.qrDataUrl ?? livePairing.qrDataUrl,
       pairingCode: update.pairingCode ?? livePairing.pairingCode,
       updatedAt: new Date().toISOString(),

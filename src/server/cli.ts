@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { createWriteStream, type WriteStream } from "node:fs";
+import { createWriteStream, existsSync, type WriteStream } from "node:fs";
 import { mkdir, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import { cleanupSensitiveWorkDirs } from "./cleanup";
@@ -12,7 +12,8 @@ import { inspectArchive } from "./import/inspect";
 import { runImport } from "./import/importer";
 import { createSyntheticFixture } from "./import/fixtures";
 import { BaileysLiveWhatsAppClient, runBaileysProof } from "./live/baileysClient";
-import { assertLiveBaselineReady } from "./live/baseline";
+import { closeLegacyWallClockGaps } from "./live/auditor";
+import { assertLiveBaselineExists } from "./live/baseline";
 import { LiveMaintainer, liveOptionsFromConfig } from "./live/maintainer";
 import { ImportTerminalProgress, type ImportProgressEvent } from "./import/progress";
 import { publicErrorMessage, redactForDisplay, safeBasename } from "./privacy";
@@ -140,7 +141,7 @@ async function main(): Promise<void> {
   if (command === "live-proof") {
     const repository = createArchiveRepository();
     try {
-      await assertLiveBaselineReady(repository, config.live.maxBackfillPerChatDays);
+      await assertLiveBaselineExists(repository, config.live.maxBackfillPerChatDays);
     } finally {
       await repository.close?.();
     }
@@ -225,7 +226,12 @@ async function main(): Promise<void> {
 async function runLiveStartCommand(args: Args): Promise<void> {
   const repository = createArchiveRepository();
   const options = liveOptionsFromConfig();
-  await assertLiveBaselineReady(repository, options.maxBackfillPerChatDays);
+  await repository.reconcileLiveState();
+  await closeLegacyWallClockGaps(repository);
+  // Linking needs an archive to exist; age never blocks pairing or resume.
+  if (!existsSync(path.join(options.authDir, "creds.json"))) {
+    await assertLiveBaselineExists(repository, options.maxBackfillPerChatDays);
+  }
   const client = new BaileysLiveWhatsAppClient({
     authDir: options.authDir,
     phoneNumber: stringArg(args.phone),

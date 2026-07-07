@@ -55,9 +55,12 @@ export function baselineFromStatus(status: StatusSummary, latestMessageAt: strin
   };
 }
 
-export async function assertLiveBaselineReady(repository: ArchiveRepository, maxBackfillDays: number): Promise<void> {
+// Linking requires an archive to exist so recovery has something to anchor to,
+// but a stale archive never blocks it: long downtime becomes honest gaps and
+// grouped uncertainty instead of a forced re-import.
+export async function assertLiveBaselineExists(repository: ArchiveRepository, maxBackfillDays: number): Promise<void> {
   const baseline = await getLiveBaselineSummary(repository, maxBackfillDays);
-  if (!baseline.ready) {
+  if (baseline.status === "missing_archive" || baseline.status === "missing_messages") {
     throw new Error(baseline.warning ?? "Live sync requires an imported WhatsApp archive baseline.");
   }
 }

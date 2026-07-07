@@ -1,87 +1,105 @@
 import type { ArchiveRepository } from "../db/repository";
-import type { LiveChatCheckpointRecord, LiveGapWindowRecord } from "../../shared/types";
+import type { ChatSyncStateRecord, LiveChatCheckpointRecord, LiveGapWindowRecord } from "../../shared/types";
 import type { LiveMaintainerOptions } from "./types";
 
-export interface ArchiveWatermark {
-  chatSourceId: string;
-  latestArchivedMessageKey: string | null;
-  latestArchivedAtMs: number | null;
-  earliestArchivedMessageKey: string | null;
-  earliestArchivedAtMs: number | null;
-}
+// Messages carry second-precision timestamps; treat near-equal watermarks as equal.
+export const GAP_TOLERANCE_MS = 5_000;
 
 export interface GapAuditInput {
-  watermarks: ArchiveWatermark[];
-  requiredLowerBoundAtMs: number | null;
+  trigger: "late_start" | "disconnect" | "manual";
   nowMs?: number;
-  reason?: "late_start" | "disconnect" | "watermark_mismatch" | "history_sync_stalled";
 }
 
-export async function computeArchiveWatermarks(repository: ArchiveRepository): Promise<ArchiveWatermark[]> {
-  const chats = await repository.listChats({ limit: 10000, offset: 0, includeEventOnly: true });
-  const watermarks: ArchiveWatermark[] = [];
-  for (const chat of chats) {
-    const latest = (await repository.listMessages(chat.id, { limit: 1, offset: 0, order: "desc" }))[0] ?? null;
-    const earliest = (await repository.listMessages(chat.id, { limit: 1, offset: 0, order: "asc" }))[0] ?? null;
-    watermarks.push({
-      chatSourceId: chat.sourceChatId,
-      latestArchivedMessageKey: latest?.sourceMessageId ?? null,
-      latestArchivedAtMs: latest?.timestampMs ?? null,
-      earliestArchivedMessageKey: earliest?.sourceMessageId ?? null,
-      earliestArchivedAtMs: earliest?.timestampMs ?? null
-    });
-  }
-  return watermarks;
+export interface GapAuditResult {
+  checkpoints: LiveChatCheckpointRecord[];
+  gapsOpened: number;
+  legacyGapsClosed: number;
 }
 
+// Evidence-based audit: a gap opens only when the platform reports conversation
+// activity newer than the chat's archived watermark. Quiet chats produce no
+// mismatch and therefore no gap, regardless of how long the app was offline.
 export async function auditChatGaps(
   repository: ArchiveRepository,
   input: GapAuditInput,
-  options: Pick<LiveMaintainerOptions, "maxGapRetries">
-): Promise<{ checkpoints: LiveChatCheckpointRecord[]; gapsOpened: number }> {
+  options: Pick<LiveMaintainerOptions, "maxGapRetries" | "maxBackfillPerChatDays">
+): Promise<GapAuditResult> {
+  const legacyGapsClosed = await closeLegacyWallClockGaps(repository);
   const existingGaps = await repository.listLiveGaps(["open", "retrying", "uncertain", "needs_user_action"]);
+  const openByChat = new Set(existingGaps.map((gap) => gap.chatSourceId));
+  const states = await repository.listChatSyncStates();
   const checkpoints: LiveChatCheckpointRecord[] = [];
   let gapsOpened = 0;
-  for (const watermark of input.watermarks) {
-    const openForChat = existingGaps.some((gap) => gap.chatSourceId === watermark.chatSourceId && gap.status !== "closed");
-    const hasMissingWindow =
-      input.requiredLowerBoundAtMs != null &&
-      watermark.latestArchivedAtMs != null &&
-      watermark.latestArchivedAtMs < input.requiredLowerBoundAtMs;
+  for (const state of states) {
+    const mismatch = hasWatermarkMismatch(state);
+    const openForChat = openByChat.has(state.chatSourceId);
     const checkpoint: LiveChatCheckpointRecord = {
-      chatSourceId: watermark.chatSourceId,
-      latestArchivedMessageKey: watermark.latestArchivedMessageKey,
-      latestArchivedAtMs: watermark.latestArchivedAtMs,
-      earliestArchivedMessageKey: watermark.earliestArchivedMessageKey,
-      earliestArchivedAtMs: watermark.earliestArchivedAtMs,
+      chatSourceId: state.chatSourceId,
+      latestArchivedMessageKey: state.latestArchivedMessageId,
+      latestArchivedAtMs: state.latestArchivedAtMs,
+      earliestArchivedMessageKey: state.earliestArchivedMessageId,
+      earliestArchivedAtMs: state.earliestArchivedAtMs,
       latestLiveMessageKey: null,
       latestLiveAtMs: null,
-      oldestVerifiedMessageKey: watermark.earliestArchivedMessageKey,
-      oldestVerifiedAtMs: watermark.earliestArchivedAtMs,
-      health: hasMissingWindow || openForChat ? "catching_up" : "healthy",
+      oldestVerifiedMessageKey: state.earliestArchivedMessageId,
+      oldestVerifiedAtMs: state.earliestArchivedAtMs,
+      health: mismatch || openForChat ? "catching_up" : "healthy",
       retryCount: 0,
       lastAuditAt: new Date(input.nowMs ?? Date.now()).toISOString()
     };
     await repository.upsertLiveCheckpoint(checkpoint);
     checkpoints.push(checkpoint);
-    if (hasMissingWindow && !openForChat) {
+    if (mismatch && !openForChat) {
+      const fallbackFloorMs = (state.platformRecencyMs ?? 0) - options.maxBackfillPerChatDays * 86_400_000;
       const gap: LiveGapWindowRecord = {
-        chatSourceId: watermark.chatSourceId,
-        reason: input.reason ?? "late_start",
+        chatSourceId: state.chatSourceId,
+        reason: "watermark_mismatch",
         status: "open",
-        startAtMs: watermark.latestArchivedAtMs,
-        endAtMs: input.requiredLowerBoundAtMs,
-        requiredLowerBoundAtMs: watermark.latestArchivedAtMs,
-        anchorMessageKey: watermark.latestArchivedMessageKey,
+        startAtMs: state.latestArchivedAtMs ?? fallbackFloorMs,
+        endAtMs: state.platformRecencyMs,
+        requiredLowerBoundAtMs: state.latestArchivedAtMs ?? fallbackFloorMs,
+        anchorMessageKey: null,
         requestCount: 0,
-        confidence: "medium",
-        notes: `Archive is older than required lower bound; retry limit ${options.maxGapRetries}.`
+        confidence: "high",
+        notes: `Platform activity is newer than the archive watermark (trigger: ${input.trigger}; retry limit ${options.maxGapRetries}).`
       };
       await repository.upsertLiveGap(gap);
       gapsOpened += 1;
     }
   }
-  return { checkpoints, gapsOpened };
+  return { checkpoints, gapsOpened, legacyGapsClosed };
+}
+
+function hasWatermarkMismatch(state: ChatSyncStateRecord): boolean {
+  if (state.platformRecencyMs == null) {
+    // No platform evidence is not proof of completeness, but it is also not
+    // evidence of missing data; do not open a gap.
+    return false;
+  }
+  if (state.latestArchivedAtMs == null) {
+    return true;
+  }
+  return state.platformRecencyMs > state.latestArchivedAtMs + GAP_TOLERANCE_MS;
+}
+
+// Pre-rewrite audits opened a gap per chat using the wall clock as the required
+// lower bound (required == start, reason disconnect/late_start). Close them once;
+// real mismatches reopen through the evidence-based audit above. Exported so
+// server boot can clean stale noise even when no live session can connect.
+export async function closeLegacyWallClockGaps(repository: ArchiveRepository): Promise<number> {
+  const gaps = await repository.listLiveGaps(["open", "retrying", "uncertain", "needs_user_action"]);
+  let closed = 0;
+  for (const gap of gaps) {
+    const isLegacy =
+      (gap.reason === "disconnect" || gap.reason === "late_start") &&
+      gap.requiredLowerBoundAtMs != null &&
+      gap.requiredLowerBoundAtMs === gap.startAtMs;
+    if (isLegacy && gap.id != null) {
+      await repository.updateLiveGapStatus(gap.id, "closed", "Superseded by evidence-based audit.");
+      closed += 1;
+    }
+  }
+  return closed;
 }
 
 export function auditMessageEventCheckpoint(

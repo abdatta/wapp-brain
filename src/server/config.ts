@@ -10,16 +10,18 @@ const envSchema = z.object({
   APP_HOST: z.string().default("127.0.0.1"),
   APP_PORT: z.coerce.number().int().positive().default(3600),
   WAPP_WORK_DIR: z.string().default(".wapp-brain"),
-  LIVE_WHATSAPP_ENABLED: z
+  LIVE_AUTO_RESUME: z
     .string()
     .optional()
-    .transform((value) => value === "1" || value === "true"),
+    .transform((value) => value !== "0" && value !== "false"),
   LIVE_WHATSAPP_CLIENT: z.enum(["baileys"]).default("baileys"),
   LIVE_MAX_BACKFILL_PER_CHAT_MESSAGES: z.coerce.number().int().positive().default(2000),
   LIVE_MAX_BACKFILL_PER_CHAT_DAYS: z.coerce.number().int().positive().default(14),
   LIVE_MAX_CONCURRENT_CHAT_BACKFILLS: z.coerce.number().int().positive().default(1),
   LIVE_MIN_BACKFILL_DELAY_MS: z.coerce.number().int().positive().default(3000),
   LIVE_MAX_GAP_RETRIES: z.coerce.number().int().positive().default(5),
+  LIVE_RECOVERY_INTERVAL_MS: z.coerce.number().int().positive().default(30_000),
+  LIVE_AUDIT_SETTLE_MS: z.coerce.number().int().nonnegative().default(60_000),
   WAPP_MEMORY_DIR: z.string().optional(),
   WAPP_MEMORY_PROVIDER: z.enum(["local", "codex"]).default("local"),
   WAPP_MEMORY_REMOTE_MODEL_ENABLED: z
@@ -47,7 +49,7 @@ export const config = {
     port: parsed.APP_PORT
   },
   live: {
-    enabled: Boolean(parsed.LIVE_WHATSAPP_ENABLED),
+    autoResume: Boolean(parsed.LIVE_AUTO_RESUME ?? true),
     client: parsed.LIVE_WHATSAPP_CLIENT,
     authDir: path.join(workDir, "live", "baileys-auth"),
     spikePath: path.join(workDir, "live", "baileys-spike.json"),
@@ -55,7 +57,9 @@ export const config = {
     maxBackfillPerChatDays: parsed.LIVE_MAX_BACKFILL_PER_CHAT_DAYS,
     maxConcurrentChatBackfills: parsed.LIVE_MAX_CONCURRENT_CHAT_BACKFILLS,
     minBackfillDelayMs: parsed.LIVE_MIN_BACKFILL_DELAY_MS,
-    maxGapRetries: parsed.LIVE_MAX_GAP_RETRIES
+    maxGapRetries: parsed.LIVE_MAX_GAP_RETRIES,
+    recoveryIntervalMs: parsed.LIVE_RECOVERY_INTERVAL_MS,
+    auditSettleMs: parsed.LIVE_AUDIT_SETTLE_MS
   },
   memory: {
     rootDir: memoryRootDir,

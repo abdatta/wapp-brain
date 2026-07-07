@@ -1,6 +1,7 @@
 import type {
   ChatListItem,
   ChatRecord,
+  ChatSyncStateRecord,
   ContactRecord,
   ImportTotals,
   ImportWarning,
@@ -27,6 +28,7 @@ import type {
   MessageRecord,
   ParticipantRecord,
   ChatListOptions,
+  RecoveryAnchorRecord,
   StatusSummary
 } from "../../shared/types";
 
@@ -40,21 +42,25 @@ export interface ArchiveRepository {
   upsertChats(runId: string, chats: ChatRecord[]): Promise<Map<string, number>>;
   upsertParticipants(participants: ParticipantRecord[]): Promise<number>;
   upsertMessages(messages: MessageRecord[]): Promise<number>;
-  refreshChatStats(): Promise<void>;
+  refreshChatStats(chatSourceIds?: string[]): Promise<void>;
   clearArchiveData(): Promise<void>;
   getStatus(): Promise<StatusSummary>;
   upsertLiveSession(session: Partial<LiveSessionSummary> & { id: string; status: LiveSessionSummary["status"]; clientName: string }): Promise<void>;
+  reconcileLiveState(): Promise<{ staleSessions: number; staleRuns: number }>;
   startLiveSyncRun(sourceSummary: Record<string, unknown>): Promise<string>;
   completeLiveSyncRun(runId: string, totals: LiveSyncTotals, warningCount: number): Promise<void>;
   failLiveSyncRun(runId: string, code: string, message: string, totals?: LiveSyncTotals, warningCount?: number): Promise<void>;
   upsertLiveCheckpoint(checkpoint: LiveChatCheckpointRecord): Promise<void>;
-  listLiveCheckpoints(): Promise<LiveChatCheckpointRecord[]>;
+  listLiveCheckpoints(chatSourceIds?: string[]): Promise<LiveChatCheckpointRecord[]>;
+  listChatSyncStates(chatSourceIds?: string[]): Promise<ChatSyncStateRecord[]>;
+  getRecoveryAnchor(chatSourceId: string, afterMs: number | null): Promise<RecoveryAnchorRecord | null>;
   upsertLiveGap(gap: LiveGapWindowRecord): Promise<number>;
   updateLiveGapStatus(id: number, status: LiveGapStatus, notes?: string | null): Promise<void>;
   listLiveGaps(statuses?: LiveGapStatus[]): Promise<LiveGapWindowRecord[]>;
   recordLiveEventReceipt(receipt: LiveEventReceiptRecord): Promise<void>;
   hasLiveEventReceipt(eventKey: string): Promise<boolean>;
   applyLiveMessageUpdates(updates: Array<Omit<LiveMessageUpdateRecord, "applied">>): Promise<LiveMessageUpdateResult>;
+  listPendingLiveMessageUpdates(limit?: number): Promise<LiveMessageUpdateRecord[]>;
   getLiveStatus(): Promise<LiveMaintainerStatusSummary>;
   listChats(options: ChatListOptions): Promise<ChatListItem[]>;
   listMessages(

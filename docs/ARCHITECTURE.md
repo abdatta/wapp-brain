@@ -31,15 +31,24 @@ user files/key
 Optional live maintenance flow:
 
 ```text
-explicit linked-device pairing
+server start
+  -> reconcile stale session/run state
+  -> auto-resume when linked credentials exist (LIVE_AUTO_RESUME)
   -> local WhatsApp Web protocol client
-  -> live/offline/history events
+  -> live/offline/history events + message state updates (edits/deletes/reactions)
   -> live normalizer
-  -> ArchiveRepository upserts
-  -> per-chat checkpoints and gap windows
-  -> bounded recovery planner
-  -> local API/UI health and alerts
+  -> ArchiveRepository upserts (deletes tombstone originals)
+  -> per-chat checkpoints and evidence-based gap windows
+  -> periodic bounded recovery loop (closes gaps from ingested evidence)
+  -> local API/UI health, grouped uncertainty, and re-pair alerts
 ```
+
+Live gap detection is evidence-based: a gap opens only when platform-reported
+chat recency is newer than the chat's archived watermark, and it closes only
+when covering history evidence has actually been ingested. Quiet chats never
+open gaps. Windows beyond the platform recovery horizon are reported as grouped
+uncertainty instead of per-chat alerts. A logged-out linked device stops
+reconnection and surfaces a re-pair action instead of retrying forever.
 
 Second-brain memory flow:
 

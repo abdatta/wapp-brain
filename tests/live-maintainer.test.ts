@@ -1,3 +1,4 @@
+import Database from "better-sqlite3";
 import { mkdtemp, rm } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import os from "node:os";
@@ -6,11 +7,11 @@ import { describe, expect, it } from "vitest";
 import type { ChatRecord, LiveGapWindowRecord, LiveSyncTotals, MessageRecord } from "../src/shared/types";
 import { MemoryArchiveRepository } from "../src/server/db/memoryRepository";
 import { SqliteArchiveRepository } from "../src/server/db/sqliteRepository";
-import { auditChatGaps, computeArchiveWatermarks } from "../src/server/live/auditor";
-import { assertLiveBaselineReady, getLiveBaselineSummary } from "../src/server/live/baseline";
+import { auditChatGaps } from "../src/server/live/auditor";
+import { assertLiveBaselineExists, getLiveBaselineSummary } from "../src/server/live/baseline";
 import { getLiveDependencyStatus, isSafeBaileysVersion } from "../src/server/live/dependency";
 import { LiveMaintainer } from "../src/server/live/maintainer";
-import { normalizeBaileysMessage, normalizeBaileysMessagesWithJidResolver } from "../src/server/live/normalize";
+import { liveMessageKey, normalizeBaileysMessage, normalizeBaileysMessagesWithJidResolver } from "../src/server/live/normalize";
 import { recoverDueGaps } from "../src/server/live/recovery";
 import type {
   LiveConnectionUpdate,
@@ -62,7 +63,7 @@ describe("live WhatsApp maintainer", () => {
   it("blocks live pairing until an imported archive baseline exists", async () => {
     const repository = new MemoryArchiveRepository();
 
-    await expect(assertLiveBaselineReady(repository, 14)).rejects.toThrow("Import a WhatsApp backup");
+    await expect(assertLiveBaselineExists(repository, 14)).rejects.toThrow("Import a WhatsApp backup");
 
     await seedChat(repository, "baseline@s.whatsapp.net", "Baseline", Date.now());
     const baseline = await getLiveBaselineSummary(repository, 14);
@@ -70,7 +71,7 @@ describe("live WhatsApp maintainer", () => {
     expect(baseline.ready).toBe(true);
   });
 
-  it("blocks live pairing when the archive baseline is older than the recovery window", async () => {
+  it("reports stale baselines as advisory without blocking pairing or resume", async () => {
     const repository = new MemoryArchiveRepository();
     await seedChat(repository, "old@s.whatsapp.net", "Old", Date.now() - 20 * 86_400_000);
 
@@ -78,7 +79,7 @@ describe("live WhatsApp maintainer", () => {
 
     expect(baseline.ready).toBe(false);
     expect(baseline.status).toBe("too_old");
-    await expect(assertLiveBaselineReady(repository, 14)).rejects.toThrow("older than 14 days");
+    await expect(assertLiveBaselineExists(repository, 14)).resolves.toBeUndefined();
   });
 
   it("normalizes Baileys message payloads without exposing full raw bodies in metadata", () => {
@@ -252,66 +253,555 @@ describe("live WhatsApp maintainer", () => {
     expect(updateResult.pending).toBe(1);
   });
 
-  it("detects late-start gaps per chat from archive watermarks", async () => {
+  it("opens gaps only when platform recency is newer than the archive watermark", async () => {
     const repository = new MemoryArchiveRepository();
     await seedChat(repository, "fresh@s.whatsapp.net", "Fresh", 1712095200000);
     await seedChat(repository, "stale@s.whatsapp.net", "Stale", 1712059200000);
-    const requiredLowerBoundAtMs = 1712095200000;
+    await repository.upsertChats("audit", [
+      { ...makeChat("fresh@s.whatsapp.net", "Fresh"), platformRecencyMs: 1712095200000 },
+      { ...makeChat("stale@s.whatsapp.net", "Stale"), platformRecencyMs: 1712095200000 }
+    ]);
 
-    const watermarks = await computeArchiveWatermarks(repository);
-    const result = await auditChatGaps(repository, { watermarks, requiredLowerBoundAtMs }, { maxGapRetries: 5 });
+    const result = await auditChatGaps(repository, { trigger: "late_start" }, { maxGapRetries: 5, maxBackfillPerChatDays: 14 });
     const gaps = await repository.listLiveGaps(["open"]);
     const checkpoints = await repository.listLiveCheckpoints();
 
     expect(result.gapsOpened).toBe(1);
     expect(gaps[0]?.chatSourceId).toBe("stale@s.whatsapp.net");
+    expect(gaps[0]?.reason).toBe("watermark_mismatch");
+    expect(gaps[0]?.startAtMs).toBe(1712059200000);
+    expect(gaps[0]?.endAtMs).toBe(1712095200000);
     expect(checkpoints.find((checkpoint) => checkpoint.chatSourceId === "fresh@s.whatsapp.net")?.health).toBe("healthy");
     expect(checkpoints.find((checkpoint) => checkpoint.chatSourceId === "stale@s.whatsapp.net")?.health).toBe("catching_up");
   });
 
-  it("creates disconnect recovery gaps after reconnect", async () => {
+  it("does not flag quiet chats without platform evidence of missing data", async () => {
+    const repository = new MemoryArchiveRepository();
+    await seedChat(repository, "quiet@s.whatsapp.net", "Quiet", 1712000001000);
+
+    const result = await auditChatGaps(repository, { trigger: "disconnect" }, { maxGapRetries: 5, maxBackfillPerChatDays: 14 });
+
+    expect(result.gapsOpened).toBe(0);
+    expect(await repository.listLiveGaps(["open"])).toHaveLength(0);
+  });
+
+  it("closes legacy wall-clock gaps once the evidence-based audit runs", async () => {
+    const repository = new MemoryArchiveRepository();
+    await seedChat(repository, "legacy@s.whatsapp.net", "Legacy", 1712000001000);
+    await repository.upsertLiveGap({
+      ...makeGap("legacy@s.whatsapp.net"),
+      reason: "disconnect",
+      startAtMs: 1712000001000,
+      requiredLowerBoundAtMs: 1712000001000,
+      endAtMs: 1712095200000
+    });
+
+    const result = await auditChatGaps(repository, { trigger: "late_start" }, { maxGapRetries: 5, maxBackfillPerChatDays: 14 });
+    const open = await repository.listLiveGaps(["open", "retrying", "uncertain", "needs_user_action"]);
+
+    expect(result.legacyGapsClosed).toBe(1);
+    expect(open).toHaveLength(0);
+  });
+
+  it("audits downtime on first connect without an in-process disconnect", async () => {
     const repository = new MemoryArchiveRepository();
     const client = new FakeLiveClient();
     const maintainer = new LiveMaintainer(repository, client, testOptions());
-    await seedChat(repository, "disconnect@s.whatsapp.net", "Disconnect", 1712000001000);
+    await seedChat(repository, "boot@s.whatsapp.net", "Boot", 1712000001000);
+    await repository.upsertChats("audit", [{ ...makeChat("boot@s.whatsapp.net", "Boot"), platformRecencyMs: 1712095200000 }]);
 
     await maintainer.start();
-    await client.emitConnection({ state: "disconnected" });
-    await client.emitConnection({ state: "connected" });
+    await maintainer.runRecoveryOnce();
     await maintainer.stop();
 
-    const gaps = await repository.listLiveGaps(["open"]);
+    const gaps = await repository.listLiveGaps(["open", "retrying", "uncertain", "needs_user_action"]);
 
-    expect(gaps.some((gap) => gap.reason === "disconnect" && gap.chatSourceId === "disconnect@s.whatsapp.net")).toBe(true);
+    expect(gaps.some((gap) => gap.chatSourceId === "boot@s.whatsapp.net" && gap.reason === "watermark_mismatch")).toBe(true);
   });
 
-  it("marks bounded recovery outcomes as closed, uncertain, or needs user action", async () => {
+  it("marks bounded recovery outcomes from evidence, retry budgets, and platform horizons", async () => {
     const repository = new MemoryArchiveRepository();
     const client = new FakeLiveClient();
-    await repository.upsertLiveGap({ ...makeGap("closed@s.whatsapp.net"), id: 1, requiredLowerBoundAtMs: 1000, startAtMs: 5000 });
-    await repository.upsertLiveGap({ ...makeGap("uncertain@s.whatsapp.net"), id: 2, startAtMs: 5000 });
-    await repository.upsertLiveGap({ ...makeGap("limit@s.whatsapp.net"), id: 3, requestCount: 5 });
+    const now = 1712000000000;
+    const hour = 3_600_000;
+
+    // closable: anchor exists above the floor, history returns evidence at/below it
+    await seedChat(repository, "closed@s.whatsapp.net", "Closed", now - 10 * hour);
+    await repository.upsertMessages([makeMessage("closed@s.whatsapp.net", "closed-anchor", now)]);
+    await repository.upsertLiveGap({
+      ...makeGap("closed@s.whatsapp.net"),
+      startAtMs: now - 10 * hour,
+      endAtMs: now,
+      requiredLowerBoundAtMs: now - 10 * hour
+    });
     client.historyResults.set("closed@s.whatsapp.net", {
-      status: "closed",
-      events: [makeLiveEvent("closed@s.whatsapp.net", "older", 1000)],
-      oldestReturnedAtMs: 1000,
+      status: "partial",
+      events: [makeLiveEvent("closed@s.whatsapp.net", "older", now - 10 * hour - 1000)],
       messageCount: 1
     });
-    client.historyResults.set("uncertain@s.whatsapp.net", {
-      status: "empty",
-      events: [],
-      messageCount: 0
+
+    // platform horizon: window wider than maxBackfillPerChatDays
+    await seedChat(repository, "horizon@s.whatsapp.net", "Horizon", now - 100 * 24 * hour);
+    await repository.upsertLiveGap({
+      ...makeGap("horizon@s.whatsapp.net"),
+      startAtMs: now - 100 * 24 * hour,
+      endAtMs: now,
+      requiredLowerBoundAtMs: now - 100 * 24 * hour
     });
 
-    const summary = await recoverDueGaps(repository, client, { ...testOptions(), maxConcurrentChatBackfills: 3 });
+    // retries exhausted with anchor movement since the last attempt
+    await seedChat(repository, "limit@s.whatsapp.net", "Limit", now - 10 * hour);
+    await repository.upsertMessages([makeMessage("limit@s.whatsapp.net", "limit-anchor", now)]);
+    await repository.upsertLiveGap({
+      ...makeGap("limit@s.whatsapp.net"),
+      startAtMs: now - 10 * hour,
+      endAtMs: now,
+      requiredLowerBoundAtMs: now - 10 * hour,
+      requestCount: 5,
+      anchorMessageKey: "wa-web|limit@s.whatsapp.net||0|previous-anchor"
+    });
+
+    // retries exhausted with no anchor movement at all
+    await seedChat(repository, "stalled@s.whatsapp.net", "Stalled", now - 10 * hour);
+    await repository.upsertMessages([makeMessage("stalled@s.whatsapp.net", "stalled-anchor", now)]);
+    await repository.upsertLiveGap({
+      ...makeGap("stalled@s.whatsapp.net"),
+      startAtMs: now - 10 * hour,
+      endAtMs: now,
+      requiredLowerBoundAtMs: now - 10 * hour,
+      requestCount: 5,
+      anchorMessageKey: liveMessageKey({
+        chatSourceId: "stalled@s.whatsapp.net",
+        sourceMessageId: "stalled-anchor",
+        participant: null,
+        fromMe: false
+      })
+    });
+
+    const summary = await recoverDueGaps(repository, client, { ...testOptions(), maxConcurrentChatBackfills: 4 });
     const gaps = await repository.listLiveGaps();
 
     expect(summary.closed).toBe(1);
-    expect(summary.uncertain).toBe(1);
+    expect(summary.uncertain).toBe(2);
     expect(summary.needsUserAction).toBe(1);
     expect(gaps.find((gap) => gap.chatSourceId === "closed@s.whatsapp.net")?.status).toBe("closed");
-    expect(gaps.find((gap) => gap.chatSourceId === "uncertain@s.whatsapp.net")?.status).toBe("uncertain");
+    expect(gaps.find((gap) => gap.chatSourceId === "horizon@s.whatsapp.net")?.status).toBe("uncertain");
     expect(gaps.find((gap) => gap.chatSourceId === "limit@s.whatsapp.net")?.status).toBe("needs_user_action");
+    expect(gaps.find((gap) => gap.chatSourceId === "stalled@s.whatsapp.net")?.status).toBe("uncertain");
+  });
+
+  it("runs recovery on its own schedule without user action", async () => {
+    const repository = new MemoryArchiveRepository();
+    const client = new FakeLiveClient();
+    const maintainer = new LiveMaintainer(repository, client, { ...testOptions(), recoveryIntervalMs: 1000 });
+    const now = 1712000000000;
+    await seedChat(repository, "auto@s.whatsapp.net", "Auto", now - 3_600_000);
+    await repository.upsertMessages([makeMessage("auto@s.whatsapp.net", "auto-anchor", now)]);
+    await repository.upsertLiveGap({
+      ...makeGap("auto@s.whatsapp.net"),
+      startAtMs: now - 3_600_000,
+      endAtMs: now,
+      requiredLowerBoundAtMs: now - 3_600_000
+    });
+    client.historyResults.set("auto@s.whatsapp.net", {
+      status: "partial",
+      events: [makeLiveEvent("auto@s.whatsapp.net", "auto-cover", now - 3_601_000)],
+      messageCount: 1
+    });
+
+    await maintainer.start();
+    await waitFor(async () => (await repository.listLiveGaps(["closed"])).length > 0, 5_000);
+    await maintainer.stop();
+
+    const gaps = await repository.listLiveGaps();
+
+    expect(gaps.find((gap) => gap.chatSourceId === "auto@s.whatsapp.net")?.status).toBe("closed");
+  }, 15000);
+
+  it("closes gaps when covering history evidence is ingested asynchronously", async () => {
+    const repository = new MemoryArchiveRepository();
+    const client = new FakeLiveClient();
+    const maintainer = new LiveMaintainer(repository, client, testOptions());
+    const bound = 1712000000000;
+    await seedChat(repository, "async@s.whatsapp.net", "Async", bound);
+    const gapId = await repository.upsertLiveGap({
+      ...makeGap("async@s.whatsapp.net"),
+      startAtMs: bound,
+      endAtMs: bound + 3_600_000,
+      requiredLowerBoundAtMs: bound
+    });
+
+    await maintainer.start();
+    await client.emit(makeLiveEvent("async@s.whatsapp.net", "cover", bound - 1000));
+    await maintainer.stop();
+
+    const gaps = await repository.listLiveGaps();
+
+    expect(gaps.find((gap) => gap.id === gapId)?.status).toBe("closed");
+  });
+
+  it("keeps ingesting after a poisoned event", async () => {
+    const repository = new PoisonableRepository();
+    const client = new FakeLiveClient();
+    const maintainer = new LiveMaintainer(repository, client, testOptions());
+
+    await maintainer.start();
+    await client.emit(makeLiveEvent("poison@s.whatsapp.net", "poison-1", 1712000001000));
+    await client.emit(makeLiveEvent("healthy@s.whatsapp.net", "ok-1", 1712000002000));
+    await maintainer.stop();
+
+    const status = await repository.getStatus();
+
+    expect(status.counts.messages).toBe(1);
+    expect(status.live?.session?.status).toBe("stopped");
+  });
+
+  it("reconciles stale connected sessions and running runs at startup", async () => {
+    const repository = new MemoryArchiveRepository();
+    await repository.upsertLiveSession({ id: "default", status: "connected", clientName: "baileys" });
+    await repository.startLiveSyncRun();
+
+    const result = await repository.reconcileLiveState();
+    const live = await repository.getLiveStatus();
+
+    expect(result.staleSessions).toBe(1);
+    expect(result.staleRuns).toBe(1);
+    expect(live.session?.status).toBe("stopped");
+    expect(live.currentRun).toBeNull();
+  });
+
+  it("records logged-out sessions distinctly", async () => {
+    const repository = new MemoryArchiveRepository();
+    const client = new FakeLiveClient();
+    const maintainer = new LiveMaintainer(repository, client, testOptions());
+
+    await maintainer.start();
+    await client.emitConnection({ state: "logged_out", lastError: "WhatsApp unlinked this device." });
+    const live = await repository.getLiveStatus();
+    await maintainer.stop();
+
+    expect(live.session?.status).toBe("logged_out");
+    expect(live.session?.lastError).toContain("unlinked");
+  });
+
+  it("tombstones the original message when a revoke protocol message arrives", async () => {
+    const repository = new MemoryArchiveRepository();
+    const client = new FakeLiveClient();
+    const maintainer = new LiveMaintainer(repository, client, testOptions());
+    const base = makeLiveEvent("revoke@s.whatsapp.net", "m1", 1712000001000);
+
+    const revoke = await normalizeBaileysMessagesWithJidResolver(
+      [
+        {
+          key: { remoteJid: "revoke@s.whatsapp.net", id: "REV1", fromMe: false },
+          messageTimestamp: 1712000101,
+          message: { protocolMessage: { type: 0, key: { remoteJid: "revoke@s.whatsapp.net", id: "m1", fromMe: false } } }
+        }
+      ],
+      "wa-web:messages.upsert",
+      (jid) => jid
+    );
+
+    expect(revoke.messages ?? []).toHaveLength(0);
+    expect(revoke.updates?.[0]?.updateType).toBe("delete");
+
+    await maintainer.start();
+    await client.emit(base);
+    await client.emit(revoke);
+    await maintainer.stop();
+
+    const chats = await repository.listChats({ limit: 10, offset: 0, includeEventOnly: true });
+    const messages = await repository.listMessages(chats[0].id, { limit: 10, offset: 0 });
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.isDeleted).toBe(true);
+  });
+
+  it("applies protocol edits to the original message body", async () => {
+    const repository = new MemoryArchiveRepository();
+    const client = new FakeLiveClient();
+    const maintainer = new LiveMaintainer(repository, client, testOptions());
+    const base = makeLiveEvent("edit@s.whatsapp.net", "m1", 1712000001000);
+    const edit = await normalizeBaileysMessagesWithJidResolver(
+      [
+        {
+          key: { remoteJid: "edit@s.whatsapp.net", id: "EDIT1", fromMe: false },
+          messageTimestamp: 1712000201,
+          message: {
+            protocolMessage: {
+              type: 14,
+              key: { remoteJid: "edit@s.whatsapp.net", id: "m1", fromMe: false },
+              editedMessage: { conversation: "edited text" }
+            }
+          }
+        }
+      ],
+      "wa-web:messages.upsert",
+      (jid) => jid
+    );
+
+    await maintainer.start();
+    await client.emit(base);
+    await client.emit(edit);
+    await maintainer.stop();
+
+    const chats = await repository.listChats({ limit: 10, offset: 0, includeEventOnly: true });
+    const messages = await repository.listMessages(chats[0].id, { limit: 10, offset: 0 });
+
+    expect(messages[0]?.body).toBe("edited text");
+  });
+
+  it("stores reactions as updates instead of standalone messages", async () => {
+    const repository = new MemoryArchiveRepository();
+    const client = new FakeLiveClient();
+    const maintainer = new LiveMaintainer(repository, client, testOptions());
+    const base = makeLiveEvent("react@s.whatsapp.net", "m1", 1712000001000);
+    const reaction = await normalizeBaileysMessagesWithJidResolver(
+      [
+        {
+          key: { remoteJid: "react@s.whatsapp.net", id: "REACT1", fromMe: false },
+          messageTimestamp: 1712000301,
+          message: { reactionMessage: { key: { remoteJid: "react@s.whatsapp.net", id: "m1", fromMe: false }, text: "\u{1F44D}" } }
+        }
+      ],
+      "wa-web:messages.upsert",
+      (jid) => jid
+    );
+
+    expect(reaction.messages ?? []).toHaveLength(0);
+    expect(reaction.updates?.[0]?.updateType).toBe("reaction");
+
+    await maintainer.start();
+    await client.emit(base);
+    await client.emit(reaction);
+    await maintainer.stop();
+
+    const chats = await repository.listChats({ limit: 10, offset: 0, includeEventOnly: true });
+    const messages = await repository.listMessages(chats[0].id, { limit: 10, offset: 0 });
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.messageType).toBe("text");
+  });
+
+  it("unwraps view-once and document-with-caption envelopes to real content", () => {
+    const viewOnce = normalizeBaileysMessage(
+      {
+        key: { remoteJid: "wrap@s.whatsapp.net", id: "VO1", fromMe: false },
+        messageTimestamp: 1712000001,
+        message: { viewOnceMessageV2: { message: { imageMessage: { caption: "hidden photo", mimetype: "image/jpeg" } } } }
+      },
+      "wa-web:messages.upsert"
+    );
+    const docWithCaption = normalizeBaileysMessage(
+      {
+        key: { remoteJid: "wrap@s.whatsapp.net", id: "DOC1", fromMe: false },
+        messageTimestamp: 1712000002,
+        message: { documentWithCaptionMessage: { message: { documentMessage: { caption: "the contract", fileName: "contract.pdf", mimetype: "application/pdf" } } } }
+      },
+      "wa-web:messages.upsert"
+    );
+
+    expect(viewOnce?.messageType).toBe("image");
+    expect(viewOnce?.hasMedia).toBe(true);
+    expect(viewOnce?.caption).toBe("hidden photo");
+    expect(docWithCaption?.messageType).toBe("document");
+    expect(docWithCaption?.caption).toBe("the contract");
+    expect(docWithCaption?.mediaName).toBe("contract.pdf");
+  });
+
+  it("applies revokes written from the sender's perspective to the archived original", async () => {
+    const repository = new MemoryArchiveRepository();
+    const client = new FakeLiveClient();
+    const maintainer = new LiveMaintainer(repository, client, testOptions());
+    const base = makeLiveEvent("perspective@s.whatsapp.net", "m1", 1712000001000);
+    const revoke = await normalizeBaileysMessagesWithJidResolver(
+      [
+        {
+          key: { remoteJid: "perspective@s.whatsapp.net", id: "REV9", fromMe: false },
+          messageTimestamp: 1712000101,
+          // protocol key uses the sender's perspective: fromMe=true, LID chat jid
+          message: { protocolMessage: { type: 0, key: { remoteJid: "244543240839423@lid", id: "m1", fromMe: true } } }
+        }
+      ],
+      "wa-web:messages.upsert",
+      (jid) => jid
+    );
+
+    await maintainer.start();
+    await client.emit(base);
+    await client.emit(revoke);
+    await maintainer.stop();
+
+    const chats = await repository.listChats({ limit: 10, offset: 0, includeEventOnly: true });
+    const messages = await repository.listMessages(chats[0].id, { limit: 10, offset: 0 });
+
+    expect(messages[0]?.isDeleted).toBe(true);
+  });
+
+  it("extracts edits delivered through the messages.update channel", async () => {
+    const { normalizeBaileysMessageUpdatesWithJidResolver } = await import("../src/server/live/normalize");
+    const event = await normalizeBaileysMessageUpdatesWithJidResolver(
+      [
+        {
+          key: { remoteJid: "editchan@s.whatsapp.net", id: "m1", fromMe: false },
+          update: { message: { editedMessage: { message: { conversation: "corrected text" } } }, messageTimestamp: 1712000500 }
+        }
+      ],
+      (jid) => jid
+    );
+
+    expect(event.updates).toHaveLength(1);
+    expect(event.updates?.[0]?.updateType).toBe("edit");
+    expect(event.updates?.[0]?.metadata?.body).toBe("corrected text");
+  });
+
+  it("records stub messages as system events instead of empty unknown rows", () => {
+    const stub = normalizeBaileysMessage(
+      {
+        key: { remoteJid: "12036000000000@g.us", id: "STUB1", fromMe: false, participant: "15550000001@s.whatsapp.net" },
+        messageTimestamp: 1712000001,
+        messageStubType: 27,
+        messageStubParameters: ["15550000002@s.whatsapp.net"]
+      },
+      "wa-web:messages.upsert"
+    );
+
+    expect(stub?.messageType).toBe("system");
+    expect(stub?.direction).toBe("system");
+    expect(stub?.rawMetadata?.stubType).toBe(27);
+  });
+
+  it("escapes the key delimiter so hostile message ids cannot collide", async () => {
+    const tricky = liveMessageKey({ chatSourceId: "chat@s.whatsapp.net", sourceMessageId: "id|with|pipes%", participant: null, fromMe: false });
+    const plain = liveMessageKey({ chatSourceId: "chat@s.whatsapp.net", sourceMessageId: "normal-id", participant: null, fromMe: false });
+    const { liveKeyMessageId } = await import("../src/server/live/normalize");
+
+    expect(tricky.split("|")).toHaveLength(5);
+    expect(liveKeyMessageId(tricky)).toBe("id|with|pipes%");
+    expect(plain).toBe("wa-web|chat@s.whatsapp.net||0|normal-id");
+  });
+
+  it("does not fabricate phone numbers from LID or group identifiers", async () => {
+    const event = await normalizeBaileysMessagesWithJidResolver(
+      [
+        {
+          key: { remoteJid: "244543240839423@lid", id: "LIDPHONE1", fromMe: false },
+          messageTimestamp: 1712000001,
+          pushName: "Lid Person",
+          message: { conversation: "hello" }
+        }
+      ],
+      "wa-web:messages.upsert",
+      (jid) => jid
+    );
+
+    expect(event.contacts?.[0]?.pushName).toBe("Lid Person");
+    expect(event.contacts?.[0]?.phoneNumber).toBeNull();
+  });
+
+  it("normalizes Baileys v7 group participant objects without crashing", async () => {
+    const { normalizeBaileysGroupParticipantsWithJidResolver } = await import("../src/server/live/normalize");
+    const event = await normalizeBaileysGroupParticipantsWithJidResolver(
+      {
+        id: "12036000000000@g.us",
+        action: "add",
+        participants: [
+          { id: "244543240839423@lid", phoneNumber: "15550000001@s.whatsapp.net" },
+          { id: "15550000002@s.whatsapp.net" },
+          "15550000003@s.whatsapp.net",
+          null,
+          { id: null } as never,
+          42 as never
+        ]
+      },
+      (jid) => jid,
+      1712000001000
+    );
+
+    expect(event.participants?.map((participant) => participant.sourceJid)).toEqual([
+      "15550000001@s.whatsapp.net",
+      "15550000002@s.whatsapp.net",
+      "15550000003@s.whatsapp.net"
+    ]);
+    expect(event.participants?.every((participant) => participant.chatSourceId === "12036000000000@g.us")).toBe(true);
+  });
+
+  it("sorts chats by conversation recency, ignoring system events (memory)", async () => {
+    const repository = new MemoryArchiveRepository();
+    const runId = await repository.startImportRun({ fixture: "sorting" });
+    await repository.upsertChats(runId, [makeChat("quiettext@s.whatsapp.net", "Quiet Text"), makeChat("noisyevents@s.whatsapp.net", "Noisy Events")]);
+    await repository.upsertMessages([
+      makeMessage("quiettext@s.whatsapp.net", "t1", 2000),
+      makeMessage("noisyevents@s.whatsapp.net", "t0", 1000),
+      makeSystemEvent("noisyevents@s.whatsapp.net", "e1", 9000)
+    ]);
+    await repository.refreshChatStats();
+
+    const chats = await repository.listChats({ limit: 10, offset: 0, includeEventOnly: true });
+
+    expect(chats.map((chat) => chat.sourceChatId)).toEqual(["quiettext@s.whatsapp.net", "noisyevents@s.whatsapp.net"]);
+    expect(chats[1]?.lastMessageAt).toBe(new Date(1000).toISOString());
+  });
+
+  it("sorts chats by conversation recency, ignoring system events (sqlite)", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-sorting-"));
+    let repository: SqliteArchiveRepository | null = null;
+    try {
+      repository = new SqliteArchiveRepository(path.join(tempDir, "archive.sqlite"));
+      const runId = await repository.startImportRun({ fixture: "sorting" });
+      await repository.upsertChats(runId, [makeChat("quiettext@s.whatsapp.net", "Quiet Text"), makeChat("noisyevents@s.whatsapp.net", "Noisy Events")]);
+      await repository.upsertMessages([
+        makeMessage("quiettext@s.whatsapp.net", "t1", 2000),
+        makeMessage("noisyevents@s.whatsapp.net", "t0", 1000),
+        makeSystemEvent("noisyevents@s.whatsapp.net", "e1", 9000)
+      ]);
+      await repository.refreshChatStats();
+
+      const chats = await repository.listChats({ limit: 10, offset: 0, includeEventOnly: true });
+
+      expect(chats.map((chat) => chat.sourceChatId)).toEqual(["quiettext@s.whatsapp.net", "noisyevents@s.whatsapp.net"]);
+      expect(chats[1]?.lastMessageAt).toBe(new Date(1000).toISOString());
+    } finally {
+      await repository?.close();
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("migrates older archives to accept the logged_out session status", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-live-migration-"));
+    const archivePath = path.join(tempDir, "archive.sqlite");
+    try {
+      const raw = new Database(archivePath);
+      raw.exec(
+        `CREATE TABLE live_sessions (
+          id TEXT PRIMARY KEY,
+          status TEXT NOT NULL CHECK (status IN ('not_configured','pairing','connected','disconnected','stopped','error')),
+          client_name TEXT NOT NULL,
+          linked_device_jid TEXT NULL,
+          last_connected_at TEXT NULL,
+          last_disconnected_at TEXT NULL,
+          last_error TEXT NULL,
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+          updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        )`
+      );
+      raw.prepare(`INSERT INTO live_sessions (id, status, client_name) VALUES ('default', 'stopped', 'baileys')`).run();
+      raw.close();
+
+      let repository = new SqliteArchiveRepository(archivePath);
+      await repository.upsertLiveSession({ id: "default", status: "logged_out", clientName: "baileys" });
+      let live = await repository.getLiveStatus();
+      expect(live.session?.status).toBe("logged_out");
+      await repository.close();
+
+      // Idempotent: reopening must not error or lose data.
+      repository = new SqliteArchiveRepository(archivePath);
+      live = await repository.getLiveStatus();
+      expect(live.session?.status).toBe("logged_out");
+      await repository.close();
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
   });
 
   it("serves live API status and retry/unlink controls locally", async () => {
@@ -353,8 +843,17 @@ describe("live WhatsApp maintainer", () => {
       await repository.close().catch(() => undefined);
       await rm(tempDir, { recursive: true, force: true });
     }
-  }, 20000);
+  }, 40000);
 });
+
+class PoisonableRepository extends MemoryArchiveRepository {
+  async upsertMessages(messages: MessageRecord[]): Promise<number> {
+    if (messages.some((message) => message.chatSourceId.startsWith("poison@"))) {
+      throw new Error("Synthetic poisoned event");
+    }
+    return super.upsertMessages(messages);
+  }
+}
 
 class FakeLiveClient implements LiveWhatsAppClient {
   readonly name = "baileys" as const;
@@ -399,8 +898,19 @@ class FakeLiveClient implements LiveWhatsAppClient {
   }
 }
 
+async function waitFor(condition: () => Promise<boolean>, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await condition()) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error("Timed out waiting for condition.");
+}
+
 async function waitForHttp(url: string): Promise<void> {
-  const deadline = Date.now() + 10_000;
+  const deadline = Date.now() + 25_000;
   while (Date.now() < deadline) {
     try {
       const response = await fetch(url);
@@ -471,10 +981,20 @@ function makeMessage(chatSourceId: string, id: string, timestampMs: number): Mes
   };
 }
 
+function makeSystemEvent(chatSourceId: string, id: string, timestampMs: number): MessageRecord {
+  return {
+    ...makeMessage(chatSourceId, id, timestampMs),
+    direction: "system",
+    messageType: "system",
+    rawTypeCode: "system",
+    body: null
+  };
+}
+
 function makeGap(chatSourceId: string): LiveGapWindowRecord {
   return {
     chatSourceId,
-    reason: "late_start",
+    reason: "watermark_mismatch",
     status: "open",
     startAtMs: 1000,
     endAtMs: 5000,
@@ -494,7 +1014,9 @@ function testOptions(): LiveMaintainerOptions {
     maxBackfillPerChatDays: 14,
     maxConcurrentChatBackfills: 2,
     minBackfillDelayMs: 0,
-    maxGapRetries: 5
+    maxGapRetries: 5,
+    recoveryIntervalMs: 60_000,
+    auditSettleMs: 0
   };
 }
 

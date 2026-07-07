@@ -7,8 +7,23 @@ describe("premium onboarding state", () => {
     expect(deriveGuidedSetup(status({ messages: 0 })).state).toBe("empty_archive");
   });
 
-  it("maps stale baselines to backup refresh", () => {
+  it("maps stale baselines to backup refresh only before any session exists", () => {
     expect(deriveGuidedSetup(status({ messages: 10, baselineStatus: "too_old" })).state).toBe("baseline_too_old");
+  });
+
+  it("lets a paired session resume despite a stale baseline", () => {
+    const setup = deriveGuidedSetup(status({ messages: 10, baselineStatus: "too_old", sessionStatus: "stopped" }));
+
+    expect(setup.state).toBe("paused");
+    expect(setup.primaryAction).toBe("resume_sync");
+  });
+
+  it("maps logged-out sessions to re-pair", () => {
+    const setup = deriveGuidedSetup(status({ messages: 10, baselineStatus: "ready", sessionStatus: "logged_out" }));
+
+    expect(setup.state).toBe("logged_out");
+    expect(setup.primaryAction).toBe("repair_link");
+    expect(setup.canLink).toBe(true);
   });
 
   it("maps ready unlinked baselines to link action", () => {
@@ -28,6 +43,22 @@ describe("premium onboarding state", () => {
       "needs_attention"
     );
   });
+
+  it("never lets gap counts mask a broken connection", () => {
+    expect(deriveGuidedSetup(status({ messages: 10, baselineStatus: "ready", sessionStatus: "disconnected", openGapCount: 3842 })).state).toBe(
+      "disconnected"
+    );
+    expect(deriveGuidedSetup(status({ messages: 10, baselineStatus: "ready", sessionStatus: "pairing", openGapCount: 3842 })).state).toBe("linking");
+    expect(deriveGuidedSetup(status({ messages: 10, baselineStatus: "ready", sessionStatus: "logged_out", openGapCount: 3842 })).state).toBe(
+      "logged_out"
+    );
+  });
+
+  it("treats grouped uncertainty as informational, not attention", () => {
+    const setup = deriveGuidedSetup(status({ messages: 10, baselineStatus: "ready", sessionStatus: "connected", uncertainGapCount: 500 }));
+
+    expect(setup.state).toBe("syncing");
+  });
 });
 
 function status(options: {
@@ -35,6 +66,7 @@ function status(options: {
   baselineStatus?: LiveMaintainerStatusSummary["baseline"]["status"];
   sessionStatus?: NonNullable<LiveMaintainerStatusSummary["session"]>["status"];
   openGapCount?: number;
+  uncertainGapCount?: number;
 }): StatusSummary {
   const baselineReady = options.baselineStatus === "ready";
   const latestMessageAt = new Date().toISOString();
@@ -78,7 +110,11 @@ function status(options: {
         : null,
       currentRun: null,
       totals: { contacts: 0, chats: 0, participants: 0, messages: 0, updates: 0, gapsOpened: 0, gapsClosed: 0, warnings: 0 },
-      openGapCount: options.openGapCount ?? 0,
+      openGapCount: (options.openGapCount ?? 0) + (options.uncertainGapCount ?? 0),
+      gapGroups: [
+        ...(options.openGapCount ? [{ status: "open" as const, reason: "watermark_mismatch" as const, count: options.openGapCount }] : []),
+        ...(options.uncertainGapCount ? [{ status: "uncertain" as const, reason: "watermark_mismatch" as const, count: options.uncertainGapCount }] : [])
+      ],
       chatHealth: []
     }
   };

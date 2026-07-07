@@ -43,7 +43,7 @@ export function inferChatType(jid: string | null | undefined): ChatType {
   if (jid.endsWith("@newsletter")) {
     return "community";
   }
-  if (jid.endsWith("@s.whatsapp.net") || jid.endsWith("@c.us") || jid.endsWith("@lid")) {
+  if (jid.endsWith("@s.whatsapp.net") || jid.endsWith("@c.us") || jid.endsWith("@lid") || jid.endsWith("@hosted.lid")) {
     return "dm";
   }
   return "unknown";

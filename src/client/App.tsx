@@ -144,7 +144,9 @@ export function App() {
         const selectedChatChanged = currentSelectedChat
           ? change.chatSourceIds.length === 0 || change.chatSourceIds.includes(currentSelectedChat.sourceChatId)
           : false;
-        if (currentSelectedChat && selectedChatChanged) {
+        // WhatsApp behavior: live updates follow the conversation only when the
+        // user is already at the bottom; never move them while reading history.
+        if (currentSelectedChat && selectedChatChanged && isNearBottom(messageListRef.current)) {
           setMessageOffset(0);
           setMessageHasMore(false);
           scrollActionRef.current = "bottom";
@@ -198,6 +200,11 @@ export function App() {
     if (!list || !action) {
       return;
     }
+    if (messages.length === 0) {
+      // Chat switches render an intermediate empty list; keep the pending
+      // scroll intent alive until real content exists to scroll to.
+      return;
+    }
     if (action === "bottom") {
       list.scrollTop = list.scrollHeight;
     } else {
@@ -205,7 +212,7 @@ export function App() {
       list.scrollTop += heightDelta;
     }
     scrollActionRef.current = null;
-  }, [messages.length]);
+  }, [messages]);
 
   async function refreshStatus() {
     try {
@@ -729,7 +736,16 @@ function LivePanel({
   const state = setup?.state ?? "empty_archive";
   const baselineReady = Boolean(live?.baseline.ready);
   const hasLiveSession = Boolean(live?.session && live.session.status !== "not_configured");
-  const health = live?.openGapCount ? "needs_user_action" : live?.session?.status === "connected" ? "healthy" : baselineReady ? "ready" : "disconnected";
+  const actionableGaps = gaps.filter((gap) => gap.status !== "uncertain");
+  const uncertainCount = (live?.gapGroups ?? []).filter((group) => group.status === "uncertain").reduce((sum, group) => sum + group.count, 0);
+  const health =
+    live?.session?.status === "logged_out" || actionableGaps.length
+      ? "needs_user_action"
+      : live?.session?.status === "connected"
+        ? "healthy"
+        : baselineReady
+          ? "ready"
+          : "disconnected";
   return (
     <section className={`livePanel ${livePanelOpen ? "" : "collapsed"}`}>
       <button className="panelToggle" type="button" aria-expanded={livePanelOpen} onClick={() => setLivePanelOpen((current) => !current)}>
@@ -763,9 +779,17 @@ function LivePanel({
               </span>
             </div>
           )}
-          {gaps.length > 0 && (
+          {uncertainCount > 0 && (
+            <div className="baselineNotice blocked">
+              <span>
+                {uncertainCount.toLocaleString()} chat window{uncertainCount === 1 ? "" : "s"} cannot be proven complete (platform history
+                limits). This is informational, not actionable.
+              </span>
+            </div>
+          )}
+          {actionableGaps.length > 0 && (
             <div className="gapList">
-              {gaps.slice(0, 5).map((gap) => (
+              {actionableGaps.slice(0, 5).map((gap) => (
                 <div className={`gapItem ${gap.status}`} key={gap.id ?? `${gap.chatSourceId}-${gap.startAtMs}`}>
                   <div>
                     <strong>{gap.chatSourceId}</strong>
@@ -788,10 +812,15 @@ function LivePanel({
               Import backup
             </button>
           )}
-          {(setup?.primaryAction === "link_whatsapp" || setup?.primaryAction === "reconnect") && (
-            <button className="primaryButton fullButton" onClick={onLink} disabled={Boolean(busy) || !baselineReady} type="button">
+          {(setup?.primaryAction === "link_whatsapp" || setup?.primaryAction === "reconnect" || setup?.primaryAction === "repair_link") && (
+            <button
+              className="primaryButton fullButton"
+              onClick={onLink}
+              disabled={Boolean(busy) || (setup.primaryAction === "link_whatsapp" && !baselineReady)}
+              type="button"
+            >
               <QrCode size={16} />
-              {setup.primaryAction === "reconnect" ? "Reconnect" : "Link WhatsApp"}
+              {setup.primaryAction === "reconnect" ? "Reconnect" : setup.primaryAction === "repair_link" ? "Re-pair WhatsApp" : "Link WhatsApp"}
             </button>
           )}
           {setup?.primaryAction === "resume_sync" && (
@@ -960,17 +989,20 @@ function OnboardingPanel({
 }) {
   const setup = status?.setup;
   const action = setup?.primaryAction ?? "import_backup";
+  // The sheen reads as "working" — show it only while something actually runs.
+  const processing = Boolean(busy) || Boolean(status?.memory?.activeRun);
   const primary = {
     import_backup: { label: "Import backup", icon: <Upload size={17} />, onClick: onImport },
     link_whatsapp: { label: "Link WhatsApp", icon: <QrCode size={17} />, onClick: onLink },
     monitor_sync: { label: "View live health", icon: <Signal size={17} />, onClick: onReviewGaps },
     resume_sync: { label: "Resume sync", icon: <Play size={17} />, onClick: onResume },
     reconnect: { label: "Reconnect", icon: <Link2 size={17} />, onClick: onLink },
+    repair_link: { label: "Re-pair WhatsApp", icon: <QrCode size={17} />, onClick: onLink },
     review_gaps: { label: "Review gaps", icon: <AlertTriangle size={17} />, onClick: onReviewGaps }
   }[action];
   return (
     <section className={`onboardingPanel ${setup?.state ?? "loading"}`}>
-      <div className="premiumSheen" />
+      {processing && <div className="premiumSheen" />}
       <div className="onboardingHeader">
         <span className="eyebrow">
           <Sparkles size={14} />
@@ -1714,7 +1746,12 @@ function MessageBubble({ message, isGroup }: { message: MessageListItem; isGroup
 }
 
 function isSystemEvent(message: MessageListItem): boolean {
-  return message.direction === "system" || message.messageType === "system" || message.messageType === "status";
+  return (
+    message.direction === "system" ||
+    message.messageType === "system" ||
+    message.messageType === "status" ||
+    message.messageType === "reaction"
+  );
 }
 
 function messagePlaceholder(message: MessageListItem): string {
@@ -1762,6 +1799,13 @@ function SkeletonMessages() {
       ))}
     </>
   );
+}
+
+function isNearBottom(list: HTMLDivElement | null): boolean {
+  if (!list) {
+    return true;
+  }
+  return list.scrollHeight - list.scrollTop - list.clientHeight < 160;
 }
 
 function groupMessagesByDay(messages: MessageListItem[]) {

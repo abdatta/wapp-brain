@@ -137,6 +137,16 @@ The server binds to `127.0.0.1` by default.
 
 For large chats, the viewer loads the newest message window first and displays that loaded window in chronological order. Use **Load older messages** to page back through the conversation without sending the whole chat to the browser at once.
 
+## Live Sync
+
+After a backup import, link WhatsApp as a companion device from the app UI (Live Sync panel). From then on the archive keeps itself current:
+
+- When the server starts and linked-device credentials exist, live sync resumes automatically (`LIVE_AUTO_RESUME=false` disables this).
+- Startup and reconnects audit downtime against platform-reported chat activity; only chats with real evidence of missing messages get recovery gaps, and bounded backfill runs on its own schedule until gaps close or are honestly marked uncertain.
+- Long downtime never blocks resume. Only first-time linking requires a recent backup baseline.
+- Live edits, deletes, and reactions are applied to the original archived messages; deletes show as WhatsApp-style tombstones.
+- If WhatsApp unlinks the device, the app stops reconnecting and shows a Re-pair WhatsApp action instead.
+
 ## Second-Brain Memory
 
 Memory generation is local-first. The default REM command writes Obsidian-compatible Markdown pages and citation sidecars under `.wapp-brain/memory/`:
