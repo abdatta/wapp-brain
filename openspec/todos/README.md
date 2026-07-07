@@ -13,7 +13,6 @@ Keep entries behavior-focused:
 
 | Item | Type | Status | Area |
 | --- | --- | --- | --- |
-| [Contact And Group Identity Integrity](./contact-and-group-identity-integrity.md) | Feature / bug cluster | Ready to propose | Contacts / identity |
 | [Autonomous Laptop Operation](./autonomous-laptop-operation.md) | Feature | Ready to propose | Lifecycle / alerting |
 | [Archive Full-Text And Semantic Search](./archive-full-text-and-semantic-search.md) | Feature | Needs specification | Search / retrieval |
 | [Self-Updating Memory Schedule](./self-updating-memory-schedule.md) | Feature | Needs specification | Second brain |
@@ -28,5 +27,6 @@ Keep entries behavior-focused:
 | --- | --- |
 | Deleted Messages Not Marked On Originals | Absorbed by change `make-live-sync-trustworthy` (delete tombstone requirements) |
 | Live Sync Gap Count For Older Chats | Absorbed by change `make-live-sync-trustworthy` (evidence-based auditing, grouped uncertainty) |
-| wa.db Contact Enrichment Not Reflected | Folded into [Contact And Group Identity Integrity](./contact-and-group-identity-integrity.md) |
+| wa.db Contact Enrichment Not Reflected | Folded into Contact And Group Identity Integrity |
+| Contact And Group Identity Integrity | Implemented in change `contact-and-group-identity-integrity` (archived 2026-07-07) |
 | Inbox Sorting Includes System Updates | Implemented in change `make-live-sync-trustworthy` (WhatsApp-style conversation recency ordering) |
