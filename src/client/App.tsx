@@ -1750,7 +1750,8 @@ function isSystemEvent(message: MessageListItem): boolean {
     message.direction === "system" ||
     message.messageType === "system" ||
     message.messageType === "status" ||
-    message.messageType === "reaction"
+    message.messageType === "reaction" ||
+    message.messageType === "encrypted_update"
   );
 }
 
@@ -1759,6 +1760,7 @@ function messagePlaceholder(message: MessageListItem): string {
   if (message.messageType === "call") return "Call";
   if (message.messageType === "system") return "System event";
   if (message.messageType === "status") return "Status event";
+  if (message.messageType === "encrypted_update") return "Encrypted edit of an earlier message";
   if (message.hasMedia) return `${humanizeMessageType(message.messageType)} message`;
   if (message.messageType.startsWith("unknown")) return "Unsupported message";
   return `${humanizeMessageType(message.messageType)} message`;

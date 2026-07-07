@@ -714,14 +714,49 @@ function detectMessageType(content: Record<string, unknown> | null): string {
   if (content.locationMessage || content.liveLocationMessage) return "location";
   if (content.protocolMessage) return "system";
   if (content.reactionMessage) return "reaction";
-  return `unknown_${Object.keys(content)[0] ?? "message"}`;
+  if (content.templateMessage) return "template";
+  if (content.interactiveMessage) return "interactive";
+  // Message-secrets payload (edit/event-edit) encrypted with a per-message key
+  // we do not hold; label honestly instead of "unknown".
+  if (content.secretEncryptedMessage) return "encrypted_update";
+  if (content.messageHistoryNotice) return "system";
+  // messageContextInfo is metadata that rides alongside real content; never
+  // let it name the unknown type.
+  return `unknown_${Object.keys(content).find((key) => key !== "messageContextInfo") ?? "message"}`;
 }
 
 function extractText(content: Record<string, unknown> | null): string | null {
   if (!content) return null;
   if (typeof content.conversation === "string") return content.conversation;
   const extended = content.extendedTextMessage as { text?: string } | undefined;
-  return extended?.text ?? null;
+  if (extended?.text) return extended.text;
+  const template = content.templateMessage as
+    | {
+        hydratedTemplate?: HydratedTemplateLike | null;
+        hydratedFourRowTemplate?: HydratedTemplateLike | null;
+        interactiveMessageTemplate?: InteractiveContentLike | null;
+      }
+    | undefined;
+  const hydrated = template?.hydratedTemplate ?? template?.hydratedFourRowTemplate;
+  if (hydrated) {
+    return firstNonEmpty(hydrated.hydratedContentText, hydrated.hydratedTitleText, hydrated.hydratedFooterText);
+  }
+  const interactive = (content.interactiveMessage ?? template?.interactiveMessageTemplate) as InteractiveContentLike | undefined;
+  if (interactive) {
+    return firstNonEmpty(interactive.body?.text, interactive.footer?.text);
+  }
+  return null;
+}
+
+interface InteractiveContentLike {
+  body?: { text?: string | null } | null;
+  footer?: { text?: string | null } | null;
+}
+
+interface HydratedTemplateLike {
+  hydratedContentText?: string | null;
+  hydratedTitleText?: string | null;
+  hydratedFooterText?: string | null;
 }
 
 function extractCaption(content: Record<string, unknown> | null): string | null {

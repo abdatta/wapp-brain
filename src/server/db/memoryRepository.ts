@@ -853,7 +853,12 @@ function groupGaps(gaps: LiveGapWindowRecord[]): Array<{ status: LiveGapStatus; 
 }
 
 function isVisibleExchange(message: MessageRecord): boolean {
-  if (message.messageType === "system" || message.messageType === "status" || message.messageType === "reaction") {
+  if (
+    message.messageType === "system" ||
+    message.messageType === "status" ||
+    message.messageType === "reaction" ||
+    message.messageType === "encrypted_update"
+  ) {
     return false;
   }
   return (

@@ -18,6 +18,7 @@ Keep entries behavior-focused:
 | [Archive Full-Text And Semantic Search](./archive-full-text-and-semantic-search.md) | Feature | Needs specification | Search / retrieval |
 | [Self-Updating Memory Schedule](./self-updating-memory-schedule.md) | Feature | Needs specification | Second brain |
 | [Thread View Signal Vs Noise](./thread-view-signal-vs-noise.md) | Feature / behavior alignment | Needs specification | Thread view |
+| [Interpret Unsupported Message Types](./interpret-unsupported-message-types.md) | Feature / investigation | Needs specification | Import / live message content |
 | [MCP Chat Reader Server](./mcp-chat-reader-server.md) | Feature | Idea | AI access |
 | [Media Folder Import Reliability](./media-folder-import-reliability.md) | Bug / design follow-up | Needs investigation | Import |
 

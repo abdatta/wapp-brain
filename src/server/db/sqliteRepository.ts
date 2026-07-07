@@ -2319,7 +2319,7 @@ function emptyStatus(initialized: boolean, error?: string): StatusSummary {
 // A "visible exchange" is a message a user would recognize as conversation:
 // used both to hide event-only chats and to compute WhatsApp-style recency.
 function visibleExchangePredicate(alias: string): string {
-  return `${alias}.message_type NOT IN ('system', 'status', 'reaction')
+  return `${alias}.message_type NOT IN ('system', 'status', 'reaction', 'encrypted_update')
           AND (
             ${alias}.direction IN ('incoming', 'outgoing')
             OR NULLIF(TRIM(COALESCE(${alias}.body, '')), '') IS NOT NULL

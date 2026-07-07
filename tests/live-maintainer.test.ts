@@ -655,6 +655,48 @@ describe("live WhatsApp maintainer", () => {
     expect(event.updates?.[0]?.metadata?.body).toBe("corrected text");
   });
 
+  it("extracts business template text and labels interactive and secret-encrypted content honestly", () => {
+    const template = normalizeBaileysMessage(
+      {
+        key: { remoteJid: "biz@s.whatsapp.net", id: "TPL1", fromMe: false },
+        messageTimestamp: 1712000001,
+        message: { templateMessage: { hydratedTemplate: { hydratedContentText: "Your order has shipped", hydratedTitleText: "Order update" } } }
+      },
+      "wa-web:messages.upsert"
+    );
+    const secret = normalizeBaileysMessage(
+      {
+        key: { remoteJid: "dm@s.whatsapp.net", id: "SEC1", fromMe: false },
+        messageTimestamp: 1712000002,
+        message: { messageContextInfo: {}, secretEncryptedMessage: { secretEncType: 2 } }
+      },
+      "wa-web:messages.upsert"
+    );
+    const unknownPoll = normalizeBaileysMessage(
+      {
+        key: { remoteJid: "dm@s.whatsapp.net", id: "POLL1", fromMe: false },
+        messageTimestamp: 1712000003,
+        message: { messageContextInfo: {}, pollCreationMessageV3: { name: "?" } }
+      },
+      "wa-web:messages.upsert"
+    );
+
+    const interactiveTemplate = normalizeBaileysMessage(
+      {
+        key: { remoteJid: "biz@s.whatsapp.net", id: "TPL2", fromMe: false },
+        messageTimestamp: 1712000004,
+        message: { templateMessage: { interactiveMessageTemplate: { body: { text: "Choose a delivery slot" } } } }
+      },
+      "wa-web:messages.upsert"
+    );
+
+    expect(template?.messageType).toBe("template");
+    expect(template?.body).toBe("Your order has shipped");
+    expect(interactiveTemplate?.body).toBe("Choose a delivery slot");
+    expect(secret?.messageType).toBe("encrypted_update");
+    expect(unknownPoll?.messageType).toBe("unknown_pollCreationMessageV3");
+  });
+
   it("records stub messages as system events instead of empty unknown rows", () => {
     const stub = normalizeBaileysMessage(
       {
