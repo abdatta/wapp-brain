@@ -5,6 +5,7 @@ import {
   ChevronDown,
   ChevronRight,
   Circle,
+  CircleStop,
   Database,
   Download,
   Eye,
@@ -24,10 +25,10 @@ import {
   ShieldCheck,
   Signal,
   Sparkles,
-  Square,
   Trash2,
   Unlink,
-  Upload
+  Upload,
+  X
 } from "lucide-react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
@@ -42,6 +43,7 @@ import type {
   ImportVerificationSummary,
   LiveGapWindowRecord,
   LivePairingSummary,
+  LiveSyncProgress,
   MemoryCitationResolution,
   MemoryQueryResult,
   MessageListItem,
@@ -57,6 +59,7 @@ import {
   getCurrentImportJob,
   getImportJob,
   getLivePairing,
+  getLiveProgress,
   getStatus,
   initDatabase,
   linkLiveSession,
@@ -101,6 +104,7 @@ export function App() {
   const [activeImportJob, setActiveImportJob] = useState<ImportJobSummary | null>(null);
   const [pairingOpen, setPairingOpen] = useState(false);
   const [pairing, setPairing] = useState<LivePairingSummary | null>(null);
+  const [liveProgress, setLiveProgress] = useState<LiveSyncProgress | null>(null);
   const [memoryQuery, setMemoryQuery] = useState("");
   const [memoryResult, setMemoryResult] = useState<MemoryQueryResult | null>(null);
   const [memoryCitation, setMemoryCitation] = useState<MemoryCitationResolution | null>(null);
@@ -152,7 +156,9 @@ export function App() {
           scrollActionRef.current = "bottom";
           void loadMessages(currentSelectedChat, true);
         }
-      }, 150);
+        // 1s throttle: initial history sync fires many archive events per
+        // second, and each refresh runs real status queries on the server.
+      }, 1000);
     };
 
     events.addEventListener("archive-updated", (event) => {
@@ -193,6 +199,27 @@ export function App() {
       window.clearInterval(timer);
     };
   }, [pairingOpen]);
+
+  useEffect(() => {
+    if (status?.live?.session?.status !== "connected") {
+      setLiveProgress(null);
+      return;
+    }
+    let cancelled = false;
+    const poll = () => {
+      getLiveProgress()
+        .then((next) => {
+          if (!cancelled) setLiveProgress(next);
+        })
+        .catch(() => undefined);
+    };
+    poll();
+    const timer = window.setInterval(poll, 1500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [status?.live?.session?.status]);
 
   useLayoutEffect(() => {
     const list = messageListRef.current;
@@ -536,6 +563,7 @@ export function App() {
           <OnboardingPanel
             status={status}
             busy={busy}
+            progress={liveProgress}
             onImport={() => setImportWizardOpen(true)}
             onLink={() => void handleLinkLive()}
             onResume={() => void handleResumeLive()}
@@ -555,6 +583,7 @@ export function App() {
             status={status}
             gaps={liveGaps}
             busy={busy}
+            progress={liveProgress}
             onImport={() => setImportWizardOpen(true)}
             onLink={() => void handleLinkLive()}
             onRetryGap={(id) => void handleRetryGap(id)}
@@ -616,7 +645,7 @@ export function App() {
                 }}
                 type="button"
               >
-                <span className="chatName">{chat.displayName}</span>
+                <span className="chatName">{chatDisplayLabel(chat)}</span>
                 <span className="chatMeta">
                   <span>{chat.chatType}</span>
                   <span>{chat.messageCount.toLocaleString()}</span>
@@ -646,7 +675,7 @@ export function App() {
             <>
               <div className="threadHeader">
                 <div>
-                  <h2>{selectedChat.displayName}</h2>
+                  <h2>{chatDisplayLabel(selectedChat)}</h2>
                   <p>
                     {selectedChat.chatType} | {selectedChat.messageCount.toLocaleString()} messages
                     {selectedChat.participantCount ? ` | ${selectedChat.participantCount.toLocaleString()} participants` : ""}
@@ -713,6 +742,7 @@ function LivePanel({
   status,
   gaps,
   busy,
+  progress,
   onImport,
   onLink,
   onRetryGap,
@@ -723,6 +753,7 @@ function LivePanel({
   status: StatusSummary | null;
   gaps: LiveGapWindowRecord[];
   busy: string | null;
+  progress: LiveSyncProgress | null;
   onImport: () => void;
   onLink: () => void;
   onRetryGap: (id: number) => void;
@@ -738,8 +769,10 @@ function LivePanel({
   const hasLiveSession = Boolean(live?.session && live.session.status !== "not_configured");
   const actionableGaps = gaps.filter((gap) => gap.status !== "uncertain");
   const uncertainCount = (live?.gapGroups ?? []).filter((group) => group.status === "uncertain").reduce((sum, group) => sum + group.count, 0);
+  const identityHealth = live?.identityHealth;
+  const identityIssues = (identityHealth?.unnamedGroups ?? 0) + (identityHealth?.unresolvedLids ?? 0);
   const health =
-    live?.session?.status === "logged_out" || actionableGaps.length
+    live?.session?.status === "logged_out" || actionableGaps.length || identityIssues
       ? "needs_user_action"
       : live?.session?.status === "connected"
         ? "healthy"
@@ -758,6 +791,7 @@ function LivePanel({
       </button>
       {livePanelOpen && (
         <>
+          {progress?.active && <SyncProgress progress={progress} />}
           <div className="statusGrid">
             <Metric label="State" value={state.replaceAll("_", " ")} />
             <Metric label="Open gaps" value={String(live?.openGapCount ?? 0)} />
@@ -784,6 +818,16 @@ function LivePanel({
               <span>
                 {uncertainCount.toLocaleString()} chat window{uncertainCount === 1 ? "" : "s"} cannot be proven complete (platform history
                 limits). This is informational, not actionable.
+              </span>
+            </div>
+          )}
+          {identityIssues > 0 && (
+            <div className="baselineNotice blocked">
+              <span>
+                Identity health: {identityHealth?.unnamedGroups ? `${identityHealth.unnamedGroups.toLocaleString()} unnamed group${identityHealth.unnamedGroups === 1 ? "" : "s"}` : ""}
+                {identityHealth?.unnamedGroups && identityHealth?.unresolvedLids ? ", " : ""}
+                {identityHealth?.unresolvedLids ? `${identityHealth.unresolvedLids.toLocaleString()} unresolved contact identit${identityHealth.unresolvedLids === 1 ? "y" : "ies"}` : ""}.
+                {" "}Look for "Unnamed group" and "Unresolved contact" entries in the chat list.
               </span>
             </div>
           )}
@@ -975,6 +1019,7 @@ function MemoryPanel({
 function OnboardingPanel({
   status,
   busy,
+  progress,
   onImport,
   onLink,
   onResume,
@@ -982,6 +1027,7 @@ function OnboardingPanel({
 }: {
   status: StatusSummary | null;
   busy: string | null;
+  progress: LiveSyncProgress | null;
   onImport: () => void;
   onLink: () => void;
   onResume: () => void;
@@ -990,7 +1036,7 @@ function OnboardingPanel({
   const setup = status?.setup;
   const action = setup?.primaryAction ?? "import_backup";
   // The sheen reads as "working" — show it only while something actually runs.
-  const processing = Boolean(busy) || Boolean(status?.memory?.activeRun);
+  const processing = Boolean(busy) || Boolean(status?.memory?.activeRun) || Boolean(progress?.active);
   const primary = {
     import_backup: { label: "Import backup", icon: <Upload size={17} />, onClick: onImport },
     link_whatsapp: { label: "Link WhatsApp", icon: <QrCode size={17} />, onClick: onLink },
@@ -1022,6 +1068,7 @@ function OnboardingPanel({
           <span>{setup.blockingReason}</span>
         </div>
       )}
+      {progress?.active && <SyncProgress progress={progress} />}
       <button className="heroAction" onClick={primary.onClick} disabled={Boolean(busy) || !setup} type="button">
         {busy ? <Loader2 className="spin" size={17} /> : primary.icon}
         {primary.label}
@@ -1080,6 +1127,27 @@ function ImportWizard({
   const [job, setJob] = useState<ImportJobSummary | null>(initialJob);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [autoCloseIn, setAutoCloseIn] = useState<number | null>(null);
+
+  // A finished import closes itself after a short countdown shown on the
+  // Done button; any interaction path through onClose cancels it implicitly.
+  useEffect(() => {
+    if (job?.status !== "completed") {
+      setAutoCloseIn(null);
+      return;
+    }
+    setAutoCloseIn(5);
+    const timer = window.setInterval(() => {
+      setAutoCloseIn((current) => (current == null ? current : current - 1));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [job?.status]);
+
+  useEffect(() => {
+    if (autoCloseIn === 0) {
+      onClose();
+    }
+  }, [autoCloseIn, onClose]);
 
   useEffect(() => {
     if (initialJob) {
@@ -1245,7 +1313,7 @@ function ImportWizard({
             <p>Pick files, verify the key locally, choose merge or replace, then watch the import phases.</p>
           </div>
           <button className="iconButton" onClick={() => void close()} type="button" aria-label="Close import wizard">
-            <Square size={15} />
+            <X size={16} />
           </button>
         </div>
         <div className="wizardSteps">
@@ -1391,13 +1459,23 @@ function ImportWizard({
             <ImportProgress job={job} />
             <WizardActions
               busy={busy}
-              primaryLabel={job?.status === "completed" || job?.status === "cancelled" || job?.status === "failed" ? "Done" : job?.status === "cancelling" ? "Stopping" : "Importing"}
-              primaryIcon={job?.status === "completed" ? <CheckCircle2 size={16} /> : job?.status === "cancelled" || job?.status === "failed" ? <Square size={16} /> : <Loader2 className="spin" size={16} />}
+              primaryLabel={
+                job?.status === "completed"
+                  ? autoCloseIn != null
+                    ? `Done (${autoCloseIn})`
+                    : "Done"
+                  : job?.status === "cancelled" || job?.status === "failed"
+                    ? "Done"
+                    : job?.status === "cancelling"
+                      ? "Stopping"
+                      : "Importing"
+              }
+              primaryIcon={job?.status === "completed" ? <CheckCircle2 size={16} /> : job?.status === "cancelled" || job?.status === "failed" ? <X size={16} /> : <Loader2 className="spin" size={16} />}
               primaryDisabled={job?.status !== "completed" && job?.status !== "cancelled" && job?.status !== "failed"}
               onPrimary={onClose}
               onBack={null}
               dangerLabel={job?.status === "queued" || job?.status === "running" || job?.status === "cancelling" ? "Stop import" : null}
-              dangerIcon={job?.status === "cancelling" ? <Loader2 className="spin" size={16} /> : <Square size={16} />}
+              dangerIcon={job?.status === "cancelling" ? <Loader2 className="spin" size={16} /> : <CircleStop size={16} />}
               dangerDisabled={Boolean(busy) || job?.status === "cancelling"}
               onDanger={() => void stopImport()}
             />
@@ -1552,7 +1630,7 @@ function ImportProgress({ job }: { job: ImportJobSummary | null }) {
         active={messagePreparing || Boolean(latestMessages && job?.status === "running")}
         detail={messageDetail}
       />
-      {latestWarnings && (
+      {latestWarnings && latestWarnings.count > 0 && (
         <div className="warningSummary">
           <AlertTriangle size={15} />
           <span>
@@ -1562,6 +1640,39 @@ function ImportProgress({ job }: { job: ImportJobSummary | null }) {
       )}
     </div>
   );
+}
+
+function SyncProgress({ progress }: { progress: LiveSyncProgress }) {
+  const messagesDetail = `${progress.processedMessages.toLocaleString()} messages synced${
+    progress.queuedMessages ? ` | ${progress.queuedMessages.toLocaleString()} in current batch` : ""
+  }`;
+  // Phase 1: WhatsApp's proactive history push (platform-reported percent).
+  if (progress.historySyncPercent != null && progress.historySyncPercent < 100) {
+    return (
+      <ProgressBar
+        label="WhatsApp history sync (recent chats)"
+        value={progress.historySyncPercent}
+        active
+        detail={`${Math.round(progress.historySyncPercent)}% | ${messagesDetail}`}
+      />
+    );
+  }
+  // Phase 2: our per-chat backfill of the downtime window.
+  if (progress.auditPending) {
+    return <ProgressBar label="Preparing chat-by-chat backfill" value={0} active detail={messagesDetail} />;
+  }
+  if (progress.gapsOpened > progress.gapsClosed) {
+    const value = progressPercent(progress.gapsClosed, progress.gapsOpened);
+    return (
+      <ProgressBar
+        label="Backfilling older chat windows"
+        value={value}
+        active
+        detail={`${progress.gapsClosed.toLocaleString()} of ${progress.gapsOpened.toLocaleString()} chat windows caught up | ${messagesDetail}`}
+      />
+    );
+  }
+  return <ProgressBar label="Live catch-up" value={100} active detail={messagesDetail} />;
 }
 
 function progressPercent(value: number, total: number): number {
@@ -1584,6 +1695,14 @@ function ProgressBar({ label, value, detail, active = false }: { label: string; 
 
 function PairingModal({ pairing, onClose, onRetry }: { pairing: LivePairingSummary | null; onClose: () => void; onRetry: () => void }) {
   const expired = pairing?.expiresAt ? Date.now() > Date.parse(pairing.expiresAt) && pairing.state !== "connected" : false;
+  const connected = pairing?.state === "connected";
+  useEffect(() => {
+    if (!connected) {
+      return;
+    }
+    const timer = window.setTimeout(onClose, 1500);
+    return () => window.clearTimeout(timer);
+  }, [connected, onClose]);
   return (
     <div className="modalBackdrop" role="dialog" aria-modal="true" aria-labelledby="pair-title">
       <section className="pairingModal">
@@ -1597,11 +1716,23 @@ function PairingModal({ pairing, onClose, onRetry }: { pairing: LivePairingSumma
             <p>Open WhatsApp on your phone, then use Linked devices to scan or pair. The live client is read-only guarded.</p>
           </div>
           <button className="iconButton" onClick={onClose} type="button" aria-label="Close pairing">
-            <Square size={15} />
+            <X size={16} />
           </button>
         </div>
         <div className="pairingBody">
-          {pairing?.qrDataUrl ? <img className="qrImage" src={pairing.qrDataUrl} alt="WhatsApp pairing QR" /> : <div className="qrPlaceholder"><Loader2 className="spin" size={26} /><span>Waiting for QR</span></div>}
+          {connected ? (
+            <div className="qrPlaceholder">
+              <CheckCircle2 size={26} />
+              <span>Linked — closing…</span>
+            </div>
+          ) : pairing?.qrDataUrl ? (
+            <img className="qrImage" src={pairing.qrDataUrl} alt="WhatsApp pairing QR" />
+          ) : (
+            <div className="qrPlaceholder">
+              <Loader2 className="spin" size={26} />
+              <span>Waiting for QR</span>
+            </div>
+          )}
           {pairing?.pairingCode && (
             <div className="pairingCode">
               <span>Pairing code</span>
@@ -1712,13 +1843,41 @@ function hasArchiveData(status: StatusSummary | null): boolean {
   return Boolean(status?.latestImport || status?.counts.messages || status?.counts.chats);
 }
 
+// Mention tokens inside display text: server-resolved "@<label>" spans (the
+// exact labels arrive on the DTO) plus raw unresolved "@<digits>" tokens.
+function renderMentions(text: string, mentions: string[]): ReactNode {
+  const tokens = [...new Set(mentions)]
+    .sort((a, b) => b.length - a.length)
+    .map((label) => escapeRegExp(`@${label}`));
+  tokens.push("@\\d{5,20}");
+  const splitter = new RegExp(`(${tokens.join("|")})`);
+  const parts = text.split(splitter);
+  if (parts.length === 1) {
+    return text;
+  }
+  // A single capture group means odd indices are the matched mention tokens.
+  return parts.map((part, index) =>
+    index % 2 === 1 ? (
+      <span key={index} className="mention">
+        {part}
+      </span>
+    ) : (
+      part
+    )
+  );
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function MessageBubble({ message, isGroup }: { message: MessageListItem; isGroup: boolean }) {
   const text = message.body || message.caption;
   const placeholder = messagePlaceholder(message);
   if (isSystemEvent(message)) {
     return (
       <article className="systemChip">
-        <span>{text || placeholder}</span>
+        <span>{text ? renderMentions(text, message.mentions) : placeholder}</span>
         <time>{formatTime(message.sentAt)}</time>
       </article>
     );
@@ -1726,11 +1885,11 @@ function MessageBubble({ message, isGroup }: { message: MessageListItem; isGroup
   return (
     <article className={`messageBubble ${message.direction}`}>
       <div className="messageMeta">
-        {isGroup && message.direction !== "outgoing" && <span>{message.senderDisplayName ?? "Unknown sender"}</span>}
+        {isGroup && message.direction !== "outgoing" && <span>{message.senderDisplayName ?? "Unresolved contact"}</span>}
         <time>{formatTime(message.sentAt)}</time>
       </div>
       {text ? (
-        <p>{text}</p>
+        <p>{renderMentions(text, message.mentions)}</p>
       ) : (
         <p className="placeholderText">{placeholder}</p>
       )}
@@ -1801,6 +1960,13 @@ function SkeletonMessages() {
       ))}
     </>
   );
+}
+
+function chatDisplayLabel(chat: ChatListItem): string {
+  if (chat.displayName) {
+    return chat.displayName;
+  }
+  return chat.chatType === "group" ? "Unnamed group" : "Unresolved contact";
 }
 
 function isNearBottom(list: HTMLDivElement | null): boolean {

@@ -110,6 +110,7 @@ function status(options: {
         : null,
       currentRun: null,
       totals: { contacts: 0, chats: 0, participants: 0, messages: 0, updates: 0, gapsOpened: 0, gapsClosed: 0, warnings: 0 },
+      identityHealth: { unnamedGroups: 0, unresolvedLids: 0, samples: [] },
       openGapCount: (options.openGapCount ?? 0) + (options.uncertainGapCount ?? 0),
       gapGroups: [
         ...(options.openGapCount ? [{ status: "open" as const, reason: "watermark_mismatch" as const, count: options.openGapCount }] : []),

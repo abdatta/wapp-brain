@@ -146,6 +146,7 @@ After a backup import, link WhatsApp as a companion device from the app UI (Live
 - Long downtime never blocks resume. Only first-time linking requires a recent backup baseline.
 - Live edits, deletes, and reactions are applied to the original archived messages; deletes show as WhatsApp-style tombstones.
 - If WhatsApp unlinks the device, the app stops reconnecting and shows a Re-pair WhatsApp action instead.
+- One message = one archive row across backup and live sources; LID/phone identity splits merge automatically as mappings are learned. Chats and senders always display a name or phone number — unnamed groups and unresolved identities appear as explicit identity-health alerts, never as raw IDs.
 
 ## Second-Brain Memory
 

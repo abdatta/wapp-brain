@@ -1,10 +1,14 @@
 import type { ArchiveRepository } from "../db/repository";
 import { config } from "../config";
 import { configuredTraceRecorder } from "../diagnostics/traceRecorder";
+import { messageKey } from "../identity/keys";
 import { assertLiveDependencySafe } from "./dependency";
 import { auditChatGaps, auditMessageEventCheckpoint, GAP_TOLERANCE_MS } from "./auditor";
 import { recoverDueGaps } from "./recovery";
+import type { LiveSyncProgress } from "../../shared/types";
 import { addEventToTotals, emptyLiveTotals, type LiveMaintainerOptions, type LiveMessageEvent, type LiveWhatsAppClient } from "./types";
+
+const INGEST_MESSAGE_CHUNK_SIZE = 500;
 
 export interface LiveMaintainerCallbacks {
   onArchiveChanged?: (event: LiveMessageEvent) => void | Promise<void>;
@@ -20,6 +24,40 @@ export class LiveMaintainer {
   private recoveryRunning = false;
   private auditDueAtMs: number | null = null;
   private pendingAuditTrigger: "late_start" | "disconnect" | null = null;
+  private readonly namingAttempts = new Map<string, { count: number; nextAtMs: number }>();
+  private readonly progress = {
+    processedMessages: 0,
+    processedEvents: 0,
+    queuedMessages: 0,
+    historySyncPercent: null as number | null,
+    lastEventAtMs: null as number | null
+  };
+
+  // Snapshot of in-memory counters only — safe to serve on every UI poll even
+  // while ingestion is grinding, because it never touches the database.
+  getSyncProgress(): LiveSyncProgress {
+    const lastEventAtMs = this.progress.lastEventAtMs;
+    const auditPending = this.pendingAuditTrigger != null;
+    const backfillOutstanding = this.totals.gapsOpened > this.totals.gapsClosed;
+    const historyPushRunning = this.progress.historySyncPercent != null && this.progress.historySyncPercent < 100;
+    return {
+      // Active means "there is catch-up work in flight", not merely "an event
+      // arrived recently": platform push running, downtime audit still due,
+      // per-chat backfill outstanding, or a fresh event burst.
+      active:
+        this.connected &&
+        (historyPushRunning || auditPending || backfillOutstanding || (lastEventAtMs != null && Date.now() - lastEventAtMs < 45_000)),
+      connected: this.connected,
+      processedMessages: this.progress.processedMessages,
+      processedEvents: this.progress.processedEvents,
+      queuedMessages: this.progress.queuedMessages,
+      historySyncPercent: this.progress.historySyncPercent,
+      auditPending,
+      gapsOpened: this.totals.gapsOpened,
+      gapsClosed: this.totals.gapsClosed,
+      lastEventAt: lastEventAtMs ? new Date(lastEventAtMs).toISOString() : null
+    };
+  }
 
   constructor(
     private readonly repository: ArchiveRepository,
@@ -125,6 +163,8 @@ export class LiveMaintainer {
       if (summary.attempted || summary.closed || summary.pendingUpdatesRetried) {
         await configuredTraceRecorder?.record("live.recovery_tick", { runId: this.runId, ...summary });
       }
+      await this.sweepUnmergedIdentities();
+      await this.runGroupNamingPass();
     } catch (error) {
       this.totals = { ...this.totals, warnings: this.totals.warnings + 1 };
       await configuredTraceRecorder?.record("live.recovery_tick_failed", {
@@ -133,6 +173,71 @@ export class LiveMaintainer {
       });
     } finally {
       this.recoveryRunning = false;
+    }
+  }
+
+  // Links can be learned while the archive is closed (or by the importer);
+  // merge a bounded batch of still-split identities per tick.
+  private async sweepUnmergedIdentities(): Promise<void> {
+    const unmerged = await this.repository.listUnmergedLidIdentities(3);
+    for (const { lid, pn } of unmerged) {
+      const merged = await this.repository.mergeIdentity(lid, pn);
+      await configuredTraceRecorder?.record("live.identity_merged", { runId: this.runId, lid, source: "sweep", ...merged });
+    }
+  }
+
+  // Groups must have a name or become an explicit alert; while connected,
+  // actively fetch missing subjects, bounded and with per-chat backoff.
+  private async runGroupNamingPass(): Promise<void> {
+    if (!this.connected || !this.client.fetchGroupMetadata) {
+      return;
+    }
+    const now = Date.now();
+    // Pull a wide candidate window so permanently-failing groups (left groups,
+    // forbidden metadata) cannot starve the rest of the queue.
+    const candidates = (await this.repository.listUnnamedGroupChats(50)).filter((jid) => {
+      const attempt = this.namingAttempts.get(jid);
+      return !attempt || (attempt.nextAtMs <= now && attempt.count < 5);
+    });
+    for (const jid of candidates.slice(0, 3)) {
+      const attempt = this.namingAttempts.get(jid) ?? { count: 0, nextAtMs: 0 };
+      this.namingAttempts.set(jid, { count: attempt.count + 1, nextAtMs: now + 600_000 * 2 ** attempt.count });
+      try {
+        const metadata = await this.client.fetchGroupMetadata(jid);
+        if (!metadata) {
+          continue;
+        }
+        if (metadata.identityLinks.length) {
+          await this.repository.recordIdentityLinks(metadata.identityLinks.map((link) => ({ ...link, source: "group-metadata" })));
+        }
+        if (metadata.subject) {
+          await this.repository.upsertChats(this.runId ?? "live", [
+            { sourceChatId: jid, jid, displayName: metadata.subject, chatType: "group", rawMetadata: { source: "wa-web-group-metadata" } }
+          ]);
+        }
+        if (metadata.participants.length) {
+          await this.repository.upsertParticipants(
+            metadata.participants.map((participant) => ({
+              chatSourceId: jid,
+              sourceJid: participant.jid,
+              membershipSource: "source" as const,
+              rawMetadata: { source: "wa-web-group-metadata", role: participant.role ?? null }
+            }))
+          );
+        }
+        await configuredTraceRecorder?.record("live.group_metadata_fetched", {
+          runId: this.runId,
+          jid,
+          hasSubject: Boolean(metadata.subject),
+          participants: metadata.participants.length
+        });
+      } catch (error) {
+        await configuredTraceRecorder?.record("live.group_metadata_failed", {
+          runId: this.runId,
+          jid,
+          message: error instanceof Error ? error.message.slice(0, 300) : "Group metadata fetch failed."
+        });
+      }
     }
   }
 
@@ -151,17 +256,63 @@ export class LiveMaintainer {
     }
   }
 
-  private async ingestEvent(event: LiveMessageEvent): Promise<void> {
-    await configuredTraceRecorder?.record("live.ingest_event.start", { runId: this.runId, event });
-    if (await this.repository.hasLiveEventReceipt(event.eventKey)) {
-      await configuredTraceRecorder?.record("live.ingest_event.skipped_duplicate", { runId: this.runId, eventKey: event.eventKey });
+  private async ingestEvent(rawEvent: LiveMessageEvent): Promise<void> {
+    await configuredTraceRecorder?.record("live.ingest_event.start", { runId: this.runId, event: rawEvent });
+    if (await this.repository.hasLiveEventReceipt(rawEvent.eventKey)) {
+      await configuredTraceRecorder?.record("live.ingest_event.skipped_duplicate", { runId: this.runId, eventKey: rawEvent.eventKey });
       return;
     }
+    // Identity mappings first, so the rest of the event ingests canonically and
+    // records archived earlier under the LID form merge immediately.
+    if (rawEvent.identityLinks?.length) {
+      const learned = await this.repository.recordIdentityLinks(
+        rawEvent.identityLinks.map((link) => ({ ...link, source: rawEvent.eventType }))
+      );
+      let processed = 0;
+      for (const lid of learned) {
+        const pn = await this.repository.resolveIdentityJid(lid);
+        if (pn !== lid) {
+          const merged = await this.repository.mergeIdentity(lid, pn);
+          if (merged.chatsMerged || merged.contactsMerged || merged.messagesCollapsed) {
+            await configuredTraceRecorder?.record("live.identity_merged", { runId: this.runId, lid, ...merged });
+          }
+        }
+        // History sync can deliver thousands of mappings in one event; yield
+        // periodically so the API stays responsive while they process.
+        processed += 1;
+        if (processed % 25 === 0) {
+          await new Promise((resolve) => setImmediate(resolve));
+        }
+      }
+    }
+    // Canonicalize once here so upserts AND post-ingest bookkeeping (stats,
+    // gap closure, checkpoints, receipts) all see the same identities the
+    // repository will store — including links learned this very event.
+    const event = await this.canonicalizeEvent(rawEvent);
+    const historyPercent = Number((rawEvent.rawMetadata as { progress?: unknown } | null | undefined)?.progress);
+    if (Number.isFinite(historyPercent)) {
+      this.progress.historySyncPercent = Math.max(this.progress.historySyncPercent ?? 0, Math.min(100, historyPercent));
+    }
+    this.progress.lastEventAtMs = Date.now();
     if (event.chats?.length) await this.repository.upsertChats(this.runId ?? "live", event.chats);
     if (event.contacts?.length) await this.repository.upsertContacts(this.runId ?? "live", event.contacts);
     if (event.participants?.length) await this.repository.upsertParticipants(event.participants);
-    if (event.messages?.length) await this.repository.upsertMessages(event.messages);
+    if (event.messages?.length) {
+      // History chunks can carry thousands of messages; ingest in slices and
+      // yield between them so API requests keep flowing during catch-up.
+      this.progress.queuedMessages = event.messages.length;
+      for (let index = 0; index < event.messages.length; index += INGEST_MESSAGE_CHUNK_SIZE) {
+        const chunk = event.messages.slice(index, index + INGEST_MESSAGE_CHUNK_SIZE);
+        await this.repository.upsertMessages(chunk);
+        this.progress.processedMessages += chunk.length;
+        this.progress.queuedMessages = Math.max(0, event.messages.length - index - chunk.length);
+        if (index + INGEST_MESSAGE_CHUNK_SIZE < event.messages.length) {
+          await new Promise((resolve) => setImmediate(resolve));
+        }
+      }
+    }
     if (event.updates?.length) await this.repository.applyLiveMessageUpdates(event.updates);
+    this.progress.processedEvents += 1;
     await this.repository.recordLiveEventReceipt({
       eventKey: event.eventKey,
       eventType: event.eventType,
@@ -181,6 +332,56 @@ export class LiveMaintainer {
     await configuredTraceRecorder?.record("live.ingest_event.complete", { runId: this.runId, eventKey: event.eventKey, totals: this.totals });
     await configuredTraceRecorder?.snapshotArchive(`after-live-event-${event.eventKey.replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 80)}`, config.archive.sqlitePath);
     await this.callbacks.onArchiveChanged?.(event);
+  }
+
+  private async canonicalizeEvent(event: LiveMessageEvent): Promise<LiveMessageEvent> {
+    // Resolve each unique identity once per event: history chunks carry
+    // thousands of rows but only a handful of distinct chats/senders.
+    const uniqueJids = new Set<string>();
+    const collect = (jid: string | null | undefined) => {
+      if (jid && jid !== "me") {
+        uniqueJids.add(jid);
+      }
+    };
+    for (const message of event.messages ?? []) {
+      collect(message.chatSourceId);
+      collect(message.senderSourceJid);
+    }
+    for (const chat of event.chats ?? []) collect(chat.sourceChatId);
+    for (const participant of event.participants ?? []) {
+      collect(participant.chatSourceId);
+      collect(participant.sourceJid);
+    }
+    for (const update of event.updates ?? []) collect(update.chatSourceId);
+    const canonical = new Map<string, string>();
+    for (const jid of uniqueJids) {
+      canonical.set(jid, await this.repository.resolveIdentityJid(jid));
+    }
+    const resolve = (jid: string | null | undefined): string | null =>
+      jid == null ? null : jid === "me" ? "me" : canonical.get(jid) ?? jid;
+    const messages = event.messages?.map((message) => {
+      const chatSourceId = resolve(message.chatSourceId) ?? message.chatSourceId;
+      return {
+        ...message,
+        chatSourceId,
+        senderSourceJid: resolve(message.senderSourceJid) ?? message.senderSourceJid,
+        sourceMessageKey: messageKey(chatSourceId, message.sourceMessageId)
+      };
+    });
+    const chats = event.chats?.map((chat) => {
+      const sourceChatId = resolve(chat.sourceChatId) ?? chat.sourceChatId;
+      return { ...chat, sourceChatId, jid: sourceChatId };
+    });
+    const participants = event.participants?.map((participant) => ({
+      ...participant,
+      chatSourceId: resolve(participant.chatSourceId) ?? participant.chatSourceId,
+      sourceJid: resolve(participant.sourceJid) ?? participant.sourceJid
+    }));
+    const updates = event.updates?.map((update) => ({
+      ...update,
+      chatSourceId: resolve(update.chatSourceId) ?? update.chatSourceId
+    }));
+    return { ...event, messages, chats, participants, updates };
   }
 
   // A gap closes only when ingested evidence for its chat reaches the gap's

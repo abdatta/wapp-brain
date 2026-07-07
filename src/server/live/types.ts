@@ -47,6 +47,7 @@ export interface LiveMessageEvent {
     | "message-receipt.update"
     | "groups.update"
     | "group-participants.update"
+    | "lid-mapping.update"
     | "call";
   mode: "notify" | "append" | "history" | "update";
   occurredAtMs?: number | null;
@@ -55,6 +56,7 @@ export interface LiveMessageEvent {
   participants?: ParticipantRecord[];
   messages?: MessageRecord[];
   updates?: LiveMessageStateUpdate[];
+  identityLinks?: Array<{ lid: string; pn: string }>;
   rawMetadata?: Record<string, unknown> | null;
 }
 
@@ -62,7 +64,7 @@ export type LiveMessageStateUpdate = Omit<LiveMessageUpdateRecord, "applied">;
 
 export interface LiveHistoryRequest {
   chatSourceId: string;
-  anchorMessageKey?: string | null;
+  anchor?: { id: string; fromMe?: boolean | null; participant?: string | null } | null;
   oldestMsgTimestampMs?: number | null;
   count: number;
 }
@@ -75,6 +77,12 @@ export interface LiveHistoryResult {
   errorMessage?: string | null;
 }
 
+export interface LiveGroupMetadataResult {
+  subject: string | null;
+  participants: Array<{ jid: string; role?: string | null }>;
+  identityLinks: Array<{ lid: string; pn: string }>;
+}
+
 export interface LiveWhatsAppClient {
   readonly name: "baileys";
   connect(): Promise<void>;
@@ -82,6 +90,7 @@ export interface LiveWhatsAppClient {
   onConnectionUpdate(handler: (update: LiveConnectionUpdate) => void | Promise<void>): void;
   onEvent(handler: (event: LiveMessageEvent) => void | Promise<void>): void;
   fetchHistory?(request: LiveHistoryRequest): Promise<LiveHistoryResult>;
+  fetchGroupMetadata?(jid: string): Promise<LiveGroupMetadataResult | null>;
 }
 
 export interface LiveProofResult {

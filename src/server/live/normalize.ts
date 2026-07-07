@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { ChatRecord, ChatType, ContactRecord, MessageRecord, ParticipantRecord } from "../../shared/types";
+import { messageKey } from "../identity/keys";
 import { inferChatType, normalizeJid } from "../import/jid";
 import type { LiveMessageEvent, LiveMessageStateUpdate } from "./types";
 
@@ -29,6 +30,8 @@ interface BaileysLikeMessage {
   message?: Record<string, unknown> | null;
   messageStubType?: number | string | null;
   messageStubParameters?: string[] | null;
+  // WebMessageInfo carries the group sender here in history-sync payloads.
+  participant?: string | null;
 }
 
 interface LongLike {
@@ -75,15 +78,15 @@ export function normalizeBaileysMessage(message: BaileysLikeMessage, sourceTable
   // membership changes, missed calls, undecryptable placeholders).
   const stubType = !content && message.messageStubType != null ? message.messageStubType : null;
   const messageType = stubType != null ? "system" : detectMessageType(content);
-  const senderSourceJid = fromMe ? null : message.key?.participant ?? chatSourceId;
+  // Real-time deliveries carry the group sender in key.participant; history
+  // sync often carries it only in the envelope's top-level participant. A
+  // group message with neither has an UNKNOWN sender — the group's own
+  // identity must never be attributed as the author.
+  const participant = message.key?.participant ?? message.participant ?? null;
+  const senderSourceJid = fromMe ? null : inferChatType(chatSourceId) === "group" ? participant : participant ?? chatSourceId;
   return {
     sourceMessageId,
-    sourceMessageKey: liveMessageKey({
-      chatSourceId,
-      sourceMessageId,
-      participant: message.key?.participant ?? null,
-      fromMe
-    }),
+    sourceMessageKey: messageKey(chatSourceId, sourceMessageId),
     sourceTable,
     sourceRowId: sourceRowId ?? sourceMessageId,
     chatSourceId,
@@ -185,12 +188,7 @@ function targetedUpdate(
   if (!targetKey.remoteJid || !targetKey.id) {
     return null;
   }
-  const sourceMessageKey = liveMessageKey({
-    chatSourceId: targetKey.remoteJid,
-    sourceMessageId: targetKey.id,
-    participant: targetKey.participant ?? null,
-    fromMe: targetKey.fromMe ?? null
-  });
+  const sourceMessageKey = messageKey(targetKey.remoteJid, targetKey.id);
   return {
     eventKey: `wa-web:${updateType}:${sourceMessageKey}:${occurredAtMs ?? ""}`,
     chatSourceId: targetKey.remoteJid,
@@ -243,12 +241,30 @@ export async function normalizeBaileysContactsWithJidResolver(
   const normalized = (
     await Promise.all(contacts.map((contact) => normalizeBaileysContactWithJidResolver(contact, resolveJid)))
   ).filter((contact): contact is ContactRecord => Boolean(contact));
+  // Contacts carrying both identity forms are a mapping source in their own right.
+  const identityLinks: Array<{ lid: string; pn: string }> = [];
+  for (const contact of contacts) {
+    const lid = pickLidForm(contact.lid) ?? pickLidForm(contact.id);
+    const pn = pickPhoneForm(contact.phoneNumber) ?? pickPhoneForm(contact.id);
+    if (lid && pn) {
+      identityLinks.push({ lid, pn });
+    }
+  }
   return {
     eventKey: boundedEventKey(eventType, normalized.map((contact) => contact.sourceJid)),
     eventType,
     mode: "update",
-    contacts: normalized
+    contacts: normalized,
+    identityLinks: identityLinks.length ? identityLinks : undefined
   };
+}
+
+function pickLidForm(value: string | null | undefined): string | null {
+  return typeof value === "string" && (value.endsWith("@lid") || value.endsWith("@hosted.lid")) ? value : null;
+}
+
+function pickPhoneForm(value: string | null | undefined): string | null {
+  return typeof value === "string" && (value.endsWith("@s.whatsapp.net") || value.endsWith("@c.us")) ? value : null;
 }
 
 export async function normalizeBaileysChatsWithJidResolver(
@@ -272,20 +288,11 @@ export function normalizeDeleteUpdate(key: { remoteJid?: string | null; id?: str
   if (!key.remoteJid || !key.id) {
     return null;
   }
+  const sourceMessageKey = messageKey(key.remoteJid, key.id);
   return {
-    eventKey: `wa-web:delete:${liveMessageKey({
-      chatSourceId: key.remoteJid,
-      sourceMessageId: key.id,
-      participant: key.participant ?? null,
-      fromMe: key.fromMe ?? null
-    })}`,
+    eventKey: `wa-web:delete:${sourceMessageKey}`,
     chatSourceId: key.remoteJid,
-    sourceMessageKey: liveMessageKey({
-      chatSourceId: key.remoteJid,
-      sourceMessageId: key.id,
-      participant: key.participant ?? null,
-      fromMe: key.fromMe ?? null
-    }),
+    sourceMessageKey,
     updateType: "delete"
   };
 }
@@ -376,12 +383,7 @@ export async function normalizeBaileysReactionsWithJidResolver(
     if (!chatSourceId || !item.key?.id) {
       continue;
     }
-    const sourceMessageKey = liveMessageKey({
-      chatSourceId,
-      sourceMessageId: item.key.id,
-      participant: (await resolveCanonicalJid(item.key.participant, resolveJid)) ?? null,
-      fromMe: item.key.fromMe ?? null
-    });
+    const sourceMessageKey = messageKey(chatSourceId, item.key.id);
     const reactorJid = (await resolveCanonicalJid(item.reaction?.key?.participant, resolveJid)) ?? (item.reaction?.key?.fromMe ? "me" : null);
     updates.push({
       eventKey: `wa-web:reaction:${sourceMessageKey}:${reactorJid ?? "unknown"}`,
@@ -407,12 +409,7 @@ export async function normalizeBaileysReceiptsWithJidResolver(
     if (!chatSourceId || !item.key?.id) {
       continue;
     }
-    const sourceMessageKey = liveMessageKey({
-      chatSourceId,
-      sourceMessageId: item.key.id,
-      participant: (await resolveCanonicalJid(item.key.participant, resolveJid)) ?? null,
-      fromMe: item.key.fromMe ?? null
-    });
+    const sourceMessageKey = messageKey(chatSourceId, item.key.id);
     const userJid = (await resolveCanonicalJid(item.receipt?.userJid, resolveJid)) ?? null;
     const receiptType = item.receipt?.readTimestamp ? "read" : item.receipt?.playedTimestamp ? "played" : "delivery";
     updates.push({
@@ -506,40 +503,6 @@ function updatesEvent(eventType: LiveMessageEvent["eventType"], updates: LiveMes
   };
 }
 
-export function liveMessageKey(input: {
-  chatSourceId: string;
-  sourceMessageId: string;
-  participant?: string | null;
-  fromMe?: boolean | null;
-}): string {
-  return [
-    "wa-web",
-    escapeLiveKeyComponent(input.chatSourceId),
-    escapeLiveKeyComponent(input.participant ?? ""),
-    input.fromMe === true ? "1" : input.fromMe === false ? "0" : "x",
-    escapeLiveKeyComponent(input.sourceMessageId)
-  ].join("|");
-}
-
-// Message ids and participants are third-party-controlled strings that may
-// contain the key delimiter; escape injectively so distinct messages can never
-// serialize to the same key. Keys without '|' or '%' stay byte-identical to
-// previously archived rows.
-function escapeLiveKeyComponent(value: string): string {
-  return value.replace(/%/g, "%25").replace(/\|/g, "%7C");
-}
-
-export function unescapeLiveKeyComponent(value: string): string {
-  return value.replace(/%7C/g, "|").replace(/%25/g, "%");
-}
-
-export function liveKeyMessageId(sourceMessageKey: string): string | null {
-  if (!sourceMessageKey.startsWith("wa-web|")) {
-    return null;
-  }
-  const parts = sourceMessageKey.split("|");
-  return parts.length >= 5 ? unescapeLiveKeyComponent(parts[4]) || null : null;
-}
 
 function eventFromMessages(normalized: MessageRecord[], sourceTable: string, updates: LiveMessageStateUpdate[] = []): LiveMessageEvent {
   const contacts = contactsFromMessages(normalized);
@@ -623,6 +586,11 @@ function contactsFromMessages(messages: MessageRecord[]): Map<string, ContactRec
     if (!message.senderSourceJid || message.senderSourceJid === "me") {
       continue;
     }
+    // A group must never gain a contact record from its own messages (DM
+    // senders ARE the chat, so the check is group-scoped).
+    if (message.senderSourceJid === message.chatSourceId && inferChatType(message.chatSourceId) === "group") {
+      continue;
+    }
     const pushName = typeof message.rawMetadata?.pushName === "string" ? message.rawMetadata.pushName.trim() : "";
     if (!pushName) {
       continue;
@@ -644,6 +612,7 @@ async function resolveMessageJids(message: BaileysLikeMessage, resolveJid: LiveJ
   }
   return {
     ...message,
+    participant: await resolveCanonicalJid(message.participant, resolveJid),
     key: {
       ...message.key,
       remoteJid: await resolveCanonicalJid(message.key.remoteJid, resolveJid),

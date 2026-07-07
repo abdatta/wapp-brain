@@ -15,10 +15,17 @@ import {
   normalizeBaileysMessageUpdatesWithJidResolver,
   normalizeBaileysReactionsWithJidResolver,
   normalizeBaileysReceiptsWithJidResolver,
-  unescapeLiveKeyComponent,
   type LiveJidResolver
 } from "./normalize";
-import type { LiveConnectionUpdate, LiveHistoryRequest, LiveHistoryResult, LiveMessageEvent, LiveProofResult, LiveWhatsAppClient } from "./types";
+import type {
+  LiveConnectionUpdate,
+  LiveGroupMetadataResult,
+  LiveHistoryRequest,
+  LiveHistoryResult,
+  LiveMessageEvent,
+  LiveProofResult,
+  LiveWhatsAppClient
+} from "./types";
 
 type Handler<T> = (value: T) => void | Promise<void>;
 
@@ -134,7 +141,12 @@ export class BaileysLiveWhatsAppClient implements LiveWhatsAppClient {
       await configuredTraceRecorder?.record("baileys.normalized_event", { name: "messages.upsert", event: normalized });
       await this.emitEvent(normalized);
     });
-    on("messaging-history.set", async (event: { messages?: unknown[]; lidPnMappings?: Array<{ lid: string; pn: string }> }) => {
+    on("messaging-history.set", async (event: {
+      messages?: unknown[];
+      lidPnMappings?: Array<{ lid: string; pn: string }>;
+      progress?: number | null;
+      syncType?: number | string | null;
+    }) => {
       await configuredTraceRecorder?.record("baileys.raw_event", { name: "messaging-history.set", event });
       await storeLidPnMappings(socket, event.lidPnMappings);
       const normalized = await normalizeBaileysMessagesWithJidResolver((event.messages ?? []) as any[], "wa-web:history-sync", resolveLiveJid);
@@ -142,6 +154,12 @@ export class BaileysLiveWhatsAppClient implements LiveWhatsAppClient {
       const chats = await normalizeBaileysChatsWithJidResolver(((event as { chats?: unknown[] }).chats ?? []) as any[], "chats.upsert", resolveLiveJid);
       normalized.contacts = mergeBySourceJid(normalized.contacts ?? [], contacts.contacts ?? []);
       normalized.chats = mergeBySourceChatId(normalized.chats ?? [], chats.chats ?? []);
+      normalized.identityLinks = [
+        ...(event.lidPnMappings ?? []).map((mapping) => ({ lid: mapping.lid, pn: mapping.pn })),
+        ...(contacts.identityLinks ?? [])
+      ];
+      // WhatsApp reports overall history-sync progress; surface it for the UI.
+      normalized.rawMetadata = { ...(normalized.rawMetadata ?? {}), progress: event.progress ?? null, syncType: event.syncType ?? null };
       await configuredTraceRecorder?.record("baileys.normalized_event", { name: "messaging-history.set", event: normalized });
       await this.emitEvent(normalized);
     });
@@ -172,6 +190,14 @@ export class BaileysLiveWhatsAppClient implements LiveWhatsAppClient {
     on("lid-mapping.update", async (mapping: { lid: string; pn: string }) => {
       await configuredTraceRecorder?.record("baileys.raw_event", { name: "lid-mapping.update", event: mapping });
       await storeLidPnMappings(socket, [mapping]);
+      if (mapping?.lid && mapping?.pn) {
+        await this.emitEvent({
+          eventKey: `lid-mapping.update:${mapping.lid}`,
+          eventType: "lid-mapping.update",
+          mode: "update",
+          identityLinks: [{ lid: mapping.lid, pn: mapping.pn }]
+        });
+      }
     });
     on("messages.update", async (items: unknown[]) => {
       await configuredTraceRecorder?.record("baileys.raw_event", { name: "messages.update", event: items });
@@ -255,18 +281,52 @@ export class BaileysLiveWhatsAppClient implements LiveWhatsAppClient {
   }
 
   async fetchHistory(request: LiveHistoryRequest): Promise<LiveHistoryResult> {
-    if (!this.socket?.fetchMessageHistory || !request.anchorMessageKey || !request.oldestMsgTimestampMs) {
+    if (!this.socket?.fetchMessageHistory || !request.anchor || !request.oldestMsgTimestampMs) {
       return { status: "unsupported", events: [], messageCount: 0, errorMessage: "Baileys on-demand history requires a live socket and anchor message." };
     }
     try {
       // Baileys forwards this verbatim into the wire field oldestMsgTimestampMs
       // — it expects MILLISECONDS; dividing by 1000 sends a 1970-era anchor and
       // the phone returns nothing.
-      await this.socket.fetchMessageHistory(request.count, decodeLiveMessageKey(request.anchorMessageKey), Math.floor(request.oldestMsgTimestampMs));
+      await this.socket.fetchMessageHistory(
+        request.count,
+        {
+          remoteJid: request.chatSourceId,
+          id: request.anchor.id,
+          fromMe: request.anchor.fromMe ?? undefined,
+          participant: request.anchor.participant ?? undefined
+        },
+        Math.floor(request.oldestMsgTimestampMs)
+      );
       return { status: "partial", events: [], messageCount: 0 };
     } catch (error) {
       return { status: "failed", events: [], messageCount: 0, errorMessage: safeError(error) };
     }
+  }
+
+  async fetchGroupMetadata(jid: string): Promise<LiveGroupMetadataResult | null> {
+    if (!this.socket?.groupMetadata) {
+      return null;
+    }
+    // groupMetadata is a read query; the read-only socket guards do not block it.
+    const metadata = (await this.socket.groupMetadata(jid)) as {
+      subject?: string | null;
+      participants?: Array<{ id?: string | null; phoneNumber?: string | null; lid?: string | null; admin?: string | null }>;
+    };
+    const participants: LiveGroupMetadataResult["participants"] = [];
+    const identityLinks: LiveGroupMetadataResult["identityLinks"] = [];
+    for (const participant of metadata.participants ?? []) {
+      const preferred = participant.phoneNumber || participant.id || participant.lid;
+      if (typeof preferred === "string" && preferred) {
+        participants.push({ jid: preferred, role: participant.admin ?? null });
+      }
+      const lid = isLidJid(participant.lid) ? participant.lid : isLidJid(participant.id) ? participant.id : null;
+      const pn = typeof participant.phoneNumber === "string" && participant.phoneNumber.includes("@") ? participant.phoneNumber : null;
+      if (lid && pn) {
+        identityLinks.push({ lid, pn });
+      }
+    }
+    return { subject: metadata.subject ?? null, participants, identityLinks };
   }
 
   private async emitConnection(update: LiveConnectionUpdate): Promise<void> {
@@ -600,12 +660,3 @@ function safeError(error: unknown): string {
   return "Unknown live client error.";
 }
 
-function decodeLiveMessageKey(sourceMessageKey: string): { remoteJid: string; id: string; participant?: string; fromMe?: boolean } {
-  const [, chatSourceId, participant, fromMe, sourceMessageId] = sourceMessageKey.split("|");
-  return {
-    remoteJid: unescapeLiveKeyComponent(chatSourceId),
-    id: unescapeLiveKeyComponent(sourceMessageId),
-    participant: participant ? unescapeLiveKeyComponent(participant) : undefined,
-    fromMe: fromMe === "1" ? true : fromMe === "0" ? false : undefined
-  };
-}

@@ -38,7 +38,9 @@ import type {
 } from "../../shared/types";
 import { config } from "../config";
 import { baselineFromStatus } from "../live/baseline";
-import { liveKeyMessageId } from "../live/normalize";
+import { messageIdFromKey, messageKey } from "../identity/keys";
+import { applyMentionLabels, appliedMentionLabels, extractMentionDigits, mentionJidCandidates } from "../identity/mentions";
+import { normalizeJid } from "../import/jid";
 import { getMemoryProviderStatus } from "../memory/provider";
 
 export class MemoryArchiveRepository implements ArchiveRepository {
@@ -66,6 +68,147 @@ export class MemoryArchiveRepository implements ArchiveRepository {
   private nextChatId = 1;
   private nextMessageId = 1;
   private nextLiveGapId = 1;
+  private identityLinks = new Map<string, string>();
+
+  private canonicalJid(jid: string | null | undefined): string | null {
+    const normalized = normalizeJid(jid);
+    if (!normalized) {
+      return null;
+    }
+    return this.identityLinks.get(normalized) ?? normalized;
+  }
+
+  async resolveIdentityJid(jid: string): Promise<string> {
+    return this.canonicalJid(jid) ?? jid;
+  }
+
+  async recordIdentityLinks(links: Array<{ lid: string; pn: string; source?: string | null }>): Promise<string[]> {
+    const learned: string[] = [];
+    for (const link of links) {
+      const lid = normalizeJid(link.lid);
+      const pn = normalizeJid(link.pn);
+      if (!lid || !pn || lid === pn || !(lid.endsWith("@lid") || lid.endsWith("@hosted.lid")) || !pn.endsWith("@s.whatsapp.net") || this.identityLinks.has(lid)) {
+        continue;
+      }
+      this.identityLinks.set(lid, pn);
+      learned.push(lid);
+    }
+    return learned;
+  }
+
+  async clearIdentityDerivedChatNames(): Promise<number> {
+    let cleared = 0;
+    for (const chat of this.chats.values()) {
+      if (chat.displayName && isIdentityDerivedName(chat.displayName, chat.jid)) {
+        chat.displayName = null;
+        cleared += 1;
+      }
+    }
+    return cleared;
+  }
+
+  async listUnnamedGroupChats(limit = 20): Promise<string[]> {
+    return [...this.chats.values()]
+      .filter((chat) => chat.chatType === "group" && (!chat.displayName?.trim() || chat.displayName === chat.jid))
+      .slice(0, Math.max(1, limit))
+      .map((chat) => chat.sourceChatId);
+  }
+
+  async listUnmergedLidIdentities(limit = 20): Promise<Array<{ lid: string; pn: string }>> {
+    const unmerged: Array<{ lid: string; pn: string }> = [];
+    for (const [lid, pn] of this.identityLinks) {
+      const hasChats = this.chats.has(lid);
+      const hasContacts = this.contacts.has(lid);
+      const hasSenders = [...this.messages.values()].some((message) => message.senderSourceJid === lid);
+      if (hasChats || hasContacts || hasSenders) {
+        unmerged.push({ lid, pn });
+        if (unmerged.length >= limit) {
+          break;
+        }
+      }
+    }
+    return unmerged;
+  }
+
+  async mergeIdentity(lid: string, pn: string): Promise<{ chatsMerged: number; contactsMerged: number; messagesCollapsed: number }> {
+    const result = { chatsMerged: 0, contactsMerged: 0, messagesCollapsed: 0 };
+    const lidChat = this.chats.get(lid);
+    const pnChat = this.chats.get(pn);
+    if (lidChat) {
+      result.chatsMerged += 1;
+      if (!pnChat) {
+        this.chats.delete(lid);
+        this.chats.set(pn, { ...lidChat, sourceChatId: pn, jid: pn });
+      } else {
+        pnChat.displayName = pnChat.displayName || lidChat.displayName || null;
+        pnChat.platformRecencyMs = Math.max(pnChat.platformRecencyMs ?? 0, lidChat.platformRecencyMs ?? 0) || null;
+        this.chats.delete(lid);
+      }
+      for (const [key, message] of [...this.messages]) {
+        if (message.chatSourceId !== lid) {
+          continue;
+        }
+        const rekeyed = { ...message, chatSourceId: pn, sourceMessageKey: messageKey(pn, message.sourceMessageId) };
+        const conflict = this.messages.get(rekeyed.sourceMessageKey);
+        this.messages.delete(key);
+        if (conflict) {
+          result.messagesCollapsed += 1;
+          if ((rekeyed.body ? 1 : 0) + (rekeyed.caption ? 1 : 0) > (conflict.body ? 1 : 0) + (conflict.caption ? 1 : 0)) {
+            this.messages.set(rekeyed.sourceMessageKey, { ...rekeyed, id: conflict.id });
+          }
+        } else {
+          this.messages.set(rekeyed.sourceMessageKey, rekeyed);
+        }
+      }
+    }
+    const lidContact = this.contacts.get(lid);
+    const pnContact = this.contacts.get(pn);
+    if (lidContact) {
+      result.contactsMerged += 1;
+      if (!pnContact) {
+        this.contacts.delete(lid);
+        this.contacts.set(pn, { ...lidContact, sourceJid: pn });
+      } else {
+        pnContact.displayName = pnContact.displayName || lidContact.displayName || null;
+        pnContact.pushName = pnContact.pushName || lidContact.pushName || null;
+        pnContact.phoneNumber = pnContact.phoneNumber || lidContact.phoneNumber || null;
+        this.contacts.delete(lid);
+      }
+    }
+    for (const message of this.messages.values()) {
+      if (message.senderSourceJid === lid) {
+        message.senderSourceJid = pn;
+      }
+    }
+    const rekeyedParticipants: ParticipantRecord[] = [];
+    for (const [key, participant] of [...this.participants]) {
+      if (participant.sourceJid === lid || participant.chatSourceId === lid) {
+        this.participants.delete(key);
+        rekeyedParticipants.push({
+          ...participant,
+          sourceJid: participant.sourceJid === lid ? pn : participant.sourceJid,
+          chatSourceId: participant.chatSourceId === lid ? pn : participant.chatSourceId
+        });
+      }
+    }
+    if (rekeyedParticipants.length) {
+      await this.upsertParticipants(rekeyedParticipants);
+    }
+    const lidCheckpoint = this.liveCheckpoints.get(lid);
+    if (lidCheckpoint) {
+      if (!this.liveCheckpoints.has(pn)) {
+        this.liveCheckpoints.set(pn, { ...lidCheckpoint, chatSourceId: pn });
+      }
+      this.liveCheckpoints.delete(lid);
+    }
+    for (const gap of this.liveGaps.values()) {
+      if (gap.chatSourceId === lid) {
+        gap.chatSourceId = pn;
+      }
+    }
+    await this.refreshChatStats([pn]);
+    return result;
+  }
 
   async createRestorePoint(_label: string): Promise<ArchiveRestorePoint> {
     const snapshot = {
@@ -164,7 +307,12 @@ export class MemoryArchiveRepository implements ArchiveRepository {
   }
 
   async upsertContacts(_runId: string, contacts: ContactRecord[]): Promise<Map<string, number>> {
-    for (const contact of contacts) {
+    for (const rawContact of contacts) {
+      const sourceJid = this.canonicalJid(rawContact.sourceJid);
+      if (!sourceJid) {
+        continue;
+      }
+      const contact = { ...rawContact, sourceJid };
       const existing = this.contacts.get(contact.sourceJid);
       this.contacts.set(contact.sourceJid, {
         ...existing,
@@ -185,12 +333,18 @@ export class MemoryArchiveRepository implements ArchiveRepository {
   }
 
   async upsertChats(_runId: string, chats: ChatRecord[]): Promise<Map<string, number>> {
-    for (const chat of chats) {
+    for (const rawChat of chats) {
+      const sourceChatId = this.canonicalJid(rawChat.sourceChatId);
+      if (!sourceChatId) {
+        continue;
+      }
+      const displayName = rawChat.displayName && !isIdentityDerivedName(rawChat.displayName, sourceChatId) ? rawChat.displayName : null;
+      const chat = { ...rawChat, sourceChatId, jid: sourceChatId, displayName };
       const existing = this.chats.get(chat.sourceChatId);
       this.chats.set(chat.sourceChatId, {
         ...existing,
         ...chat,
-        displayName: chat.displayName || existing?.displayName || chat.jid,
+        displayName: chat.displayName || existing?.displayName || null,
         chatType: chat.chatType === "unknown" && existing ? existing.chatType : chat.chatType,
         platformRecencyMs: maxNullableMs(existing?.platformRecencyMs ?? null, chat.platformRecencyMs ?? null),
         id: existing?.id ?? this.nextChatId++,
@@ -210,11 +364,21 @@ export class MemoryArchiveRepository implements ArchiveRepository {
   }
 
   async upsertMessages(messages: MessageRecord[]): Promise<number> {
-    for (const message of messages) {
+    for (const rawMessage of messages) {
+      const chatSourceId = this.canonicalJid(rawMessage.chatSourceId);
+      if (!chatSourceId || !rawMessage.sourceMessageId) {
+        continue;
+      }
+      const senderSourceJid =
+        rawMessage.senderSourceJid === "me" ? "me" : this.canonicalJid(rawMessage.senderSourceJid) ?? rawMessage.senderSourceJid ?? null;
+      const message = { ...rawMessage, chatSourceId, senderSourceJid, sourceMessageKey: messageKey(chatSourceId, rawMessage.sourceMessageId) };
       const existing = this.messages.get(message.sourceMessageKey);
       this.messages.set(message.sourceMessageKey, {
         ...existing,
         ...message,
+        body: existing?.isDeleted ? existing.body : message.body ?? existing?.body ?? null,
+        caption: existing?.isDeleted ? existing.caption : message.caption ?? existing?.caption ?? null,
+        isDeleted: Boolean(existing?.isDeleted) || message.isDeleted,
         id: existing?.id ?? this.nextMessageId++
       });
     }
@@ -253,6 +417,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     this.liveReceipts.clear();
     this.liveUpdates.clear();
     this.liveSession = null;
+    this.identityLinks.clear();
     this.nextContactId = 1;
     this.nextChatId = 1;
     this.nextMessageId = 1;
@@ -407,7 +572,12 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     return this.liveReceipts.has(eventKey);
   }
 
-  async applyLiveMessageUpdates(updates: Array<Omit<LiveMessageUpdateRecord, "applied">>): Promise<LiveMessageUpdateResult> {
+  async applyLiveMessageUpdates(rawUpdates: Array<Omit<LiveMessageUpdateRecord, "applied">>): Promise<LiveMessageUpdateResult> {
+    const updates = rawUpdates.map((update) => {
+      const chatSourceId = this.canonicalJid(update.chatSourceId) ?? update.chatSourceId;
+      const targetId = messageIdFromKey(update.sourceMessageKey);
+      return { ...update, chatSourceId, sourceMessageKey: targetId ? messageKey(chatSourceId, targetId) : update.sourceMessageKey };
+    });
     let applied = 0;
     let pending = 0;
     for (const update of updates) {
@@ -437,7 +607,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
   }
 
   private findUpdateTarget(update: Omit<LiveMessageUpdateRecord, "applied">): (MessageRecord & { id: number }) | undefined {
-    const messageId = liveKeyMessageId(update.sourceMessageKey);
+    const messageId = messageIdFromKey(update.sourceMessageKey);
     if (!messageId) {
       return undefined;
     }
@@ -477,6 +647,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       totals: currentRun?.totals ?? emptyLiveTotals(),
       openGapCount: openGaps.length,
       gapGroups: groupGaps(openGaps),
+      identityHealth: await this.computeIdentityHealth(),
       chatHealth: [...this.liveCheckpoints.values()].map((checkpoint) => {
         const chat = this.chats.get(checkpoint.chatSourceId);
         const chatOpenGaps = openGaps.filter((gap) => gap.chatSourceId === checkpoint.chatSourceId);
@@ -492,6 +663,24 @@ export class MemoryArchiveRepository implements ArchiveRepository {
         };
       })
     };
+  }
+
+  private async computeIdentityHealth(): Promise<{ unnamedGroups: number; unresolvedLids: number; samples: string[] }> {
+    const unnamed = await this.listUnnamedGroupChats(1000);
+    const lidJids = new Set<string>();
+    for (const chat of this.chats.values()) {
+      if (chat.sourceChatId.endsWith("@lid") || chat.sourceChatId.endsWith("@hosted.lid")) {
+        lidJids.add(chat.sourceChatId);
+      }
+    }
+    for (const message of this.messages.values()) {
+      const sender = message.senderSourceJid;
+      if (sender && (sender.endsWith("@lid") || sender.endsWith("@hosted.lid"))) {
+        lidJids.add(sender);
+      }
+    }
+    const unresolved = [...lidJids].filter((jid) => !this.identityLinks.has(jid));
+    return { unnamedGroups: unnamed.length, unresolvedLids: unresolved.length, samples: unnamed.slice(0, 5) };
   }
 
   private async getStatusWithoutLive(): Promise<StatusSummary> {
@@ -521,8 +710,15 @@ export class MemoryArchiveRepository implements ArchiveRepository {
 
   async listChats(options: ChatListOptions): Promise<ChatListItem[]> {
     const search = options.search?.toLowerCase();
+    const searchDigits = search ? search.replace(/\D/g, "") : "";
     return [...this.chats.values()]
-      .filter((chat) => !search || chat.displayName?.toLowerCase().includes(search) || chat.jid.toLowerCase().includes(search))
+      .filter(
+        (chat) =>
+          !search ||
+          chat.displayName?.toLowerCase().includes(search) ||
+          chat.jid.toLowerCase().includes(search) ||
+          (searchDigits.length >= 4 && chat.jid.includes(searchDigits))
+      )
       .filter((chat) => !options.type || options.type === "all" || chat.chatType === options.type)
       .filter((chat) => options.includeEventOnly || this.hasVisibleExchange(chat.sourceChatId))
       .sort((a, b) => (b.lastMessageAt ?? "").localeCompare(a.lastMessageAt ?? ""))
@@ -531,7 +727,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
         id: chat.id,
         sourceChatId: chat.sourceChatId,
         jid: chat.jid,
-        displayName: chat.displayName || chat.jid,
+        displayName: chat.displayName?.trim() && chat.displayName !== chat.jid ? chat.displayName : displayPhoneFromJid(chat.jid),
         chatType: chat.chatType,
         messageCount: chat.messageCount,
         participantCount: chat.participantCount,
@@ -558,18 +754,24 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       })
       .slice(options.offset, options.offset + options.limit)
       .map((message) => {
-        const sender = message.senderSourceJid ? this.contacts.get(message.senderSourceJid) : null;
+        // Legacy rows may carry the group's own JID as the sender; unknown, not "the group".
+        const groupSelfSender = chat.chatType === "group" && message.senderSourceJid === chat.sourceChatId;
+        const sender = !groupSelfSender && message.senderSourceJid ? this.contacts.get(message.senderSourceJid) : null;
+        const mentionLabels = this.resolveMentionLabels([message.body ?? null, message.caption ?? null]);
         return {
           id: message.id,
           sourceMessageId: message.sourceMessageId,
-          senderDisplayName: sender?.displayName ?? message.senderSourceJid ?? null,
+          senderDisplayName: groupSelfSender
+            ? null
+            : sender?.displayName?.trim() || sender?.pushName?.trim() || sender?.phoneNumber || displayPhoneFromJid(message.senderSourceJid),
           senderSourceJid: message.senderSourceJid ?? null,
           timestampMs: message.timestampMs ?? null,
           sentAt: message.timestampMs ? new Date(message.timestampMs).toISOString() : null,
           direction: message.direction,
           messageType: message.messageType,
-          body: message.body ?? null,
-          caption: message.caption ?? null,
+          body: applyMentionLabels(message.body ?? null, mentionLabels),
+          caption: applyMentionLabels(message.caption ?? null, mentionLabels),
+          mentions: appliedMentionLabels([message.body ?? null, message.caption ?? null], mentionLabels),
           hasMedia: message.hasMedia,
           mediaMimeType: message.mediaMimeType ?? null,
           mediaName: message.mediaName ?? null,
@@ -797,6 +999,23 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       .map((message, index) => this.toMemoryEvidence(message, index));
   }
 
+  private resolveMentionLabels(texts: Array<string | null>): Map<string, string> {
+    const digitsSet = extractMentionDigits(texts);
+    const labels = new Map<string, string>();
+    for (const digits of digitsSet) {
+      for (const candidate of mentionJidCandidates(digits)) {
+        const canonical = this.canonicalJid(candidate) ?? candidate;
+        const contact = this.contacts.get(canonical);
+        const label = contact?.displayName?.trim() || contact?.pushName?.trim() || contact?.phoneNumber || null;
+        if (label) {
+          labels.set(digits, label);
+          break;
+        }
+      }
+    }
+    return labels;
+  }
+
   private hasVisibleExchange(chatSourceId: string): boolean {
     return [...this.messages.values()].some((message) => message.chatSourceId === chatSourceId && isVisibleExchange(message));
   }
@@ -835,6 +1054,18 @@ function cloneMap<K, V>(map: Map<K, V>): Map<K, V> {
   return new Map(structuredClone([...map]));
 }
 
+function displayPhoneFromJid(jid: string | null | undefined): string | null {
+  if (!jid) {
+    return null;
+  }
+  const [user, server] = jid.split("@");
+  if (server !== "s.whatsapp.net" && server !== "c.us") {
+    return null;
+  }
+  const digits = user?.split(":")[0]?.replace(/\D/g, "");
+  return digits ? `+${digits}` : null;
+}
+
 function maxNullableMs(left: number | null, right: number | null): number | null {
   if (left == null) return right;
   if (right == null) return left;
@@ -844,7 +1075,7 @@ function maxNullableMs(left: number | null, right: number | null): number | null
 function groupGaps(gaps: LiveGapWindowRecord[]): Array<{ status: LiveGapStatus; reason: LiveGapWindowRecord["reason"]; count: number }> {
   const groups = new Map<string, { status: LiveGapStatus; reason: LiveGapWindowRecord["reason"]; count: number }>();
   for (const gap of gaps) {
-    const key = `${gap.status} ${gap.reason}`;
+    const key = `${gap.status}\u0000${gap.reason}`;
     const group = groups.get(key) ?? { status: gap.status, reason: gap.reason, count: 0 };
     group.count += 1;
     groups.set(key, group);
@@ -878,6 +1109,17 @@ function isIdentityDisplayName(chat: ChatRecord & { displayName?: string | null 
     return true;
   }
   return displayName === chat.jid || displayName === chat.sourceChatId || displayName === localPartFromJid(chat.sourceChatId);
+}
+
+// True when a "name" is just the identity restated (bare digits of the JID's
+// local part, or the JID itself) — permitted as a fill, never as a label.
+function isIdentityDerivedName(name: string, jid: string): boolean {
+  const trimmed = name.trim();
+  if (!trimmed) {
+    return true;
+  }
+  const localPart = localPartFromJid(jid);
+  return trimmed === jid || trimmed === localPart || trimmed.replace(/\D/g, "") === localPart;
 }
 
 function localPartFromJid(jid: string): string {

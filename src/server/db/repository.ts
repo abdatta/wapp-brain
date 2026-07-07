@@ -42,6 +42,12 @@ export interface ArchiveRepository {
   upsertChats(runId: string, chats: ChatRecord[]): Promise<Map<string, number>>;
   upsertParticipants(participants: ParticipantRecord[]): Promise<number>;
   upsertMessages(messages: MessageRecord[]): Promise<number>;
+  recordIdentityLinks(links: Array<{ lid: string; pn: string; source?: string | null }>): Promise<string[]>;
+  resolveIdentityJid(jid: string): Promise<string>;
+  listUnmergedLidIdentities(limit?: number): Promise<Array<{ lid: string; pn: string }>>;
+  mergeIdentity(lid: string, pn: string): Promise<{ chatsMerged: number; contactsMerged: number; messagesCollapsed: number }>;
+  listUnnamedGroupChats(limit?: number): Promise<string[]>;
+  clearIdentityDerivedChatNames(): Promise<number>;
   refreshChatStats(chatSourceIds?: string[]): Promise<void>;
   clearArchiveData(): Promise<void>;
   getStatus(): Promise<StatusSummary>;

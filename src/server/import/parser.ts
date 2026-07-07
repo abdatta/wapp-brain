@@ -6,7 +6,7 @@ import type {
   MessageRecord,
   ParticipantRecord
 } from "../../shared/types";
-import { displayFromJid, inferChatType, normalizeJid, phoneFromJid } from "./jid";
+import { inferChatType, normalizeJid, phoneFromJid } from "./jid";
 import { boolish, directionFromFromMe, messageTypeFromCode, normalizeTimestampMs } from "./messageTypes";
 import {
   columnsFor,
@@ -18,7 +18,7 @@ import {
   SQLiteInspection,
   tableColumnNames
 } from "./sqlite";
-import { stableMessageKey } from "./hash";
+import { messageKey, surrogateMessageId } from "../identity/keys";
 
 type SqlRow = Record<string, unknown>;
 const ROW_WARNING_LIMIT = 50;
@@ -74,6 +74,7 @@ const MODERN_MESSAGE_COLUMNS = [
 export interface ParsedWhatsAppSource {
   contacts: ContactRecord[];
   chats: ChatRecord[];
+  identityLinks: Array<{ lid: string; pn: string }>;
   warnings: ImportWarning[];
   iterateMessages: () => IterableIterator<MessageRecord>;
   getParticipants: () => ParticipantRecord[];
@@ -83,7 +84,11 @@ export interface ParsedWhatsAppSource {
   messageCountEstimate: number | null;
 }
 
-export function parseWhatsAppSource(msgstoreDb: Database.Database, waDb?: Database.Database | null): ParsedWhatsAppSource {
+export function parseWhatsAppSource(
+  msgstoreDb: Database.Database,
+  waDb?: Database.Database | null,
+  sourceFingerprint?: string | null
+): ParsedWhatsAppSource {
   const msgInspection = inspectSQLite(msgstoreDb);
   const waInspection = waDb ? inspectSQLite(waDb) : null;
   const warnings: ImportWarning[] = [];
@@ -93,7 +98,8 @@ export function parseWhatsAppSource(msgstoreDb: Database.Database, waDb?: Databa
 
   const jidMap = buildJidMap(msgstoreDb, msgInspection);
   const chatRowJidMap = buildChatRowJidMap(msgstoreDb, msgInspection, jidMap);
-  readWaContacts(waDb, waInspection, contactMap, warnings);
+  const identityLinks: Array<{ lid: string; pn: string }> = [];
+  readWaContacts(waDb, waInspection, contactMap, warnings, identityLinks);
   readJidContacts(jidMap, contactMap);
   contactMap.set("me", {
     sourceJid: "me",
@@ -126,6 +132,7 @@ export function parseWhatsAppSource(msgstoreDb: Database.Database, waDb?: Databa
   return {
     contacts: [...contactMap.values()],
     chats,
+    identityLinks,
     warnings,
     supported: Boolean(adapter),
     iterateMessages: function* () {
@@ -133,10 +140,10 @@ export function parseWhatsAppSource(msgstoreDb: Database.Database, waDb?: Databa
         return;
       }
       for (const message of adapter === "legacy"
-        ? iterateLegacyMessages(msgstoreDb, msgInspection, contactMap, participantMap, warnings, () => {
+        ? iterateLegacyMessages(msgstoreDb, msgInspection, contactMap, participantMap, warnings, sourceFingerprint ?? null, () => {
             skippedRows += 1;
           })
-        : iterateModernMessages(msgstoreDb, msgInspection, jidMap, chatRowJidMap, contactMap, participantMap, warnings, () => {
+        : iterateModernMessages(msgstoreDb, msgInspection, jidMap, chatRowJidMap, contactMap, participantMap, warnings, sourceFingerprint ?? null, () => {
             skippedRows += 1;
           })) {
         yield message;
@@ -164,7 +171,8 @@ function readWaContacts(
   waDb: Database.Database | null | undefined,
   waInspection: SQLiteInspection | null,
   contactMap: Map<string, ContactRecord>,
-  warnings: ImportWarning[]
+  warnings: ImportWarning[],
+  identityLinks: Array<{ lid: string; pn: string }> = []
 ): void {
   if (!waDb || !waInspection) {
     warnings.push({
@@ -197,8 +205,10 @@ function readWaContacts(
     });
     return;
   }
+  const lidColumn = pickColumn(columns, ["lid_jid", "lid", "lid_raw_string"]);
   const selected = [
     jidColumn,
+    ...(lidColumn ? [lidColumn] : []),
     ...["display_name", "wa_name", "notify_name", "given_name", "family_name", "sort_name", "number", "phone_number"]
   ].filter((column, index, all) => columns.has(column) && all.indexOf(column) === index);
   const rows = waDb.prepare(`SELECT ${selected.map(quoteIdentifier).join(", ")} FROM wa_contacts`).iterate() as Iterable<SqlRow>;
@@ -207,11 +217,19 @@ function readWaContacts(
     if (!jid) {
       continue;
     }
-    const displayName = firstString(row, ["display_name", "wa_name", "notify_name", "given_name", "sort_name", "number"]) ?? displayFromJid(jid);
+    // Newer wa.db builds carry the LID alias next to the phone JID — a
+    // first-class identity-link source for merging split records.
+    if (lidColumn && jid.endsWith("@s.whatsapp.net")) {
+      const lid = normalizeJid(row[lidColumn]);
+      if (lid && (lid.endsWith("@lid") || lid.endsWith("@hosted.lid"))) {
+        identityLinks.push({ lid, pn: jid });
+      }
+    }
+    const displayName = firstString(row, ["display_name", "wa_name", "notify_name", "given_name", "sort_name"]) ?? null;
     const existing = contactMap.get(jid);
     contactMap.set(jid, {
       sourceJid: jid,
-      displayName: displayName || existing?.displayName || displayFromJid(jid),
+      displayName: displayName || existing?.displayName || null,
       pushName: firstString(row, ["wa_name", "notify_name"]) ?? existing?.pushName ?? null,
       phoneNumber: firstString(row, ["number", "phone_number"]) ?? phoneFromJid(jid),
       rawMetadata: {
@@ -265,7 +283,7 @@ function readJidContacts(jidMap: Map<number, string>, contactMap: Map<string, Co
     if (!contactMap.has(jid)) {
       contactMap.set(jid, {
         sourceJid: jid,
-        displayName: displayFromJid(jid),
+        displayName: null,
         phoneNumber: phoneFromJid(jid),
         rawMetadata: { source: "jid" }
       });
@@ -310,7 +328,7 @@ function readModernChats(
     if (!jid) {
       continue;
     }
-    const displayName = firstString(row, ["subject", "display_name"]) ?? contactMap.get(jid)?.displayName ?? displayFromJid(jid);
+    const displayName = firstString(row, ["subject", "display_name"]) ?? contactMap.get(jid)?.displayName ?? null;
     chats.set(jid, {
       sourceChatId: jid,
       jid,
@@ -348,7 +366,7 @@ function readLegacyChats(
     if (!jid) {
       continue;
     }
-    const displayName = firstString(row, ["subject", "display_name"]) ?? contactMap.get(jid)?.displayName ?? displayFromJid(jid);
+    const displayName = firstString(row, ["subject", "display_name"]) ?? contactMap.get(jid)?.displayName ?? null;
     chats.set(jid, {
       sourceChatId: jid,
       jid,
@@ -401,7 +419,7 @@ function addDerivedChat(jid: string | null | undefined, contactMap: Map<string, 
   chats.set(jid, {
     sourceChatId: jid,
     jid,
-    displayName: contactMap.get(jid)?.displayName ?? displayFromJid(jid),
+    displayName: contactMap.get(jid)?.displayName ?? null,
     chatType: inferChatType(jid),
     rawMetadata: { source: "derived_from_messages" }
   });
@@ -427,6 +445,7 @@ function* iterateLegacyMessages(
   contactMap: Map<string, ContactRecord>,
   participantMap: Map<string, ParticipantRecord>,
   warnings: ImportWarning[],
+  sourceFingerprint: string | null,
   onSkippedRow: () => void
 ): IterableIterator<MessageRecord> {
   const columns = columnsFor(inspection, "messages");
@@ -462,10 +481,10 @@ function* iterateLegacyMessages(
     const timestampMs = normalizeTimestampMs(row.timestamp ?? row.received_timestamp);
     const body = stringOrNull(row.data ?? row.text_data);
     const caption = stringOrNull(row.media_caption ?? row.caption);
-    const sourceMessageId = keyId ? `legacy:${chatJid}:${keyId}` : `legacy:row:${sourceRowId}`;
+    const sourceMessageId = keyId ?? surrogateMessageId("legacy", sourceRowId, sourceFingerprint);
     yield {
       sourceMessageId,
-      sourceMessageKey: stableMessageKey(["legacy", chatJid, senderJid, fromMe, keyId ?? sourceRowId]),
+      sourceMessageKey: messageKey(chatJid, sourceMessageId),
       sourceTable: "messages",
       sourceRowId,
       chatSourceId: chatJid,
@@ -481,7 +500,7 @@ function* iterateLegacyMessages(
       hasMedia: messageType !== "text" || Boolean(row.media_mime_type || row.media_name),
       mediaMimeType: stringOrNull(row.media_mime_type),
       mediaName: stringOrNull(row.media_name),
-      quotedSourceMessageId: row.quoted_row_id == null ? null : `legacy:row:${row.quoted_row_id}`,
+      quotedSourceMessageId: row.quoted_row_id == null ? null : surrogateMessageId("legacy", String(row.quoted_row_id), sourceFingerprint),
       isDeleted: body == null && caption == null && messageType.startsWith("unknown"),
       isForwarded: boolish(row.forwarded),
       isStarred: boolish(row.starred),
@@ -503,6 +522,7 @@ function* iterateModernMessages(
   contactMap: Map<string, ContactRecord>,
   participantMap: Map<string, ParticipantRecord>,
   warnings: ImportWarning[],
+  sourceFingerprint: string | null,
   onSkippedRow: () => void
 ): IterableIterator<MessageRecord> {
   const columns = columnsFor(inspection, "message");
@@ -548,10 +568,10 @@ function* iterateModernMessages(
     const timestampMs = normalizeTimestampMs(row.timestamp ?? row.received_timestamp);
     const body = stringOrNull(row.text_data ?? row.joined_text_data ?? row.data);
     const caption = stringOrNull(row.caption);
-    const sourceMessageId = keyId ? `modern:${chatJid}:${keyId}` : `modern:row:${sourceRowId}`;
+    const sourceMessageId = keyId ?? surrogateMessageId("modern", sourceRowId, sourceFingerprint);
     yield {
       sourceMessageId,
-      sourceMessageKey: stableMessageKey(["modern", chatJid, senderJid, fromMe, keyId ?? sourceRowId]),
+      sourceMessageKey: messageKey(chatJid, sourceMessageId),
       sourceTable: "message",
       sourceRowId,
       chatSourceId: chatJid,
@@ -567,7 +587,7 @@ function* iterateModernMessages(
       hasMedia: messageType !== "text",
       mediaMimeType: null,
       mediaName: null,
-      quotedSourceMessageId: row.quoted_message_row_id == null ? null : `modern:row:${row.quoted_message_row_id}`,
+      quotedSourceMessageId: row.quoted_message_row_id == null ? null : surrogateMessageId("modern", String(row.quoted_message_row_id), sourceFingerprint),
       isDeleted: body == null && caption == null && messageType.startsWith("unknown"),
       isForwarded: boolish(row.forwarded),
       isStarred: boolish(row.starred),
@@ -598,7 +618,7 @@ function addParticipant(
   participantMap.set(key, {
     chatSourceId: chatJid,
     sourceJid: participantJid,
-    displayName: contactMap.get(participantJid)?.displayName ?? displayFromJid(participantJid),
+    displayName: contactMap.get(participantJid)?.displayName ?? null,
     membershipSource: "inferred",
     firstSeenAtMs: existing?.firstSeenAtMs ? Math.min(existing.firstSeenAtMs, timestampMs ?? existing.firstSeenAtMs) : timestampMs,
     lastSeenAtMs: existing?.lastSeenAtMs ? Math.max(existing.lastSeenAtMs, timestampMs ?? existing.lastSeenAtMs) : timestampMs,
@@ -612,7 +632,7 @@ function ensureContact(jid: string | null | undefined, contactMap: Map<string, C
   }
   contactMap.set(jid, {
     sourceJid: jid,
-    displayName: displayFromJid(jid),
+    displayName: null,
     phoneNumber: phoneFromJid(jid),
     rawMetadata: { source: "messages" }
   });

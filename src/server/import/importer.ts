@@ -2,7 +2,7 @@ import fs from "node:fs";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { setImmediate } from "node:timers/promises";
-import type { ImportRequest, ImportTotals, MessageRecord } from "../../shared/types";
+import type { ImportRequest, ImportTotals, ImportWarning, MessageRecord } from "../../shared/types";
 import { config } from "../config";
 import { ensureManagedWorkDir } from "../cleanup";
 import type { ArchiveRepository } from "../db/repository";
@@ -99,7 +99,10 @@ export async function runImport(
 
     throwIfAborted(options.signal);
     options.onProgress?.({ type: "step", step: "parsing", message: "Inspecting WhatsApp schema and contacts." });
-    const parsed = parseWhatsAppSource(msgstoreDb, waDb);
+    // Content fingerprint scopes surrogate ids for keyless rows: idempotent for
+    // the same backup, collision-free across different backups.
+    const sourceFingerprint = await fingerprintFile(prepared.sqlitePath);
+    const parsed = parseWhatsAppSource(msgstoreDb, waDb, sourceFingerprint);
     await configuredTraceRecorder?.record("import.parsed", {
       runId,
       supported: parsed.supported,
@@ -126,11 +129,34 @@ export async function runImport(
 
     throwIfAborted(options.signal);
     options.onProgress?.({ type: "step", step: "contacts", message: "Importing contacts." });
+    if (parsed.identityLinks.length) {
+      await repository.recordIdentityLinks(parsed.identityLinks.map((link) => ({ ...link, source: "wa.db" })));
+    }
     await repository.upsertContacts(runId, parsed.contacts);
     totals.contacts = parsed.contacts.length;
     options.onProgress?.({ type: "step", step: "chats", message: "Importing chats." });
     await repository.upsertChats(runId, parsed.chats);
     totals.chats = parsed.chats.length;
+    // Re-propagate contact names now that the chats exist (replace-mode imports
+    // create chats after contacts), then report enrichment visibly.
+    const namedChatsBefore = await countResolvedChatNames(repository);
+    await repository.upsertContacts(runId, parsed.contacts);
+    const namedChatsAfter = await countResolvedChatNames(repository);
+    // Informational summary entry; deliberately excluded from warning counters
+    // (persistedWarningCount indexes into parsed.warnings for late additions).
+    const enrichmentWarning: ImportWarning = {
+      severity: "info",
+      code: "CONTACT_ENRICHMENT",
+      entityType: "contact",
+      message: `Contact enrichment: ${parsed.contacts.length} contacts read, ${namedChatsAfter} of ${parsed.chats.length} chats named (${Math.max(0, namedChatsAfter - namedChatsBefore)} improved by contact propagation), ${parsed.identityLinks.length} identity links learned.`,
+      context: {
+        contactsRead: parsed.contacts.length,
+        chatsNamed: namedChatsAfter,
+        namesImproved: Math.max(0, namedChatsAfter - namedChatsBefore),
+        identityLinks: parsed.identityLinks.length
+      }
+    };
+    await repository.addWarnings(runId, [enrichmentWarning]);
 
     options.onProgress?.({ type: "step", step: "messages", message: "Importing messages in batches." });
     options.onProgress?.({
@@ -219,6 +245,34 @@ export async function runImport(
     await prepared?.cleanup();
     await preparedWa?.cleanup();
   }
+}
+
+async function fingerprintFile(filePath: string): Promise<string> {
+  const { createHash } = await import("node:crypto");
+  const { createReadStream } = await import("node:fs");
+  return new Promise<string>((resolve, reject) => {
+    const hash = createHash("sha256");
+    const stream = createReadStream(filePath);
+    stream.on("data", (chunk) => hash.update(chunk));
+    stream.on("error", reject);
+    stream.on("end", () => resolve(hash.digest("hex").slice(0, 12)));
+  });
+}
+
+// Counts chats whose display resolves to a name/phone, so enrichment deltas
+// (names improved by wa.db) are observable in the import summary.
+async function countResolvedChatNames(repository: ArchiveRepository): Promise<number> {
+  let offset = 0;
+  let count = 0;
+  for (;;) {
+    const page = await repository.listChats({ limit: 200, offset, includeEventOnly: true });
+    count += page.filter((chat) => Boolean(chat.displayName)).length;
+    if (page.length < 200) {
+      break;
+    }
+    offset += page.length;
+  }
+  return count;
 }
 
 function throwIfAborted(signal?: AbortSignal): void {

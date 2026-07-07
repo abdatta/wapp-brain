@@ -121,6 +121,19 @@ app.post("/api/live/link", async (req, res) => {
   try {
     await assertLiveBaselineExists(repository, config.live.maxBackfillPerChatDays);
     const phoneNumber = typeof req.body?.phoneNumber === "string" && req.body.phoneNumber.trim() ? req.body.phoneNumber.trim() : null;
+    // WhatsApp only issues a pairing QR for UNREGISTERED credentials. After a
+    // remote unlink (logged_out) the stored creds still exist but are dead —
+    // reconnecting with them just yields another 401 and no QR, forever.
+    // Re-pairing therefore needs a clean slate: stop any maintainer holding
+    // the dead session and remove the auth state (including its backup).
+    const options = liveOptionsFromConfig();
+    const live = await repository.getLiveStatus();
+    if (live.session?.status === "logged_out" || !(await ensureUsableLiveCreds(options.authDir))) {
+      await stopActiveMaintainer();
+      await fs.promises.rm(options.authDir, { recursive: true, force: true });
+      await repository.upsertLiveSession({ id: "default", status: "not_configured", clientName: options.clientName, lastError: null });
+      livePairing = idlePairing();
+    }
     await startLiveMaintainer(phoneNumber);
     res.json({ ok: true, pairing: livePairing, live: await repository.getLiveStatus() });
   } catch (error) {
@@ -141,6 +154,25 @@ app.post("/api/live/resume", async (_req, res) => {
 
 app.get("/api/live/pairing", (_req, res) => {
   res.json(livePairing);
+});
+
+// In-memory counters only — no database access, so it answers instantly even
+// while heavy history-sync ingestion is running.
+app.get("/api/live/progress", (_req, res) => {
+  res.json(
+    activeMaintainer?.getSyncProgress() ?? {
+      active: false,
+      connected: false,
+      processedMessages: 0,
+      processedEvents: 0,
+      queuedMessages: 0,
+      historySyncPercent: null,
+      auditPending: false,
+      gapsOpened: 0,
+      gapsClosed: 0,
+      lastEventAt: null
+    }
+  );
 });
 
 app.get("/api/archive/events", (req, res) => {
@@ -455,6 +487,10 @@ try {
   // Recompute chat recency under the current visibility rules (fast, and keeps
   // archives created before rule changes correctly ordered).
   await repository.refreshChatStats();
+  const clearedNames = await repository.clearIdentityDerivedChatNames();
+  if (clearedNames) {
+    console.log(`Cleared ${clearedNames} identity-derived chat name(s); they will resolve via contacts or the group-naming pass.`);
+  }
 } catch (error) {
   console.warn(`Live state reconciliation skipped: ${publicErrorMessage(error)}`);
 }

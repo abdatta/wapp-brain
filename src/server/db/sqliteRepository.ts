@@ -39,14 +39,23 @@ import type {
 } from "../../shared/types";
 import { config } from "../config";
 import { baselineFromStatus } from "../live/baseline";
-import { liveKeyMessageId } from "../live/normalize";
+import { messageIdFromKey, messageKey } from "../identity/keys";
+import { applyMentionLabels, appliedMentionLabels, extractMentionDigits, mentionJidCandidates } from "../identity/mentions";
+import { normalizeJid } from "../import/jid";
 import { getMemoryProviderStatus } from "../memory/provider";
+import { PublicError } from "../privacy";
 import type { ArchiveRepository, ArchiveRestorePoint } from "./repository";
 
 const TOOL_VERSION = "0.1.0";
+// Bumped when identity keying changes incompatibly; archives with data written
+// under an older scheme are refused (user-approved: re-import instead of migrate).
+const IDENTITY_VERSION = "2";
+const LEGACY_ARCHIVE_MESSAGE =
+  "This archive predates canonical identity keys. Run a Clear-and-replace import of your latest backup (or delete the archive file and run init-db), then re-pair live sync.";
 const SQLITE_IN_QUERY_BATCH_SIZE = 500;
 const ARCHIVE_TABLES = [
   "import_runs",
+  "identity_links",
   "contacts",
   "chats",
   "chat_participants",
@@ -68,6 +77,7 @@ const ARCHIVE_TABLES = [
   "memory_job_locks"
 ] as const;
 const DELETE_TABLE_ORDER = [
+  "identity_links",
   "memory_job_locks",
   "memory_validation_issues",
   "memory_citations",
@@ -107,6 +117,19 @@ function liveSessionsTableDdl(tableName: string): string {
 }
 
 const schemaStatements = [
+  `CREATE TABLE IF NOT EXISTS schema_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS identity_links (
+    lid TEXT PRIMARY KEY,
+    pn TEXT NOT NULL,
+    source TEXT NULL,
+    learned_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  )`,
+
   `CREATE TABLE IF NOT EXISTS import_runs (
     id TEXT PRIMARY KEY,
     status TEXT NOT NULL CHECK (status IN ('running','completed','failed')),
@@ -399,6 +422,8 @@ const schemaStatements = [
   `CREATE INDEX IF NOT EXISTS idx_chats_type ON chats (chat_type)`,
   `CREATE INDEX IF NOT EXISTS idx_chat_participants_contact ON chat_participants (contact_id, chat_id)`,
   `CREATE INDEX IF NOT EXISTS idx_messages_chat_time ON messages (chat_id, timestamp_ms, id)`,
+  `CREATE INDEX IF NOT EXISTS idx_messages_sender_jid ON messages (sender_source_jid)`,
+  `CREATE INDEX IF NOT EXISTS idx_chat_participants_source_jid ON chat_participants (source_jid)`,
   `CREATE INDEX IF NOT EXISTS idx_messages_sender_time ON messages (chat_id, sender_contact_id, timestamp_ms)`,
   `CREATE INDEX IF NOT EXISTS idx_messages_type_time ON messages (message_type, timestamp_ms)`,
   `CREATE INDEX IF NOT EXISTS idx_live_runs_status ON live_sync_runs (status, started_at)`,
@@ -445,12 +470,350 @@ export function isSqliteArchiveInitialized(dbPath = config.archive.sqlitePath): 
 
 export class SqliteArchiveRepository implements ArchiveRepository {
   private readonly db: Database.Database;
+  private legacyArchive = false;
+  private readonly identityLinks = new Map<string, string>();
 
   constructor(private readonly dbPath = config.archive.sqlitePath) {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     this.db = new Database(dbPath);
     configureDatabase(this.db);
     ensureSchema(this.db);
+    this.initializeIdentityState();
+  }
+
+  private initializeIdentityState(): void {
+    const stored = (this.db.prepare(`SELECT value FROM schema_meta WHERE key = 'identity_version'`).get() as { value: string } | undefined)?.value;
+    if (stored === IDENTITY_VERSION) {
+      this.legacyArchive = false;
+    } else {
+      const messageCount = (this.db.prepare(`SELECT COUNT(*) AS count FROM messages`).get() as { count: number }).count;
+      if (messageCount === 0) {
+        this.stampIdentityVersion();
+      } else {
+        this.legacyArchive = true;
+      }
+    }
+    this.identityLinks.clear();
+    const rows = this.db.prepare(`SELECT lid, pn FROM identity_links`).all() as Array<{ lid: string; pn: string }>;
+    for (const row of rows) {
+      this.identityLinks.set(row.lid, row.pn);
+    }
+  }
+
+  private stampIdentityVersion(): void {
+    this.db
+      .prepare(
+        `INSERT INTO schema_meta (key, value, updated_at) VALUES ('identity_version', ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+      )
+      .run(IDENTITY_VERSION, currentIso());
+    this.legacyArchive = false;
+  }
+
+  private assertWritableIdentityVersion(): void {
+    if (this.legacyArchive) {
+      throw new PublicError("ARCHIVE_LEGACY_IDENTITY", LEGACY_ARCHIVE_MESSAGE);
+    }
+  }
+
+  // Canonical form for any JID: normalized, then LID mapped to its phone form
+  // when a persisted link exists. Every write path funnels through this.
+  private canonicalJid(jid: string | null | undefined): string | null {
+    const normalized = normalizeJid(jid);
+    if (!normalized) {
+      return null;
+    }
+    return this.identityLinks.get(normalized) ?? normalized;
+  }
+
+  async resolveIdentityJid(jid: string): Promise<string> {
+    return this.canonicalJid(jid) ?? jid;
+  }
+
+  async recordIdentityLinks(links: Array<{ lid: string; pn: string; source?: string | null }>): Promise<string[]> {
+    const insert = this.db.prepare(
+      `INSERT INTO identity_links (lid, pn, source, learned_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT(lid) DO NOTHING`
+    );
+    const learned: string[] = [];
+    for (const link of links) {
+      const lid = normalizeJid(link.lid);
+      const pn = normalizeJid(link.pn);
+      // Links are irrevocable (first write wins) and trigger destructive merges;
+      // both sides must be strictly well-formed.
+      if (!lid || !pn || lid === pn || !isLidFormJid(lid) || !pn.endsWith("@s.whatsapp.net")) {
+        continue;
+      }
+      const result = insert.run(lid, pn, link.source ?? null, currentIso());
+      if (result.changes > 0) {
+        this.identityLinks.set(lid, pn);
+        learned.push(lid);
+      }
+    }
+    return learned;
+  }
+
+  // Identity health scans distinct senders across the whole archive; the UI
+  // polls status on every archive change, so cache with a short TTL to keep
+  // heavy sync periods responsive (health is advisory, not transactional).
+  private identityHealthCache: { atMs: number; value: { unnamedGroups: number; unresolvedLids: number; samples: string[] } } | null = null;
+
+  private async getIdentityHealth(): Promise<{ unnamedGroups: number; unresolvedLids: number; samples: string[] }> {
+    const now = Date.now();
+    if (this.identityHealthCache && now - this.identityHealthCache.atMs < 15_000) {
+      return this.identityHealthCache.value;
+    }
+    const samples = await this.listUnnamedGroupChats(5);
+    const counts = this.db
+      .prepare(
+        `SELECT
+          (SELECT COUNT(*) FROM chats WHERE chat_type = 'group' AND (display_name IS NULL OR TRIM(display_name) = '' OR display_name = jid)) AS unnamed_groups,
+          (SELECT COUNT(*) FROM (
+             SELECT source_chat_id AS j FROM chats WHERE source_chat_id LIKE '%@lid' OR source_chat_id LIKE '%@hosted.lid'
+             UNION
+             SELECT jid AS j FROM (SELECT DISTINCT sender_source_jid AS jid FROM messages WHERE sender_source_jid IS NOT NULL)
+             WHERE jid LIKE '%@lid' OR jid LIKE '%@hosted.lid'
+           ) WHERE j NOT IN (SELECT lid FROM identity_links)) AS unresolved_lids`
+      )
+      .get() as { unnamed_groups: number; unresolved_lids: number };
+    const value = {
+      unnamedGroups: Number(counts.unnamed_groups ?? 0),
+      unresolvedLids: Number(counts.unresolved_lids ?? 0),
+      samples
+    };
+    this.identityHealthCache = { atMs: now, value };
+    return value;
+  }
+
+  // Display-time mention resolution: digits → phone/LID candidates → canonical
+  // identity → contact display chain. Unresolved tokens stay unchanged.
+  private resolveMentionLabels(texts: Array<string | null>): Map<string, string> {
+    const digitsSet = extractMentionDigits(texts);
+    if (digitsSet.size === 0) {
+      return new Map();
+    }
+    const digitsByJid = new Map<string, string>();
+    for (const digits of digitsSet) {
+      for (const candidate of mentionJidCandidates(digits)) {
+        const canonical = this.canonicalJid(candidate) ?? candidate;
+        if (!digitsByJid.has(canonical)) {
+          digitsByJid.set(canonical, digits);
+        }
+      }
+    }
+    const jids = [...digitsByJid.keys()];
+    const labels = new Map<string, string>();
+    for (let index = 0; index < jids.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = jids.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      const rows = this.db
+        .prepare(
+          `SELECT source_jid,
+                  COALESCE(NULLIF(TRIM(COALESCE(display_name, '')), ''), NULLIF(TRIM(COALESCE(push_name, '')), ''), phone_number) AS label
+           FROM contacts
+           WHERE source_jid IN (${batch.map(() => "?").join(",")})`
+        )
+        .all(...batch) as Array<{ source_jid: string; label: string | null }>;
+      for (const row of rows) {
+        const digits = digitsByJid.get(row.source_jid);
+        if (digits && row.label && !labels.has(digits)) {
+          labels.set(digits, row.label);
+        }
+      }
+    }
+    return labels;
+  }
+
+  // One-time hygiene for rows written before identity-derived names were
+  // rejected at the write boundary.
+  async clearIdentityDerivedChatNames(): Promise<number> {
+    const rows = this.db
+      .prepare(`SELECT id, display_name, jid FROM chats WHERE display_name IS NOT NULL AND TRIM(display_name) <> ''`)
+      .all() as Array<{ id: number; display_name: string; jid: string }>;
+    const clear = this.db.prepare(`UPDATE chats SET display_name = NULL, updated_at = ? WHERE id = ?`);
+    let cleared = 0;
+    const transaction = this.db.transaction(() => {
+      for (const row of rows) {
+        if (isIdentityDerivedName(row.display_name, row.jid)) {
+          clear.run(currentIso(), row.id);
+          cleared += 1;
+        }
+      }
+    });
+    transaction();
+    return cleared;
+  }
+
+  async listUnnamedGroupChats(limit = 20): Promise<string[]> {
+    const rows = this.db
+      .prepare(
+        `SELECT source_chat_id FROM chats
+         WHERE chat_type = 'group' AND (display_name IS NULL OR TRIM(display_name) = '' OR display_name = jid)
+         ORDER BY last_message_at_ms IS NULL, last_message_at_ms DESC
+         LIMIT ?`
+      )
+      .all(Math.max(1, limit)) as Array<{ source_chat_id: string }>;
+    return rows.map((row) => row.source_chat_id);
+  }
+
+  async listUnmergedLidIdentities(limit = 20): Promise<Array<{ lid: string; pn: string }>> {
+    return this.db
+      .prepare(
+        `SELECT l.lid, l.pn FROM identity_links l
+         WHERE EXISTS (SELECT 1 FROM chats WHERE chats.source_chat_id = l.lid)
+            OR EXISTS (SELECT 1 FROM contacts WHERE contacts.source_jid = l.lid)
+            OR EXISTS (SELECT 1 FROM messages WHERE messages.sender_source_jid = l.lid)
+            OR EXISTS (SELECT 1 FROM chat_participants WHERE chat_participants.source_jid = l.lid)
+         LIMIT ?`
+      )
+      .all(Math.max(1, limit)) as Array<{ lid: string; pn: string }>;
+  }
+
+  async mergeIdentity(lid: string, pn: string): Promise<{ chatsMerged: number; contactsMerged: number; messagesCollapsed: number }> {
+    const result = { chatsMerged: 0, contactsMerged: 0, messagesCollapsed: 0 };
+    // The vast majority of learned links have nothing archived under the LID
+    // form (history sync ships mappings for every contact); skip the merge
+    // machinery entirely unless the LID actually appears somewhere.
+    const hasPresence = this.db
+      .prepare(
+        `SELECT EXISTS (SELECT 1 FROM chats WHERE source_chat_id = ?)
+             OR EXISTS (SELECT 1 FROM contacts WHERE source_jid = ?)
+             OR EXISTS (SELECT 1 FROM messages WHERE sender_source_jid = ?)
+             OR EXISTS (SELECT 1 FROM chat_participants WHERE source_jid = ?)
+             OR EXISTS (SELECT 1 FROM live_chat_checkpoints WHERE chat_source_id = ?)
+             OR EXISTS (SELECT 1 FROM live_gap_windows WHERE chat_source_id = ?) AS present`
+      )
+      .get(lid, lid, lid, lid, lid, lid) as { present: number };
+    if (!hasPresence.present) {
+      return result;
+    }
+    const transaction = this.db.transaction(() => {
+      // Chats: rename when the canonical chat is absent; otherwise move
+      // messages across and collapse (chat, id) conflicts onto the richer row.
+      const lidChat = this.db.prepare(`SELECT id FROM chats WHERE source_chat_id = ?`).get(lid) as { id: number } | undefined;
+      const pnChat = this.db.prepare(`SELECT id FROM chats WHERE source_chat_id = ?`).get(pn) as { id: number } | undefined;
+      if (lidChat && !pnChat) {
+        this.db.prepare(`UPDATE chats SET source_chat_id = ?, jid = ?, updated_at = ? WHERE id = ?`).run(pn, pn, currentIso(), lidChat.id);
+        this.rekeyChatMessages(lidChat.id, pn);
+        result.chatsMerged += 1;
+      } else if (lidChat && pnChat) {
+        const moveTargets = this.db
+          .prepare(`SELECT id, source_message_id FROM messages WHERE chat_id = ?`)
+          .all(lidChat.id) as Array<{ id: number; source_message_id: string }>;
+        const findConflict = this.db.prepare(`SELECT id FROM messages WHERE chat_id = ? AND source_message_id = ?`);
+        const moveOne = this.db.prepare(`UPDATE messages SET chat_id = ?, source_message_key = ? WHERE id = ?`);
+        for (const message of moveTargets) {
+          const conflict = findConflict.get(pnChat.id, message.source_message_id) as { id: number } | undefined;
+          if (conflict) {
+            this.collapseMessagePair(conflict.id, message.id);
+            result.messagesCollapsed += 1;
+          } else {
+            moveOne.run(pnChat.id, messageKey(pn, message.source_message_id), message.id);
+          }
+        }
+        this.db
+          .prepare(
+            `UPDATE chats SET
+               display_name = COALESCE(NULLIF(chats.display_name, ''), (SELECT NULLIF(display_name, '') FROM chats c2 WHERE c2.id = ?)),
+               platform_recency_ms = MAX(COALESCE(chats.platform_recency_ms, 0), COALESCE((SELECT platform_recency_ms FROM chats c2 WHERE c2.id = ?), 0)),
+               updated_at = ?
+             WHERE id = ?`
+          )
+          .run(lidChat.id, lidChat.id, currentIso(), pnChat.id);
+        this.db.prepare(`DELETE FROM chat_participants WHERE chat_id = ? AND source_jid IN (SELECT source_jid FROM chat_participants WHERE chat_id = ?)`).run(lidChat.id, pnChat.id);
+        this.db.prepare(`UPDATE chat_participants SET chat_id = ? WHERE chat_id = ?`).run(pnChat.id, lidChat.id);
+        this.db.prepare(`DELETE FROM chats WHERE id = ?`).run(lidChat.id);
+        result.chatsMerged += 1;
+      }
+
+      // Contacts: keep the canonical row, absorb missing fields, delete the husk.
+      const lidContact = this.db.prepare(`SELECT id FROM contacts WHERE source_jid = ?`).get(lid) as { id: number } | undefined;
+      const pnContact = this.db.prepare(`SELECT id FROM contacts WHERE source_jid = ?`).get(pn) as { id: number } | undefined;
+      if (lidContact && !pnContact) {
+        this.db.prepare(`UPDATE contacts SET source_jid = ?, updated_at = ? WHERE id = ?`).run(pn, currentIso(), lidContact.id);
+        result.contactsMerged += 1;
+      } else if (lidContact && pnContact) {
+        this.db
+          .prepare(
+            `UPDATE contacts SET
+               display_name = COALESCE(NULLIF(contacts.display_name, ''), (SELECT NULLIF(display_name, '') FROM contacts c2 WHERE c2.id = ?)),
+               push_name = COALESCE(NULLIF(contacts.push_name, ''), (SELECT NULLIF(push_name, '') FROM contacts c2 WHERE c2.id = ?)),
+               phone_number = COALESCE(contacts.phone_number, (SELECT phone_number FROM contacts c2 WHERE c2.id = ?)),
+               updated_at = ?
+             WHERE id = ?`
+          )
+          .run(lidContact.id, lidContact.id, lidContact.id, currentIso(), pnContact.id);
+        this.db.prepare(`UPDATE messages SET sender_contact_id = ? WHERE sender_contact_id = ?`).run(pnContact.id, lidContact.id);
+        this.db.prepare(`UPDATE chat_participants SET contact_id = ? WHERE contact_id = ?`).run(pnContact.id, lidContact.id);
+        this.db.prepare(`DELETE FROM contacts WHERE id = ?`).run(lidContact.id);
+        result.contactsMerged += 1;
+      }
+      this.db.prepare(`UPDATE messages SET sender_source_jid = ? WHERE sender_source_jid = ?`).run(pn, lid);
+      this.db
+        .prepare(`DELETE FROM chat_participants WHERE source_jid = ? AND EXISTS (SELECT 1 FROM chat_participants p2 WHERE p2.chat_id = chat_participants.chat_id AND p2.source_jid = ?)`)
+        .run(lid, pn);
+      this.db.prepare(`UPDATE chat_participants SET source_jid = ? WHERE source_jid = ?`).run(pn, lid);
+
+      // Live bookkeeping follows the merge.
+      const pnCheckpoint = this.db.prepare(`SELECT chat_source_id FROM live_chat_checkpoints WHERE chat_source_id = ?`).get(pn);
+      if (pnCheckpoint) {
+        this.db.prepare(`DELETE FROM live_chat_checkpoints WHERE chat_source_id = ?`).run(lid);
+      } else {
+        this.db.prepare(`UPDATE live_chat_checkpoints SET chat_source_id = ? WHERE chat_source_id = ?`).run(pn, lid);
+      }
+      // Anchor keys embed the old chat form; recovery recomputes them anyway.
+      this.db.prepare(`UPDATE live_gap_windows SET chat_source_id = ?, anchor_message_key = NULL WHERE chat_source_id = ?`).run(pn, lid);
+      this.db.prepare(`UPDATE live_message_updates SET chat_source_id = ? WHERE chat_source_id = ?`).run(pn, lid);
+    });
+    transaction();
+    await this.refreshChatStats([pn]);
+    await this.markStaleMemoryForMissingMessages();
+    return result;
+  }
+
+  // Re-derive message keys after their chat's canonical JID changed.
+  private rekeyChatMessages(chatId: number, canonicalChatJid: string): void {
+    const rows = this.db.prepare(`SELECT id, source_message_id FROM messages WHERE chat_id = ?`).all(chatId) as Array<{
+      id: number;
+      source_message_id: string;
+    }>;
+    const update = this.db.prepare(`UPDATE messages SET source_message_key = ? WHERE id = ?`);
+    for (const row of rows) {
+      update.run(messageKey(canonicalChatJid, row.source_message_id), row.id);
+    }
+  }
+
+  // Merge two rows representing the same WhatsApp message: tombstones stick,
+  // richer content wins, and the dropped row's unique metadata is absorbed.
+  private collapseMessagePair(keepId: number, dropId: number): void {
+    const richness = this.db.prepare(
+      `SELECT id, (NULLIF(TRIM(COALESCE(body, '')), '') IS NOT NULL) + (NULLIF(TRIM(COALESCE(caption, '')), '') IS NOT NULL) + has_media AS score
+       FROM messages WHERE id IN (?, ?)`
+    );
+    const scores = new Map((richness.all(keepId, dropId) as Array<{ id: number; score: number }>).map((row) => [row.id, row.score]));
+    const contentSource = (scores.get(dropId) ?? 0) > (scores.get(keepId) ?? 0) ? dropId : keepId;
+    this.db
+      .prepare(
+        `UPDATE messages SET
+           is_deleted = MAX(is_deleted, (SELECT is_deleted FROM messages m2 WHERE m2.id = ?)),
+           is_starred = MAX(is_starred, (SELECT is_starred FROM messages m2 WHERE m2.id = ?)),
+           is_forwarded = MAX(is_forwarded, (SELECT is_forwarded FROM messages m2 WHERE m2.id = ?)),
+           timestamp_ms = COALESCE(timestamp_ms, (SELECT timestamp_ms FROM messages m2 WHERE m2.id = ?)),
+           sent_at = COALESCE(sent_at, (SELECT sent_at FROM messages m2 WHERE m2.id = ?)),
+           sender_source_jid = COALESCE(sender_source_jid, (SELECT sender_source_jid FROM messages m2 WHERE m2.id = ?)),
+           quoted_source_message_id = COALESCE(quoted_source_message_id, (SELECT quoted_source_message_id FROM messages m2 WHERE m2.id = ?)),
+           raw_metadata_json = COALESCE(raw_metadata_json, (SELECT raw_metadata_json FROM messages m2 WHERE m2.id = ?)),
+           body = (SELECT body FROM messages m2 WHERE m2.id = ?),
+           caption = (SELECT caption FROM messages m2 WHERE m2.id = ?),
+           has_media = MAX(has_media, (SELECT has_media FROM messages m2 WHERE m2.id = ?)),
+           media_mime_type = COALESCE(media_mime_type, (SELECT media_mime_type FROM messages m2 WHERE m2.id = ?)),
+           media_name = COALESCE(media_name, (SELECT media_name FROM messages m2 WHERE m2.id = ?)),
+           message_type = (SELECT message_type FROM messages m2 WHERE m2.id = ?)
+         WHERE id = ?`
+      )
+      .run(dropId, dropId, dropId, dropId, dropId, dropId, dropId, dropId, contentSource, contentSource, dropId, dropId, dropId, contentSource, keepId);
+    // A merged tombstone hides content, matching delete-update semantics.
+    this.db.prepare(`UPDATE messages SET body = NULL, caption = NULL WHERE id = ? AND is_deleted = 1`).run(keepId);
+    this.db.prepare(`DELETE FROM messages WHERE id = ?`).run(dropId);
   }
 
   async createRestorePoint(label: string): Promise<ArchiveRestorePoint> {
@@ -474,6 +837,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
   }
 
   async startImportRun(sourceSummary: Record<string, unknown>): Promise<string> {
+    this.assertWritableIdentityVersion();
     const id = crypto.randomUUID();
     this.db
       .prepare(
@@ -537,11 +901,23 @@ export class SqliteArchiveRepository implements ArchiveRepository {
   }
 
   async upsertContacts(runId: string, contacts: ContactRecord[]): Promise<Map<string, number>> {
+    this.assertWritableIdentityVersion();
     const unique = new Map<string, ContactRecord>();
     for (const contact of contacts) {
-      if (contact.sourceJid) {
-        unique.set(contact.sourceJid, contact);
+      const sourceJid = this.canonicalJid(contact.sourceJid);
+      if (!sourceJid) {
+        continue;
       }
+      // Two records can canonicalize onto one identity within a batch (LID stub
+      // + real contact); merge field-wise so a stub cannot clobber a name.
+      const existing = unique.get(sourceJid);
+      unique.set(sourceJid, {
+        ...contact,
+        sourceJid,
+        displayName: existing?.displayName?.trim() || contact.displayName || null,
+        pushName: existing?.pushName?.trim() || contact.pushName || null,
+        phoneNumber: existing?.phoneNumber || contact.phoneNumber || null
+      });
     }
     if (unique.size === 0) {
       return new Map();
@@ -580,11 +956,17 @@ export class SqliteArchiveRepository implements ArchiveRepository {
   }
 
   async upsertChats(runId: string, chats: ChatRecord[]): Promise<Map<string, number>> {
+    this.assertWritableIdentityVersion();
     const unique = new Map<string, ChatRecord>();
     for (const chat of chats) {
-      if (chat.sourceChatId) {
-        unique.set(chat.sourceChatId, chat);
+      const sourceChatId = this.canonicalJid(chat.sourceChatId);
+      if (!sourceChatId) {
+        continue;
       }
+      // Platform chat metadata sometimes carries the bare number/LID digits as
+      // the "name"; identity-derived names must never become display labels.
+      const displayName = chat.displayName && !isIdentityDerivedName(chat.displayName, sourceChatId) ? chat.displayName : null;
+      unique.set(sourceChatId, { ...chat, sourceChatId, jid: sourceChatId, displayName });
     }
     if (unique.size === 0) {
       return new Map();
@@ -634,9 +1016,15 @@ export class SqliteArchiveRepository implements ArchiveRepository {
   }
 
   async upsertParticipants(participants: ParticipantRecord[]): Promise<number> {
+    this.assertWritableIdentityVersion();
     const unique = new Map<string, ParticipantRecord>();
     for (const participant of participants) {
-      unique.set(`${participant.chatSourceId}\u0000${participant.sourceJid}`, participant);
+      const chatSourceId = this.canonicalJid(participant.chatSourceId);
+      const sourceJid = this.canonicalJid(participant.sourceJid);
+      if (!chatSourceId || !sourceJid) {
+        continue;
+      }
+      unique.set(`${chatSourceId}\u0000${sourceJid}`, { ...participant, chatSourceId, sourceJid });
     }
     if (unique.size === 0) {
       return 0;
@@ -711,15 +1099,30 @@ export class SqliteArchiveRepository implements ArchiveRepository {
   }
 
   async upsertMessages(messages: MessageRecord[]): Promise<number> {
+    this.assertWritableIdentityVersion();
     if (messages.length === 0) {
       return 0;
     }
 
-    const chatIds = this.getChatIds([...new Set(messages.map((message) => message.chatSourceId))]);
+    // Canonicalize identities and re-derive the message key so every source
+    // converges on (canonical chat, key_id) no matter what the producer built.
+    const canonical = messages
+      .map((message) => {
+        const chatSourceId = this.canonicalJid(message.chatSourceId);
+        if (!chatSourceId || !message.sourceMessageId) {
+          return null;
+        }
+        const senderSourceJid =
+          message.senderSourceJid === "me" ? "me" : this.canonicalJid(message.senderSourceJid) ?? message.senderSourceJid ?? null;
+        return { ...message, chatSourceId, senderSourceJid, sourceMessageKey: messageKey(chatSourceId, message.sourceMessageId) } as MessageRecord;
+      })
+      .filter((message): message is MessageRecord => message !== null);
+
+    const chatIds = this.getChatIds([...new Set(canonical.map((message) => message.chatSourceId))]);
     const senderIds = this.getContactIds([
-      ...new Set(messages.map((message) => message.senderSourceJid).filter((jid): jid is string => Boolean(jid)))
+      ...new Set(canonical.map((message) => message.senderSourceJid).filter((jid): jid is string => Boolean(jid)))
     ]);
-    const rows = messages
+    const rows = canonical
       .map((message) => {
         const chatId = chatIds.get(message.chatSourceId);
         if (!chatId) {
@@ -765,24 +1168,28 @@ export class SqliteArchiveRepository implements ArchiveRepository {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(source_message_key) DO UPDATE SET
          chat_id = excluded.chat_id,
-         sender_contact_id = excluded.sender_contact_id,
-         sender_source_jid = excluded.sender_source_jid,
-         timestamp_ms = excluded.timestamp_ms,
-         sent_at = excluded.sent_at,
+         sender_contact_id = COALESCE(excluded.sender_contact_id, messages.sender_contact_id),
+         sender_source_jid = COALESCE(excluded.sender_source_jid, messages.sender_source_jid),
+         timestamp_ms = COALESCE(excluded.timestamp_ms, messages.timestamp_ms),
+         sent_at = COALESCE(excluded.sent_at, messages.sent_at),
          direction = excluded.direction,
-         from_me = excluded.from_me,
-         message_type = excluded.message_type,
-         raw_type_code = excluded.raw_type_code,
-         body = excluded.body,
-         caption = excluded.caption,
-         has_media = excluded.has_media,
-         media_mime_type = excluded.media_mime_type,
-         media_name = excluded.media_name,
-         quoted_source_message_id = excluded.quoted_source_message_id,
-         is_deleted = excluded.is_deleted,
-         is_forwarded = excluded.is_forwarded,
-         is_starred = excluded.is_starred,
-         raw_metadata_json = excluded.raw_metadata_json`
+         from_me = COALESCE(excluded.from_me, messages.from_me),
+         message_type = CASE
+           WHEN (excluded.message_type = 'system' OR excluded.message_type LIKE 'unknown%')
+                AND messages.message_type <> 'system' AND messages.message_type NOT LIKE 'unknown%' THEN messages.message_type
+           ELSE excluded.message_type
+         END,
+         raw_type_code = COALESCE(excluded.raw_type_code, messages.raw_type_code),
+         body = CASE WHEN messages.is_deleted = 1 THEN messages.body ELSE COALESCE(NULLIF(excluded.body, ''), messages.body) END,
+         caption = CASE WHEN messages.is_deleted = 1 THEN messages.caption ELSE COALESCE(NULLIF(excluded.caption, ''), messages.caption) END,
+         has_media = MAX(messages.has_media, excluded.has_media),
+         media_mime_type = COALESCE(excluded.media_mime_type, messages.media_mime_type),
+         media_name = COALESCE(excluded.media_name, messages.media_name),
+         quoted_source_message_id = COALESCE(excluded.quoted_source_message_id, messages.quoted_source_message_id),
+         is_deleted = MAX(messages.is_deleted, excluded.is_deleted),
+         is_forwarded = MAX(messages.is_forwarded, excluded.is_forwarded),
+         is_starred = MAX(messages.is_starred, excluded.is_starred),
+         raw_metadata_json = COALESCE(excluded.raw_metadata_json, messages.raw_metadata_json)`
     );
     const transaction = this.db.transaction(() => {
       for (const row of rows) {
@@ -854,6 +1261,9 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       }
       this.clearSqliteSequence();
     })();
+    // A cleared archive is a valid fresh start under the current identity scheme.
+    this.stampIdentityVersion();
+    this.identityLinks.clear();
   }
 
   async getStatus(): Promise<StatusSummary> {
@@ -886,7 +1296,8 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         configured: true,
         initialized: true,
         adapter: "sqlite",
-        location: path.basename(this.dbPath)
+        location: path.basename(this.dbPath),
+        ...(this.legacyArchive ? { error: LEGACY_ARCHIVE_MESSAGE } : {})
       },
       counts: {
         chats: Number(counts.chats ?? 0),
@@ -935,6 +1346,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
   }
 
   async startLiveSyncRun(sourceSummary: Record<string, unknown>): Promise<string> {
+    this.assertWritableIdentityVersion();
     const id = crypto.randomUUID();
     this.db
       .prepare(
@@ -1192,7 +1604,18 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     return Boolean(row);
   }
 
-  async applyLiveMessageUpdates(updates: Array<Omit<LiveMessageUpdateRecord, "applied">>): Promise<LiveMessageUpdateResult> {
+  async applyLiveMessageUpdates(rawUpdates: Array<Omit<LiveMessageUpdateRecord, "applied">>): Promise<LiveMessageUpdateResult> {
+    this.assertWritableIdentityVersion();
+    // Updates may target a LID-form chat; canonicalize and re-derive the key.
+    const updates = rawUpdates.map((update) => {
+      const chatSourceId = this.canonicalJid(update.chatSourceId) ?? update.chatSourceId;
+      const targetId = messageIdFromKey(update.sourceMessageKey);
+      return {
+        ...update,
+        chatSourceId,
+        sourceMessageKey: targetId ? messageKey(chatSourceId, targetId) : update.sourceMessageKey
+      };
+    });
     let applied = 0;
     let pending = 0;
     const insert = this.db.prepare(
@@ -1231,7 +1654,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       for (const update of updates) {
         let targetKey: string | null = update.sourceMessageKey;
         if (!exists.get(targetKey)) {
-          const messageId = liveKeyMessageId(update.sourceMessageKey);
+          const messageId = messageIdFromKey(update.sourceMessageKey);
           const fallback = messageId ? (fallbackKey.get(update.chatSourceId, messageId) as { key: string } | undefined) : undefined;
           targetKey = fallback?.key ?? null;
         }
@@ -1329,6 +1752,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
          ORDER BY count DESC`
       )
       .all() as Array<{ status: LiveGapStatus; reason: LiveGapReason; count: number }>;
+    const identityHealth = await this.getIdentityHealth();
     const healthRows = this.db
       .prepare(
         `SELECT c.chat_source_id, chats.display_name, c.health, c.latest_archived_at_ms, c.latest_live_at_ms,
@@ -1350,6 +1774,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       totals: currentRunRow ? totalsOrEmptyLive(parseJson(currentRunRow.totals_json) as LiveSyncTotals | null) : emptyLiveTotals(),
       openGapCount: openGaps.length,
       gapGroups: gapGroupRows.map((row) => ({ status: row.status, reason: row.reason, count: Number(row.count) })),
+      identityHealth,
       chatHealth: healthRows.map((row) => ({
         chatSourceId: row.chat_source_id,
         chatDisplayName: row.display_name ?? null,
@@ -1392,7 +1817,8 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         configured: true,
         initialized: true,
         adapter: "sqlite",
-        location: path.basename(this.dbPath)
+        location: path.basename(this.dbPath),
+        ...(this.legacyArchive ? { error: LEGACY_ARCHIVE_MESSAGE } : {})
       },
       counts: {
         chats: Number(counts.chats ?? 0),
@@ -1423,8 +1849,16 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     const where: string[] = [];
     const params: unknown[] = [];
     if (options.search) {
-      where.push("(display_name LIKE ? OR jid LIKE ?)");
-      params.push(`%${options.search}%`, `%${options.search}%`);
+      // Users search what they see: phone-fallback labels ("+1555...") must
+      // match jids by their digits.
+      const digits = options.search.replace(/\D/g, "");
+      if (digits.length >= 4) {
+        where.push("(display_name LIKE ? OR jid LIKE ? OR jid LIKE ?)");
+        params.push(`%${options.search}%`, `%${options.search}%`, `%${digits}%`);
+      } else {
+        where.push("(display_name LIKE ? OR jid LIKE ?)");
+        params.push(`%${options.search}%`, `%${options.search}%`);
+      }
     }
     if (options.type && options.type !== "all") {
       where.push("chat_type = ?");
@@ -1441,7 +1875,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     params.push(options.limit, options.offset);
     const rows = this.db
       .prepare(
-        `SELECT id, source_chat_id, jid, COALESCE(NULLIF(display_name, ''), jid) AS display_name, chat_type,
+        `SELECT id, source_chat_id, jid, NULLIF(TRIM(COALESCE(display_name, '')), '') AS display_name, chat_type,
                 message_count, participant_count, last_message_at
          FROM chats
          ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
@@ -1453,7 +1887,9 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       id: Number(row.id),
       sourceChatId: row.source_chat_id,
       jid: row.jid,
-      displayName: row.display_name,
+      // Name, else phone number, never a raw identifier; NULL means unresolved
+      // and the client renders an explicit state.
+      displayName: row.display_name && row.display_name !== row.jid ? row.display_name : displayPhoneFromJid(row.jid),
       chatType: row.chat_type as ChatListItem["chatType"],
       messageCount: Number(row.message_count ?? 0),
       participantCount: Number(row.participant_count ?? 0),
@@ -1477,29 +1913,43 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     }
     params.push(options.limit, options.offset);
     const orderDirection = options.order === "desc" ? "DESC" : "ASC";
+    // Legacy rows may carry the group's own JID as the sender (pre-fix history
+    // sync); those senders are unknown, never "the group".
+    const chat = this.db.prepare(`SELECT source_chat_id, chat_type FROM chats WHERE id = ?`).get(chatId) as
+      | { source_chat_id: string; chat_type: string }
+      | undefined;
     const rows = this.db
       .prepare(
-        `SELECT m.id, m.source_message_id, COALESCE(c.display_name, m.sender_source_jid) AS sender_display_name,
+        `SELECT m.id, m.source_message_id,
+                COALESCE(NULLIF(TRIM(COALESCE(c.display_name, '')), ''), NULLIF(TRIM(COALESCE(c.push_name, '')), ''), c.phone_number) AS sender_display_name,
                 m.sender_source_jid, m.timestamp_ms, m.sent_at, m.direction, m.message_type, m.body, m.caption,
                 m.has_media, m.media_mime_type, m.media_name, m.is_deleted, m.is_forwarded, m.is_starred
          FROM messages m
-         LEFT JOIN contacts c ON c.id = m.sender_contact_id
+         LEFT JOIN contacts c ON c.source_jid = m.sender_source_jid
          WHERE ${where.join(" AND ")}
          ORDER BY m.timestamp_ms ${orderDirection}, m.id ${orderDirection}
          LIMIT ? OFFSET ?`
       )
       .all(...params) as SqliteMessageRow[];
+    const groupSelfSender = chat?.chat_type === "group" ? chat.source_chat_id : null;
+    const mentionLabels = this.resolveMentionLabels(rows.flatMap((row) => [row.body, row.caption]));
     return rows.map((row) => ({
       id: Number(row.id),
       sourceMessageId: row.source_message_id,
-      senderDisplayName: row.sender_display_name,
+      // Saved name, else push name, else phone number; a raw identifier is
+      // never surfaced as the sender label (NULL = unresolved).
+      senderDisplayName:
+        groupSelfSender && row.sender_source_jid === groupSelfSender
+          ? null
+          : row.sender_display_name ?? displayPhoneFromJid(row.sender_source_jid),
       senderSourceJid: row.sender_source_jid,
       timestampMs: row.timestamp_ms == null ? null : Number(row.timestamp_ms),
       sentAt: row.sent_at,
       direction: row.direction as MessageListItem["direction"],
       messageType: row.message_type,
-      body: row.body,
-      caption: row.caption,
+      body: applyMentionLabels(row.body, mentionLabels),
+      caption: applyMentionLabels(row.caption, mentionLabels),
+      mentions: appliedMentionLabels([row.body, row.caption], mentionLabels),
       hasMedia: Boolean(row.has_media),
       mediaMimeType: row.media_mime_type,
       mediaName: row.media_name,
@@ -1543,6 +1993,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     sourceEndAtMs?: number | null;
     sourceSummary?: Record<string, unknown> | null;
   }): Promise<string> {
+    this.assertWritableIdentityVersion();
     const id = crypto.randomUUID();
     this.db
       .prepare(
@@ -1677,13 +2128,14 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     const rows = this.db
       .prepare(
         `SELECT m.id, m.source_message_key, m.source_message_id, chats.source_chat_id, m.chat_id,
-                COALESCE(NULLIF(chats.display_name, ''), chats.jid) AS chat_display_name,
-                m.sender_source_jid, COALESCE(c.display_name, m.sender_source_jid) AS sender_display_name,
+                NULLIF(TRIM(COALESCE(chats.display_name, '')), '') AS chat_display_name, chats.jid AS chat_jid,
+                m.sender_source_jid,
+                COALESCE(NULLIF(TRIM(COALESCE(c.display_name, '')), ''), NULLIF(TRIM(COALESCE(c.push_name, '')), ''), c.phone_number) AS sender_display_name,
                 m.timestamp_ms, m.sent_at, m.direction, m.message_type,
                 COALESCE(NULLIF(m.body, ''), NULLIF(m.caption, '')) AS text
          FROM messages m
          JOIN chats ON chats.id = m.chat_id
-         LEFT JOIN contacts c ON c.id = m.sender_contact_id
+         LEFT JOIN contacts c ON c.source_jid = m.sender_source_jid
          WHERE ${where.join(" AND ")}
          ORDER BY m.timestamp_ms ASC, m.id ASC
          LIMIT ?`
@@ -1882,13 +2334,14 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     const rows = this.db
       .prepare(
         `SELECT m.id, m.source_message_key, m.source_message_id, chats.source_chat_id, m.chat_id,
-                COALESCE(NULLIF(chats.display_name, ''), chats.jid) AS chat_display_name,
-                m.sender_source_jid, COALESCE(c.display_name, m.sender_source_jid) AS sender_display_name,
+                NULLIF(TRIM(COALESCE(chats.display_name, '')), '') AS chat_display_name, chats.jid AS chat_jid,
+                m.sender_source_jid,
+                COALESCE(NULLIF(TRIM(COALESCE(c.display_name, '')), ''), NULLIF(TRIM(COALESCE(c.push_name, '')), ''), c.phone_number) AS sender_display_name,
                 m.timestamp_ms, m.sent_at, m.direction, m.message_type,
                 COALESCE(NULLIF(m.body, ''), NULLIF(m.caption, '')) AS text
          FROM messages m
          JOIN chats ON chats.id = m.chat_id
-         LEFT JOIN contacts c ON c.id = m.sender_contact_id
+         LEFT JOIN contacts c ON c.source_jid = m.sender_source_jid
          WHERE m.chat_id = ? AND m.id BETWEEN ? AND ?
          ORDER BY m.timestamp_ms ASC, m.id ASC`
       )
@@ -1931,9 +2384,11 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         if (!contact.sourceJid) {
           continue;
         }
-        if (displayName) {
+        // Identity-derived "names" (bare digits of the JID) may fill an empty
+        // slot but must never replace a real name.
+        if (displayName && !isIdentityDerivedName(displayName, contact.sourceJid)) {
           updateDisplayName.run(displayName, currentIso(), contact.sourceJid);
-        } else if (pushName) {
+        } else if (pushName && !isIdentityDerivedName(pushName, contact.sourceJid)) {
           updatePushNameFallback.run(pushName, currentIso(), contact.sourceJid, localPartFromJid(contact.sourceJid));
         }
       }
@@ -1986,6 +2441,10 @@ export class SqliteArchiveRepository implements ArchiveRepository {
             const columnList = columns.map(quoteIdentifier).join(", ");
             this.db.prepare(`INSERT INTO ${table} (${columnList}) SELECT ${columnList} FROM ${snapshotName}.${table}`).run();
           }
+          // schema_meta must roll back too, or a failed clear-and-replace over a
+          // legacy archive would leave the new identity stamp on legacy data.
+          this.db.prepare(`DELETE FROM schema_meta`).run();
+          this.db.prepare(`INSERT INTO schema_meta (key, value, updated_at) SELECT key, value, updated_at FROM ${snapshotName}.schema_meta`).run();
           this.clearSqliteSequence();
           this.db.prepare("INSERT INTO sqlite_sequence (name, seq) SELECT name, seq FROM import_restore_snapshot.sqlite_sequence").run();
         })();
@@ -1995,6 +2454,9 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     } finally {
       this.db.pragma("foreign_keys = ON");
     }
+    // Recompute the legacy gate and rebuild the identity-link cache from the
+    // restored tables, discarding anything learned during the aborted run.
+    this.initializeIdentityState();
   }
 
   private clearSqliteSequence(): void {
@@ -2242,9 +2704,9 @@ function rowToMemoryEvidence(row: SqliteMemoryEvidenceRow, index: number): Memor
     sourceMessageId: row.source_message_id,
     sourceChatId: row.source_chat_id,
     chatId: Number(row.chat_id),
-    chatDisplayName: row.chat_display_name,
+    chatDisplayName: row.chat_display_name ?? displayPhoneFromJid(row.chat_jid),
     senderSourceJid: row.sender_source_jid,
-    senderDisplayName: row.sender_display_name,
+    senderDisplayName: row.sender_display_name ?? displayPhoneFromJid(row.sender_source_jid),
     timestampMs: nullableNumber(row.timestamp_ms),
     sentAt: row.sent_at,
     direction: row.direction as MemoryEvidenceMessage["direction"],
@@ -2316,6 +2778,20 @@ function emptyStatus(initialized: boolean, error?: string): StatusSummary {
   };
 }
 
+// Phone digits from a phone-addressed JID only; LID/group/broadcast ids are
+// numeric but are NOT phone numbers.
+function displayPhoneFromJid(jid: string | null | undefined): string | null {
+  if (!jid) {
+    return null;
+  }
+  const [user, server] = jid.split("@");
+  if (server !== "s.whatsapp.net" && server !== "c.us") {
+    return null;
+  }
+  const digits = user?.split(":")[0]?.replace(/\D/g, "");
+  return digits ? `+${digits}` : null;
+}
+
 // A "visible exchange" is a message a user would recognize as conversation:
 // used both to hide event-only chats and to compute WhatsApp-style recency.
 function visibleExchangePredicate(alias: string): string {
@@ -2332,6 +2808,21 @@ function visibleExchangePredicate(alias: string): string {
 
 function currentIso(): string {
   return new Date().toISOString();
+}
+
+function isLidFormJid(jid: string): boolean {
+  return jid.endsWith("@lid") || jid.endsWith("@hosted.lid");
+}
+
+// True when a "name" is just the identity restated (bare digits of the JID's
+// local part, or the JID itself) — permitted as a fill, never as an overwrite.
+function isIdentityDerivedName(name: string, jid: string): boolean {
+  const trimmed = name.trim();
+  if (!trimmed) {
+    return true;
+  }
+  const localPart = localPartFromJid(jid);
+  return trimmed === jid || trimmed === localPart || trimmed.replace(/\D/g, "") === localPart;
 }
 
 
@@ -2502,6 +2993,7 @@ interface SqliteMemoryEvidenceRow {
   source_chat_id: string;
   chat_id: number;
   chat_display_name: string | null;
+  chat_jid: string | null;
   sender_source_jid: string | null;
   sender_display_name: string | null;
   timestamp_ms: number | null;

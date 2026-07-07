@@ -318,7 +318,11 @@ async function runJob(
       await cancelImportStagingSession(sessionId);
     }
   } catch (error) {
-    await restorePoint?.restore();
+    // A legacy-gate refusal happens before anything is written; skip the
+    // (expensive) full-archive rollback in that case.
+    if (!(error instanceof PublicError && error.code === "ARCHIVE_LEGACY_IDENTITY")) {
+      await restorePoint?.restore();
+    }
     job.status = isCancellation(error, job) ? "cancelled" : "failed";
     job.finishedAt = new Date().toISOString();
     job.error = job.status === "cancelled" ? "Import stopped. The local archive was rolled back to its previous state." : publicErrorMessage(error);

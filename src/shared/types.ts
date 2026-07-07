@@ -164,7 +164,9 @@ export interface ChatListItem {
   id: number;
   sourceChatId: string;
   jid: string;
-  displayName: string;
+  // Name or phone number; NULL means unresolved and the UI renders an explicit
+  // state instead of a raw identifier.
+  displayName: string | null;
   chatType: ChatType;
   messageCount: number;
   participantCount: number;
@@ -190,6 +192,9 @@ export interface MessageListItem {
   messageType: string;
   body: string | null;
   caption: string | null;
+  // Resolved mention labels substituted into body/caption ("@<label>" spans),
+  // so the UI can highlight them; unresolved tokens stay raw @digits.
+  mentions: string[];
   hasMedia: boolean;
   mediaMimeType: string | null;
   mediaName: string | null;
@@ -479,7 +484,31 @@ export interface LiveMaintainerStatusSummary {
   totals: LiveSyncTotals;
   openGapCount: number;
   gapGroups: LiveGapGroupSummary[];
+  identityHealth: IdentityHealthSummary;
   chatHealth: LiveChatHealthSummary[];
+}
+
+export interface IdentityHealthSummary {
+  unnamedGroups: number;
+  unresolvedLids: number;
+  samples: string[];
+}
+
+// In-memory sync progress; served without touching the database so the UI can
+// poll it even while heavy ingestion is running.
+export interface LiveSyncProgress {
+  active: boolean;
+  connected: boolean;
+  processedMessages: number;
+  processedEvents: number;
+  queuedMessages: number;
+  // Platform-reported progress of WhatsApp's proactive history push (phase 1).
+  historySyncPercent: number | null;
+  // Per-chat backfill of downtime windows (phase 2): audit → gaps → recovery.
+  auditPending: boolean;
+  gapsOpened: number;
+  gapsClosed: number;
+  lastEventAt: string | null;
 }
 
 export interface LiveGapGroupSummary {

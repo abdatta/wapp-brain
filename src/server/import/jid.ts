@@ -53,16 +53,14 @@ export function phoneFromJid(jid: string | null | undefined): string | null {
   if (!jid) {
     return null;
   }
-  const user = normalizeUserPart(jid.split("@")[0]);
-  return /^\d+$/.test(user) ? user : null;
-}
-
-export function displayFromJid(jid: string | null | undefined): string {
-  if (!jid) {
-    return "Unknown";
+  // Only phone-addressed servers carry real phone numbers; LID, group, and
+  // broadcast identifiers are numeric but are NOT phone numbers.
+  const [rawUser, server] = jid.split("@");
+  if (server !== "s.whatsapp.net" && server !== "c.us") {
+    return null;
   }
-  const phone = phoneFromJid(jid);
-  return phone ?? jid;
+  const user = normalizeUserPart(rawUser);
+  return /^\d+$/.test(user) ? user : null;
 }
 
 function normalizeUserPart(user: string): string {

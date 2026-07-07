@@ -1,5 +1,5 @@
 import type { ArchiveRepository } from "../db/repository";
-import { liveMessageKey } from "./normalize";
+import { messageKey } from "../identity/keys";
 import { inferChatType } from "../import/jid";
 import type { LiveHistoryRequest, LiveMaintainerOptions, LiveWhatsAppClient } from "./types";
 
@@ -61,15 +61,13 @@ export async function recoverDueGaps(
       summary.uncertain += 1;
       continue;
     }
-    const anchorKey = liveMessageKey({
-      chatSourceId: gap.chatSourceId,
-      sourceMessageId: anchor.sourceMessageId,
-      participant:
-        inferChatType(gap.chatSourceId) === "group" && !anchor.fromMe && anchor.senderSourceJid !== gap.chatSourceId
-          ? anchor.senderSourceJid
-          : null,
-      fromMe: anchor.fromMe
-    });
+    // Stall detection compares the canonical anchor identity between attempts;
+    // the wire request carries the full structured key separately.
+    const anchorKey = messageKey(gap.chatSourceId, anchor.sourceMessageId);
+    const anchorParticipant =
+      inferChatType(gap.chatSourceId) === "group" && !anchor.fromMe && anchor.senderSourceJid !== gap.chatSourceId
+        ? anchor.senderSourceJid
+        : null;
 
     if (gap.requestCount >= options.maxGapRetries) {
       const stalled = gap.anchorMessageKey === anchorKey;
@@ -90,10 +88,14 @@ export async function recoverDueGaps(
 
     const request: LiveHistoryRequest = {
       chatSourceId: gap.chatSourceId,
-      anchorMessageKey: anchorKey,
+      anchor: { id: anchor.sourceMessageId, fromMe: anchor.fromMe, participant: anchorParticipant },
       oldestMsgTimestampMs: anchor.timestampMs,
       count: options.maxBackfillPerChatMessages
     };
+    // Space out on-demand requests within a tick; they all hit the phone.
+    if (summary.attempted > 1 && options.minBackfillDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, Math.min(options.minBackfillDelayMs, 1500)));
+    }
     const result = await client.fetchHistory(request);
     await repository.upsertLiveGap({
       ...gap,
@@ -106,6 +108,7 @@ export async function recoverDueGaps(
     // Some clients return history synchronously; ingest it so the evidence counts.
     if (result.events.length) {
       const chatSourceIds = new Set<string>();
+      const canonicalOf = new Map<string, string>();
       for (const event of result.events) {
         if (event.contacts?.length) await repository.upsertContacts("live-recovery", event.contacts);
         if (event.chats?.length) await repository.upsertChats("live-recovery", event.chats);
@@ -113,14 +116,16 @@ export async function recoverDueGaps(
         if (event.messages?.length) {
           await repository.upsertMessages(event.messages);
           for (const message of event.messages) {
-            chatSourceIds.add(message.chatSourceId);
+            const canonical = await repository.resolveIdentityJid(message.chatSourceId);
+            canonicalOf.set(message.chatSourceId, canonical);
+            chatSourceIds.add(canonical);
           }
         }
       }
       await repository.refreshChatStats([...chatSourceIds]);
       const minIngestedAtMs = result.events
         .flatMap((event) => event.messages ?? [])
-        .filter((message) => message.chatSourceId === gap.chatSourceId)
+        .filter((message) => (canonicalOf.get(message.chatSourceId) ?? message.chatSourceId) === gap.chatSourceId)
         .reduce<number | null>((min, message) => (message.timestampMs == null ? min : Math.min(min ?? Infinity, message.timestampMs)), null);
       const bound = gap.requiredLowerBoundAtMs ?? gap.startAtMs;
       if (bound == null || (minIngestedAtMs != null && minIngestedAtMs <= bound + 5_000)) {

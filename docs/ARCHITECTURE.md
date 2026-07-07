@@ -50,6 +50,19 @@ open gaps. Windows beyond the platform recovery horizon are reported as grouped
 uncertainty instead of per-chat alerts. A logged-out linked device stops
 reconnection and surfaces a re-pair action instead of retrying forever.
 
+## Identity Model
+
+One WhatsApp message = one archive row, keyed by `(canonical chat JID, key_id)`
+across every source (backup import, history sync, live delivery). LID↔phone
+mappings are persisted in `identity_links` and every JID canonicalizes through
+them at the repository write boundary; mappings learned late trigger an
+idempotent merge of chats, contacts, messages, checkpoints, and gap windows
+recorded under the LID form. Display identity is name → push name → phone
+number — never a raw identifier; unnamed groups and unresolved LID identities
+are counted as identity health and surfaced as alerts. Archives written under
+the previous identity scheme are refused with a re-import instruction
+(`schema_meta.identity_version`); there is no migration path by design.
+
 Second-brain memory flow:
 
 ```text

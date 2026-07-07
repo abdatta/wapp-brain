@@ -20,6 +20,10 @@ Search the whole archive the way a second brain deserves: fast global full-text 
 - Full-text matching is fast on large archives (indexed, not linear scans) and handles word-boundary and prefix matching better than substring matching.
 - A later semantic layer lets the user find messages by meaning ("that conversation about renting in Lisbon") using locally computed embeddings; enabling any remote embedding/LLM service remains an explicit opt-in after privacy review.
 - The second-brain memory query uses the same improved retrieval so cited answers draw from better evidence.
+- **Identity-aware inference** (decided 2026-07-07, builds on the canonical-identity change): mentions become structured entity references, not just display substitutions.
+  - Capture mentioned identities at ingest — live `contextInfo.mentionedJid` and the Android backup's mentions table — into a `message_mentions(message, mentioned_identity)` relation, canonicalized through identity links, enabling person-scoped search/boosting, wiki person pages with mentioned-in backlinks, and QnA grounding by entity. The display-time `@digits` regex resolution (shipped in the identity change) remains the fallback for rows without captured metadata.
+  - Derived layers read a *resolved* text form (mentions as names, sender identity attached) for generation and embedding, while citations keep the raw stored text — a query like a person's name can never match a vector built from raw LID digits.
+  - Identity improvements (new links, group finally named) propagate to derived pages/embeddings via the existing memory staleness machinery: mark dependents stale, regenerate on the next run.
 
 ## Behavior Questions
 

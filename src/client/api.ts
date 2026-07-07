@@ -11,6 +11,7 @@ import type {
   LiveGapWindowRecord,
   LiveMaintainerStatusSummary,
   LivePairingSummary,
+  LiveSyncProgress,
   MemoryConsolidationResult,
   MemoryCitationResolution,
   MemoryProviderStatus,
@@ -158,6 +159,10 @@ export function resumeLiveSession(): Promise<{ ok: boolean; live: LiveMaintainer
 
 export function getLivePairing(): Promise<LivePairingSummary> {
   return request<LivePairingSummary>("/api/live/pairing");
+}
+
+export function getLiveProgress(): Promise<LiveSyncProgress> {
+  return request<LiveSyncProgress>("/api/live/progress");
 }
 
 export function getMemoryStatus(): Promise<MemoryStatusSummary> {

@@ -11,7 +11,8 @@ import { auditChatGaps } from "../src/server/live/auditor";
 import { assertLiveBaselineExists, getLiveBaselineSummary } from "../src/server/live/baseline";
 import { getLiveDependencyStatus, isSafeBaileysVersion } from "../src/server/live/dependency";
 import { LiveMaintainer } from "../src/server/live/maintainer";
-import { liveMessageKey, normalizeBaileysMessage, normalizeBaileysMessagesWithJidResolver } from "../src/server/live/normalize";
+import { messageIdFromKey, messageKey } from "../src/server/identity/keys";
+import { normalizeBaileysMessage, normalizeBaileysMessagesWithJidResolver } from "../src/server/live/normalize";
 import { recoverDueGaps } from "../src/server/live/recovery";
 import type {
   LiveConnectionUpdate,
@@ -93,7 +94,7 @@ describe("live WhatsApp maintainer", () => {
       "wa-web:messages.upsert"
     );
 
-    expect(message?.sourceMessageKey).toBe("wa-web|15550000001@s.whatsapp.net||0|ABC123");
+    expect(message?.sourceMessageKey).toBe("wa|15550000001@s.whatsapp.net|ABC123");
     expect(message?.body).toBe("hello live world");
     expect(JSON.stringify(message?.rawMetadata)).not.toContain("hello live world");
   });
@@ -113,7 +114,7 @@ describe("live WhatsApp maintainer", () => {
 
     expect(event.chats?.[0]?.sourceChatId).toBe("919051167186@s.whatsapp.net");
     expect(event.messages?.[0]?.chatSourceId).toBe("919051167186@s.whatsapp.net");
-    expect(event.messages?.[0]?.sourceMessageKey).toBe("wa-web|919051167186@s.whatsapp.net||0|LID123");
+    expect(event.messages?.[0]?.sourceMessageKey).toBe("wa|919051167186@s.whatsapp.net|LID123");
   });
 
   it("strips live device suffixes before deriving archive chat keys", async () => {
@@ -132,7 +133,7 @@ describe("live WhatsApp maintainer", () => {
     expect(event.chats?.[0]?.sourceChatId).toBe("12136968563@s.whatsapp.net");
     expect(event.messages?.[0]?.chatSourceId).toBe("12136968563@s.whatsapp.net");
     expect(event.messages?.[0]?.senderSourceJid).toBe("12136968563@s.whatsapp.net");
-    expect(event.messages?.[0]?.sourceMessageKey).toBe("wa-web|12136968563@s.whatsapp.net||0|DEVICE123");
+    expect(event.messages?.[0]?.sourceMessageKey).toBe("wa|12136968563@s.whatsapp.net|DEVICE123");
   });
 
   it("ingests duplicate live events idempotently through the maintainer", async () => {
@@ -213,7 +214,7 @@ describe("live WhatsApp maintainer", () => {
     const client = new FakeLiveClient();
     const maintainer = new LiveMaintainer(repository, client, testOptions());
     const base = makeLiveEvent("updates@s.whatsapp.net", "m1", 1712000001000);
-    const pendingKey = "wa-web|updates@s.whatsapp.net||0|missing";
+    const pendingKey = "wa|updates@s.whatsapp.net|missing";
 
     await maintainer.start();
     await client.emit(base);
@@ -358,7 +359,7 @@ describe("live WhatsApp maintainer", () => {
       endAtMs: now,
       requiredLowerBoundAtMs: now - 10 * hour,
       requestCount: 5,
-      anchorMessageKey: "wa-web|limit@s.whatsapp.net||0|previous-anchor"
+      anchorMessageKey: "wa|limit@s.whatsapp.net|previous-anchor"
     });
 
     // retries exhausted with no anchor movement at all
@@ -370,12 +371,7 @@ describe("live WhatsApp maintainer", () => {
       endAtMs: now,
       requiredLowerBoundAtMs: now - 10 * hour,
       requestCount: 5,
-      anchorMessageKey: liveMessageKey({
-        chatSourceId: "stalled@s.whatsapp.net",
-        sourceMessageId: "stalled-anchor",
-        participant: null,
-        fromMe: false
-      })
+      anchorMessageKey: messageKey("stalled@s.whatsapp.net", "stalled-anchor")
     });
 
     const summary = await recoverDueGaps(repository, client, { ...testOptions(), maxConcurrentChatBackfills: 4 });
@@ -388,6 +384,35 @@ describe("live WhatsApp maintainer", () => {
     expect(gaps.find((gap) => gap.chatSourceId === "horizon@s.whatsapp.net")?.status).toBe("uncertain");
     expect(gaps.find((gap) => gap.chatSourceId === "limit@s.whatsapp.net")?.status).toBe("needs_user_action");
     expect(gaps.find((gap) => gap.chatSourceId === "stalled@s.whatsapp.net")?.status).toBe("uncertain");
+  });
+
+  it("ingests large history chunks in slices and reports sync progress", async () => {
+    const repository = new MemoryArchiveRepository();
+    const client = new FakeLiveClient();
+    const maintainer = new LiveMaintainer(repository, client, testOptions());
+    const bigBatch: MessageRecord[] = Array.from({ length: 1200 }, (_, index) =>
+      makeMessage("bulk@s.whatsapp.net", `bulk-${index}`, 1712000000000 + index)
+    );
+
+    await maintainer.start();
+    await client.emit({
+      eventKey: "history-chunk-1",
+      eventType: "messaging-history.set",
+      mode: "history",
+      chats: [makeChat("bulk@s.whatsapp.net", "Bulk")],
+      messages: bigBatch,
+      rawMetadata: { progress: 42 }
+    });
+    const progress = maintainer.getSyncProgress();
+    await maintainer.stop();
+
+    const status = await repository.getStatus();
+
+    expect(status.counts.messages).toBe(1200);
+    expect(progress.processedMessages).toBe(1200);
+    expect(progress.processedEvents).toBe(1);
+    expect(progress.historySyncPercent).toBe(42);
+    expect(progress.active).toBe(true);
   });
 
   it("runs recovery on its own schedule without user action", async () => {
@@ -713,14 +738,13 @@ describe("live WhatsApp maintainer", () => {
     expect(stub?.rawMetadata?.stubType).toBe(27);
   });
 
-  it("escapes the key delimiter so hostile message ids cannot collide", async () => {
-    const tricky = liveMessageKey({ chatSourceId: "chat@s.whatsapp.net", sourceMessageId: "id|with|pipes%", participant: null, fromMe: false });
-    const plain = liveMessageKey({ chatSourceId: "chat@s.whatsapp.net", sourceMessageId: "normal-id", participant: null, fromMe: false });
-    const { liveKeyMessageId } = await import("../src/server/live/normalize");
+  it("escapes the key delimiter so hostile message ids cannot collide", () => {
+    const tricky = messageKey("chat@s.whatsapp.net", "id|with|pipes%");
+    const plain = messageKey("chat@s.whatsapp.net", "normal-id");
 
-    expect(tricky.split("|")).toHaveLength(5);
-    expect(liveKeyMessageId(tricky)).toBe("id|with|pipes%");
-    expect(plain).toBe("wa-web|chat@s.whatsapp.net||0|normal-id");
+    expect(tricky.split("|")).toHaveLength(3);
+    expect(messageIdFromKey(tricky)).toBe("id|with|pipes%");
+    expect(plain).toBe("wa|chat@s.whatsapp.net|normal-id");
   });
 
   it("does not fabricate phone numbers from LID or group identifiers", async () => {
@@ -1004,7 +1028,7 @@ function makeChat(chatSourceId: string, displayName: string): ChatRecord {
 function makeMessage(chatSourceId: string, id: string, timestampMs: number): MessageRecord {
   return {
     sourceMessageId: id,
-    sourceMessageKey: `wa-web|${chatSourceId}||0|${id}`,
+    sourceMessageKey: `wa|${chatSourceId}|${id}`,
     sourceTable: "wa-web:messages.upsert",
     sourceRowId: id,
     chatSourceId,
@@ -1041,7 +1065,7 @@ function makeGap(chatSourceId: string): LiveGapWindowRecord {
     startAtMs: 1000,
     endAtMs: 5000,
     requiredLowerBoundAtMs: 1000,
-    anchorMessageKey: `wa-web|${chatSourceId}||0|anchor`,
+    anchorMessageKey: `wa|${chatSourceId}|anchor`,
     requestCount: 0,
     confidence: "medium"
   };

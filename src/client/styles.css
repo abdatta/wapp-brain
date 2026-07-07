@@ -882,6 +882,12 @@ h1 {
   font-style: italic;
 }
 
+.messageBubble .mention,
+.systemChip .mention {
+  color: #53bdeb;
+  font-weight: 500;
+}
+
 .messageFlags {
   gap: 6px;
   flex-wrap: wrap;
