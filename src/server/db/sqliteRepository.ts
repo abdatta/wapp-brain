@@ -33,14 +33,18 @@ import type {
   MemoryValidationIssue,
   MessageListItem,
   MessageRecord,
+  MessageSecretRecord,
   ParticipantRecord,
   RecoveryAnchorRecord,
+  RetainedPayloadRecord,
   StatusSummary
 } from "../../shared/types";
 import { config } from "../config";
 import { baselineFromStatus } from "../live/baseline";
 import { messageIdFromKey, messageKey } from "../identity/keys";
 import { applyMentionLabels, appliedMentionLabels, extractMentionDigits, mentionJidCandidates } from "../identity/mentions";
+import { mergeInteractionMetadata } from "./interactions";
+import { interpretMessage } from "../interpretation/messageInterpretation";
 import { normalizeJid } from "../import/jid";
 import { getMemoryProviderStatus } from "../memory/provider";
 import { PublicError } from "../privacy";
@@ -101,6 +105,21 @@ const DELETE_TABLE_ORDER = [
 ] as const;
 
 const LIVE_SESSION_STATUSES = ["not_configured", "pairing", "connected", "disconnected", "stopped", "error", "logged_out"] as const;
+const MESSAGE_UPDATE_TYPES = ["delete", "edit", "reaction", "poll_vote", "event_response", "receipt", "call", "unknown"] as const;
+
+function liveMessageUpdatesTableDdl(tableName: string): string {
+  return `CREATE TABLE IF NOT EXISTS ${tableName} (
+    event_key TEXT PRIMARY KEY,
+    chat_source_id TEXT NOT NULL,
+    source_message_key TEXT NOT NULL,
+    update_type TEXT NOT NULL CHECK (update_type IN (${MESSAGE_UPDATE_TYPES.map((type) => `'${type}'`).join(",")})),
+    occurred_at_ms INTEGER NULL,
+    applied INTEGER NOT NULL DEFAULT 0,
+    metadata_json TEXT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  )`;
+}
 
 function liveSessionsTableDdl(tableName: string): string {
   return `CREATE TABLE IF NOT EXISTS ${tableName} (
@@ -297,17 +316,33 @@ const schemaStatements = [
     metadata_json TEXT NULL
   )`,
 
-  `CREATE TABLE IF NOT EXISTS live_message_updates (
-    event_key TEXT PRIMARY KEY,
+  liveMessageUpdatesTableDdl("live_message_updates"),
+
+  `CREATE TABLE IF NOT EXISTS message_secrets (
+    message_key TEXT PRIMARY KEY,
     chat_source_id TEXT NOT NULL,
-    source_message_key TEXT NOT NULL,
-    update_type TEXT NOT NULL CHECK (update_type IN ('delete','edit','reaction','receipt','call','unknown')),
-    occurred_at_ms INTEGER NULL,
-    applied INTEGER NOT NULL DEFAULT 0,
-    metadata_json TEXT NULL,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    source_message_id TEXT NOT NULL,
+    secret BLOB NOT NULL,
+    source TEXT NOT NULL CHECK (source IN ('live','backup')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   )`,
+
+  `CREATE TABLE IF NOT EXISTS retained_encrypted_payloads (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_key TEXT NOT NULL UNIQUE,
+    target_message_key TEXT NOT NULL,
+    chat_source_id TEXT NOT NULL,
+    target_message_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('poll_vote','event_response','secret_encrypted')),
+    actor_jid TEXT NULL,
+    enc_payload BLOB NOT NULL,
+    enc_iv BLOB NULL,
+    occurred_at_ms INTEGER NULL,
+    metadata_json TEXT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  )`,
+
+  `CREATE INDEX IF NOT EXISTS idx_retained_payloads_target ON retained_encrypted_payloads (target_message_key)`,
 
   `CREATE TABLE IF NOT EXISTS memory_runs (
     id TEXT PRIMARY KEY,
@@ -621,6 +656,71 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       }
     }
     return labels;
+  }
+
+  async collapseSupersededMessages(
+    pairs: Array<{ chatSourceId: string; staleMessageId: string; canonicalMessageId: string }>
+  ): Promise<number> {
+    this.assertWritableIdentityVersion();
+    if (pairs.length === 0) {
+      return 0;
+    }
+    // The stale row is a previous import of the same message under its edit
+    // key; the canonical row (just upserted) already carries the final text,
+    // and live-derived state always targeted the canonical identity.
+    const remove = this.db.prepare(
+      `DELETE FROM messages
+       WHERE source_message_key = ?
+         AND EXISTS (SELECT 1 FROM messages canonical WHERE canonical.source_message_key = ?)`
+    );
+    let collapsed = 0;
+    const transaction = this.db.transaction(() => {
+      for (const pair of pairs) {
+        const chatSourceId = this.canonicalJid(pair.chatSourceId) ?? pair.chatSourceId;
+        const result = remove.run(messageKey(chatSourceId, pair.staleMessageId), messageKey(chatSourceId, pair.canonicalMessageId));
+        collapsed += result.changes;
+      }
+    });
+    transaction();
+    if (collapsed > 0) {
+      await this.markStaleMemoryForMissingMessages();
+    }
+    return collapsed;
+  }
+
+  async listUnknownTypeCodes(): Promise<Array<{ code: string; count: number; examples: Array<{ chatLabel: string; timestampMs: number | null }> }>> {
+    const codes = this.db
+      .prepare(
+        `SELECT COALESCE(NULLIF(TRIM(COALESCE(raw_type_code, '')), ''), REPLACE(message_type, 'unknown_', '')) AS code, COUNT(*) AS n
+         FROM messages
+         WHERE message_type LIKE 'unknown%'
+         GROUP BY 1
+         ORDER BY n DESC, code ASC`
+      )
+      .all() as Array<{ code: string; n: number }>;
+    const exampleStmt = this.db.prepare(
+      `SELECT COALESCE(NULLIF(TRIM(COALESCE(c.display_name, '')), ''), '') AS display_name, c.jid AS jid, m.timestamp_ms AS timestamp_ms
+       FROM messages m
+       JOIN chats c ON c.id = m.chat_id
+       WHERE m.message_type LIKE 'unknown%'
+         AND COALESCE(NULLIF(TRIM(COALESCE(m.raw_type_code, '')), ''), REPLACE(m.message_type, 'unknown_', '')) = ?
+       ORDER BY m.timestamp_ms DESC
+       LIMIT 3`
+    );
+    return codes.map((row) => ({
+      code: String(row.code),
+      count: Number(row.n),
+      examples: (exampleStmt.all(String(row.code)) as Array<{ display_name: string; jid: string; timestamp_ms: number | null }>).map(
+        (example) => ({
+          // Display rule: name, else phone digits, never a raw identifier.
+          chatLabel:
+            example.display_name ||
+            displayPhoneFromJid(example.jid) ||
+            (example.jid.endsWith("@g.us") ? "Unnamed group" : "Unresolved chat"),
+          timestampMs: example.timestamp_ms == null ? null : Number(example.timestamp_ms)
+        })
+      )
+    }));
   }
 
   // One-time hygiene for rows written before identity-derived names were
@@ -1180,13 +1280,34 @@ export class SqliteArchiveRepository implements ArchiveRepository {
            ELSE excluded.message_type
          END,
          raw_type_code = COALESCE(excluded.raw_type_code, messages.raw_type_code),
-         body = CASE WHEN messages.is_deleted = 1 THEN messages.body ELSE COALESCE(NULLIF(excluded.body, ''), messages.body) END,
-         caption = CASE WHEN messages.is_deleted = 1 THEN messages.caption ELSE COALESCE(NULLIF(excluded.caption, ''), messages.caption) END,
+         body = CASE
+           WHEN messages.is_deleted = 1
+                AND NOT (messages.message_type LIKE 'unknown%' AND messages.body IS NULL AND messages.caption IS NULL
+                         AND excluded.is_deleted = 0)
+           THEN messages.body
+           ELSE COALESCE(NULLIF(excluded.body, ''), messages.body)
+         END,
+         caption = CASE
+           WHEN messages.is_deleted = 1
+                AND NOT (messages.message_type LIKE 'unknown%' AND messages.body IS NULL AND messages.caption IS NULL
+                         AND excluded.is_deleted = 0)
+           THEN messages.caption
+           ELSE COALESCE(NULLIF(excluded.caption, ''), messages.caption)
+         END,
          has_media = MAX(messages.has_media, excluded.has_media),
          media_mime_type = COALESCE(excluded.media_mime_type, messages.media_mime_type),
          media_name = COALESCE(excluded.media_name, messages.media_name),
          quoted_source_message_id = COALESCE(excluded.quoted_source_message_id, messages.quoted_source_message_id),
-         is_deleted = MAX(messages.is_deleted, excluded.is_deleted),
+         -- A textless unknown-typed row flagged deleted is the retired
+         -- inference heuristic, not evidence; a re-import bearing a fresh
+         -- not-deleted verdict heals it. Real tombstones (typed rows) keep
+         -- their sticky deletion.
+         is_deleted = CASE
+           WHEN messages.message_type LIKE 'unknown%' AND messages.body IS NULL AND messages.caption IS NULL
+                AND excluded.is_deleted = 0
+           THEN 0
+           ELSE MAX(messages.is_deleted, excluded.is_deleted)
+         END,
          is_forwarded = MAX(messages.is_forwarded, excluded.is_forwarded),
          is_starred = MAX(messages.is_starred, excluded.is_starred),
          raw_metadata_json = COALESCE(excluded.raw_metadata_json, messages.raw_metadata_json)`
@@ -1639,6 +1760,8 @@ export class SqliteArchiveRepository implements ArchiveRepository {
            raw_metadata_json = json_set(COALESCE(raw_metadata_json, '{}'), '$.edited', 1)
        WHERE source_message_key = ?`
     );
+    const readMetadata = this.db.prepare(`SELECT raw_metadata_json FROM messages WHERE source_message_key = ?`);
+    const writeMetadata = this.db.prepare(`UPDATE messages SET raw_metadata_json = ? WHERE source_message_key = ?`);
     const exists = this.db.prepare(`SELECT 1 AS found FROM messages WHERE source_message_key = ?`);
     // Update targets may have been archived from backup (different key format) or
     // with a different participant/fromMe composition; fall back to matching by
@@ -1666,6 +1789,14 @@ export class SqliteArchiveRepository implements ArchiveRepository {
           if (update.updateType === "edit" && typeof update.metadata?.body === "string") {
             applyEdit.run(update.metadata.body, targetKey);
           }
+          if (update.updateType === "poll_vote" || update.updateType === "event_response") {
+            const row = readMetadata.get(targetKey) as { raw_metadata_json: string | null } | undefined;
+            const metadata = (parseJson(row?.raw_metadata_json ?? null) as Record<string, unknown> | null) ?? {};
+            const merged = mergeInteractionMetadata(metadata, update);
+            if (merged) {
+              writeMetadata.run(stringifyJson(merged), targetKey);
+            }
+          }
           applied += 1;
         } else {
           pending += 1;
@@ -1684,6 +1815,151 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     });
     transaction();
     return { applied, pending };
+  }
+
+  async recordMessageSecrets(secrets: MessageSecretRecord[]): Promise<number> {
+    this.assertWritableIdentityVersion();
+    if (secrets.length === 0) {
+      return 0;
+    }
+    const insert = this.db.prepare(
+      `INSERT INTO message_secrets (message_key, chat_source_id, source_message_id, secret, source)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(message_key) DO NOTHING`
+    );
+    let recorded = 0;
+    const transaction = this.db.transaction(() => {
+      for (const entry of secrets) {
+        const chatSourceId = this.canonicalJid(entry.chatSourceId) ?? entry.chatSourceId;
+        if (!chatSourceId || !entry.sourceMessageId || entry.secret.length === 0) {
+          continue;
+        }
+        const result = insert.run(
+          messageKey(chatSourceId, entry.sourceMessageId),
+          chatSourceId,
+          entry.sourceMessageId,
+          Buffer.from(entry.secret),
+          entry.source
+        );
+        recorded += result.changes;
+      }
+    });
+    transaction();
+    return recorded;
+  }
+
+  async getMessageSecret(chatSourceId: string, sourceMessageId: string): Promise<Uint8Array | null> {
+    const canonical = this.canonicalJid(chatSourceId) ?? chatSourceId;
+    const row = this.db
+      .prepare(`SELECT secret FROM message_secrets WHERE message_key = ?`)
+      .get(messageKey(canonical, sourceMessageId)) as { secret: Buffer } | undefined;
+    return row?.secret ?? null;
+  }
+
+  async countMessageSecrets(): Promise<number> {
+    const row = this.db.prepare(`SELECT COUNT(*) AS n FROM message_secrets`).get() as { n: number };
+    return Number(row.n ?? 0);
+  }
+
+  async retainEncryptedPayloads(payloads: RetainedPayloadRecord[]): Promise<number> {
+    this.assertWritableIdentityVersion();
+    if (payloads.length === 0) {
+      return 0;
+    }
+    const insert = this.db.prepare(
+      `INSERT INTO retained_encrypted_payloads
+       (event_key, target_message_key, chat_source_id, target_message_id, kind, actor_jid, enc_payload, enc_iv, occurred_at_ms, metadata_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(event_key) DO NOTHING`
+    );
+    let retained = 0;
+    const transaction = this.db.transaction(() => {
+      for (const payload of payloads) {
+        const chatSourceId = this.canonicalJid(payload.chatSourceId) ?? payload.chatSourceId;
+        if (!chatSourceId || !payload.targetMessageId || payload.encPayload.length === 0) {
+          continue;
+        }
+        const result = insert.run(
+          payload.eventKey,
+          messageKey(chatSourceId, payload.targetMessageId),
+          chatSourceId,
+          payload.targetMessageId,
+          payload.kind,
+          payload.actorJid ?? null,
+          Buffer.from(payload.encPayload),
+          payload.encIv ? Buffer.from(payload.encIv) : null,
+          payload.occurredAtMs ?? null,
+          stringifyJson(payload.metadata ?? null)
+        );
+        retained += result.changes;
+      }
+    });
+    transaction();
+    return retained;
+  }
+
+  async listRetainedEncryptedPayloads(limit = 500): Promise<RetainedPayloadRecord[]> {
+    const rows = this.db
+      .prepare(
+        `SELECT id, event_key, chat_source_id, target_message_id, kind, actor_jid, enc_payload, enc_iv, occurred_at_ms, metadata_json
+         FROM retained_encrypted_payloads
+         ORDER BY id ASC
+         LIMIT ?`
+      )
+      .all(Math.max(1, limit)) as Array<{
+      id: number;
+      event_key: string;
+      chat_source_id: string;
+      target_message_id: string;
+      kind: RetainedPayloadRecord["kind"];
+      actor_jid: string | null;
+      enc_payload: Buffer;
+      enc_iv: Buffer | null;
+      occurred_at_ms: number | null;
+      metadata_json: string | null;
+    }>;
+    return rows.map((row) => ({
+      id: Number(row.id),
+      eventKey: row.event_key,
+      chatSourceId: row.chat_source_id,
+      targetMessageId: row.target_message_id,
+      kind: row.kind,
+      actorJid: row.actor_jid,
+      encPayload: row.enc_payload,
+      encIv: row.enc_iv,
+      occurredAtMs: row.occurred_at_ms == null ? null : Number(row.occurred_at_ms),
+      metadata: (parseJson(row.metadata_json) as Record<string, unknown> | null) ?? null
+    }));
+  }
+
+  async deleteRetainedEncryptedPayload(id: number): Promise<void> {
+    this.db.prepare(`DELETE FROM retained_encrypted_payloads WHERE id = ?`).run(id);
+  }
+
+  async getMessageInterpretationContext(
+    chatSourceId: string,
+    sourceMessageId: string
+  ): Promise<{ senderSourceJid: string | null; fromMe: boolean | null; rawMetadata: Record<string, unknown> | null } | null> {
+    const canonical = this.canonicalJid(chatSourceId) ?? chatSourceId;
+    const row = this.db
+      .prepare(
+        `SELECT m.sender_source_jid, m.from_me, m.raw_metadata_json
+         FROM messages m
+         JOIN chats c ON c.id = m.chat_id
+         WHERE c.source_chat_id = ? AND m.source_message_id = ?
+         LIMIT 1`
+      )
+      .get(canonical, sourceMessageId) as
+      | { sender_source_jid: string | null; from_me: number | null; raw_metadata_json: string | null }
+      | undefined;
+    if (!row) {
+      return null;
+    }
+    return {
+      senderSourceJid: row.sender_source_jid,
+      fromMe: row.from_me == null ? null : Boolean(row.from_me),
+      rawMetadata: (parseJson(row.raw_metadata_json) as Record<string, unknown> | null) ?? null
+    };
   }
 
   async listPendingLiveMessageUpdates(limit = 500): Promise<LiveMessageUpdateRecord[]> {
@@ -1947,6 +2223,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       sentAt: row.sent_at,
       direction: row.direction as MessageListItem["direction"],
       messageType: row.message_type,
+      interpretation: interpretMessage({ messageType: row.message_type, isDeleted: Boolean(row.is_deleted) }),
       body: applyMentionLabels(row.body, mentionLabels),
       caption: applyMentionLabels(row.caption, mentionLabels),
       mentions: appliedMentionLabels([row.body, row.caption], mentionLabels),
@@ -2475,8 +2752,32 @@ function configureDatabase(db: Database.Database): void {
 
 function ensureSchema(db: Database.Database): void {
   migrateLiveSessionStatuses(db);
+  migrateLiveMessageUpdateTypes(db);
   db.exec(schemaStatements.join(";\n"));
   migrateAdditiveColumns(db);
+}
+
+// SQLite cannot alter CHECK constraints in place; rebuild live_message_updates
+// when an older archive lacks an update type the app now uses (poll_vote,
+// event_response).
+function migrateLiveMessageUpdateTypes(db: Database.Database): void {
+  const existing = db
+    .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'live_message_updates'`)
+    .get() as { sql: string } | undefined;
+  if (!existing?.sql || MESSAGE_UPDATE_TYPES.every((type) => existing.sql.includes(`'${type}'`))) {
+    return;
+  }
+  db.transaction(() => {
+    db.exec(liveMessageUpdatesTableDdl("live_message_updates_migrated"));
+    db.exec(
+      `INSERT INTO live_message_updates_migrated
+       (event_key, chat_source_id, source_message_key, update_type, occurred_at_ms, applied, metadata_json, created_at, updated_at)
+       SELECT event_key, chat_source_id, source_message_key, update_type, occurred_at_ms, applied, metadata_json, created_at, updated_at
+       FROM live_message_updates`
+    );
+    db.exec(`DROP TABLE live_message_updates`);
+    db.exec(`ALTER TABLE live_message_updates_migrated RENAME TO live_message_updates`);
+  })();
 }
 
 function migrateAdditiveColumns(db: Database.Database): void {
@@ -2711,6 +3012,7 @@ function rowToMemoryEvidence(row: SqliteMemoryEvidenceRow, index: number): Memor
     sentAt: row.sent_at,
     direction: row.direction as MemoryEvidenceMessage["direction"],
     messageType: row.message_type,
+    interpretation: interpretMessage({ messageType: row.message_type }),
     text: row.text
   };
 }

@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { createWriteStream, existsSync, type WriteStream } from "node:fs";
-import { mkdir, rm, stat } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { cleanupSensitiveWorkDirs } from "./cleanup";
 import { config } from "./config";
@@ -10,6 +10,7 @@ import { configuredTraceRecorder, getTraceRecorderSummary } from "./diagnostics/
 import { runDoctor } from "./doctor";
 import { inspectArchive } from "./import/inspect";
 import { runImport } from "./import/importer";
+import { parseWorksheetAnnotations, renderUnknownTypeReport } from "./import/unknownTypeReport";
 import { createSyntheticFixture } from "./import/fixtures";
 import { BaileysLiveWhatsAppClient, runBaileysProof } from "./live/baileysClient";
 import { closeLegacyWallClockGaps } from "./live/auditor";
@@ -94,6 +95,25 @@ async function main(): Promise<void> {
 
   if (command === "import") {
     await runImportCommand(args);
+    return;
+  }
+
+  if (command === "unknown-report") {
+    const repository = createArchiveRepository();
+    try {
+      const entries = await repository.listUnknownTypeCodes();
+      const outputPath = path.join(path.dirname(config.archive.sqlitePath), "unknown-type-report.md");
+      const existing = existsSync(outputPath) ? await readFile(outputPath, "utf8") : null;
+      const annotations = parseWorksheetAnnotations(existing);
+      const markdown = renderUnknownTypeReport(entries, annotations, new Date().toISOString());
+      await writeFile(outputPath, markdown, "utf8");
+      const annotated = entries.filter((entry) => annotations.has(entry.code)).length;
+      console.log(
+        `Unknown-type worksheet regenerated: ${entries.length} code(s) remain (${annotated} annotated). ${displayPath(outputPath)}`
+      );
+    } finally {
+      await repository.close?.();
+    }
     return;
   }
 

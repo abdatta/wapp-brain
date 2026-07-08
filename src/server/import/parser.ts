@@ -3,11 +3,13 @@ import type {
   ChatRecord,
   ContactRecord,
   ImportWarning,
+  LiveMessageUpdateRecord,
   MessageRecord,
+  MessageSecretRecord,
   ParticipantRecord
 } from "../../shared/types";
 import { inferChatType, normalizeJid, phoneFromJid } from "./jid";
-import { boolish, directionFromFromMe, messageTypeFromCode, normalizeTimestampMs } from "./messageTypes";
+import { boolish, directionFromFromMe, isMediaMessageType, messageTypeFromCode, normalizeTimestampMs } from "./messageTypes";
 import {
   columnsFor,
   hasColumns,
@@ -77,6 +79,15 @@ export interface ParsedWhatsAppSource {
   identityLinks: Array<{ lid: string; pn: string }>;
   warnings: ImportWarning[];
   iterateMessages: () => IterableIterator<MessageRecord>;
+  // Backup add-on records (reactions, poll votes, event responses) as the same
+  // targeted state updates the live path applies to original messages.
+  iterateAddOnUpdates: () => IterableIterator<Omit<LiveMessageUpdateRecord, "applied">>;
+  // Per-message secrets carried by the backup (message_secret), keyed by the
+  // message's canonical identity — arms late decryption retroactively.
+  iterateMessageSecrets: () => IterableIterator<MessageSecretRecord>;
+  // Available after iterateMessages completes: stale edit-key identities to
+  // collapse onto their canonical (original-key) rows.
+  getEditRekeys: () => Array<{ chatSourceId: string; staleMessageId: string; canonicalMessageId: string }>;
   getParticipants: () => ParticipantRecord[];
   getSkippedRows: () => number;
   schemaReport: Record<string, string[]>;
@@ -118,6 +129,8 @@ export function parseWhatsAppSource(
   }
 
   const adapter = chooseMessageAdapter(msgInspection);
+  // Empty maps for legacy schemas — every sidecar table is guarded.
+  const sidecars = loadInterpretationSidecars(msgstoreDb, msgInspection, jidMap);
   const messageCountEstimate = adapter ? countMessageRows(msgstoreDb, adapter) : null;
   if (!adapter) {
     warnings.push({
@@ -143,10 +156,39 @@ export function parseWhatsAppSource(
         ? iterateLegacyMessages(msgstoreDb, msgInspection, contactMap, participantMap, warnings, sourceFingerprint ?? null, () => {
             skippedRows += 1;
           })
-        : iterateModernMessages(msgstoreDb, msgInspection, jidMap, chatRowJidMap, contactMap, participantMap, warnings, sourceFingerprint ?? null, () => {
+        : iterateModernMessages(msgstoreDb, msgInspection, jidMap, chatRowJidMap, contactMap, participantMap, warnings, sourceFingerprint ?? null, sidecars, () => {
             skippedRows += 1;
           })) {
         yield message;
+      }
+    },
+    iterateAddOnUpdates: function* () {
+      if (adapter !== "modern") {
+        return;
+      }
+      yield* iterateModernAddOnUpdates(msgstoreDb, msgInspection, jidMap, chatRowJidMap, sidecars.edits);
+    },
+    getEditRekeys: () => [...sidecars.editRekeys],
+    iterateMessageSecrets: function* () {
+      if (adapter !== "modern" || !hasColumns(msgInspection, "message_secret", ["message_row_id", "message_secret"])) {
+        return;
+      }
+      const rows = msgstoreDb
+        .prepare(
+          `SELECT s.message_secret AS secret, m._id AS row_id, m.key_id AS key_id, m.chat_row_id AS chat_row_id
+           FROM message_secret s
+           JOIN message m ON m._id = s.message_row_id`
+        )
+        .iterate() as Iterable<SqlRow>;
+      for (const row of rows) {
+        const chatJid = chatRowJidMap.get(Number(row.chat_row_id));
+        const edit = sidecars.edits.get(Number(row.row_id));
+        const messageId = edit?.originalKeyId ?? stringOrNull(row.key_id);
+        const secret = row.secret;
+        if (!chatJid || !messageId || !(secret instanceof Buffer) || secret.length === 0) {
+          continue;
+        }
+        yield { chatSourceId: chatJid, sourceMessageId: messageId, secret, source: "backup" };
       }
     },
     getParticipants: () => [...participantMap.values()],
@@ -497,11 +539,13 @@ function* iterateLegacyMessages(
       rawTypeCode: rawTypeCode == null ? null : String(rawTypeCode),
       body,
       caption,
-      hasMedia: messageType !== "text" || Boolean(row.media_mime_type || row.media_name),
+      hasMedia: isMediaMessageType(messageType) || Boolean(row.media_mime_type || row.media_name),
       mediaMimeType: stringOrNull(row.media_mime_type),
       mediaName: stringOrNull(row.media_name),
       quotedSourceMessageId: row.quoted_row_id == null ? null : surrogateMessageId("legacy", String(row.quoted_row_id), sourceFingerprint),
-      isDeleted: body == null && caption == null && messageType.startsWith("unknown"),
+      // Deletion is a fact (revocation records), never inferred from an
+      // unrecognized type — unknowns render as honest legacy placeholders.
+      isDeleted: messageType === "admin_revoked" || messageType === "revoked",
       isForwarded: boolish(row.forwarded),
       isStarred: boolish(row.starred),
       rawMetadata: {
@@ -514,6 +558,346 @@ function* iterateLegacyMessages(
   }
 }
 
+// Sidecar-table content for mapped types: what a message *was* (poll question,
+// event, template text, invite) lives beside the main row in modern schemas.
+// Keys are message _id row ids; every table is optional per-archive.
+interface InterpretationSidecars {
+  polls: Map<number, { options: Array<{ name: string; votes: number }>; selectableOptionsCount: number | null }>;
+  events: Map<number, SqlRow>;
+  eventInvites: Map<number, SqlRow>;
+  templates: Map<number, { contentText: string | null; footerText: string | null; buttons: string[] }>;
+  uiElements: Map<number, SqlRow>;
+  groupInvites: Map<number, SqlRow>;
+  revoked: Map<number, { revokedByJid: string | null; revokedAtMs: number | null }>;
+  calls: Map<number, { videoCall: boolean; durationSeconds: number | null; missed: boolean }>;
+  // Android re-keys an edited message in place: the row's key_id becomes the
+  // latest edit's key while message_edit_info preserves the original. Live
+  // sync archives the message under that original key, so the original is the
+  // canonical identity across sources.
+  edits: Map<number, { originalKeyId: string | null; editedAtMs: number | null }>;
+  // Stale identities superseded by the original-key convergence: archives
+  // written by earlier importer versions hold edited rows under their edit
+  // key; these pairs let the importer collapse them onto the canonical row.
+  editRekeys: Array<{ chatSourceId: string; staleMessageId: string; canonicalMessageId: string }>;
+}
+
+function loadInterpretationSidecars(
+  db: Database.Database,
+  inspection: SQLiteInspection,
+  jidMap: Map<number, string>
+): InterpretationSidecars {
+  const sidecars: InterpretationSidecars = {
+    polls: new Map(),
+    events: new Map(),
+    eventInvites: new Map(),
+    templates: new Map(),
+    uiElements: new Map(),
+    groupInvites: new Map(),
+    revoked: new Map(),
+    calls: new Map(),
+    edits: new Map(),
+    editRekeys: []
+  };
+  const rowsOf = (table: string, columns: string[]): SqlRow[] => {
+    if (!hasColumns(inspection, table, columns)) {
+      return [];
+    }
+    try {
+      return db.prepare(`SELECT * FROM ${quoteIdentifier(table)}`).all() as SqlRow[];
+    } catch {
+      return [];
+    }
+  };
+
+  for (const row of rowsOf("message_poll", ["message_row_id"])) {
+    sidecars.polls.set(Number(row.message_row_id), {
+      options: [],
+      selectableOptionsCount: row.selectable_options_count == null ? null : Number(row.selectable_options_count)
+    });
+  }
+  for (const row of rowsOf("message_poll_option", ["message_row_id", "option_name"])) {
+    const poll = sidecars.polls.get(Number(row.message_row_id)) ?? { options: [], selectableOptionsCount: null };
+    poll.options.push({ name: String(row.option_name ?? ""), votes: Number(row.vote_total ?? 0) });
+    sidecars.polls.set(Number(row.message_row_id), poll);
+  }
+  for (const row of rowsOf("message_event", ["message_row_id", "name"])) {
+    sidecars.events.set(Number(row.message_row_id), row);
+  }
+  for (const row of rowsOf("message_event_invite", ["message_row_id", "event_title"])) {
+    sidecars.eventInvites.set(Number(row.message_row_id), row);
+  }
+  for (const row of rowsOf("message_template", ["message_row_id"])) {
+    sidecars.templates.set(Number(row.message_row_id), {
+      contentText: stringOrNull(row.content_text_data),
+      footerText: stringOrNull(row.footer_text_data),
+      buttons: []
+    });
+  }
+  for (const row of rowsOf("message_template_button", ["message_row_id", "text_data"])) {
+    const template = sidecars.templates.get(Number(row.message_row_id)) ?? { contentText: null, footerText: null, buttons: [] };
+    const label = stringOrNull(row.text_data);
+    if (label) {
+      template.buttons.push(label);
+    }
+    sidecars.templates.set(Number(row.message_row_id), template);
+  }
+  for (const row of rowsOf("message_ui_elements", ["message_row_id"])) {
+    sidecars.uiElements.set(Number(row.message_row_id), row);
+  }
+  for (const row of rowsOf("message_group_invite", ["message_row_id", "group_name"])) {
+    sidecars.groupInvites.set(Number(row.message_row_id), row);
+  }
+  for (const row of rowsOf("message_revoked", ["message_row_id"])) {
+    const adminRowId = row.admin_jid_row_id == null ? null : Number(row.admin_jid_row_id);
+    const revokedAtMs = normalizeTimestampMs(row.revoke_timestamp);
+    sidecars.revoked.set(Number(row.message_row_id), {
+      revokedByJid: adminRowId == null ? null : jidMap.get(adminRowId) ?? null,
+      revokedAtMs
+    });
+  }
+  if (hasColumns(inspection, "message_call_log", ["message_row_id", "call_log_row_id"]) && hasColumns(inspection, "call_log", ["_id"])) {
+    try {
+      const rows = db
+        .prepare(
+          `SELECT mcl.message_row_id AS message_row_id, cl.video_call AS video_call, cl.duration AS duration
+           FROM message_call_log mcl JOIN call_log cl ON cl._id = mcl.call_log_row_id`
+        )
+        .all() as SqlRow[];
+      for (const row of rows) {
+        sidecars.calls.set(Number(row.message_row_id), {
+          videoCall: boolish(row.video_call),
+          durationSeconds: row.duration == null ? null : Number(row.duration),
+          missed: false
+        });
+      }
+    } catch {
+      // Optional enrichment only.
+    }
+  }
+  for (const row of rowsOf("missed_call_logs", ["message_row_id"])) {
+    sidecars.calls.set(Number(row.message_row_id), {
+      videoCall: boolish(row.video_call),
+      durationSeconds: null,
+      missed: true
+    });
+  }
+  for (const row of rowsOf("message_edit_info", ["message_row_id", "original_key_id"])) {
+    sidecars.edits.set(Number(row.message_row_id), {
+      originalKeyId: stringOrNull(row.original_key_id),
+      editedAtMs: normalizeTimestampMs(row.edited_timestamp ?? row.sender_timestamp)
+    });
+  }
+  return sidecars;
+}
+
+// Body/caption fill only when the main row had none; structured extras land in
+// rawMetadata under documented keys (poll, event, template, groupInvite,
+// revoked) for downstream consumers. The typed placeholder is the floor.
+function enrichFromSidecars(
+  messageType: string,
+  rowId: number,
+  sidecars: InterpretationSidecars
+): { body?: string | null; caption?: string | null; metadata?: Record<string, unknown> } {
+  if (messageType === "poll") {
+    const poll = sidecars.polls.get(rowId);
+    return poll && poll.options.length > 0 ? { metadata: { poll } } : {};
+  }
+  if (messageType === "event") {
+    const event = sidecars.events.get(rowId);
+    if (event) {
+      return {
+        body: stringOrNull(event.name),
+        caption: stringOrNull(event.description),
+        metadata: {
+          event: {
+            locationName: stringOrNull(event.location_name),
+            startTimeMs: normalizeTimestampMs(event.start_time),
+            endTimeMs: normalizeTimestampMs(event.end_time),
+            joinLink: stringOrNull(event.join_link),
+            isCanceled: boolish(event.is_canceled)
+          }
+        }
+      };
+    }
+    const invite = sidecars.eventInvites.get(rowId);
+    if (invite) {
+      return {
+        body: stringOrNull(invite.event_title),
+        caption: stringOrNull(invite.caption),
+        metadata: {
+          event: {
+            startTimeMs: normalizeTimestampMs(invite.start_time),
+            endTimeMs: normalizeTimestampMs(invite.end_time),
+            isCanceled: boolish(invite.is_canceled),
+            joinLink: stringOrNull(invite.call_link)
+          }
+        }
+      };
+    }
+    return {};
+  }
+  if (messageType === "template" || messageType === "list") {
+    const template = sidecars.templates.get(rowId);
+    if (template) {
+      return {
+        body: template.contentText,
+        metadata: { template: { footerText: template.footerText, buttons: template.buttons } }
+      };
+    }
+    const elements = sidecars.uiElements.get(rowId);
+    if (elements) {
+      return {
+        body: stringOrNull(elements.description),
+        metadata: {
+          template: {
+            footerText: stringOrNull(elements.footer_text),
+            buttons: [stringOrNull(elements.button_text)].filter((label): label is string => label !== null),
+            elementContent: stringOrNull(elements.element_content)
+          }
+        }
+      };
+    }
+    return {};
+  }
+  if (messageType === "group_invite") {
+    const invite = sidecars.groupInvites.get(rowId);
+    if (!invite) {
+      return {};
+    }
+    return {
+      body: stringOrNull(invite.group_name),
+      metadata: {
+        groupInvite: {
+          expiresAtMs: normalizeTimestampMs(invite.expiration),
+          expired: boolish(invite.expired)
+        }
+      }
+    };
+  }
+  if (messageType === "admin_revoked" || messageType === "revoked") {
+    const revoked = sidecars.revoked.get(rowId);
+    // The row's own timestamp is the original post time (verified on the real
+    // archive); the revocation moment and actor ride in metadata when known.
+    return revoked ? { metadata: { revoked } } : {};
+  }
+  if (messageType === "call" || messageType === "missed_call") {
+    const call = sidecars.calls.get(rowId);
+    return call ? { metadata: { call } } : {};
+  }
+  return {};
+}
+
+// Reactions, poll votes, and event responses from message_add_on become the
+// same targeted state updates the live path emits: keyed by the parent
+// message's canonical identity, deterministic per (target, actor) so
+// re-imports stay idempotent. Receipts and pin/edit add-ons are skipped
+// (receipts are sync noise; edits converge through message_edit_info).
+function* iterateModernAddOnUpdates(
+  db: Database.Database,
+  inspection: SQLiteInspection,
+  jidMap: Map<number, string>,
+  chatRowJidMap: Map<number, string>,
+  edits: InterpretationSidecars["edits"]
+): IterableIterator<Omit<LiveMessageUpdateRecord, "applied">> {
+  if (!hasColumns(inspection, "message_add_on", ["_id", "chat_row_id", "parent_message_row_id"])) {
+    return;
+  }
+  const optionNames = new Map<number, string>();
+  if (hasColumns(inspection, "message_poll_option", ["_id", "option_name"])) {
+    for (const row of db.prepare(`SELECT _id, option_name FROM message_poll_option`).iterate() as Iterable<SqlRow>) {
+      optionNames.set(Number(row._id), String(row.option_name ?? ""));
+    }
+  }
+  const selectedOptions = new Map<number, string[]>();
+  if (hasColumns(inspection, "message_add_on_poll_vote_selected_option", ["message_add_on_row_id", "message_poll_option_id"])) {
+    for (const row of db
+      .prepare(`SELECT message_add_on_row_id, message_poll_option_id FROM message_add_on_poll_vote_selected_option`)
+      .iterate() as Iterable<SqlRow>) {
+      const addOnId = Number(row.message_add_on_row_id);
+      const optionName = optionNames.get(Number(row.message_poll_option_id));
+      if (optionName == null) {
+        continue;
+      }
+      selectedOptions.set(addOnId, [...(selectedOptions.get(addOnId) ?? []), optionName]);
+    }
+  }
+  const reactionJoin = hasColumns(inspection, "message_add_on_reaction", ["message_add_on_row_id", "reaction"]);
+  const voteJoin = hasColumns(inspection, "message_add_on_poll_vote", ["message_add_on_row_id"]);
+  const responseJoin = hasColumns(inspection, "message_add_on_event_response", ["message_add_on_row_id", "response"]);
+  if (!reactionJoin && !voteJoin && !responseJoin) {
+    return;
+  }
+  const rows = db
+    .prepare(
+      `SELECT a._id AS add_on_id, a.chat_row_id AS chat_row_id, a.from_me AS from_me,
+              a.sender_jid_row_id AS sender_jid_row_id, a.timestamp AS timestamp,
+              p._id AS parent_row_id, p.key_id AS parent_key_id
+              ${reactionJoin ? ", r.reaction AS reaction" : ", NULL AS reaction"}
+              ${voteJoin ? ", v.message_add_on_row_id AS vote_row, v.sender_timestamp AS vote_timestamp" : ", NULL AS vote_row, NULL AS vote_timestamp"}
+              ${responseJoin ? ", e.message_add_on_row_id AS response_row, e.response AS event_response, e.extra_guest_count AS extra_guest_count, e.sender_timestamp AS response_timestamp" : ", NULL AS response_row, NULL AS event_response, NULL AS extra_guest_count, NULL AS response_timestamp"}
+       FROM message_add_on a
+       JOIN message p ON p._id = a.parent_message_row_id
+       ${reactionJoin ? "LEFT JOIN message_add_on_reaction r ON r.message_add_on_row_id = a._id" : ""}
+       ${voteJoin ? "LEFT JOIN message_add_on_poll_vote v ON v.message_add_on_row_id = a._id" : ""}
+       ${responseJoin ? "LEFT JOIN message_add_on_event_response e ON e.message_add_on_row_id = a._id" : ""}
+       ORDER BY a._id ASC`
+    )
+    .iterate() as Iterable<SqlRow>;
+  for (const row of rows) {
+    const chatJid = chatRowJidMap.get(Number(row.chat_row_id));
+    if (!chatJid) {
+      continue;
+    }
+    // Target the parent's canonical identity: edited parents live under their
+    // original key across sources.
+    const parentEdit = edits.get(Number(row.parent_row_id));
+    const targetId = parentEdit?.originalKeyId ?? stringOrNull(row.parent_key_id);
+    if (!targetId) {
+      continue;
+    }
+    const targetKey = messageKey(chatJid, targetId);
+    const actorJid = boolish(row.from_me) ? "me" : jidMap.get(Number(row.sender_jid_row_id)) ?? null;
+    const occurredAtMs = normalizeTimestampMs(row.timestamp);
+    const reaction = stringOrNull(row.reaction);
+    if (reaction) {
+      yield {
+        eventKey: `import:reaction:${targetKey}:${actorJid ?? "unknown"}`,
+        chatSourceId: chatJid,
+        sourceMessageKey: targetKey,
+        updateType: "reaction",
+        occurredAtMs,
+        metadata: { emoji: reaction, reactorJid: actorJid }
+      };
+      continue;
+    }
+    if (row.vote_row != null) {
+      yield {
+        eventKey: `import:poll_vote:${targetKey}:${actorJid ?? "unknown"}`,
+        chatSourceId: chatJid,
+        sourceMessageKey: targetKey,
+        updateType: "poll_vote",
+        occurredAtMs: normalizeTimestampMs(row.vote_timestamp) ?? occurredAtMs,
+        metadata: { voterJid: actorJid, options: selectedOptions.get(Number(row.add_on_id)) ?? [] }
+      };
+      continue;
+    }
+    if (row.response_row != null) {
+      yield {
+        eventKey: `import:event_response:${targetKey}:${actorJid ?? "unknown"}`,
+        chatSourceId: chatJid,
+        sourceMessageKey: targetKey,
+        updateType: "event_response",
+        occurredAtMs: normalizeTimestampMs(row.response_timestamp) ?? occurredAtMs,
+        metadata: {
+          responderJid: actorJid,
+          response: row.event_response == null ? null : Number(row.event_response),
+          extraGuestCount: row.extra_guest_count == null ? null : Number(row.extra_guest_count)
+        }
+      };
+    }
+  }
+}
+
 function* iterateModernMessages(
   db: Database.Database,
   inspection: SQLiteInspection,
@@ -523,6 +907,7 @@ function* iterateModernMessages(
   participantMap: Map<string, ParticipantRecord>,
   warnings: ImportWarning[],
   sourceFingerprint: string | null,
+  sidecars: InterpretationSidecars,
   onSkippedRow: () => void
 ): IterableIterator<MessageRecord> {
   const columns = columnsFor(inspection, "message");
@@ -566,9 +951,18 @@ function* iterateModernMessages(
     }
     const keyId = stringOrNull(row.key_id);
     const timestampMs = normalizeTimestampMs(row.timestamp ?? row.received_timestamp);
-    const body = stringOrNull(row.text_data ?? row.joined_text_data ?? row.data);
-    const caption = stringOrNull(row.caption);
-    const sourceMessageId = keyId ?? surrogateMessageId("modern", sourceRowId, sourceFingerprint);
+    const rowIdNumber = Number(row._id ?? fallbackRow);
+    const sidecar = enrichFromSidecars(messageType, rowIdNumber, sidecars);
+    const body = stringOrNull(row.text_data ?? row.joined_text_data ?? row.data) ?? sidecar.body ?? null;
+    const caption = stringOrNull(row.caption) ?? sidecar.caption ?? null;
+    // Edited rows carry the latest edit's key; the original key is the
+    // identity live sync archived them under.
+    const edit = sidecars.edits.get(rowIdNumber);
+    const identityKeyId = edit?.originalKeyId ?? keyId;
+    if (edit?.originalKeyId && keyId && edit.originalKeyId !== keyId) {
+      sidecars.editRekeys.push({ chatSourceId: chatJid, staleMessageId: keyId, canonicalMessageId: edit.originalKeyId });
+    }
+    const sourceMessageId = identityKeyId ?? surrogateMessageId("modern", sourceRowId, sourceFingerprint);
     yield {
       sourceMessageId,
       sourceMessageKey: messageKey(chatJid, sourceMessageId),
@@ -584,11 +978,13 @@ function* iterateModernMessages(
       rawTypeCode: rawTypeCode == null ? null : String(rawTypeCode),
       body,
       caption,
-      hasMedia: messageType !== "text",
+      hasMedia: isMediaMessageType(messageType),
       mediaMimeType: null,
       mediaName: null,
       quotedSourceMessageId: row.quoted_message_row_id == null ? null : surrogateMessageId("modern", String(row.quoted_message_row_id), sourceFingerprint),
-      isDeleted: body == null && caption == null && messageType.startsWith("unknown"),
+      // Deletion is a fact (revocation records), never inferred from an
+      // unrecognized type — unknowns render as honest legacy placeholders.
+      isDeleted: messageType === "admin_revoked" || messageType === "revoked",
       isForwarded: boolish(row.forwarded),
       isStarred: boolish(row.starred),
       rawMetadata: {
@@ -597,7 +993,9 @@ function* iterateModernMessages(
         sourceColumns: [...selected, ...(textJoin ? ["message_text.text_data"] : [])].filter((column) => {
           const alias = column === "message_text.text_data" ? "joined_text_data" : column;
           return row[alias] != null;
-        })
+        }),
+        ...(sidecar.metadata ?? {}),
+        ...(edit ? { edited: 1, editedAtMs: edit.editedAtMs, latestEditKeyId: keyId } : {})
       }
     };
   }

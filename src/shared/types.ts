@@ -181,6 +181,15 @@ export interface ChatListOptions {
   includeEventOnly?: boolean;
 }
 
+// Server-side interpretation of a message whose body cannot speak for itself:
+// a label naming the kind, plus a reason when genuinely unreadable. NULL for
+// plain text. One source of truth for UI, memory evidence, and future
+// search/MCP/agent consumers.
+export interface MessageInterpretationSummary {
+  label: string;
+  reason: string | null;
+}
+
 export interface MessageListItem {
   id: number;
   sourceMessageId: string;
@@ -190,6 +199,7 @@ export interface MessageListItem {
   sentAt: string | null;
   direction: "incoming" | "outgoing" | "system" | "unknown";
   messageType: string;
+  interpretation: MessageInterpretationSummary | null;
   body: string | null;
   caption: string | null;
   // Resolved mention labels substituted into body/caption ("@<label>" spans),
@@ -278,6 +288,7 @@ export interface MemoryEvidenceMessage {
   sentAt: string | null;
   direction: "incoming" | "outgoing" | "system" | "unknown";
   messageType: string;
+  interpretation: MessageInterpretationSummary | null;
   text: string | null;
 }
 
@@ -421,6 +432,7 @@ export type ImportProgressStep =
   | "contacts"
   | "chats"
   | "messages"
+  | "addons"
   | "participants"
   | "finalizing"
   | "completed";
@@ -617,11 +629,38 @@ export interface LiveEventReceiptRecord {
   metadata?: Record<string, unknown> | null;
 }
 
+// Per-message secrets (WhatsApp "message secrets" layer) unlock
+// secret-encrypted updates targeting the message: poll votes, event responses,
+// and edits. Stored deliberately (user decision, 2026-07-07): the archive
+// already holds the corresponding plaintext locally. Secret bytes MUST never
+// reach logs, DTOs, exports, or diagnostics.
+export interface MessageSecretRecord {
+  chatSourceId: string;
+  sourceMessageId: string;
+  secret: Uint8Array;
+  source: "live" | "backup";
+}
+
+// A secret-encrypted payload the archive cannot decrypt yet, retained keyed to
+// its target so a later-learned secret makes it readable retroactively.
+export interface RetainedPayloadRecord {
+  id?: number;
+  eventKey: string;
+  chatSourceId: string;
+  targetMessageId: string;
+  kind: "poll_vote" | "event_response" | "secret_encrypted";
+  actorJid: string | null;
+  encPayload: Uint8Array;
+  encIv: Uint8Array | null;
+  occurredAtMs: number | null;
+  metadata?: Record<string, unknown> | null;
+}
+
 export interface LiveMessageUpdateRecord {
   eventKey: string;
   chatSourceId: string;
   sourceMessageKey: string;
-  updateType: "delete" | "edit" | "reaction" | "receipt" | "call" | "unknown";
+  updateType: "delete" | "edit" | "reaction" | "poll_vote" | "event_response" | "receipt" | "call" | "unknown";
   occurredAtMs?: number | null;
   applied: boolean;
   metadata?: Record<string, unknown> | null;

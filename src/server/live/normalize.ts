@@ -1,5 +1,13 @@
 import { createHash } from "node:crypto";
-import type { ChatRecord, ChatType, ContactRecord, MessageRecord, ParticipantRecord } from "../../shared/types";
+import type {
+  ChatRecord,
+  ChatType,
+  ContactRecord,
+  MessageRecord,
+  MessageSecretRecord,
+  ParticipantRecord,
+  RetainedPayloadRecord
+} from "../../shared/types";
 import { messageKey } from "../identity/keys";
 import { inferChatType, normalizeJid } from "../import/jid";
 import type { LiveMessageEvent, LiveMessageStateUpdate } from "./types";
@@ -71,6 +79,12 @@ export function normalizeBaileysMessage(message: BaileysLikeMessage, sourceTable
   if (content?.protocolMessage || content?.reactionMessage) {
     return null;
   }
+  // Poll votes and event responses are secret-encrypted updates targeting
+  // another message, not messages of their own — they flow through payload
+  // retention and decryption instead of message rows.
+  if (content?.pollUpdateMessage || content?.encEventResponseMessage) {
+    return null;
+  }
   const fromMe = message.key?.fromMe ?? null;
   const timestampMs = timestampToMs(message.messageTimestamp);
   const body = extractText(content);
@@ -112,9 +126,49 @@ export function normalizeBaileysMessage(message: BaileysLikeMessage, sourceTable
       contentKeys: content ? Object.keys(content).slice(0, 12) : [],
       ...(stubType != null
         ? { stubType, stubParameters: (message.messageStubParameters ?? []).slice(0, 8) }
-        : {})
+        : {}),
+      // Structured extras under the same documented keys the backup importer
+      // writes (poll options feed vote decryption; event times feed display).
+      ...structuredContentMetadata(content)
     }
   };
+}
+
+function structuredContentMetadata(content: Record<string, unknown> | null): Record<string, unknown> {
+  if (!content) {
+    return {};
+  }
+  const poll = (content.pollCreationMessage ?? content.pollCreationMessageV2 ?? content.pollCreationMessageV3) as
+    | { options?: Array<{ optionName?: string | null }> | null; selectableOptionsCount?: number | null }
+    | undefined;
+  if (poll) {
+    const options = (poll.options ?? [])
+      .map((option) => (typeof option?.optionName === "string" && option.optionName !== "" ? option.optionName : null))
+      .filter((name): name is string => name !== null)
+      .map((name) => ({ name, votes: 0 }));
+    return { poll: { options, selectableOptionsCount: poll.selectableOptionsCount ?? null } };
+  }
+  const event = content.eventMessage as
+    | {
+        startTime?: number | LongLike | null;
+        endTime?: number | LongLike | null;
+        joinLink?: string | null;
+        isCanceled?: boolean | null;
+        location?: { name?: string | null } | null;
+      }
+    | undefined;
+  if (event) {
+    return {
+      event: {
+        locationName: event.location?.name ?? null,
+        startTimeMs: timestampToMs(event.startTime ?? null),
+        endTimeMs: timestampToMs(event.endTime ?? null),
+        joinLink: event.joinLink ?? null,
+        isCanceled: Boolean(event.isCanceled)
+      }
+    };
+  }
+  return {};
 }
 
 // Protocol messages (revokes, edits) and reactions target another message; they
@@ -199,6 +253,97 @@ function targetedUpdate(
   };
 }
 
+// The message-secret riding in an envelope's context info arms this message's
+// future secret-encrypted updates (votes, responses, edits) for decryption.
+export function secretFromBaileysMessage(message: BaileysLikeMessage): MessageSecretRecord | null {
+  const chatSourceId = message.key?.remoteJid ?? null;
+  const sourceMessageId = message.key?.id ?? null;
+  if (!chatSourceId || !sourceMessageId) {
+    return null;
+  }
+  const topLevel = (message.message as Record<string, unknown> | null | undefined)?.messageContextInfo as
+    | { messageSecret?: Uint8Array | null }
+    | undefined;
+  const inner = unwrapMessageContent(message.message)?.messageContextInfo as { messageSecret?: Uint8Array | null } | undefined;
+  const secret = topLevel?.messageSecret ?? inner?.messageSecret;
+  if (!(secret instanceof Uint8Array) || secret.length === 0) {
+    return null;
+  }
+  return { chatSourceId, sourceMessageId, secret, source: "live" };
+}
+
+// Secret-encrypted payloads keyed to their target: decrypted when the target's
+// secret is (or becomes) known, retained honestly otherwise. The raw actor
+// form rides in metadata because the decryption HKDF binds the exact jid
+// strings the sender used.
+export function retainedPayloadFromBaileysMessage(message: BaileysLikeMessage, rawActorJid?: string | null): RetainedPayloadRecord | null {
+  const chatSourceId = message.key?.remoteJid ?? null;
+  const envelopeId = message.key?.id ?? null;
+  if (!chatSourceId || !envelopeId) {
+    return null;
+  }
+  const content = unwrapMessageContent(message.message);
+  if (!content) {
+    return null;
+  }
+  const fromMe = message.key?.fromMe ?? null;
+  const participant = message.key?.participant ?? message.participant ?? null;
+  const actorJid = fromMe ? "me" : inferChatType(chatSourceId) === "group" ? participant : participant ?? chatSourceId;
+  const occurredAtMs = timestampToMs(message.messageTimestamp);
+  const poll = content.pollUpdateMessage as
+    | { pollCreationMessageKey?: { id?: string | null } | null; vote?: { encPayload?: Uint8Array | null; encIv?: Uint8Array | null } | null; senderTimestampMs?: number | LongLike | null }
+    | undefined;
+  if (poll?.pollCreationMessageKey?.id && poll.vote?.encPayload?.length) {
+    return {
+      eventKey: `wa-web:retained:poll_vote:${chatSourceId}:${envelopeId}`,
+      chatSourceId,
+      targetMessageId: poll.pollCreationMessageKey.id,
+      kind: "poll_vote",
+      actorJid,
+      encPayload: poll.vote.encPayload,
+      encIv: poll.vote.encIv ?? null,
+      occurredAtMs: timestampToMs(poll.senderTimestampMs ?? null) ?? occurredAtMs,
+      metadata: rawActorJid ? { rawActorJid } : null
+    };
+  }
+  const eventResponse = content.encEventResponseMessage as
+    | { eventCreationMessageKey?: { id?: string | null } | null; encPayload?: Uint8Array | null; encIv?: Uint8Array | null }
+    | undefined;
+  if (eventResponse?.eventCreationMessageKey?.id && eventResponse.encPayload?.length) {
+    return {
+      eventKey: `wa-web:retained:event_response:${chatSourceId}:${envelopeId}`,
+      chatSourceId,
+      targetMessageId: eventResponse.eventCreationMessageKey.id,
+      kind: "event_response",
+      actorJid,
+      encPayload: eventResponse.encPayload,
+      encIv: eventResponse.encIv ?? null,
+      occurredAtMs,
+      metadata: rawActorJid ? { rawActorJid } : null
+    };
+  }
+  const secretEncrypted = content.secretEncryptedMessage as
+    | { targetMessageKey?: { id?: string | null } | null; encPayload?: Uint8Array | null; encIv?: Uint8Array | null; secretEncType?: number | string | null }
+    | undefined;
+  if (secretEncrypted?.targetMessageKey?.id && secretEncrypted.encPayload?.length) {
+    return {
+      eventKey: `wa-web:retained:secret_encrypted:${chatSourceId}:${envelopeId}`,
+      chatSourceId,
+      targetMessageId: secretEncrypted.targetMessageKey.id,
+      kind: "secret_encrypted",
+      actorJid,
+      encPayload: secretEncrypted.encPayload,
+      encIv: secretEncrypted.encIv ?? null,
+      occurredAtMs,
+      metadata: {
+        secretEncType: secretEncrypted.secretEncType ?? null,
+        ...(rawActorJid ? { rawActorJid } : {})
+      }
+    };
+  }
+  return null;
+}
+
 export function normalizeBaileysMessages(messages: BaileysLikeMessage[], sourceTable: string): LiveMessageEvent {
   const normalized = messages
     .map((message, index) => normalizeBaileysMessage(message, sourceTable, message.key?.id ?? String(index)))
@@ -206,7 +351,13 @@ export function normalizeBaileysMessages(messages: BaileysLikeMessage[], sourceT
   const updates = messages
     .map((message) => updateFromBaileysMessage(message))
     .filter((update): update is LiveMessageStateUpdate => Boolean(update));
-  return eventFromMessages(normalized, sourceTable, updates);
+  const secrets = messages
+    .map((message) => secretFromBaileysMessage(message))
+    .filter((secret): secret is MessageSecretRecord => Boolean(secret));
+  const retainedPayloads = messages
+    .map((message) => retainedPayloadFromBaileysMessage(message))
+    .filter((payload): payload is RetainedPayloadRecord => Boolean(payload));
+  return { ...eventFromMessages(normalized, sourceTable, updates), secrets, retainedPayloads };
 }
 
 export async function normalizeBaileysMessageWithJidResolver(
@@ -230,7 +381,17 @@ export async function normalizeBaileysMessagesWithJidResolver(
   const updates = resolved
     .map((message) => updateFromBaileysMessage(message))
     .filter((update): update is LiveMessageStateUpdate => Boolean(update));
-  return eventFromMessages(normalized, sourceTable, updates);
+  const secrets = resolved
+    .map((message) => secretFromBaileysMessage(message))
+    .filter((secret): secret is MessageSecretRecord => Boolean(secret));
+  // Storage keys use canonical jids; the raw pre-resolution actor rides along
+  // because decryption binds the exact jid strings the sender used.
+  const retainedPayloads = resolved
+    .map((message, index) =>
+      retainedPayloadFromBaileysMessage(message, messages[index]?.key?.participant ?? messages[index]?.participant ?? null)
+    )
+    .filter((payload): payload is RetainedPayloadRecord => Boolean(payload));
+  return { ...eventFromMessages(normalized, sourceTable, updates), secrets, retainedPayloads };
 }
 
 export async function normalizeBaileysContactsWithJidResolver(
@@ -689,6 +850,39 @@ function detectMessageType(content: Record<string, unknown> | null): string {
   // we do not hold; label honestly instead of "unknown".
   if (content.secretEncryptedMessage) return "encrypted_update";
   if (content.messageHistoryNotice) return "system";
+  // Shared vocabulary with the backup importer (messageTypeFromCode) — the
+  // same real-world kind stores the same type string from either source.
+  if (
+    content.pollCreationMessage ||
+    content.pollCreationMessageV2 ||
+    content.pollCreationMessageV3 ||
+    content.pollCreationMessageV4
+  ) {
+    return "poll";
+  }
+  // Poll votes travel secret-encrypted; the message-secrets pass decrypts them
+  // into vote updates when the poll's secret is held.
+  if (content.pollUpdateMessage) return "encrypted_update";
+  if (content.eventMessage) return "event";
+  if (content.albumMessage) return "album";
+  if (content.listMessage) return "list";
+  if (
+    content.listResponseMessage ||
+    content.buttonsResponseMessage ||
+    content.templateButtonReplyMessage ||
+    content.interactiveResponseMessage
+  ) {
+    return "list_response";
+  }
+  if (content.buttonsMessage) return "template";
+  if (content.groupInviteMessage) return "group_invite";
+  if (content.paymentInviteMessage) return "payment_invite";
+  if (content.messageHistoryBundle) return "history_share";
+  if (content.statusMentionMessage) return "status_mention";
+  if (content.ptvMessage) return "video";
+  if (content.productMessage) return "product";
+  // Baileys' proto key really is spelled "callLogMesssage".
+  if (content.callLogMesssage) return "call";
   // messageContextInfo is metadata that rides alongside real content; never
   // let it name the unknown type.
   return `unknown_${Object.keys(content).find((key) => key !== "messageContextInfo") ?? "message"}`;
@@ -714,6 +908,34 @@ function extractText(content: Record<string, unknown> | null): string | null {
   if (interactive) {
     return firstNonEmpty(interactive.body?.text, interactive.footer?.text);
   }
+  // Typed content whose primary text should be archived (and searchable), in
+  // vocabulary parity with the backup sidecar-table extraction.
+  const poll = (content.pollCreationMessage ?? content.pollCreationMessageV2 ?? content.pollCreationMessageV3) as
+    | { name?: string | null }
+    | undefined;
+  if (poll?.name) return poll.name;
+  const event = content.eventMessage as { name?: string | null; description?: string | null } | undefined;
+  if (event) {
+    return firstNonEmpty(event.name, event.description);
+  }
+  const groupInvite = content.groupInviteMessage as { caption?: string | null; groupName?: string | null } | undefined;
+  if (groupInvite) {
+    return firstNonEmpty(groupInvite.caption, groupInvite.groupName);
+  }
+  const list = content.listMessage as { title?: string | null; description?: string | null } | undefined;
+  if (list) {
+    return firstNonEmpty(list.title, list.description);
+  }
+  const buttons = content.buttonsMessage as { contentText?: string | null; footerText?: string | null } | undefined;
+  if (buttons) {
+    return firstNonEmpty(buttons.contentText, buttons.footerText);
+  }
+  const listResponse = content.listResponseMessage as { title?: string | null } | undefined;
+  if (listResponse?.title) return listResponse.title;
+  const buttonsResponse = content.buttonsResponseMessage as { selectedDisplayText?: string | null } | undefined;
+  if (buttonsResponse?.selectedDisplayText) return buttonsResponse.selectedDisplayText;
+  const templateReply = content.templateButtonReplyMessage as { selectedDisplayText?: string | null } | undefined;
+  if (templateReply?.selectedDisplayText) return templateReply.selectedDisplayText;
   return null;
 }
 

@@ -17,7 +17,6 @@ Keep entries behavior-focused:
 | [Archive Full-Text And Semantic Search](./archive-full-text-and-semantic-search.md) | Feature | Needs specification | Search / retrieval |
 | [Self-Updating Memory Schedule](./self-updating-memory-schedule.md) | Feature | Needs specification | Second brain |
 | [Thread View Signal Vs Noise](./thread-view-signal-vs-noise.md) | Feature / behavior alignment | Needs specification | Thread view |
-| [Interpret Unsupported Message Types](./interpret-unsupported-message-types.md) | Feature / investigation | Needs specification | Import / live message content |
 | [MCP Chat Reader Server](./mcp-chat-reader-server.md) | Feature | Idea | AI access |
 | [Media Folder Import Reliability](./media-folder-import-reliability.md) | Bug / design follow-up | Needs investigation | Import |
 
@@ -29,4 +28,5 @@ Keep entries behavior-focused:
 | Live Sync Gap Count For Older Chats | Absorbed by change `make-live-sync-trustworthy` (evidence-based auditing, grouped uncertainty) |
 | wa.db Contact Enrichment Not Reflected | Folded into Contact And Group Identity Integrity |
 | Contact And Group Identity Integrity | Implemented in change `contact-and-group-identity-integrity` (archived 2026-07-07) |
+| Interpret Unsupported Message Types | Implemented in change `interpret-unsupported-message-types` (archived 2026-07-07) |
 | Inbox Sorting Includes System Updates | Implemented in change `make-live-sync-trustworthy` (WhatsApp-style conversation recency ordering) |

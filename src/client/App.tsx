@@ -1877,7 +1877,7 @@ function MessageBubble({ message, isGroup }: { message: MessageListItem; isGroup
   if (isSystemEvent(message)) {
     return (
       <article className="systemChip">
-        <span>{text ? renderMentions(text, message.mentions) : placeholder}</span>
+        <span>{text ? renderMentions(text, message.mentions) : placeholder.label}</span>
         <time>{formatTime(message.sentAt)}</time>
       </article>
     );
@@ -1891,7 +1891,10 @@ function MessageBubble({ message, isGroup }: { message: MessageListItem; isGroup
       {text ? (
         <p>{renderMentions(text, message.mentions)}</p>
       ) : (
-        <p className="placeholderText">{placeholder}</p>
+        <p className="placeholderText">
+          {placeholder.label}
+          {placeholder.reason && <span className="placeholderReason">{placeholder.reason}</span>}
+        </p>
       )}
       {(message.hasMedia || message.isForwarded || message.isStarred) && (
         <div className="messageFlags">
@@ -1914,15 +1917,10 @@ function isSystemEvent(message: MessageListItem): boolean {
   );
 }
 
-function messagePlaceholder(message: MessageListItem): string {
-  if (message.isDeleted) return "Deleted message";
-  if (message.messageType === "call") return "Call";
-  if (message.messageType === "system") return "System event";
-  if (message.messageType === "status") return "Status event";
-  if (message.messageType === "encrypted_update") return "Encrypted edit of an earlier message";
-  if (message.hasMedia) return `${humanizeMessageType(message.messageType)} message`;
-  if (message.messageType.startsWith("unknown")) return "Unsupported message";
-  return `${humanizeMessageType(message.messageType)} message`;
+// The server owns interpretation (one source of truth for every consumer);
+// the humanized fallback only covers DTOs from before the field existed.
+function messagePlaceholder(message: MessageListItem): { label: string; reason: string | null } {
+  return message.interpretation ?? { label: `${humanizeMessageType(message.messageType)} message`, reason: null };
 }
 
 function humanizeMessageType(value: string): string {

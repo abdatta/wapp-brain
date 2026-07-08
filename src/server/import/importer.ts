@@ -2,18 +2,27 @@ import fs from "node:fs";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { setImmediate } from "node:timers/promises";
-import type { ImportRequest, ImportTotals, ImportWarning, MessageRecord } from "../../shared/types";
+import type {
+  ImportRequest,
+  ImportTotals,
+  ImportWarning,
+  LiveMessageUpdateRecord,
+  MessageRecord,
+  MessageSecretRecord
+} from "../../shared/types";
 import { config } from "../config";
 import { ensureManagedWorkDir } from "../cleanup";
 import type { ArchiveRepository } from "../db/repository";
 import { configuredTraceRecorder } from "../diagnostics/traceRecorder";
 import { PublicError, publicErrorMessage, safeBasename } from "../privacy";
+import { runRetainedPayloadDecryptionPass } from "../live/secretsPass";
 import { prepareMsgstore, prepareSidecarDatabase } from "./decrypt";
 import { parseWhatsAppSource } from "./parser";
 import type { ImportProgressHandler } from "./progress";
 import { openReadableSQLite } from "./sqlite";
 
 const MESSAGE_BATCH_SIZE = 750;
+const ADD_ON_BATCH_SIZE = 500;
 
 export interface RunImportOptions {
   onProgress?: ImportProgressHandler;
@@ -204,6 +213,91 @@ export async function runImport(
         count: parsed.warnings.length,
         codes: [...new Set(parsed.warnings.map((warning) => warning.code))].slice(0, 20)
       });
+    }
+
+    throwIfAborted(options.signal);
+    // Archives written by earlier importer versions hold edited messages under
+    // their edit keys; collapse those onto the canonical original-key rows.
+    const editRekeys = parsed.getEditRekeys();
+    if (editRekeys.length > 0) {
+      const collapsed = await repository.collapseSupersededMessages(editRekeys);
+      if (collapsed > 0) {
+        // Informational summary entry; deliberately excluded from warning
+        // counters (persistedWarningCount indexes into parsed.warnings).
+        await repository.addWarnings(runId, [
+          {
+            severity: "info",
+            code: "EDIT_IDENTITY_COLLAPSE",
+            entityType: "message",
+            message: `Edited messages: ${collapsed} stale edit-key row(s) collapsed onto their original-key identity.`,
+            context: { collapsed, candidates: editRekeys.length }
+          }
+        ]);
+      }
+    }
+
+    throwIfAborted(options.signal);
+    options.onProgress?.({ type: "step", step: "addons", message: "Importing reactions, poll votes, and event responses." });
+    const addOnCounts: Record<string, number> = {};
+    let addOnBatch: Array<Omit<LiveMessageUpdateRecord, "applied">> = [];
+    for (const update of parsed.iterateAddOnUpdates()) {
+      throwIfAborted(options.signal);
+      addOnBatch.push(update);
+      addOnCounts[update.updateType] = (addOnCounts[update.updateType] ?? 0) + 1;
+      if (addOnBatch.length >= ADD_ON_BATCH_SIZE) {
+        await repository.applyLiveMessageUpdates(addOnBatch);
+        addOnBatch = [];
+        await yieldToEventLoop(options.signal);
+      }
+    }
+    if (addOnBatch.length > 0) {
+      await repository.applyLiveMessageUpdates(addOnBatch);
+    }
+    const addOnTotal = Object.values(addOnCounts).reduce((sum, count) => sum + count, 0);
+    if (addOnTotal > 0) {
+      // Informational summary entry; deliberately excluded from warning
+      // counters (persistedWarningCount indexes into parsed.warnings).
+      await repository.addWarnings(runId, [
+        {
+          severity: "info",
+          code: "ADD_ON_SUMMARY",
+          entityType: "message",
+          message: `Message add-ons: ${addOnCounts.reaction ?? 0} reactions, ${addOnCounts.poll_vote ?? 0} poll votes, ${addOnCounts.event_response ?? 0} event responses applied to original messages.`,
+          context: addOnCounts
+        }
+      ]);
+    }
+
+    throwIfAborted(options.signal);
+    // Secrets backfill arms historical messages for late decryption of
+    // secret-encrypted updates (poll votes, event responses, edits).
+    let secretsBackfilled = 0;
+    let secretBatch: MessageSecretRecord[] = [];
+    for (const secret of parsed.iterateMessageSecrets()) {
+      throwIfAborted(options.signal);
+      secretBatch.push(secret);
+      if (secretBatch.length >= ADD_ON_BATCH_SIZE) {
+        secretsBackfilled += await repository.recordMessageSecrets(secretBatch);
+        secretBatch = [];
+        await yieldToEventLoop(options.signal);
+      }
+    }
+    if (secretBatch.length > 0) {
+      secretsBackfilled += await repository.recordMessageSecrets(secretBatch);
+    }
+    if (secretsBackfilled > 0) {
+      const decryption = await runRetainedPayloadDecryptionPass(repository, { limit: 500 });
+      // Informational summary entry; deliberately excluded from warning
+      // counters (persistedWarningCount indexes into parsed.warnings).
+      await repository.addWarnings(runId, [
+        {
+          severity: "info",
+          code: "SECRET_BACKFILL",
+          entityType: "message",
+          message: `Message secrets: ${secretsBackfilled} newly backfilled from the backup (${await repository.countMessageSecrets()} total); ${decryption.decrypted} retained encrypted update(s) decrypted retroactively.`,
+          context: { secretsBackfilled, decrypted: decryption.decrypted }
+        }
+      ]);
     }
 
     throwIfAborted(options.signal);

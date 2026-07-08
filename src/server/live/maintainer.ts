@@ -5,6 +5,7 @@ import { messageKey } from "../identity/keys";
 import { assertLiveDependencySafe } from "./dependency";
 import { auditChatGaps, auditMessageEventCheckpoint, GAP_TOLERANCE_MS } from "./auditor";
 import { recoverDueGaps } from "./recovery";
+import { runRetainedPayloadDecryptionPass } from "./secretsPass";
 import type { LiveSyncProgress } from "../../shared/types";
 import { addEventToTotals, emptyLiveTotals, type LiveMaintainerOptions, type LiveMessageEvent, type LiveWhatsAppClient } from "./types";
 
@@ -19,6 +20,7 @@ export class LiveMaintainer {
   private totals = emptyLiveTotals();
   private stopping = false;
   private connected = false;
+  private linkedDeviceJid: string | null = null;
   private hasConnectedThisProcess = false;
   private recoveryTimer: NodeJS.Timeout | null = null;
   private recoveryRunning = false;
@@ -86,6 +88,11 @@ export class LiveMaintainer {
         lastDisconnectedAt: update.state === "disconnected" || update.state === "logged_out" ? new Date().toISOString() : undefined,
         lastError: update.lastError ?? null
       });
+      if (update.linkedDeviceJid) {
+        // Decryption of secret-encrypted payloads authored or targeted by the
+        // user needs the real linked-device jid behind archived "me".
+        this.linkedDeviceJid = update.linkedDeviceJid;
+      }
       if (update.state === "connected") {
         // Audit both cold starts (late_start) and in-process reconnects
         // (disconnect); a settle period lets offline/history events land first
@@ -165,6 +172,7 @@ export class LiveMaintainer {
       }
       await this.sweepUnmergedIdentities();
       await this.runGroupNamingPass();
+      await this.runSecretsPass();
     } catch (error) {
       this.totals = { ...this.totals, warnings: this.totals.warnings + 1 };
       await configuredTraceRecorder?.record("live.recovery_tick_failed", {
@@ -173,6 +181,16 @@ export class LiveMaintainer {
       });
     } finally {
       this.recoveryRunning = false;
+    }
+  }
+
+  // Retained secret-encrypted payloads become readable when their secret
+  // arrives (live capture or backup backfill); decrypt a bounded batch per
+  // tick and apply the results as normal targeted updates.
+  private async runSecretsPass(): Promise<void> {
+    const result = await runRetainedPayloadDecryptionPass(this.repository, { meJid: this.linkedDeviceJid, limit: 200 });
+    if (result.decrypted > 0) {
+      await configuredTraceRecorder?.record("live.secrets_decrypted", { runId: this.runId, ...result });
     }
   }
 
@@ -312,6 +330,13 @@ export class LiveMaintainer {
       }
     }
     if (event.updates?.length) await this.repository.applyLiveMessageUpdates(event.updates);
+    if (event.secrets?.length) await this.repository.recordMessageSecrets(event.secrets);
+    if (event.retainedPayloads?.length) {
+      await this.repository.retainEncryptedPayloads(event.retainedPayloads);
+      // Try immediately — the target's secret often already arrived (with the
+      // poll/event itself or from a backup backfill).
+      await runRetainedPayloadDecryptionPass(this.repository, { meJid: this.linkedDeviceJid, limit: 50 });
+    }
     this.progress.processedEvents += 1;
     await this.repository.recordLiveEventReceipt({
       eventKey: event.eventKey,

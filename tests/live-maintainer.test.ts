@@ -697,7 +697,7 @@ describe("live WhatsApp maintainer", () => {
       },
       "wa-web:messages.upsert"
     );
-    const unknownPoll = normalizeBaileysMessage(
+    const poll = normalizeBaileysMessage(
       {
         key: { remoteJid: "dm@s.whatsapp.net", id: "POLL1", fromMe: false },
         messageTimestamp: 1712000003,
@@ -719,7 +719,10 @@ describe("live WhatsApp maintainer", () => {
     expect(template?.body).toBe("Your order has shipped");
     expect(interactiveTemplate?.body).toBe("Choose a delivery slot");
     expect(secret?.messageType).toBe("encrypted_update");
-    expect(unknownPoll?.messageType).toBe("unknown_pollCreationMessageV3");
+    // Polls joined the shared vocabulary; the messageContextInfo rider still
+    // never names the type.
+    expect(poll?.messageType).toBe("poll");
+    expect(poll?.body).toBe("?");
   });
 
   it("records stub messages as system events instead of empty unknown rows", () => {

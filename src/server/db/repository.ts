@@ -26,7 +26,9 @@ import type {
   MemoryValidationIssue,
   MessageListItem,
   MessageRecord,
+  MessageSecretRecord,
   ParticipantRecord,
+  RetainedPayloadRecord,
   ChatListOptions,
   RecoveryAnchorRecord,
   StatusSummary
@@ -46,7 +48,16 @@ export interface ArchiveRepository {
   resolveIdentityJid(jid: string): Promise<string>;
   listUnmergedLidIdentities(limit?: number): Promise<Array<{ lid: string; pn: string }>>;
   mergeIdentity(lid: string, pn: string): Promise<{ chatsMerged: number; contactsMerged: number; messagesCollapsed: number }>;
+  // Collapse rows stored under a superseded identity (e.g. an edited message's
+  // edit key from an earlier importer) onto their canonical row; removed rows
+  // route through memory staleness.
+  collapseSupersededMessages(
+    pairs: Array<{ chatSourceId: string; staleMessageId: string; canonicalMessageId: string }>
+  ): Promise<number>;
   listUnnamedGroupChats(limit?: number): Promise<string[]>;
+  // Unknown-type worksheet source: per-code counts with example locations
+  // (chat display labels and timestamps only — never message content).
+  listUnknownTypeCodes(): Promise<Array<{ code: string; count: number; examples: Array<{ chatLabel: string; timestampMs: number | null }> }>>;
   clearIdentityDerivedChatNames(): Promise<number>;
   refreshChatStats(chatSourceIds?: string[]): Promise<void>;
   clearArchiveData(): Promise<void>;
@@ -67,6 +78,19 @@ export interface ArchiveRepository {
   hasLiveEventReceipt(eventKey: string): Promise<boolean>;
   applyLiveMessageUpdates(updates: Array<Omit<LiveMessageUpdateRecord, "applied">>): Promise<LiveMessageUpdateResult>;
   listPendingLiveMessageUpdates(limit?: number): Promise<LiveMessageUpdateRecord[]>;
+  // Message secrets and retained secret-encrypted payloads. Secret bytes must
+  // never appear in logs, DTOs, exports, or diagnostics.
+  recordMessageSecrets(secrets: MessageSecretRecord[]): Promise<number>;
+  getMessageSecret(chatSourceId: string, sourceMessageId: string): Promise<Uint8Array | null>;
+  countMessageSecrets(): Promise<number>;
+  retainEncryptedPayloads(payloads: RetainedPayloadRecord[]): Promise<number>;
+  listRetainedEncryptedPayloads(limit?: number): Promise<RetainedPayloadRecord[]>;
+  deleteRetainedEncryptedPayload(id: number): Promise<void>;
+  // Minimal context a decryption pass needs about a target message.
+  getMessageInterpretationContext(
+    chatSourceId: string,
+    sourceMessageId: string
+  ): Promise<{ senderSourceJid: string | null; fromMe: boolean | null; rawMetadata: Record<string, unknown> | null } | null>;
   getLiveStatus(): Promise<LiveMaintainerStatusSummary>;
   listChats(options: ChatListOptions): Promise<ChatListItem[]>;
   listMessages(

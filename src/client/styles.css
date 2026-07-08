@@ -882,6 +882,14 @@ h1 {
   font-style: italic;
 }
 
+.placeholderReason {
+  display: block;
+  margin-top: 2px;
+  font-size: 12px;
+  font-style: normal;
+  color: #8fa19c;
+}
+
 .messageBubble .mention,
 .systemChip .mention {
   color: #53bdeb;

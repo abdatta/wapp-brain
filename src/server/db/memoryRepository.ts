@@ -32,14 +32,18 @@ import type {
   MemoryValidationIssue,
   MessageListItem,
   MessageRecord,
+  MessageSecretRecord,
   ParticipantRecord,
   RecoveryAnchorRecord,
+  RetainedPayloadRecord,
   StatusSummary
 } from "../../shared/types";
 import { config } from "../config";
 import { baselineFromStatus } from "../live/baseline";
 import { messageIdFromKey, messageKey } from "../identity/keys";
 import { applyMentionLabels, appliedMentionLabels, extractMentionDigits, mentionJidCandidates } from "../identity/mentions";
+import { mergeInteractionMetadata } from "./interactions";
+import { interpretMessage } from "../interpretation/messageInterpretation";
 import { normalizeJid } from "../import/jid";
 import { getMemoryProviderStatus } from "../memory/provider";
 
@@ -56,6 +60,9 @@ export class MemoryArchiveRepository implements ArchiveRepository {
   private liveGaps = new Map<number, LiveGapWindowRecord & { id: number; createdAt: string; updatedAt: string }>();
   private liveReceipts = new Map<string, LiveEventReceiptRecord>();
   private liveUpdates = new Map<string, LiveMessageUpdateRecord>();
+  private messageSecrets = new Map<string, MessageSecretRecord>();
+  private retainedPayloads = new Map<number, RetainedPayloadRecord & { id: number }>();
+  private nextRetainedPayloadId = 1;
   private memoryRuns = new Map<string, MemoryRunSummary>();
   private memoryWindows = new Map<string, MemorySourceWindowRecord>();
   private memoryPacks = new Map<string, MemoryEvidencePackRecord>();
@@ -112,6 +119,56 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       .filter((chat) => chat.chatType === "group" && (!chat.displayName?.trim() || chat.displayName === chat.jid))
       .slice(0, Math.max(1, limit))
       .map((chat) => chat.sourceChatId);
+  }
+
+  async collapseSupersededMessages(
+    pairs: Array<{ chatSourceId: string; staleMessageId: string; canonicalMessageId: string }>
+  ): Promise<number> {
+    let collapsed = 0;
+    for (const pair of pairs) {
+      const chatSourceId = this.canonicalJid(pair.chatSourceId) ?? pair.chatSourceId;
+      const staleKey = messageKey(chatSourceId, pair.staleMessageId);
+      const canonicalKey = messageKey(chatSourceId, pair.canonicalMessageId);
+      if (this.messages.has(staleKey) && this.messages.has(canonicalKey)) {
+        this.messages.delete(staleKey);
+        collapsed += 1;
+      }
+    }
+    if (collapsed > 0) {
+      await this.markStaleMemoryForMissingMessages();
+    }
+    return collapsed;
+  }
+
+  async listUnknownTypeCodes(): Promise<Array<{ code: string; count: number; examples: Array<{ chatLabel: string; timestampMs: number | null }> }>> {
+    const byCode = new Map<string, Array<MessageRecord & { id: number }>>();
+    for (const message of this.messages.values()) {
+      if (!message.messageType.startsWith("unknown")) {
+        continue;
+      }
+      const code = String(message.rawTypeCode ?? "").trim() || message.messageType.replace(/^unknown_?/, "");
+      byCode.set(code, [...(byCode.get(code) ?? []), message]);
+    }
+    return [...byCode.entries()]
+      .map(([code, messages]) => ({
+        code,
+        count: messages.length,
+        examples: messages
+          .sort((a, b) => (b.timestampMs ?? 0) - (a.timestampMs ?? 0))
+          .slice(0, 3)
+          .map((message) => {
+            const chat = this.chats.get(message.chatSourceId);
+            // Display rule: name, else phone digits, never a raw identifier.
+            return {
+              chatLabel:
+                chat?.displayName?.trim() ||
+                displayPhoneFromJid(message.chatSourceId) ||
+                (message.chatSourceId.endsWith("@g.us") ? "Unnamed group" : "Unresolved chat"),
+              timestampMs: message.timestampMs ?? null
+            };
+          })
+      }))
+      .sort((a, b) => b.count - a.count || a.code.localeCompare(b.code));
   }
 
   async listUnmergedLidIdentities(limit = 20): Promise<Array<{ lid: string; pn: string }>> {
@@ -373,12 +430,28 @@ export class MemoryArchiveRepository implements ArchiveRepository {
         rawMessage.senderSourceJid === "me" ? "me" : this.canonicalJid(rawMessage.senderSourceJid) ?? rawMessage.senderSourceJid ?? null;
       const message = { ...rawMessage, chatSourceId, senderSourceJid, sourceMessageKey: messageKey(chatSourceId, rawMessage.sourceMessageId) };
       const existing = this.messages.get(message.sourceMessageKey);
+      // A textless unknown-typed row flagged deleted is the retired inference
+      // heuristic, not evidence; a re-import bearing a fresh not-deleted
+      // verdict heals it. Real tombstones (typed rows) keep sticky deletion.
+      const healsHeuristicDeletion =
+        Boolean(existing?.isDeleted) &&
+        Boolean(existing?.messageType.startsWith("unknown")) &&
+        existing?.body == null &&
+        existing?.caption == null &&
+        !message.isDeleted;
+      const deletionLocked = Boolean(existing?.isDeleted) && !healsHeuristicDeletion;
+      // Mirror the SQLite adapter: an incoming system/unknown classification
+      // never downgrades an already-known type.
+      const incomingTypeIsWeak = message.messageType === "system" || message.messageType.startsWith("unknown");
+      const existingTypeIsStrong =
+        existing != null && existing.messageType !== "system" && !existing.messageType.startsWith("unknown");
       this.messages.set(message.sourceMessageKey, {
         ...existing,
         ...message,
-        body: existing?.isDeleted ? existing.body : message.body ?? existing?.body ?? null,
-        caption: existing?.isDeleted ? existing.caption : message.caption ?? existing?.caption ?? null,
-        isDeleted: Boolean(existing?.isDeleted) || message.isDeleted,
+        messageType: incomingTypeIsWeak && existingTypeIsStrong ? existing.messageType : message.messageType,
+        body: deletionLocked ? existing?.body ?? null : message.body ?? existing?.body ?? null,
+        caption: deletionLocked ? existing?.caption ?? null : message.caption ?? existing?.caption ?? null,
+        isDeleted: deletionLocked || message.isDeleted,
         id: existing?.id ?? this.nextMessageId++
       });
     }
@@ -422,6 +495,9 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     this.nextChatId = 1;
     this.nextMessageId = 1;
     this.nextLiveGapId = 1;
+    this.messageSecrets.clear();
+    this.retainedPayloads.clear();
+    this.nextRetainedPayloadId = 1;
   }
 
   async getStatus(): Promise<StatusSummary> {
@@ -592,6 +668,12 @@ export class MemoryArchiveRepository implements ArchiveRepository {
           message.body = update.metadata.body;
           message.rawMetadata = { ...(message.rawMetadata ?? {}), edited: 1 };
         }
+        if (update.updateType === "poll_vote" || update.updateType === "event_response") {
+          const merged = mergeInteractionMetadata(message.rawMetadata ?? {}, update);
+          if (merged) {
+            message.rawMetadata = merged;
+          }
+        }
         applied += 1;
       } else {
         pending += 1;
@@ -604,6 +686,72 @@ export class MemoryArchiveRepository implements ArchiveRepository {
 
   async listPendingLiveMessageUpdates(limit = 500): Promise<LiveMessageUpdateRecord[]> {
     return [...this.liveUpdates.values()].filter((update) => !update.applied).slice(0, Math.max(1, limit));
+  }
+
+  async recordMessageSecrets(secrets: MessageSecretRecord[]): Promise<number> {
+    let recorded = 0;
+    for (const entry of secrets) {
+      const chatSourceId = this.canonicalJid(entry.chatSourceId) ?? entry.chatSourceId;
+      if (!chatSourceId || !entry.sourceMessageId || entry.secret.length === 0) {
+        continue;
+      }
+      const key = messageKey(chatSourceId, entry.sourceMessageId);
+      if (!this.messageSecrets.has(key)) {
+        this.messageSecrets.set(key, { ...entry, chatSourceId });
+        recorded += 1;
+      }
+    }
+    return recorded;
+  }
+
+  async getMessageSecret(chatSourceId: string, sourceMessageId: string): Promise<Uint8Array | null> {
+    const canonical = this.canonicalJid(chatSourceId) ?? chatSourceId;
+    return this.messageSecrets.get(messageKey(canonical, sourceMessageId))?.secret ?? null;
+  }
+
+  async countMessageSecrets(): Promise<number> {
+    return this.messageSecrets.size;
+  }
+
+  async retainEncryptedPayloads(payloads: RetainedPayloadRecord[]): Promise<number> {
+    let retained = 0;
+    for (const payload of payloads) {
+      const chatSourceId = this.canonicalJid(payload.chatSourceId) ?? payload.chatSourceId;
+      if (!chatSourceId || !payload.targetMessageId || payload.encPayload.length === 0) {
+        continue;
+      }
+      if ([...this.retainedPayloads.values()].some((existing) => existing.eventKey === payload.eventKey)) {
+        continue;
+      }
+      const id = this.nextRetainedPayloadId++;
+      this.retainedPayloads.set(id, { ...payload, id, chatSourceId });
+      retained += 1;
+    }
+    return retained;
+  }
+
+  async listRetainedEncryptedPayloads(limit = 500): Promise<RetainedPayloadRecord[]> {
+    return [...this.retainedPayloads.values()].slice(0, Math.max(1, limit));
+  }
+
+  async deleteRetainedEncryptedPayload(id: number): Promise<void> {
+    this.retainedPayloads.delete(id);
+  }
+
+  async getMessageInterpretationContext(
+    chatSourceId: string,
+    sourceMessageId: string
+  ): Promise<{ senderSourceJid: string | null; fromMe: boolean | null; rawMetadata: Record<string, unknown> | null } | null> {
+    const canonical = this.canonicalJid(chatSourceId) ?? chatSourceId;
+    const message = this.messages.get(messageKey(canonical, sourceMessageId));
+    if (!message) {
+      return null;
+    }
+    return {
+      senderSourceJid: message.senderSourceJid ?? null,
+      fromMe: message.fromMe ?? null,
+      rawMetadata: message.rawMetadata ?? null
+    };
   }
 
   private findUpdateTarget(update: Omit<LiveMessageUpdateRecord, "applied">): (MessageRecord & { id: number }) | undefined {
@@ -769,6 +917,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
           sentAt: message.timestampMs ? new Date(message.timestampMs).toISOString() : null,
           direction: message.direction,
           messageType: message.messageType,
+          interpretation: interpretMessage({ messageType: message.messageType, isDeleted: message.isDeleted }),
           body: applyMentionLabels(message.body ?? null, mentionLabels),
           caption: applyMentionLabels(message.caption ?? null, mentionLabels),
           mentions: appliedMentionLabels([message.body ?? null, message.caption ?? null], mentionLabels),
@@ -1037,6 +1186,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       sentAt: message.timestampMs ? new Date(message.timestampMs).toISOString() : null,
       direction: message.direction,
       messageType: message.messageType,
+      interpretation: interpretMessage({ messageType: message.messageType }),
       text: message.body ?? message.caption ?? null
     };
   }

@@ -63,6 +63,38 @@ are counted as identity health and surfaced as alerts. Archives written under
 the previous identity scheme are refused with a re-import instruction
 (`schema_meta.identity_version`); there is no migration path by design.
 
+## Message Interpretation
+
+Every archived message resolves to honest meaning through one shared type
+vocabulary: backup Android type codes (`messageTypeFromCode`) and live payload
+keys (`detectMessageType`) map to the same type strings (poll, event, album,
+view-once media, business template/list, group invite, payment invite, status
+mention, history share, admin-revoked, waiting-for-message…). User-confirmed
+codes only — unconfirmed codes stay `unknown_<code>` and render as a quiet
+"Legacy message"; `npm run unknown-report` regenerates the private mapping
+worksheet, preserving annotations, for anything still unidentified.
+Interpretation (`src/server/interpretation/messageInterpretation.ts`) is a
+server-side contract: message DTOs and memory evidence carry `{ label, reason }`
+so the thread view, second brain, and future search/MCP/agent consumers present
+the same meaning without client string logic. A bare "Unsupported message" is
+never produced; the truly unreadable states why.
+
+Backup sidecar tables enrich mapped types at import (poll questions/options,
+event details, template text and buttons, group-invite names), and
+`message_add_on` records converge through the same targeted state-update path
+live sync uses: reactions, edit history, poll votes, and event responses apply
+to the original message keyed by canonical identity. Android re-keys edited
+messages in place, so the importer keys edited rows by their
+`message_edit_info.original_key_id` — the identity live sync archived them
+under.
+
+Message secrets (WhatsApp's per-message key layer) are stored by default —
+captured live from envelopes and backfilled from the backup's `message_secret`
+table — so secret-encrypted updates (poll votes, event responses via Baileys'
+decryptors) decrypt immediately or retroactively; undecryptable payloads are
+retained keyed to their target until their secret (or decryptor) exists.
+Secrets never appear in logs, DTOs, exports, or diagnostics.
+
 Second-brain memory flow:
 
 ```text
@@ -116,6 +148,10 @@ The archive stores:
 - `live_chat_checkpoints`
 - `live_gap_windows`
 - `live_event_receipts`
+- `live_message_updates`
+- `identity_links`
+- `message_secrets`
+- `retained_encrypted_payloads`
 - `memory_runs`
 - `memory_source_windows`
 - `memory_evidence_packs`

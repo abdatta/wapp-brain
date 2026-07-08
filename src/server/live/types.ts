@@ -6,7 +6,9 @@ import type {
   LiveMessageUpdateRecord,
   LiveSyncTotals,
   MessageRecord,
-  ParticipantRecord
+  MessageSecretRecord,
+  ParticipantRecord,
+  RetainedPayloadRecord
 } from "../../shared/types";
 
 export const LIVE_CLIENT_NAME = "baileys";
@@ -57,6 +59,10 @@ export interface LiveMessageEvent {
   messages?: MessageRecord[];
   updates?: LiveMessageStateUpdate[];
   identityLinks?: Array<{ lid: string; pn: string }>;
+  // Per-message secrets captured from envelopes, and secret-encrypted payloads
+  // (poll votes, event responses, secret edits) retained for decryption.
+  secrets?: MessageSecretRecord[];
+  retainedPayloads?: RetainedPayloadRecord[];
   rawMetadata?: Record<string, unknown> | null;
 }
 

@@ -22,6 +22,7 @@ WhatsApp databases, decrypted databases, media, archive files, generated second-
 - Do not commit generated second-brain/wiki files derived from WhatsApp data.
 - The app does not store backup keys in the archive.
 - The importer does not log message bodies or key material.
+- **Message secrets are stored by default (deliberate decision, 2026-07-07).** WhatsApp distributes a per-message secret inside each message envelope; the archive persists these (from live sync and from the backup's `message_secret` table) so secret-encrypted updates targeting a message — poll votes, event responses, edits — can be decrypted, including retroactively. This is key material, but it only unlocks content whose plaintext the archive already stores, it never leaves the local archive file, and it is excluded from logs, DTOs, exports, and diagnostics. Encrypted payloads that cannot be decrypted yet are retained (not dropped) so a later-learned secret makes them readable.
 - Decrypted databases are written only to the local work directory and are removed after import unless `--keep-decrypted` is used.
 - The local archive file and generated brain files contain private WhatsApp-derived data; protect `.wapp-brain`, OS backups, and any manual exports.
 
@@ -103,6 +104,12 @@ npm run inspect -- --msgstore "C:\path\msgstore.db.crypt15" --wa "C:\path\wa.db"
 ```
 
 Inspect validates/decrypts if needed, opens SQLite, reports schema compatibility and counts, and prints redacted warnings only. It does not print message bodies or raw rows.
+
+Regenerate the private unknown-type mapping worksheet (per-code counts and example locations for any message types the importer does not map yet — your "What is it?" annotations are preserved across regenerations):
+
+```powershell
+npm run unknown-report
+```
 
 Use `--keep-decrypted` only if you intentionally want the decrypted msgstore left under `.wapp-brain/decrypted`.
 
