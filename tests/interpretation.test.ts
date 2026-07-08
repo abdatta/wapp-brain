@@ -453,7 +453,13 @@ describe("message interpretation", () => {
     const byId = new Map(messages.map((message) => [message.sourceMessageId, message]));
 
     expect(byId.get("m1")?.interpretation?.label).toBe("Poll");
-    expect(byId.get("m2")?.interpretation).toEqual({ label: "View once photo", reason: "Media is not kept in backups." });
+    // Media availability is honest per message: an imported view-once with no
+    // matched file reports import_missing, never a blanket "not kept" claim.
+    expect(byId.get("m2")?.interpretation).toEqual({
+      label: "View once photo",
+      reason: "The media file was not found in the imported media folder."
+    });
+    expect(byId.get("m2")?.media?.availability).toBe("import_missing");
     expect(byId.get("m3")?.interpretation?.label).toBe("Legacy message");
     expect(byId.get("m3")?.interpretation?.reason).toContain("(82)");
     expect(byId.get("m4")?.interpretation?.label).toBe("Deleted by a group admin");

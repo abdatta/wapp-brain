@@ -33,7 +33,7 @@ WhatsApp databases, decrypted databases, media, archive files, generated second-
   - `msgstore.db.crypt15`
   - `wa.db` or `wa.db.crypt15` if you want contact names
   - `encrypted_backup.key` or the matching 64-character crypt15 backup key
-  - optionally your local `WhatsApp/Media` folder for import context
+  - optionally your local `WhatsApp/Media` folder — its files are matched to media messages and archived locally into `.wapp-brain/media/`, viewable in the app
 
 Create `.env` from `.env.example` if you want to customize ports or the archive path:
 
@@ -89,7 +89,7 @@ npm run import -- --msgstore "C:\path\msgstore.db.crypt15" --wa "C:\path\wa.db" 
 
 Prefer `--key-file` over `--key` when possible so the raw key is not stored in your terminal command log.
 
-Optional media directory and archive destination:
+Optional media folder (archived into the local content-addressed media store) and archive destination:
 
 ```powershell
 npm run import -- --msgstore "C:\path\msgstore.db.crypt15" --wa "C:\path\wa.db" --media "C:\path\WhatsApp\Media" --archive ".wapp-brain\archive.sqlite" --key-file "C:\path\encrypted_backup.key"

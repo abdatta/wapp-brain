@@ -12,9 +12,11 @@ export class ImportTerminalProgress {
   private spinner: Ora;
   private fileBar: cliProgress.SingleBar | null = null;
   private messageBar: cliProgress.SingleBar | null = null;
+  private mediaBar: cliProgress.SingleBar | null = null;
   private filePhase: FileProgressPhase | null = null;
   private lastFileUpdateAt = 0;
   private lastMessageUpdateAt = 0;
+  private lastMediaUpdateAt = 0;
 
   constructor(label = "Starting import.") {
     this.spinner = ora({ text: label, stream: process.stderr });
@@ -29,6 +31,9 @@ export class ImportTerminalProgress {
         if (event.step !== "decrypting") {
           this.stopFileBar();
         }
+        if (event.step !== "media") {
+          this.stopMediaBar();
+        }
         this.setSpinner(event.message);
         break;
       case "file-progress":
@@ -36,6 +41,9 @@ export class ImportTerminalProgress {
         break;
       case "message-progress":
         this.handleMessageProgress(event);
+        break;
+      case "media-progress":
+        this.handleMediaProgress(event);
         break;
       case "warnings":
         if (event.count > 0) {
@@ -51,6 +59,7 @@ export class ImportTerminalProgress {
   complete(totals: { messages: number; warnings: number }): void {
     this.stopFileBar();
     this.stopMessageBar();
+    this.stopMediaBar();
     if (this.spinner.isSpinning) {
       this.spinner.succeed(`Import complete: ${totals.messages.toLocaleString()} messages, ${totals.warnings.toLocaleString()} warning(s).`);
     }
@@ -59,6 +68,7 @@ export class ImportTerminalProgress {
   fail(message: string): void {
     this.stopFileBar();
     this.stopMessageBar();
+    this.stopMediaBar();
     if (this.spinner.isSpinning) {
       this.spinner.fail(message);
     } else {
@@ -69,6 +79,7 @@ export class ImportTerminalProgress {
   stop(message?: string): void {
     this.stopFileBar();
     this.stopMessageBar();
+    this.stopMediaBar();
     if (this.spinner.isSpinning) {
       if (message) {
         this.spinner.warn(message);
@@ -158,6 +169,49 @@ export class ImportTerminalProgress {
     }
   }
 
+  // Media ingestion over a multi-GB folder is long-running; show a dedicated
+  // bar with matched/copied counts (privacy-safe — counts only, no names).
+  private handleMediaProgress(event: Extract<ImportProgressEvent, { type: "media-progress" }>): void {
+    const now = Date.now();
+    const total = event.totalRefs;
+    if (total == null || total <= 0) {
+      if (now - this.lastMediaUpdateAt >= 1000 || event.processedRefs === 0) {
+        this.setSpinner(`Archiving media: ${event.matchedRefs.toLocaleString()} matched, ${event.missingRefs.toLocaleString()} missing...`);
+        this.lastMediaUpdateAt = now;
+      }
+      return;
+    }
+    const done = event.processedRefs >= total;
+    if (!done && now - this.lastMediaUpdateAt < 100) {
+      return;
+    }
+    this.lastMediaUpdateAt = now;
+    if (!this.mediaBar) {
+      if (this.spinner.isSpinning) {
+        this.spinner.stop();
+      }
+      this.mediaBar = new cliProgress.SingleBar(
+        {
+          format: "Archiving media |{bar}| {percentage}% | {value}/{total} | matched {matched} | missing {missing}",
+          barsize: 28,
+          clearOnComplete: false,
+          hideCursor: true,
+          stream: process.stderr
+        },
+        cliProgress.Presets.shades_classic
+      );
+      this.mediaBar.start(total, 0, { matched: "0", missing: "0" });
+    }
+    this.mediaBar.update(Math.min(event.processedRefs, total), {
+      matched: event.matchedRefs.toLocaleString(),
+      missing: event.missingRefs.toLocaleString()
+    });
+    if (done) {
+      this.stopMediaBar();
+      this.setSpinner(`Archived ${event.copiedAssets.toLocaleString()} media files (${event.missingRefs.toLocaleString()} missing).`);
+    }
+  }
+
   private setSpinner(message: string): void {
     this.spinner.text = message;
     if (!this.spinner.isSpinning) {
@@ -177,6 +231,13 @@ export class ImportTerminalProgress {
     if (this.messageBar) {
       this.messageBar.stop();
       this.messageBar = null;
+    }
+  }
+
+  private stopMediaBar(): void {
+    if (this.mediaBar) {
+      this.mediaBar.stop();
+      this.mediaBar = null;
     }
   }
 }

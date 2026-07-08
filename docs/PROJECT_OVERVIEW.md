@@ -12,11 +12,11 @@ The app can:
 - Decrypt/import `msgstore.db.crypt15` with user-supplied key material.
 - Optionally use `wa.db` for contact names.
 - Preserve normalized chats, contacts, participants, messages, message metadata, warnings, and import runs.
+- Archive media locally (import backfill + live download, including view-once) and render it in the thread view.
 - Browse chats and messages in a local web UI.
 - Re-run imports without duplicating the same messages.
 
 The app does not:
-- Copy or render media files.
 - Listen to live WhatsApp messages.
 - Build embeddings, summaries, generated private wiki files, or second-brain answers.
 - Use a cloud database by default.

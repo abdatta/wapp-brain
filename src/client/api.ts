@@ -12,11 +12,13 @@ import type {
   LiveMaintainerStatusSummary,
   LivePairingSummary,
   LiveSyncProgress,
+  MediaQueueSummary,
   MemoryConsolidationResult,
   MemoryCitationResolution,
   MemoryProviderStatus,
   MemoryQueryResult,
   MemoryStatusSummary,
+  MessageEditRevisionRecord,
   MessageListItem,
   MessageListOrder,
   StatusSummary
@@ -208,6 +210,27 @@ export function listChats(params: Partial<ChatListOptions>): Promise<ChatListIte
   query.set("limit", String(params.limit ?? 60));
   query.set("offset", String(params.offset ?? 0));
   return request<ChatListItem[]>(`/api/chats?${query}`);
+}
+
+// Local loopback media URLs (used directly as img/video/audio sources).
+export function mediaAssetUrl(assetId: number): string {
+  return `/api/media/assets/${assetId}`;
+}
+
+export function mediaThumbnailUrl(assetId: number): string {
+  return `/api/media/assets/${assetId}/thumbnail`;
+}
+
+export function linkPreviewThumbnailUrl(messageId: number): string {
+  return `/api/messages/${messageId}/link-preview-thumbnail`;
+}
+
+export function listMessageRevisions(messageId: number): Promise<MessageEditRevisionRecord[]> {
+  return request<MessageEditRevisionRecord[]>(`/api/messages/${messageId}/revisions`);
+}
+
+export function retryStuckMedia(): Promise<{ ok: boolean; requeued: number; media: MediaQueueSummary }> {
+  return request<{ ok: boolean; requeued: number; media: MediaQueueSummary }>("/api/media/retry", { method: "POST", body: "{}" });
 }
 
 export function listMessages(

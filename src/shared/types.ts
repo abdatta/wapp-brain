@@ -1,5 +1,145 @@
 export type ChatType = "dm" | "group" | "community" | "broadcast" | "status" | "unknown";
 
+// Honest per-message media availability, computed server-side from asset +
+// download-queue state and read by every consumer (thread view, memory
+// evidence, search, MCP). Never claims media is kept when it is not, nor that
+// it is unkept when it is stored.
+export type MediaAvailabilityState =
+  | "stored"
+  | "downloading"
+  | "pending"
+  | "expired_unrecoverable"
+  | "not_captured"
+  | "import_missing";
+
+export type MediaAssetSource = "live-download" | "media-retry" | "import-folder";
+
+export type MediaDownloadStatus = "pending" | "downloading" | "stored" | "retry" | "expired_unrecoverable" | "failed";
+
+// The minimal downloadable descriptor captured at the platform event boundary
+// — exactly what a passive CDN fetch + local decrypt needs. Binary fields are
+// base64 strings so the record persists as JSON inside the queue row (never on
+// the messages table) and is removed once the asset is stored.
+export interface MediaDownloadDescriptor {
+  mediaType: "image" | "video" | "audio" | "document" | "sticker" | "ptv";
+  mediaKey: string;
+  directPath: string | null;
+  url: string | null;
+  fileEncSha256: string | null;
+  fileSha256: string | null;
+  mediaKeyTimestamp: number | null;
+  mimeType: string | null;
+  fileName: string | null;
+  fileLength: number | null;
+  width: number | null;
+  height: number | null;
+  durationSeconds: number | null;
+  // The exact platform key of the original delivery (raw identity forms), kept
+  // only because a media re-upload request must reference the message exactly
+  // as the sender addressed it.
+  retryKey?: { remoteJid: string; id: string; fromMe: boolean | null; participant: string | null } | null;
+}
+
+// A media capture riding on a live event from the handler boundary to the
+// durable queue: descriptor + linkage + the embedded thumbnail bytes.
+export interface CapturedMediaDescriptor {
+  chatSourceId: string;
+  sourceMessageId: string;
+  descriptor: MediaDownloadDescriptor;
+  isViewOnce: boolean;
+  messageTimestampMs: number | null;
+  thumbnail: Uint8Array | null;
+}
+
+// Sender-embedded link-preview data captured with a live text message. The
+// thumbnail is embedded bytes from the message itself — never fetched from the
+// link target.
+export interface CapturedLinkPreview {
+  chatSourceId: string;
+  sourceMessageId: string;
+  title: string | null;
+  description: string | null;
+  canonicalUrl: string | null;
+  thumbnail: Uint8Array | null;
+}
+
+export interface MediaDownloadQueueRecord {
+  id?: number;
+  messageKey: string;
+  chatSourceId: string;
+  sourceMessageId: string;
+  descriptor: MediaDownloadDescriptor;
+  thumbnail?: Uint8Array | null;
+  isViewOnce: boolean;
+  status: MediaDownloadStatus;
+  attempts: number;
+  reuploadAttempts: number;
+  nextAttemptAtMs: number | null;
+  lastError: string | null;
+  priority: number;
+}
+
+export interface MediaAssetRecord {
+  id?: number;
+  messageKey: string;
+  chatSourceId: string;
+  sha256: string;
+  storagePath: string;
+  mimeType: string | null;
+  byteSize: number;
+  width: number | null;
+  height: number | null;
+  durationMs: number | null;
+  thumbnail?: Uint8Array | null;
+  source: MediaAssetSource;
+  isViewOnce: boolean;
+  createdAt?: string;
+}
+
+// Asset reference + availability exposed on the message DTO so clients can
+// render media or explain its absence without reimplementing availability.
+export interface MessageMediaSummary {
+  availability: MediaAvailabilityState;
+  assetId: number | null;
+  mimeType: string | null;
+  byteSize: number | null;
+  width: number | null;
+  height: number | null;
+  durationMs: number | null;
+  hasThumbnail: boolean;
+  isViewOnce: boolean;
+}
+
+export interface LinkPreviewSummary {
+  title: string | null;
+  description: string | null;
+  canonicalUrl: string | null;
+  hasThumbnail: boolean;
+}
+
+// A retained prior version of an edited message (live edits only; backup
+// imports never fabricate history).
+export interface MessageEditRevisionRecord {
+  id?: number;
+  messageKey: string;
+  revisionIndex: number;
+  body: string | null;
+  caption: string | null;
+  editedAtMs: number | null;
+  createdAt?: string;
+}
+
+// Privacy-safe media diagnostics: counts by state only — no content, no paths.
+export interface MediaQueueSummary {
+  assets: number;
+  pending: number;
+  downloading: number;
+  retry: number;
+  stored: number;
+  failed: number;
+  expiredUnrecoverable: number;
+}
+
 export type ImportRunStatus = "running" | "completed" | "failed";
 export type ImportMode = "merge" | "replace";
 export type ImportStagingFileKind = "msgstore" | "wa" | "media" | "key";
@@ -208,6 +348,13 @@ export interface MessageListItem {
   hasMedia: boolean;
   mediaMimeType: string | null;
   mediaName: string | null;
+  // Media asset reference + honest availability; null for non-media messages.
+  media: MessageMediaSummary | null;
+  // Stored sender-embedded link preview; null when the message carries none.
+  linkPreview: LinkPreviewSummary | null;
+  isEdited: boolean;
+  // Retained prior revisions available for this message (live edits only).
+  editRevisionCount: number;
   isDeleted: boolean;
   isForwarded: boolean;
   isStarred: boolean;
@@ -433,6 +580,7 @@ export type ImportProgressStep =
   | "chats"
   | "messages"
   | "addons"
+  | "media"
   | "participants"
   | "finalizing"
   | "completed";
@@ -455,6 +603,16 @@ export type ImportProgressEvent =
       processedMessages: number;
       persistedMessages: number;
       totalMessages: number | null;
+    }
+  | {
+      // Media-ingestion phase progress: counts only, never file names/paths.
+      type: "media-progress";
+      processedRefs: number;
+      matchedRefs: number;
+      copiedAssets: number;
+      missingRefs: number;
+      warningCount: number;
+      totalRefs: number | null;
     }
   | {
       type: "warnings";
@@ -498,6 +656,7 @@ export interface LiveMaintainerStatusSummary {
   gapGroups: LiveGapGroupSummary[];
   identityHealth: IdentityHealthSummary;
   chatHealth: LiveChatHealthSummary[];
+  media: MediaQueueSummary;
 }
 
 export interface IdentityHealthSummary {

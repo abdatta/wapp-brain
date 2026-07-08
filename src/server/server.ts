@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { config } from "./config";
 import { cleanupSensitiveWorkDirs } from "./cleanup";
 import { createArchiveRepository, initializeArchiveDatabase } from "./db/archive";
+import { mediaBlobStore } from "./media/blobStore";
 import { configuredTraceRecorder, getTraceRecorderSummary } from "./diagnostics/traceRecorder";
 import { BaileysLiveWhatsAppClient } from "./live/baileysClient";
 import { runImport } from "./import/importer";
@@ -464,6 +465,91 @@ app.get("/api/chats/:id/messages", async (req, res) => {
   }
 });
 
+// Local-only media serving (the whole app binds to loopback). Streams original
+// blobs with HTTP range support for audio/video scrubbing. Content-addressed
+// blobs are immutable, so aggressive private caching is safe. No media paths
+// or bytes are logged.
+app.get("/api/media/assets/:id", async (req, res) => {
+  try {
+    const asset = await repository.getMediaAsset(Number(req.params.id));
+    if (!asset) {
+      res.status(404).json({ error: "Media asset was not found." });
+      return;
+    }
+    const stat = await mediaBlobStore.stat(asset.storagePath);
+    if (!stat) {
+      res.status(404).json({ error: "Media bytes are not present in the local store." });
+      return;
+    }
+    const totalSize = stat.byteSize;
+    res.setHeader("Content-Type", asset.mimeType ?? "application/octet-stream");
+    res.setHeader("Accept-Ranges", "bytes");
+    res.setHeader("Cache-Control", "private, max-age=31536000, immutable");
+    res.setHeader("ETag", `"${asset.sha256}"`);
+    const range = parseRangeHeader(req.headers.range, totalSize);
+    if (range) {
+      res.status(206);
+      res.setHeader("Content-Range", `bytes ${range.start}-${range.end}/${totalSize}`);
+      res.setHeader("Content-Length", String(range.end - range.start + 1));
+      mediaBlobStore.openStream(asset.storagePath, range).pipe(res);
+      return;
+    }
+    res.setHeader("Content-Length", String(totalSize));
+    mediaBlobStore.openStream(asset.storagePath).pipe(res);
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+app.get("/api/media/assets/:id/thumbnail", async (req, res) => {
+  try {
+    const asset = await repository.getMediaAsset(Number(req.params.id));
+    if (!asset?.thumbnail?.length) {
+      res.status(404).json({ error: "No thumbnail is stored for this asset." });
+      return;
+    }
+    res.setHeader("Content-Type", "image/jpeg");
+    res.setHeader("Cache-Control", "private, max-age=31536000, immutable");
+    res.end(Buffer.from(asset.thumbnail));
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+app.get("/api/messages/:id/link-preview-thumbnail", async (req, res) => {
+  try {
+    const thumbnail = await repository.getLinkPreviewThumbnail(Number(req.params.id));
+    if (!thumbnail?.length) {
+      res.status(404).json({ error: "No link preview thumbnail is stored for this message." });
+      return;
+    }
+    res.setHeader("Content-Type", "image/jpeg");
+    res.setHeader("Cache-Control", "private, max-age=31536000, immutable");
+    res.end(Buffer.from(thumbnail));
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+app.get("/api/messages/:id/revisions", async (req, res) => {
+  try {
+    res.json(await repository.listMessageEditRevisions(Number(req.params.id)));
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+// Retry control for stuck media downloads (failed/expired with a descriptor
+// still held); counts only in the response, never content.
+app.post("/api/media/retry", async (_req, res) => {
+  try {
+    const requeued = await repository.retryStuckMediaDownloads();
+    res.json({ ok: true, requeued, media: await repository.getMediaQueueSummary() });
+  } catch (error) {
+    res.status(400).json({ ok: false, error: publicErrorMessage(error) });
+  }
+});
+
 const distDir = path.resolve(__dirname, "../../dist");
 if (fs.existsSync(distDir)) {
   app.use(express.static(distDir));
@@ -490,6 +576,10 @@ try {
   const clearedNames = await repository.clearIdentityDerivedChatNames();
   if (clearedNames) {
     console.log(`Cleared ${clearedNames} identity-derived chat name(s); they will resolve via contacts or the group-naming pass.`);
+  }
+  const noiseRemoved = await repository.removeProtocolNoiseMessages();
+  if (noiseRemoved) {
+    console.log(`Removed ${noiseRemoved} Signal-protocol transport envelope(s) archived as messages before normalization filtered them.`);
   }
 } catch (error) {
   console.warn(`Live state reconciliation skipped: ${publicErrorMessage(error)}`);
@@ -548,6 +638,36 @@ function clampNumber(value: unknown, min: number, max: number, fallback: number)
     return fallback;
   }
   return Math.min(max, Math.max(min, Math.floor(number)));
+}
+
+// Single-range parser for media scrubbing ("bytes=start-end", open ends
+// supported). Malformed or unsatisfiable ranges fall back to a full response.
+function parseRangeHeader(header: string | undefined, totalSize: number): { start: number; end: number } | null {
+  if (!header || totalSize <= 0) {
+    return null;
+  }
+  const match = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+  if (!match || (match[1] === "" && match[2] === "")) {
+    return null;
+  }
+  let start: number;
+  let end: number;
+  if (match[1] === "") {
+    // Suffix range: last N bytes.
+    const suffix = Number(match[2]);
+    if (!Number.isFinite(suffix) || suffix <= 0) {
+      return null;
+    }
+    start = Math.max(0, totalSize - suffix);
+    end = totalSize - 1;
+  } else {
+    start = Number(match[1]);
+    end = match[2] === "" ? totalSize - 1 : Number(match[2]);
+  }
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start >= totalSize) {
+    return null;
+  }
+  return { start, end: Math.min(end, totalSize - 1) };
 }
 
 function importFileKind(value: string) {

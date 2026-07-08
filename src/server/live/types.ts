@@ -1,10 +1,13 @@
 import type {
+  CapturedLinkPreview,
+  CapturedMediaDescriptor,
   ChatRecord,
   ContactRecord,
   LiveConnectionState,
   LiveGapWindowRecord,
   LiveMessageUpdateRecord,
   LiveSyncTotals,
+  MediaDownloadQueueRecord,
   MessageRecord,
   MessageSecretRecord,
   ParticipantRecord,
@@ -63,7 +66,23 @@ export interface LiveMessageEvent {
   // (poll votes, event responses, secret edits) retained for decryption.
   secrets?: MessageSecretRecord[];
   retainedPayloads?: RetainedPayloadRecord[];
+  // Downloadable media descriptors captured at the event boundary before
+  // normalization discards them; they flow to the durable download queue,
+  // never onto the messages table.
+  mediaDescriptors?: CapturedMediaDescriptor[];
+  // Sender-embedded link previews (title/description/URL/thumbnail bytes).
+  linkPreviews?: CapturedLinkPreview[];
   rawMetadata?: Record<string, unknown> | null;
+}
+
+// Outcome of one media download attempt against the live client. "expired"
+// means the CDN link is gone (including after an exhausted or refused media
+// re-upload request); "transient" is retryable.
+export interface MediaDownloadOutcome {
+  status: "stored" | "expired" | "transient";
+  bytes?: Buffer;
+  usedReupload: boolean;
+  error?: string;
 }
 
 export type LiveMessageStateUpdate = Omit<LiveMessageUpdateRecord, "applied">;
@@ -97,6 +116,10 @@ export interface LiveWhatsAppClient {
   onEvent(handler: (event: LiveMessageEvent) => void | Promise<void>): void;
   fetchHistory?(request: LiveHistoryRequest): Promise<LiveHistoryResult>;
   fetchGroupMetadata?(jid: string): Promise<LiveGroupMetadataResult | null>;
+  // Passive CDN fetch + local decrypt of a queued media item; MAY issue a
+  // media re-upload request when the link expired and options allow it —
+  // never a read/played receipt or presence.
+  downloadMedia?(task: MediaDownloadQueueRecord, options: { allowReupload: boolean }): Promise<MediaDownloadOutcome>;
 }
 
 export interface LiveProofResult {

@@ -18,7 +18,7 @@ Keep entries behavior-focused:
 | [Self-Updating Memory Schedule](./self-updating-memory-schedule.md) | Feature | Needs specification | Second brain |
 | [Thread View Signal Vs Noise](./thread-view-signal-vs-noise.md) | Feature / behavior alignment | Needs specification | Thread view |
 | [MCP Chat Reader Server](./mcp-chat-reader-server.md) | Feature | Idea | AI access |
-| [Media Folder Import Reliability](./media-folder-import-reliability.md) | Bug / design follow-up | Needs investigation | Import |
+| [Media Folder Import Reliability](./media-folder-import-reliability.md) | Bug / design follow-up | Proposed → `complete-media-archival` (expanded to full media archival) | Import |
 
 ## Graduated / Absorbed
 

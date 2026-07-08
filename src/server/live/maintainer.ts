@@ -2,14 +2,33 @@ import type { ArchiveRepository } from "../db/repository";
 import { config } from "../config";
 import { configuredTraceRecorder } from "../diagnostics/traceRecorder";
 import { messageKey } from "../identity/keys";
+import { mediaBlobStore } from "../media/blobStore";
 import { assertLiveDependencySafe } from "./dependency";
 import { auditChatGaps, auditMessageEventCheckpoint, GAP_TOLERANCE_MS } from "./auditor";
 import { recoverDueGaps } from "./recovery";
 import { runRetainedPayloadDecryptionPass } from "./secretsPass";
-import type { LiveSyncProgress } from "../../shared/types";
+import type { LiveSyncProgress, MediaDownloadQueueRecord } from "../../shared/types";
 import { addEventToTotals, emptyLiveTotals, type LiveMaintainerOptions, type LiveMessageEvent, type LiveWhatsAppClient } from "./types";
 
 const INGEST_MESSAGE_CHUNK_SIZE = 500;
+
+// Media download bounds: a bounded batch per recovery tick with small
+// concurrency, run AFTER gap recovery and the secrets pass so media work can
+// never starve them. Transient failures back off exponentially to a cap;
+// expired links get a bounded number of media re-upload requests, rate-limited
+// per tick, then go terminal as expired_unrecoverable.
+const MEDIA_DOWNLOAD_BATCH_SIZE = 8;
+const MEDIA_DOWNLOAD_CONCURRENCY = 3;
+const MEDIA_MAX_TRANSIENT_ATTEMPTS = 8;
+const MEDIA_MAX_REUPLOAD_ATTEMPTS = 3;
+const MEDIA_REUPLOAD_REQUESTS_PER_TICK = 2;
+const MEDIA_RETRY_BASE_DELAY_MS = 30_000;
+const MEDIA_RETRY_MAX_DELAY_MS = 3_600_000;
+// Priorities: view-once first (its content is time-limited and absent from
+// backups), then fresh media (CDN links expire), then everything else.
+const MEDIA_PRIORITY_VIEW_ONCE = 100;
+const MEDIA_PRIORITY_FRESH = 50;
+const MEDIA_FRESH_WINDOW_MS = 48 * 3_600_000;
 
 export interface LiveMaintainerCallbacks {
   onArchiveChanged?: (event: LiveMessageEvent) => void | Promise<void>;
@@ -173,6 +192,8 @@ export class LiveMaintainer {
       await this.sweepUnmergedIdentities();
       await this.runGroupNamingPass();
       await this.runSecretsPass();
+      // Media runs last on the tick so gap recovery and secrets never wait.
+      await this.runMediaDownloadPass();
     } catch (error) {
       this.totals = { ...this.totals, warnings: this.totals.warnings + 1 };
       await configuredTraceRecorder?.record("live.recovery_tick_failed", {
@@ -191,6 +212,109 @@ export class LiveMaintainer {
     const result = await runRetainedPayloadDecryptionPass(this.repository, { meJid: this.linkedDeviceJid, limit: 200 });
     if (result.decrypted > 0) {
       await configuredTraceRecorder?.record("live.secrets_decrypted", { runId: this.runId, ...result });
+    }
+  }
+
+  private mediaPassRunning = false;
+
+  // Claim a bounded batch of due media downloads, fetch + decrypt each, store
+  // the blob content-addressed, link the asset, and mark the queue row
+  // terminal. Transient failures back off; expired links get bounded,
+  // rate-limited media re-upload requests before going unrecoverable.
+  private async runMediaDownloadPass(): Promise<void> {
+    if (this.mediaPassRunning || !this.connected || !this.client.downloadMedia) {
+      return;
+    }
+    this.mediaPassRunning = true;
+    let reuploadBudget = MEDIA_REUPLOAD_REQUESTS_PER_TICK;
+    try {
+      const tasks = await this.repository.claimDueMediaDownloads(MEDIA_DOWNLOAD_BATCH_SIZE, Date.now());
+      if (tasks.length === 0) {
+        return;
+      }
+      let stored = 0;
+      let failedTransient = 0;
+      let expired = 0;
+      const queue = [...tasks];
+      const worker = async (): Promise<void> => {
+        for (;;) {
+          const task = queue.shift();
+          if (!task || this.stopping) {
+            return;
+          }
+          const allowReupload = task.reuploadAttempts < MEDIA_MAX_REUPLOAD_ATTEMPTS && reuploadBudget > 0;
+          const outcome = await this.client.downloadMedia!(task, { allowReupload });
+          if (outcome.usedReupload) {
+            reuploadBudget -= 1;
+          }
+          if (outcome.status === "stored" && outcome.bytes) {
+            const blob = await mediaBlobStore.putBytes(outcome.bytes);
+            await this.repository.completeMediaDownload(task.id!, {
+              messageKey: task.messageKey,
+              chatSourceId: task.chatSourceId,
+              sha256: blob.sha256,
+              storagePath: blob.storagePath,
+              mimeType: task.descriptor.mimeType,
+              byteSize: blob.byteSize,
+              width: task.descriptor.width,
+              height: task.descriptor.height,
+              durationMs: task.descriptor.durationSeconds != null ? Math.round(task.descriptor.durationSeconds * 1000) : null,
+              thumbnail: task.thumbnail ?? null,
+              source: outcome.usedReupload ? "media-retry" : "live-download",
+              isViewOnce: task.isViewOnce
+            });
+            stored += 1;
+            continue;
+          }
+          if (outcome.status === "expired") {
+            // Re-upload attempts are bounded per message; once exhausted — or
+            // when no retry key was ever captured — the state goes terminal
+            // instead of looping forever.
+            const reuploadAttemptsAfter = task.reuploadAttempts + (outcome.usedReupload ? 1 : 0);
+            const recoverable = Boolean(task.descriptor.retryKey) && reuploadAttemptsAfter < MEDIA_MAX_REUPLOAD_ATTEMPTS;
+            if (recoverable) {
+              await this.repository.markMediaDownloadRetry(
+                task.id!,
+                outcome.error ?? "Media link expired.",
+                Date.now() + retryDelayMs(task.attempts),
+                { countReupload: outcome.usedReupload }
+              );
+            } else {
+              await this.repository.markMediaDownloadTerminal(task.id!, "expired_unrecoverable", outcome.error ?? null);
+              expired += 1;
+            }
+            continue;
+          }
+          // Transient failure: back off and retry to a cap, then mark failed.
+          if (task.attempts + 1 >= MEDIA_MAX_TRANSIENT_ATTEMPTS) {
+            await this.repository.markMediaDownloadTerminal(task.id!, "failed", outcome.error ?? null);
+          } else {
+            await this.repository.markMediaDownloadRetry(
+              task.id!,
+              outcome.error ?? "Media download failed.",
+              Date.now() + retryDelayMs(task.attempts)
+            );
+          }
+          failedTransient += 1;
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(MEDIA_DOWNLOAD_CONCURRENCY, queue.length) }, () => worker()));
+      if (stored || failedTransient || expired) {
+        await configuredTraceRecorder?.record("live.media_download_pass", {
+          runId: this.runId,
+          claimed: tasks.length,
+          stored,
+          failedTransient,
+          expired
+        });
+      }
+    } catch (error) {
+      await configuredTraceRecorder?.record("live.media_download_pass_failed", {
+        runId: this.runId,
+        message: error instanceof Error ? error.message.slice(0, 500) : "Media download pass failed."
+      });
+    } finally {
+      this.mediaPassRunning = false;
     }
   }
 
@@ -337,6 +461,34 @@ export class LiveMaintainer {
       // poll/event itself or from a backup backfill).
       await runRetainedPayloadDecryptionPass(this.repository, { meJid: this.linkedDeviceJid, limit: 50 });
     }
+    if (event.mediaDescriptors?.length) {
+      // Every media-bearing message gets a durable queue row; view-once and
+      // fresh media jump the line because their content is time-limited.
+      const now = Date.now();
+      const enqueued = await this.repository.enqueueMediaDownloads(
+        event.mediaDescriptors.map((capture) => ({
+          messageKey: messageKey(capture.chatSourceId, capture.sourceMessageId),
+          chatSourceId: capture.chatSourceId,
+          sourceMessageId: capture.sourceMessageId,
+          descriptor: capture.descriptor,
+          thumbnail: capture.thumbnail,
+          isViewOnce: capture.isViewOnce,
+          priority: capture.isViewOnce
+            ? MEDIA_PRIORITY_VIEW_ONCE
+            : capture.messageTimestampMs != null && now - capture.messageTimestampMs < MEDIA_FRESH_WINDOW_MS
+              ? MEDIA_PRIORITY_FRESH
+              : 0
+        }))
+      );
+      if (enqueued > 0 && event.mode === "notify") {
+        // Fresh real-time media downloads eagerly (CDN links expire fastest,
+        // and view-once may vanish); history chunks wait for the tick.
+        void this.runMediaDownloadPass();
+      }
+    }
+    if (event.linkPreviews?.length) {
+      await this.repository.recordLinkPreviews(event.linkPreviews);
+    }
     this.progress.processedEvents += 1;
     await this.repository.recordLiveEventReceipt({
       eventKey: event.eventKey,
@@ -378,6 +530,8 @@ export class LiveMaintainer {
       collect(participant.sourceJid);
     }
     for (const update of event.updates ?? []) collect(update.chatSourceId);
+    for (const capture of event.mediaDescriptors ?? []) collect(capture.chatSourceId);
+    for (const preview of event.linkPreviews ?? []) collect(preview.chatSourceId);
     const canonical = new Map<string, string>();
     for (const jid of uniqueJids) {
       canonical.set(jid, await this.repository.resolveIdentityJid(jid));
@@ -406,7 +560,17 @@ export class LiveMaintainer {
       ...update,
       chatSourceId: resolve(update.chatSourceId) ?? update.chatSourceId
     }));
-    return { ...event, messages, chats, participants, updates };
+    // Media linkage keys canonicalize; the descriptor keeps the raw retry key
+    // untouched because a re-upload must reference the delivery exactly.
+    const mediaDescriptors = event.mediaDescriptors?.map((capture) => ({
+      ...capture,
+      chatSourceId: resolve(capture.chatSourceId) ?? capture.chatSourceId
+    }));
+    const linkPreviews = event.linkPreviews?.map((preview) => ({
+      ...preview,
+      chatSourceId: resolve(preview.chatSourceId) ?? preview.chatSourceId
+    }));
+    return { ...event, messages, chats, participants, updates, mediaDescriptors, linkPreviews };
   }
 
   // A gap closes only when ingested evidence for its chat reaches the gap's
@@ -491,6 +655,10 @@ export function liveOptionsFromConfig(): LiveMaintainerOptions {
     recoveryIntervalMs: config.live.recoveryIntervalMs,
     auditSettleMs: config.live.auditSettleMs
   };
+}
+
+function retryDelayMs(attempts: number): number {
+  return Math.min(MEDIA_RETRY_MAX_DELAY_MS, MEDIA_RETRY_BASE_DELAY_MS * 2 ** Math.min(attempts, 8));
 }
 
 function affectedChatSourceIds(event: LiveMessageEvent): string[] {

@@ -116,7 +116,8 @@ function status(options: {
         ...(options.openGapCount ? [{ status: "open" as const, reason: "watermark_mismatch" as const, count: options.openGapCount }] : []),
         ...(options.uncertainGapCount ? [{ status: "uncertain" as const, reason: "watermark_mismatch" as const, count: options.uncertainGapCount }] : [])
       ],
-      chatHealth: []
+      chatHealth: [],
+      media: { assets: 0, pending: 0, downloading: 0, retry: 0, stored: 0, failed: 0, expiredUnrecoverable: 0 }
     }
   };
 }

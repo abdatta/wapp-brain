@@ -14,9 +14,11 @@ import { config } from "../config";
 import { ensureManagedWorkDir } from "../cleanup";
 import type { ArchiveRepository } from "../db/repository";
 import { configuredTraceRecorder } from "../diagnostics/traceRecorder";
+import { mediaBlobStore } from "../media/blobStore";
 import { PublicError, publicErrorMessage, safeBasename } from "../privacy";
 import { runRetainedPayloadDecryptionPass } from "../live/secretsPass";
 import { prepareMsgstore, prepareSidecarDatabase } from "./decrypt";
+import { mediaBackfillWarning, runImportMediaBackfill } from "./mediaBackfill";
 import { parseWhatsAppSource } from "./parser";
 import type { ImportProgressHandler } from "./progress";
 import { openReadableSQLite } from "./sqlite";
@@ -46,9 +48,10 @@ export async function runImport(
   if (request.waPath) {
     validateLocalPath(request.waPath, "wa.db");
   }
-  if (request.mediaPath) {
-    validateLocalDirectory(request.mediaPath, "media");
-  }
+  // A wrong/absent media folder never blocks message import: it degrades to a
+  // warning and the import proceeds without media.
+  const mediaRootProblem = request.mediaPath ? describeMediaDirectoryProblem(request.mediaPath) : null;
+  const mediaRoot = request.mediaPath && !mediaRootProblem ? request.mediaPath : null;
   if (request.keyPath) {
     validateLocalPath(request.keyPath, "backup key");
   }
@@ -301,6 +304,57 @@ export async function runImport(
     }
 
     throwIfAborted(options.signal);
+    // Media backfill: read the sidecar mappings, match files in the provided
+    // folder, copy into the content-addressed store, link with import
+    // provenance. Warn-not-abort throughout.
+    if (mediaRootProblem) {
+      const warning: ImportWarning = {
+        severity: "warning",
+        code: "MEDIA_FOLDER_UNREADABLE",
+        entityType: "message",
+        message: `Media folder was skipped: ${mediaRootProblem} Messages imported without media.`,
+        context: { folder: safeBasename(request.mediaPath) }
+      };
+      await repository.addWarnings(runId, [warning]);
+      warningCount += 1;
+    } else if (mediaRoot && parsed.mediaRefCountEstimate > 0) {
+      options.onProgress?.({ type: "step", step: "media", message: "Archiving media from the provided folder." });
+      try {
+        const mediaSummary = await runImportMediaBackfill({
+          repository,
+          store: mediaBlobStore,
+          mediaRoot,
+          refs: parsed.iterateMediaRefs(),
+          totalRefs: parsed.mediaRefCountEstimate,
+          onProgress: options.onProgress,
+          signal: options.signal,
+          resolveChatSourceId: (jid) => repository.resolveIdentityJid(jid)
+        });
+        const warning = mediaBackfillWarning(mediaSummary);
+        await repository.addWarnings(runId, [warning]);
+        if (warning.severity !== "info") {
+          warningCount += 1;
+        }
+        await configuredTraceRecorder?.record("import.media_backfill", { runId, ...mediaSummary });
+      } catch (error) {
+        if (error instanceof PublicError && error.code === "IMPORT_CANCELLED") {
+          throw error;
+        }
+        // Any other media failure is a warning; the message import stands.
+        await repository.addWarnings(runId, [
+          {
+            severity: "warning",
+            code: "MEDIA_INGEST_FAILED",
+            entityType: "message",
+            message: "Media ingestion failed part-way; messages were imported without the remaining media.",
+            context: { message: publicErrorMessage(error) }
+          }
+        ]);
+        warningCount += 1;
+      }
+    }
+
+    throwIfAborted(options.signal);
     options.onProgress?.({ type: "step", step: "participants", message: "Importing inferred group participants." });
     const participants = parsed.getParticipants();
     await configuredTraceRecorder?.record("import.participants", { runId, participants });
@@ -418,15 +472,22 @@ function validateLocalPath(filePath: string, label: string): void {
   }
 }
 
-function validateLocalDirectory(directoryPath: string, label: string): void {
+// Non-fatal media-folder validation: returns a human explanation of the
+// problem, or null when the directory is usable. Never throws — a bad media
+// path must not abort the message import.
+function describeMediaDirectoryProblem(directoryPath: string): string | null {
   if (!directoryPath || /^https?:\/\//i.test(directoryPath)) {
-    throw new PublicError("INPUT_NOT_LOCAL", `${label} must be a local directory path.`);
+    return "The media folder must be a local directory path.";
   }
   if (!fs.existsSync(directoryPath)) {
-    throw new PublicError("INPUT_MISSING", `${label} directory was not found.`);
+    return "The media folder was not found.";
   }
-  const stats = fs.statSync(directoryPath);
-  if (!stats.isDirectory()) {
-    throw new PublicError("INPUT_INVALID", `${label} path must be a directory.`);
+  try {
+    if (!fs.statSync(directoryPath).isDirectory()) {
+      return "The media folder path is not a directory.";
+    }
+  } catch {
+    return "The media folder could not be read.";
   }
+  return null;
 }

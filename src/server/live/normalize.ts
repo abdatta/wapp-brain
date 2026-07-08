@@ -1,8 +1,11 @@
 import { createHash } from "node:crypto";
 import type {
+  CapturedLinkPreview,
+  CapturedMediaDescriptor,
   ChatRecord,
   ChatType,
   ContactRecord,
+  MediaDownloadDescriptor,
   MessageRecord,
   MessageSecretRecord,
   ParticipantRecord,
@@ -32,6 +35,10 @@ interface BaileysLikeMessage {
     id?: string | null;
     fromMe?: boolean | null;
     participant?: string | null;
+    // Baileys marks messages whose <unavailable type="view_once"> envelope
+    // arrived without content: WhatsApp delivers view-once media only to the
+    // primary phone, never to linked devices.
+    isViewOnce?: boolean | null;
   };
   messageTimestamp?: number | LongLike | null;
   pushName?: string | null;
@@ -79,10 +86,17 @@ export function normalizeBaileysMessage(message: BaileysLikeMessage, sourceTable
   if (content?.protocolMessage || content?.reactionMessage) {
     return null;
   }
-  // Poll votes and event responses are secret-encrypted updates targeting
-  // another message, not messages of their own — they flow through payload
-  // retention and decryption instead of message rows.
-  if (content?.pollUpdateMessage || content?.encEventResponseMessage) {
+  // Poll votes, event responses, and secret-encrypted edits target another
+  // message, not messages of their own — they flow through payload retention
+  // and decryption (secret edits update the original in place) instead of
+  // becoming standalone rows.
+  if (content?.pollUpdateMessage || content?.encEventResponseMessage || content?.secretEncryptedMessage) {
+    return null;
+  }
+  // Transport-only envelopes (sender-key distribution, bare context info) are
+  // Signal-protocol plumbing, not user messages; WhatsApp's own clients never
+  // render them. Secrets riding in the context info are captured separately.
+  if (content && !hasVisibleContent(content)) {
     return null;
   }
   const fromMe = message.key?.fromMe ?? null;
@@ -91,7 +105,11 @@ export function normalizeBaileysMessage(message: BaileysLikeMessage, sourceTable
   // Content-less messages with a stub type are platform system events (group
   // membership changes, missed calls, undecryptable placeholders).
   const stubType = !content && message.messageStubType != null ? message.messageStubType : null;
-  const messageType = stubType != null ? "system" : detectMessageType(content);
+  // WhatsApp withholds view-once content from linked devices entirely (the
+  // envelope arrives marked unavailable/view_once with no ciphertext). Type it
+  // honestly instead of "unknown" — the bytes were never ours to capture.
+  const viewOnceWithheld = !content && stubType == null && message.key?.isViewOnce === true;
+  const messageType = stubType != null ? "system" : viewOnceWithheld ? "view_once" : detectMessageType(content);
   // Real-time deliveries carry the group sender in key.participant; history
   // sync often carries it only in the envelope's top-level participant. A
   // group message with neither has an UNKNOWN sender — the group's own
@@ -127,11 +145,23 @@ export function normalizeBaileysMessage(message: BaileysLikeMessage, sourceTable
       ...(stubType != null
         ? { stubType, stubParameters: (message.messageStubParameters ?? []).slice(0, 8) }
         : {}),
+      ...(viewOnceWithheld ? { viewOnceUnavailable: true } : {}),
       // Structured extras under the same documented keys the backup importer
       // writes (poll options feed vote decryption; event times feed display).
       ...structuredContentMetadata(content)
     }
   };
+}
+
+// Content keys that are Signal-protocol transport, not user-visible content.
+const PROTOCOL_ONLY_CONTENT_KEYS = new Set([
+  "messageContextInfo",
+  "senderKeyDistributionMessage",
+  "fastRatchetKeySenderKeyDistributionMessage"
+]);
+
+function hasVisibleContent(content: Record<string, unknown>): boolean {
+  return Object.keys(content).some((key) => !PROTOCOL_ONLY_CONTENT_KEYS.has(key));
 }
 
 function structuredContentMetadata(content: Record<string, unknown> | null): Record<string, unknown> {
@@ -357,7 +387,138 @@ export function normalizeBaileysMessages(messages: BaileysLikeMessage[], sourceT
   const retainedPayloads = messages
     .map((message) => retainedPayloadFromBaileysMessage(message))
     .filter((payload): payload is RetainedPayloadRecord => Boolean(payload));
-  return { ...eventFromMessages(normalized, sourceTable, updates), secrets, retainedPayloads };
+  const mediaDescriptors = messages
+    .map((message) => capturedMediaFromBaileysMessage(message, message))
+    .filter((capture): capture is CapturedMediaDescriptor => Boolean(capture));
+  const linkPreviews = messages
+    .map((message) => capturedLinkPreviewFromBaileysMessage(message))
+    .filter((preview): preview is CapturedLinkPreview => Boolean(preview));
+  return { ...eventFromMessages(normalized, sourceTable, updates), secrets, retainedPayloads, mediaDescriptors, linkPreviews };
+}
+
+// Inner media content by wrapper-aware unwrap: the downloadable descriptor
+// (media key, direct path, hashes, sizes) lives on the inner media message —
+// image, video, audio/voice, document, sticker, GIF (video), and PTV — and is
+// captured here BEFORE normalization reduces the row to display scalars. The
+// raw (pre-resolution) message supplies the exact platform key a media
+// re-upload request must reference.
+const MEDIA_CONTENT_TYPES: Array<{ key: string; mediaType: MediaDownloadDescriptor["mediaType"] }> = [
+  { key: "imageMessage", mediaType: "image" },
+  { key: "videoMessage", mediaType: "video" },
+  { key: "audioMessage", mediaType: "audio" },
+  { key: "documentMessage", mediaType: "document" },
+  { key: "stickerMessage", mediaType: "sticker" },
+  { key: "ptvMessage", mediaType: "ptv" }
+];
+
+export function capturedMediaFromBaileysMessage(
+  message: BaileysLikeMessage,
+  rawMessage?: BaileysLikeMessage
+): CapturedMediaDescriptor | null {
+  const chatSourceId = message.key?.remoteJid ?? null;
+  const sourceMessageId = message.key?.id ?? null;
+  if (!chatSourceId || !sourceMessageId) {
+    return null;
+  }
+  const { content, viewOnce } = unwrapMessageContentDetailed(message.message);
+  if (!content) {
+    return null;
+  }
+  for (const { key, mediaType } of MEDIA_CONTENT_TYPES) {
+    const media = content[key];
+    if (!media || typeof media !== "object") {
+      continue;
+    }
+    const record = media as Record<string, unknown>;
+    const mediaKey = bytesToBase64(record.mediaKey);
+    if (!mediaKey) {
+      // Without the media key there is nothing to decrypt — not downloadable.
+      return null;
+    }
+    const raw = rawMessage ?? message;
+    const thumbnail = record.jpegThumbnail;
+    return {
+      chatSourceId,
+      sourceMessageId,
+      isViewOnce: viewOnce || record.viewOnce === true,
+      messageTimestampMs: timestampToMs(message.messageTimestamp),
+      thumbnail: thumbnail instanceof Uint8Array && thumbnail.length > 0 ? thumbnail : null,
+      descriptor: {
+        mediaType,
+        mediaKey,
+        directPath: nonEmptyString(record.directPath),
+        url: nonEmptyString(record.url),
+        fileEncSha256: bytesToBase64(record.fileEncSha256),
+        fileSha256: bytesToBase64(record.fileSha256),
+        mediaKeyTimestamp: longLikeToNumber(record.mediaKeyTimestamp),
+        mimeType: nonEmptyString(record.mimetype),
+        fileName: nonEmptyString(record.fileName),
+        fileLength: longLikeToNumber(record.fileLength),
+        width: longLikeToNumber(record.width),
+        height: longLikeToNumber(record.height),
+        durationSeconds: longLikeToNumber(record.seconds),
+        retryKey: raw.key?.remoteJid && raw.key.id
+          ? {
+              remoteJid: raw.key.remoteJid,
+              id: raw.key.id,
+              fromMe: raw.key.fromMe ?? null,
+              participant: raw.key.participant ?? raw.participant ?? null
+            }
+          : null
+      }
+    };
+  }
+  return null;
+}
+
+// Sender-embedded link preview riding on an extended text message. Only
+// embedded bytes are captured — the link target is never contacted.
+export function capturedLinkPreviewFromBaileysMessage(message: BaileysLikeMessage): CapturedLinkPreview | null {
+  const chatSourceId = message.key?.remoteJid ?? null;
+  const sourceMessageId = message.key?.id ?? null;
+  if (!chatSourceId || !sourceMessageId) {
+    return null;
+  }
+  const content = unwrapMessageContent(message.message);
+  const extended = content?.extendedTextMessage as
+    | {
+        title?: string | null;
+        description?: string | null;
+        canonicalUrl?: string | null;
+        matchedText?: string | null;
+        jpegThumbnail?: Uint8Array | null;
+      }
+    | undefined;
+  if (!extended || typeof extended !== "object") {
+    return null;
+  }
+  const title = nonEmptyString(extended.title);
+  const description = nonEmptyString(extended.description);
+  const canonicalUrl = nonEmptyString(extended.canonicalUrl) ?? nonEmptyString(extended.matchedText);
+  const thumbnail = extended.jpegThumbnail instanceof Uint8Array && extended.jpegThumbnail.length > 0 ? extended.jpegThumbnail : null;
+  if (!title && !description && !thumbnail) {
+    return null;
+  }
+  return { chatSourceId, sourceMessageId, title, description, canonicalUrl, thumbnail };
+}
+
+function bytesToBase64(value: unknown): string | null {
+  if (value instanceof Uint8Array && value.length > 0) {
+    return Buffer.from(value).toString("base64");
+  }
+  return null;
+}
+
+function nonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function longLikeToNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  const number = (value as LongLike | null | undefined)?.toNumber?.();
+  return typeof number === "number" && Number.isFinite(number) ? number : null;
 }
 
 export async function normalizeBaileysMessageWithJidResolver(
@@ -391,7 +552,15 @@ export async function normalizeBaileysMessagesWithJidResolver(
       retainedPayloadFromBaileysMessage(message, messages[index]?.key?.participant ?? messages[index]?.participant ?? null)
     )
     .filter((payload): payload is RetainedPayloadRecord => Boolean(payload));
-  return { ...eventFromMessages(normalized, sourceTable, updates), secrets, retainedPayloads };
+  // Media linkage uses canonical identities; the raw message rides along so
+  // a re-upload request can reference the exact key the platform delivered.
+  const mediaDescriptors = resolved
+    .map((message, index) => capturedMediaFromBaileysMessage(message, messages[index]))
+    .filter((capture): capture is CapturedMediaDescriptor => Boolean(capture));
+  const linkPreviews = resolved
+    .map((message) => capturedLinkPreviewFromBaileysMessage(message))
+    .filter((preview): preview is CapturedLinkPreview => Boolean(preview));
+  return { ...eventFromMessages(normalized, sourceTable, updates), secrets, retainedPayloads, mediaDescriptors, linkPreviews };
 }
 
 export async function normalizeBaileysContactsWithJidResolver(
@@ -815,7 +984,17 @@ const FUTURE_PROOF_WRAPPER_KEYS = [
 ] as const;
 
 function unwrapMessageContent(message: Record<string, unknown> | null | undefined): Record<string, unknown> | null {
+  return unwrapMessageContentDetailed(message).content;
+}
+
+// Wrapper-aware unwrap: media capture needs to know a view-once envelope was
+// traversed, because the inner media message itself carries no such marker.
+function unwrapMessageContentDetailed(message: Record<string, unknown> | null | undefined): {
+  content: Record<string, unknown> | null;
+  viewOnce: boolean;
+} {
   let content = message ?? null;
+  let viewOnce = false;
   // Iterative unwrap with the same 5-level cap Baileys uses, so malformed
   // payloads cannot loop.
   for (let depth = 0; depth < 5 && content; depth += 1) {
@@ -823,13 +1002,16 @@ function unwrapMessageContent(message: Record<string, unknown> | null | undefine
     if (!wrapperKey) {
       break;
     }
+    if (wrapperKey.startsWith("viewOnce")) {
+      viewOnce = true;
+    }
     const inner = (content[wrapperKey] as { message?: Record<string, unknown> | null }).message;
     if (!inner || typeof inner !== "object") {
       break;
     }
     content = inner;
   }
-  return content;
+  return { content, viewOnce };
 }
 
 function detectMessageType(content: Record<string, unknown> | null): string {
@@ -856,10 +1038,15 @@ function detectMessageType(content: Record<string, unknown> | null): string {
     content.pollCreationMessage ||
     content.pollCreationMessageV2 ||
     content.pollCreationMessageV3 ||
-    content.pollCreationMessageV4
+    content.pollCreationMessageV4 ||
+    content.pollResultSnapshotMessage
   ) {
     return "poll";
   }
+  // Pin/keep bookkeeping renders as a system event, matching WhatsApp.
+  if (content.keepInChatMessage || content.pinInChatMessage) return "system";
+  // The platform's own "content to be delivered later" marker.
+  if (content.placeholderMessage) return "waiting_for_message";
   // Poll votes travel secret-encrypted; the message-secrets pass decrypts them
   // into vote updates when the poll's secret is held.
   if (content.pollUpdateMessage) return "encrypted_update";

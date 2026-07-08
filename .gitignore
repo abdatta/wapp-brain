@@ -43,3 +43,7 @@ logs/
 # OS/editor
 .DS_Store
 Thumbs.db
+
+# Source code under src/ is never a WhatsApp media folder (case-insensitive FS)
+!src/server/media/
+!src/server/media/**

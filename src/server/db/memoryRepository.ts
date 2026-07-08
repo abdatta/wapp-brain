@@ -3,6 +3,7 @@ import type {
   ArchiveRestorePoint
 } from "./repository";
 import type {
+  CapturedLinkPreview,
   ChatListItem,
   ChatListOptions,
   ChatRecord,
@@ -21,6 +22,12 @@ import type {
   LiveSessionSummary,
   LiveSyncRunSummary,
   LiveSyncTotals,
+  MediaAssetRecord,
+  MediaAvailabilityState,
+  MediaDownloadQueueRecord,
+  MediaQueueSummary,
+  MessageEditRevisionRecord,
+  MessageMediaSummary,
   MemoryCitationRecord,
   MemoryEvidenceMessage,
   MemoryEvidencePackRecord,
@@ -63,6 +70,12 @@ export class MemoryArchiveRepository implements ArchiveRepository {
   private messageSecrets = new Map<string, MessageSecretRecord>();
   private retainedPayloads = new Map<number, RetainedPayloadRecord & { id: number }>();
   private nextRetainedPayloadId = 1;
+  private mediaQueue = new Map<string, MediaDownloadQueueRecord & { id: number }>();
+  private mediaAssets = new Map<number, MediaAssetRecord & { id: number }>();
+  private linkPreviews = new Map<string, CapturedLinkPreview>();
+  private editRevisions = new Map<string, MessageEditRevisionRecord[]>();
+  private nextMediaQueueId = 1;
+  private nextMediaAssetId = 1;
   private memoryRuns = new Map<string, MemoryRunSummary>();
   private memoryWindows = new Map<string, MemorySourceWindowRecord>();
   private memoryPacks = new Map<string, MemoryEvidencePackRecord>();
@@ -87,6 +100,17 @@ export class MemoryArchiveRepository implements ArchiveRepository {
 
   async resolveIdentityJid(jid: string): Promise<string> {
     return this.canonicalJid(jid) ?? jid;
+  }
+
+  async getIdentityLidsForJid(jid: string): Promise<string[]> {
+    const normalized = normalizeJid(jid);
+    if (!normalized) {
+      return [];
+    }
+    if (normalized.endsWith("@lid") || normalized.endsWith("@hosted.lid")) {
+      return [normalized];
+    }
+    return [...this.identityLinks.entries()].filter(([, pn]) => pn === normalized).map(([lid]) => lid);
   }
 
   async recordIdentityLinks(links: Array<{ lid: string; pn: string; source?: string | null }>): Promise<string[]> {
@@ -119,6 +143,24 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       .filter((chat) => chat.chatType === "group" && (!chat.displayName?.trim() || chat.displayName === chat.jid))
       .slice(0, Math.max(1, limit))
       .map((chat) => chat.sourceChatId);
+  }
+
+  async removeProtocolNoiseMessages(): Promise<number> {
+    const noiseTypes = new Set(["unknown_senderKeyDistributionMessage", "encrypted_update"]);
+    let removed = 0;
+    const affected = new Set<string>();
+    for (const [key, message] of this.messages) {
+      if (message.sourceTable.startsWith("wa-web") && noiseTypes.has(message.messageType)) {
+        affected.add(message.chatSourceId);
+        this.messages.delete(key);
+        removed += 1;
+      }
+    }
+    if (removed > 0) {
+      await this.refreshChatStats([...affected]);
+      await this.markStaleMemoryForMissingMessages();
+    }
+    return removed;
   }
 
   async collapseSupersededMessages(
@@ -441,14 +483,18 @@ export class MemoryArchiveRepository implements ArchiveRepository {
         !message.isDeleted;
       const deletionLocked = Boolean(existing?.isDeleted) && !healsHeuristicDeletion;
       // Mirror the SQLite adapter: an incoming system/unknown classification
-      // never downgrades an already-known type.
+      // never downgrades an already-known type, and a contentless unknown
+      // never erases a system stub's classification.
       const incomingTypeIsWeak = message.messageType === "system" || message.messageType.startsWith("unknown");
       const existingTypeIsStrong =
         existing != null && existing.messageType !== "system" && !existing.messageType.startsWith("unknown");
+      const keepExistingType =
+        (incomingTypeIsWeak && existingTypeIsStrong) ||
+        (message.messageType.startsWith("unknown") && existing?.messageType === "system");
       this.messages.set(message.sourceMessageKey, {
         ...existing,
         ...message,
-        messageType: incomingTypeIsWeak && existingTypeIsStrong ? existing.messageType : message.messageType,
+        messageType: keepExistingType ? existing!.messageType : message.messageType,
         body: deletionLocked ? existing?.body ?? null : message.body ?? existing?.body ?? null,
         caption: deletionLocked ? existing?.caption ?? null : message.caption ?? existing?.caption ?? null,
         isDeleted: deletionLocked || message.isDeleted,
@@ -660,11 +706,21 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       const message = this.messages.get(update.sourceMessageKey) ?? this.findUpdateTarget(update);
       if (message) {
         if (update.updateType === "delete") {
+          // Tombstone only: held content stays (backup-store semantics).
           message.isDeleted = true;
-          message.body = null;
-          message.caption = null;
         }
         if (update.updateType === "edit" && typeof update.metadata?.body === "string") {
+          if (message.body != null && message.body !== update.metadata.body) {
+            const revisions = this.editRevisions.get(message.sourceMessageKey) ?? [];
+            revisions.push({
+              messageKey: message.sourceMessageKey,
+              revisionIndex: revisions.length,
+              body: message.body,
+              caption: message.caption ?? null,
+              editedAtMs: update.occurredAtMs ?? null
+            });
+            this.editRevisions.set(message.sourceMessageKey, revisions);
+          }
           message.body = update.metadata.body;
           message.rawMetadata = { ...(message.rawMetadata ?? {}), edited: 1 };
         }
@@ -754,6 +810,231 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     };
   }
 
+  async enqueueMediaDownloads(
+    items: Array<Pick<MediaDownloadQueueRecord, "messageKey" | "chatSourceId" | "sourceMessageId" | "descriptor" | "thumbnail" | "isViewOnce" | "priority">>
+  ): Promise<number> {
+    let enqueued = 0;
+    for (const item of items) {
+      const chatSourceId = this.canonicalJid(item.chatSourceId) ?? item.chatSourceId;
+      if (!chatSourceId || !item.sourceMessageId) {
+        continue;
+      }
+      const key = messageKey(chatSourceId, item.sourceMessageId);
+      const existing = this.mediaQueue.get(key);
+      if (existing) {
+        if (existing.status === "pending" || existing.status === "retry") {
+          existing.priority = Math.max(existing.priority, item.priority);
+        }
+        continue;
+      }
+      this.mediaQueue.set(key, {
+        id: this.nextMediaQueueId++,
+        messageKey: key,
+        chatSourceId,
+        sourceMessageId: item.sourceMessageId,
+        descriptor: item.descriptor,
+        thumbnail: item.thumbnail ?? null,
+        isViewOnce: item.isViewOnce,
+        status: "pending",
+        attempts: 0,
+        reuploadAttempts: 0,
+        nextAttemptAtMs: null,
+        lastError: null,
+        priority: item.priority
+      });
+      enqueued += 1;
+    }
+    return enqueued;
+  }
+
+  async claimDueMediaDownloads(limit: number, nowMs = Date.now()): Promise<MediaDownloadQueueRecord[]> {
+    const due = [...this.mediaQueue.values()]
+      .filter((entry) => (entry.status === "pending" || entry.status === "retry") && (entry.nextAttemptAtMs == null || entry.nextAttemptAtMs <= nowMs))
+      .sort((a, b) => b.priority - a.priority || a.id - b.id)
+      .slice(0, Math.max(1, limit));
+    for (const entry of due) {
+      entry.status = "downloading";
+    }
+    return due.map((entry) => ({ ...entry }));
+  }
+
+  async completeMediaDownload(queueId: number, asset: MediaAssetRecord): Promise<number> {
+    const assetId = await this.linkMediaAsset(asset);
+    const entry = [...this.mediaQueue.values()].find((candidate) => candidate.id === queueId);
+    if (entry) {
+      entry.status = "stored";
+      entry.thumbnail = null;
+      entry.lastError = null;
+    }
+    return assetId;
+  }
+
+  async markMediaDownloadRetry(queueId: number, error: string, nextAttemptAtMs: number, options: { countReupload?: boolean } = {}): Promise<void> {
+    const entry = [...this.mediaQueue.values()].find((candidate) => candidate.id === queueId);
+    if (entry) {
+      entry.status = "retry";
+      entry.attempts += 1;
+      entry.reuploadAttempts += options.countReupload ? 1 : 0;
+      entry.nextAttemptAtMs = nextAttemptAtMs;
+      entry.lastError = error;
+    }
+  }
+
+  async markMediaDownloadTerminal(queueId: number, status: "expired_unrecoverable" | "failed", error: string | null): Promise<void> {
+    const entry = [...this.mediaQueue.values()].find((candidate) => candidate.id === queueId);
+    if (entry) {
+      entry.status = status;
+      entry.lastError = error;
+    }
+  }
+
+  async linkMediaAsset(asset: MediaAssetRecord): Promise<number> {
+    const chatSourceId = this.canonicalJid(asset.chatSourceId) ?? asset.chatSourceId;
+    const existing = [...this.mediaAssets.values()].find(
+      (candidate) => candidate.messageKey === asset.messageKey && candidate.sha256 === asset.sha256
+    );
+    if (existing) {
+      return existing.id;
+    }
+    const id = this.nextMediaAssetId++;
+    this.mediaAssets.set(id, { ...asset, id, chatSourceId });
+    return id;
+  }
+
+  async getMediaAsset(assetId: number): Promise<MediaAssetRecord | null> {
+    return this.mediaAssets.get(assetId) ?? null;
+  }
+
+  async getMediaAssetForMessage(messageId: number): Promise<MediaAssetRecord | null> {
+    const message = [...this.messages.values()].find((candidate) => candidate.id === messageId);
+    if (!message) {
+      return null;
+    }
+    return [...this.mediaAssets.values()].find((candidate) => candidate.messageKey === message.sourceMessageKey) ?? null;
+  }
+
+  async getMediaQueueSummary(): Promise<MediaQueueSummary> {
+    const summary: MediaQueueSummary = {
+      assets: this.mediaAssets.size,
+      pending: 0,
+      downloading: 0,
+      retry: 0,
+      stored: 0,
+      failed: 0,
+      expiredUnrecoverable: 0
+    };
+    for (const entry of this.mediaQueue.values()) {
+      if (entry.status === "pending") summary.pending += 1;
+      else if (entry.status === "downloading") summary.downloading += 1;
+      else if (entry.status === "retry") summary.retry += 1;
+      else if (entry.status === "stored") summary.stored += 1;
+      else if (entry.status === "failed") summary.failed += 1;
+      else summary.expiredUnrecoverable += 1;
+    }
+    return summary;
+  }
+
+  async retryStuckMediaDownloads(): Promise<number> {
+    let requeued = 0;
+    for (const entry of this.mediaQueue.values()) {
+      if ((entry.status === "failed" || entry.status === "expired_unrecoverable" || entry.status === "retry") && entry.descriptor) {
+        entry.status = "pending";
+        entry.attempts = 0;
+        entry.reuploadAttempts = 0;
+        entry.nextAttemptAtMs = null;
+        requeued += 1;
+      }
+    }
+    return requeued;
+  }
+
+  async resetInFlightMediaDownloads(): Promise<number> {
+    let reset = 0;
+    for (const entry of this.mediaQueue.values()) {
+      if (entry.status === "downloading") {
+        entry.status = "pending";
+        reset += 1;
+      }
+    }
+    return reset;
+  }
+
+  async recordLinkPreviews(previews: CapturedLinkPreview[]): Promise<number> {
+    let recorded = 0;
+    for (const preview of previews) {
+      const chatSourceId = this.canonicalJid(preview.chatSourceId) ?? preview.chatSourceId;
+      if (!chatSourceId || !preview.sourceMessageId) {
+        continue;
+      }
+      const key = messageKey(chatSourceId, preview.sourceMessageId);
+      if (!this.linkPreviews.has(key)) {
+        this.linkPreviews.set(key, { ...preview, chatSourceId });
+        recorded += 1;
+      }
+    }
+    return recorded;
+  }
+
+  async getLinkPreviewThumbnail(messageId: number): Promise<Uint8Array | null> {
+    const message = [...this.messages.values()].find((candidate) => candidate.id === messageId);
+    if (!message) {
+      return null;
+    }
+    return this.linkPreviews.get(message.sourceMessageKey)?.thumbnail ?? null;
+  }
+
+  async listMessageEditRevisions(messageId: number): Promise<MessageEditRevisionRecord[]> {
+    const message = [...this.messages.values()].find((candidate) => candidate.id === messageId);
+    if (!message) {
+      return [];
+    }
+    return [...(this.editRevisions.get(message.sourceMessageKey) ?? [])].sort((a, b) => a.revisionIndex - b.revisionIndex);
+  }
+
+  // Mirrors the SQLite availability derivation for parity in tests.
+  private deriveMediaState(message: MessageRecord & { id: number }): MessageMediaSummary | null {
+    const asset = [...this.mediaAssets.values()].find((candidate) => candidate.messageKey === message.sourceMessageKey) ?? null;
+    const isViewOnceType = message.messageType.startsWith("view_once");
+    if (asset) {
+      return {
+        availability: "stored",
+        assetId: asset.id,
+        mimeType: asset.mimeType,
+        byteSize: asset.byteSize,
+        width: asset.width,
+        height: asset.height,
+        durationMs: asset.durationMs,
+        hasThumbnail: Boolean(asset.thumbnail?.length),
+        isViewOnce: asset.isViewOnce || isViewOnceType
+      };
+    }
+    if (!message.hasMedia) {
+      return null;
+    }
+    const queue = this.mediaQueue.get(message.sourceMessageKey);
+    const availability: MediaAvailabilityState =
+      queue?.status === "pending"
+        ? "pending"
+        : queue?.status === "downloading" || queue?.status === "retry"
+          ? "downloading"
+          : queue?.status === "failed" || queue?.status === "expired_unrecoverable"
+            ? "expired_unrecoverable"
+            : message.sourceTable.startsWith("wa-web")
+              ? "not_captured"
+              : "import_missing";
+    return {
+      availability,
+      assetId: null,
+      mimeType: null,
+      byteSize: null,
+      width: null,
+      height: null,
+      durationMs: null,
+      hasThumbnail: false,
+      isViewOnce: Boolean(queue?.isViewOnce) || isViewOnceType
+    };
+  }
+
   private findUpdateTarget(update: Omit<LiveMessageUpdateRecord, "applied">): (MessageRecord & { id: number }) | undefined {
     const messageId = messageIdFromKey(update.sourceMessageKey);
     if (!messageId) {
@@ -796,6 +1077,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       openGapCount: openGaps.length,
       gapGroups: groupGaps(openGaps),
       identityHealth: await this.computeIdentityHealth(),
+      media: await this.getMediaQueueSummary(),
       chatHealth: [...this.liveCheckpoints.values()].map((checkpoint) => {
         const chat = this.chats.get(checkpoint.chatSourceId);
         const chatOpenGaps = openGaps.filter((gap) => gap.chatSourceId === checkpoint.chatSourceId);
@@ -906,6 +1188,10 @@ export class MemoryArchiveRepository implements ArchiveRepository {
         const groupSelfSender = chat.chatType === "group" && message.senderSourceJid === chat.sourceChatId;
         const sender = !groupSelfSender && message.senderSourceJid ? this.contacts.get(message.senderSourceJid) : null;
         const mentionLabels = this.resolveMentionLabels([message.body ?? null, message.caption ?? null]);
+        const media = this.deriveMediaState(message);
+        const hasHeldContent = Boolean(message.body?.trim() || message.caption?.trim() || media?.availability === "stored");
+        const preview = this.linkPreviews.get(message.sourceMessageKey) ?? null;
+        const revisions = this.editRevisions.get(message.sourceMessageKey) ?? [];
         return {
           id: message.id,
           sourceMessageId: message.sourceMessageId,
@@ -917,13 +1203,29 @@ export class MemoryArchiveRepository implements ArchiveRepository {
           sentAt: message.timestampMs ? new Date(message.timestampMs).toISOString() : null,
           direction: message.direction,
           messageType: message.messageType,
-          interpretation: interpretMessage({ messageType: message.messageType, isDeleted: message.isDeleted }),
+          interpretation: interpretMessage({
+            messageType: message.messageType,
+            isDeleted: message.isDeleted,
+            hasHeldContent,
+            mediaAvailability: media?.availability ?? null
+          }),
           body: applyMentionLabels(message.body ?? null, mentionLabels),
           caption: applyMentionLabels(message.caption ?? null, mentionLabels),
           mentions: appliedMentionLabels([message.body ?? null, message.caption ?? null], mentionLabels),
           hasMedia: message.hasMedia,
           mediaMimeType: message.mediaMimeType ?? null,
           mediaName: message.mediaName ?? null,
+          media,
+          linkPreview: preview
+            ? {
+                title: preview.title,
+                description: preview.description,
+                canonicalUrl: preview.canonicalUrl,
+                hasThumbnail: Boolean(preview.thumbnail?.length)
+              }
+            : null,
+          isEdited: Boolean(message.rawMetadata?.edited) || revisions.length > 0,
+          editRevisionCount: revisions.length,
           isDeleted: message.isDeleted,
           isForwarded: message.isForwarded,
           isStarred: message.isStarred

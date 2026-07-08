@@ -10,8 +10,10 @@ import {
   Download,
   Eye,
   FileKey2,
+  FileText,
   FolderOpen,
   HardDrive,
+  History,
   KeyRound,
   Link2,
   Loader2,
@@ -30,8 +32,9 @@ import {
   Upload,
   X
 } from "lucide-react";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
+import { parseInlineSegments, parseWhatsAppBlocks, type InlineSegment } from "./whatsappFormat";
 import type {
   ArchiveChangeEvent,
   ChatListItem,
@@ -46,6 +49,7 @@ import type {
   LiveSyncProgress,
   MemoryCitationResolution,
   MemoryQueryResult,
+  MessageEditRevisionRecord,
   MessageListItem,
   StatusSummary
 } from "../shared/types";
@@ -63,13 +67,18 @@ import {
   getStatus,
   initDatabase,
   linkLiveSession,
+  linkPreviewThumbnailUrl,
   listChats,
   listLiveGaps,
+  listMessageRevisions,
   listMessages,
+  mediaAssetUrl,
+  mediaThumbnailUrl,
   queryMemory,
   resolveMemoryCitation,
   resumeLiveSession,
   retryLiveGap,
+  retryStuckMedia,
   startMemoryRun,
   startImportJob,
   stopLiveSession,
@@ -108,6 +117,7 @@ export function App() {
   const [memoryQuery, setMemoryQuery] = useState("");
   const [memoryResult, setMemoryResult] = useState<MemoryQueryResult | null>(null);
   const [memoryCitation, setMemoryCitation] = useState<MemoryCitationResolution | null>(null);
+  const [lightbox, setLightbox] = useState<{ assetId: number; mimeType: string | null } | null>(null);
   const messageListRef = useRef<HTMLDivElement | null>(null);
   const loadingMessagesRef = useRef(false);
   const scrollActionRef = useRef<"bottom" | "preserve" | null>(null);
@@ -367,6 +377,25 @@ export function App() {
     }
   }
 
+  async function handleRetryMedia() {
+    setBusy("Retrying media downloads");
+    setError(null);
+    setNotice(null);
+    try {
+      const result = await retryStuckMedia();
+      setNotice(
+        result.requeued
+          ? `${result.requeued.toLocaleString()} media download(s) queued for retry.`
+          : "No stuck media downloads were eligible for retry."
+      );
+      await refreshStatus();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not retry media downloads.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function handleUnlinkLive() {
     if (!window.confirm("Unlinking removes local live credentials. You will need to scan or pair WhatsApp again.")) {
       return;
@@ -587,6 +616,7 @@ export function App() {
             onImport={() => setImportWizardOpen(true)}
             onLink={() => void handleLinkLive()}
             onRetryGap={(id) => void handleRetryGap(id)}
+            onRetryMedia={() => void handleRetryMedia()}
             onPause={() => void handleStopLive()}
             onResume={() => void handleResumeLive()}
             onUnlink={() => void handleUnlinkLive()}
@@ -697,9 +727,23 @@ export function App() {
                 {groupedMessages.map((group) => (
                   <div key={group.day} className="dayGroup">
                     <div className="dayMarker">{group.day}</div>
-                    {group.items.map((message) => (
-                      <MessageBubble key={message.id} message={message} isGroup={selectedChat.chatType === "group"} />
-                    ))}
+                    {groupConsecutiveMedia(group.items).map((entry) =>
+                      entry.kind === "grid" ? (
+                        <MediaGridBubble
+                          key={`grid-${entry.messages[0].id}`}
+                          messages={entry.messages}
+                          isGroup={selectedChat.chatType === "group"}
+                          onOpenMedia={(assetId, mimeType) => setLightbox({ assetId, mimeType })}
+                        />
+                      ) : (
+                        <MessageBubble
+                          key={entry.message.id}
+                          message={entry.message}
+                          isGroup={selectedChat.chatType === "group"}
+                          onOpenMedia={(assetId, mimeType) => setLightbox({ assetId, mimeType })}
+                        />
+                      )
+                    )}
                   </div>
                 ))}
                 {loadingMessages && messages.length === 0 && <SkeletonMessages />}
@@ -734,6 +778,7 @@ export function App() {
         />
       )}
       {pairingOpen && <PairingModal pairing={pairing} onClose={() => setPairingOpen(false)} onRetry={() => void handleLinkLive()} />}
+      {lightbox && <MediaLightbox assetId={lightbox.assetId} mimeType={lightbox.mimeType} onClose={() => setLightbox(null)} />}
     </div>
   );
 }
@@ -746,6 +791,7 @@ function LivePanel({
   onImport,
   onLink,
   onRetryGap,
+  onRetryMedia,
   onPause,
   onResume,
   onUnlink
@@ -757,6 +803,7 @@ function LivePanel({
   onImport: () => void;
   onLink: () => void;
   onRetryGap: (id: number) => void;
+  onRetryMedia: () => void;
   onPause: () => void;
   onResume: () => void;
   onUnlink: () => void;
@@ -848,6 +895,23 @@ function LivePanel({
                   )}
                 </div>
               ))}
+            </div>
+          )}
+          {live?.media && (live.media.assets > 0 || live.media.pending + live.media.downloading + live.media.retry + live.media.failed + live.media.expiredUnrecoverable > 0) && (
+            <div className="mediaStatusRow">
+              <span>
+                Media: {live.media.assets.toLocaleString()} archived
+                {live.media.pending + live.media.downloading + live.media.retry > 0
+                  ? ` | ${(live.media.pending + live.media.downloading + live.media.retry).toLocaleString()} downloading`
+                  : ""}
+                {live.media.failed > 0 ? ` | ${live.media.failed.toLocaleString()} failed` : ""}
+                {live.media.expiredUnrecoverable > 0 ? ` | ${live.media.expiredUnrecoverable.toLocaleString()} unrecoverable` : ""}
+              </span>
+              {live.media.failed + live.media.expiredUnrecoverable + live.media.retry > 0 && (
+                <button className="miniButton" type="button" disabled={Boolean(busy)} onClick={onRetryMedia} title="Retry stuck media downloads">
+                  <RefreshCcw size={13} />
+                </button>
+              )}
             </div>
           )}
           {setup?.primaryAction === "import_backup" && (
@@ -1359,11 +1423,20 @@ function ImportWizard({
             <FilePickRow
               icon={<FolderOpen size={18} />}
               title="Media folder"
-              description="Optional. Used as local context only when media support needs it."
+              description="Optional. Your WhatsApp media is archived and shown in chats. For the real multi-GB folder, type its local path below — the server reads it directly from disk."
               file={session?.files.media}
               directory
               onPick={(files) => void upload("media", files)}
             />
+            <label className="wizardField mediaPathField">
+              <span>Media folder path (recommended for large folders — nothing is uploaded; a wrong path never blocks the import)</span>
+              <input
+                value={paths.mediaPath}
+                onChange={(event) => setPaths((current) => ({ ...current, mediaPath: event.target.value }))}
+                autoComplete="off"
+                placeholder="e.g. D:\\Backups\\WhatsApp\\Media"
+              />
+            </label>
             <button className="textButton" type="button" onClick={() => setManualOpen((current) => !current)}>
               {manualOpen ? "Hide advanced paths" : "Use advanced path fallback"}
             </button>
@@ -1371,7 +1444,6 @@ function ImportWizard({
               <div className="manualPathGrid">
                 <PathInput label="msgstore path" value={paths.msgstorePath} onChange={(value) => setPaths((current) => ({ ...current, msgstorePath: value }))} />
                 <PathInput label="wa.db or wa.db.crypt15 path" value={paths.waPath} onChange={(value) => setPaths((current) => ({ ...current, waPath: value }))} />
-                <PathInput label="media folder path" value={paths.mediaPath} onChange={(value) => setPaths((current) => ({ ...current, mediaPath: value }))} />
                 <PathInput label="key file path" value={paths.keyPath} onChange={(value) => setPaths((current) => ({ ...current, keyPath: value }))} />
               </div>
             )}
@@ -1584,6 +1656,7 @@ function ImportProgress({ job }: { job: ImportJobSummary | null }) {
   const latestStep = [...events].reverse().find((event): event is Extract<ImportProgressEvent, { type: "step" }> => event.type === "step");
   const latestFile = [...events].reverse().find((event): event is Extract<ImportProgressEvent, { type: "file-progress" }> => event.type === "file-progress");
   const latestMessages = [...events].reverse().find((event): event is Extract<ImportProgressEvent, { type: "message-progress" }> => event.type === "message-progress");
+  const latestMedia = [...events].reverse().find((event): event is Extract<ImportProgressEvent, { type: "media-progress" }> => event.type === "media-progress");
   const latestWarnings = [...events].reverse().find((event): event is Extract<ImportProgressEvent, { type: "warnings" }> => event.type === "warnings");
   const filePct = latestFile ? progressPercent(latestFile.processedBytes, latestFile.totalBytes) : 0;
   const fileDone = Boolean(latestFile && latestFile.processedBytes >= latestFile.totalBytes);
@@ -1630,6 +1703,16 @@ function ImportProgress({ job }: { job: ImportJobSummary | null }) {
         active={messagePreparing || Boolean(latestMessages && job?.status === "running")}
         detail={messageDetail}
       />
+      {latestMedia && (
+        <ProgressBar
+          label="Media"
+          value={latestMedia.totalRefs ? progressPercent(latestMedia.processedRefs, latestMedia.totalRefs) : 0}
+          active={Boolean(job?.status === "running" && latestStep?.step === "media")}
+          detail={`${latestMedia.matchedRefs.toLocaleString()} matched | ${latestMedia.copiedAssets.toLocaleString()} archived${
+            latestMedia.missingRefs ? ` | ${latestMedia.missingRefs.toLocaleString()} missing` : ""
+          }${latestMedia.totalRefs ? ` | ${latestMedia.processedRefs.toLocaleString()} / ${latestMedia.totalRefs.toLocaleString()}` : ""}`}
+        />
+      )}
       {latestWarnings && latestWarnings.count > 0 && (
         <div className="warningSummary">
           <AlertTriangle size={15} />
@@ -1867,44 +1950,485 @@ function renderMentions(text: string, mentions: string[]): ReactNode {
   );
 }
 
+// Render one WhatsApp inline-formatting tree: bold/italic/strike nest, code and
+// monospace are literal, URLs are clickable, and plain text keeps mention
+// highlighting.
+function renderInline(segments: InlineSegment[], mentions: string[]): ReactNode {
+  return segments.map((segment, index) => {
+    switch (segment.type) {
+      case "text":
+        return <span key={index}>{renderMentions(segment.value, mentions)}</span>;
+      case "url":
+        return (
+          <a
+            key={index}
+            className="linkText"
+            href={segment.value.startsWith("www.") ? `https://${segment.value}` : segment.value}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            {segment.value}
+          </a>
+        );
+      case "code":
+        return (
+          <code key={index} className="fmtMono">
+            {segment.value}
+          </code>
+        );
+      case "bold":
+        return <strong key={index}>{renderInline(segment.children, mentions)}</strong>;
+      case "italic":
+        return <em key={index}>{renderInline(segment.children, mentions)}</em>;
+      case "strike":
+        return <del key={index}>{renderInline(segment.children, mentions)}</del>;
+    }
+  });
+}
+
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function MessageBubble({ message, isGroup }: { message: MessageListItem; isGroup: boolean }) {
+// Inline-only rendering for one-line contexts (system chips): no block-level
+// lists/quotes, just formatting + links + mentions.
+function renderInlineText(text: string, mentions: string[]): ReactNode {
+  return renderInline(parseInlineSegments(text), mentions);
+}
+
+// Full message text: block-aware (quotes, bulleted and numbered lists) with
+// inline formatting inside. The container is pre-wrap, so paragraph line breaks
+// come from newline text nodes.
+function renderRichText(text: string, mentions: string[]): ReactNode {
+  return parseWhatsAppBlocks(text).map((block, blockIndex) => {
+    if (block.type === "bullet" || block.type === "numbered") {
+      const items = block.items.map((segments, itemIndex) => <li key={itemIndex}>{renderInline(segments, mentions)}</li>);
+      return block.type === "bullet" ? (
+        <ul key={blockIndex} className="fmtList">
+          {items}
+        </ul>
+      ) : (
+        <ol key={blockIndex} className="fmtList">
+          {items}
+        </ol>
+      );
+    }
+    const lineNodes: ReactNode[] = [];
+    block.lines.forEach((segments, lineIndex) => {
+      if (lineIndex > 0) {
+        lineNodes.push("\n");
+      }
+      lineNodes.push(<Fragment key={lineIndex}>{renderInline(segments, mentions)}</Fragment>);
+    });
+    return block.type === "quote" ? (
+      <blockquote key={blockIndex} className="fmtQuote">
+        {lineNodes}
+      </blockquote>
+    ) : (
+      <Fragment key={blockIndex}>{lineNodes}</Fragment>
+    );
+  });
+}
+
+type OnOpenMedia = (assetId: number, mimeType: string | null) => void;
+
+function MessageBubble({ message, isGroup, onOpenMedia }: { message: MessageListItem; isGroup: boolean; onOpenMedia: OnOpenMedia }) {
   const text = message.body || message.caption;
   const placeholder = messagePlaceholder(message);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const hasHistory = message.editRevisionCount > 0;
+
   if (isSystemEvent(message)) {
     return (
       <article className="systemChip">
-        <span>{text ? renderMentions(text, message.mentions) : placeholder.label}</span>
+        <span>{text ? renderInlineText(text, message.mentions) : placeholder.label}</span>
         <time>{formatTime(message.sentAt)}</time>
       </article>
     );
   }
   return (
-    <article className={`messageBubble ${message.direction}`}>
+    <article className={`messageBubble ${message.direction} ${message.isDeleted ? "deleted" : ""}`}>
       <div className="messageMeta">
         {isGroup && message.direction !== "outgoing" && <span>{message.senderDisplayName ?? "Unresolved contact"}</span>}
-        <time>{formatTime(message.sentAt)}</time>
+        <span className="metaRight">
+          {message.isDeleted && <span className="deletedChip">deleted</span>}
+          {message.isEdited &&
+            (hasHistory ? (
+              <button
+                className="editedChip clickable"
+                type="button"
+                onClick={() => setHistoryOpen(true)}
+                title="View edit history"
+                aria-expanded={historyOpen}
+              >
+                <History size={11} />
+                edited
+              </button>
+            ) : (
+              <span className="editedChip">edited</span>
+            ))}
+          <time>{formatTime(message.sentAt)}</time>
+        </span>
       </div>
+      {message.media && <MessageMediaView message={message} onOpenMedia={onOpenMedia} />}
       {text ? (
-        <p>{renderMentions(text, message.mentions)}</p>
+        <div className="messageText">{renderRichText(text, message.mentions)}</div>
       ) : (
-        <p className="placeholderText">
-          {placeholder.label}
-          {placeholder.reason && <span className="placeholderReason">{placeholder.reason}</span>}
-        </p>
+        !message.media && (
+          <p className="placeholderText">
+            {placeholder.label}
+            {placeholder.reason && <span className="placeholderReason">{placeholder.reason}</span>}
+          </p>
+        )
       )}
-      {(message.hasMedia || message.isForwarded || message.isStarred) && (
+      {message.linkPreview && <LinkPreviewCard message={message} />}
+      {(message.isForwarded || message.isStarred || (message.hasMedia && !message.media)) && (
         <div className="messageFlags">
-          {message.hasMedia && <span>{message.mediaMimeType ?? message.messageType}</span>}
+          {message.hasMedia && !message.media && <span>{message.mediaMimeType ?? message.messageType}</span>}
           {message.isForwarded && <span>forwarded</span>}
           {message.isStarred && <span>starred</span>}
         </div>
       )}
+      {historyOpen && <EditHistoryModal message={message} onClose={() => setHistoryOpen(false)} />}
     </article>
   );
+}
+
+// A version in the reconstructed timeline: the text that was showing, and the
+// moment it became the message's content.
+interface EditTimelineEntry {
+  key: string;
+  label: string;
+  timeMs: number | null;
+  text: string;
+  current: boolean;
+}
+
+// Reconstruct the full version timeline from the message and its retained prior
+// revisions. Each revision stores the text of a past version and the time it
+// was replaced; a version therefore became active when the PREVIOUS one was
+// replaced (and the very first became active at the original send time). This
+// is what makes the timestamps read correctly — "Original 12:31 / Edited 12:32"
+// instead of tagging the old text with the time it was edited away.
+function buildEditTimeline(message: MessageListItem, revisions: MessageEditRevisionRecord[]): EditTimelineEntry[] {
+  const currentText = message.body ?? message.caption ?? "(no text)";
+  if (revisions.length === 0) {
+    return [{ key: "cur", label: "Current version", timeMs: message.timestampMs, text: currentText, current: true }];
+  }
+  const entries: EditTimelineEntry[] = [
+    { key: "orig", label: "Original", timeMs: message.timestampMs, text: revisions[0].body ?? revisions[0].caption ?? "(no text)", current: false }
+  ];
+  for (let index = 1; index < revisions.length; index += 1) {
+    entries.push({
+      key: `rev-${revisions[index].revisionIndex}`,
+      label: "Edited",
+      timeMs: revisions[index - 1].editedAtMs,
+      text: revisions[index].body ?? revisions[index].caption ?? "(no text)",
+      current: false
+    });
+  }
+  entries.push({
+    key: "cur",
+    label: "Current version",
+    timeMs: revisions[revisions.length - 1].editedAtMs,
+    text: currentText,
+    current: true
+  });
+  return entries;
+}
+
+// Modal timeline of a message's edits, oldest to newest, each version labeled
+// with when it became the message's content.
+function EditHistoryModal({ message, onClose }: { message: MessageListItem; onClose: () => void }) {
+  const [revisions, setRevisions] = useState<MessageEditRevisionRecord[] | null>(null);
+  // Fetch fresh whenever the modal opens, and re-fetch when a live edit adds a
+  // revision (the count changes) — so the history never shows a stale snapshot.
+  // Kept in the modal (not cached on the bubble) so reopening always reloads.
+  useEffect(() => {
+    let cancelled = false;
+    listMessageRevisions(message.id)
+      .then((result) => {
+        if (!cancelled) setRevisions(result);
+      })
+      .catch(() => {
+        if (!cancelled) setRevisions([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [message.id, message.editRevisionCount]);
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  // Built oldest-to-newest for correct "became active" timestamps, shown
+  // newest-first so the current version is on top.
+  const timeline = revisions ? buildEditTimeline(message, revisions).reverse() : null;
+  const lastEditedMs = revisions && revisions.length > 0 ? revisions[revisions.length - 1].editedAtMs : null;
+  return (
+    <div className="modalBackdrop" role="dialog" aria-modal="true" aria-label="Message edit history" onClick={onClose}>
+      <section className="editHistoryModal" onClick={(event) => event.stopPropagation()}>
+        <div className="editHistoryModalHeader">
+          <div>
+            <span className="eyebrow">
+              <History size={14} />
+              Edit history
+            </span>
+            <h2>
+              {timeline ? `${timeline.length} version${timeline.length === 1 ? "" : "s"}` : "Loading…"}
+            </h2>
+            {lastEditedMs != null && <p>Last edited {formatDateTime(lastEditedMs)}</p>}
+          </div>
+          <button className="iconButton" type="button" onClick={onClose} aria-label="Close edit history">
+            <X size={16} />
+          </button>
+        </div>
+        <div className="editTimeline">
+          {timeline == null ? (
+            <div className="editTimelineLoading">
+              <Loader2 className="spin" size={18} />
+              Loading history…
+            </div>
+          ) : (
+            timeline.map((entry) => (
+              <div className={`editTimelineEntry ${entry.current ? "current" : ""}`} key={entry.key}>
+                <div className="editTimelineHead">
+                  <span className="editTimelineLabel">{entry.label}</span>
+                  <time>{formatDateTime(entry.timeMs)}</time>
+                </div>
+                <p className="editTimelineText">{entry.text}</p>
+              </div>
+            ))
+          )}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+// Media block inside a bubble: real media when stored (image/sticker opens
+// full size, video with poster, inline audio player, document row) and an
+// honest labeled placeholder when not, with a visible view-once badge.
+function MessageMediaView({ message, onOpenMedia }: { message: MessageListItem; onOpenMedia: OnOpenMedia }) {
+  const media = message.media!;
+  const placeholder = messagePlaceholder(message);
+  if (media.availability !== "stored" || media.assetId == null) {
+    return (
+      <div className="mediaUnavailable">
+        {media.isViewOnce && <span className="viewOnceBadge">view once</span>}
+        <span className="mediaUnavailableLabel">{placeholder.label}</span>
+        {placeholder.reason && <span className="placeholderReason">{placeholder.reason}</span>}
+      </div>
+    );
+  }
+  const assetId = media.assetId;
+  const mime = media.mimeType ?? "";
+  const isSticker = message.messageType === "sticker" || mime === "image/webp";
+  if (mime.startsWith("image/")) {
+    return (
+      <button className={`mediaFrame ${isSticker ? "sticker" : ""}`} type="button" onClick={() => onOpenMedia(assetId, media.mimeType)}>
+        {/* Full bytes are local; the embedded thumbnail keeps long threads light. */}
+        <img
+          className="mediaImage"
+          loading="lazy"
+          src={media.hasThumbnail && !isSticker ? mediaThumbnailUrl(assetId) : mediaAssetUrl(assetId)}
+          alt={message.mediaName ?? "Archived media"}
+          width={media.width ?? undefined}
+          height={media.height ?? undefined}
+        />
+        {media.isViewOnce && <span className="viewOnceBadge">view once</span>}
+      </button>
+    );
+  }
+  if (mime.startsWith("video/")) {
+    return (
+      <div className="mediaFrame">
+        <video
+          className="mediaVideo"
+          controls
+          preload="none"
+          poster={media.hasThumbnail ? mediaThumbnailUrl(assetId) : undefined}
+          src={mediaAssetUrl(assetId)}
+        />
+        {media.isViewOnce && <span className="viewOnceBadge">view once</span>}
+      </div>
+    );
+  }
+  if (mime.startsWith("audio/")) {
+    return (
+      <div className="mediaAudio">
+        {media.isViewOnce && <span className="viewOnceBadge">view once</span>}
+        <audio controls preload="none" src={mediaAssetUrl(assetId)} />
+        {media.durationMs != null && <span className="mediaDuration">{formatDuration(media.durationMs)}</span>}
+      </div>
+    );
+  }
+  return (
+    <a className="documentRow" href={mediaAssetUrl(assetId)} target="_blank" rel="noopener noreferrer">
+      <FileText size={18} />
+      <span className="documentName">{message.mediaName ?? placeholder.label}</span>
+      {media.byteSize != null && <span className="documentSize">{formatBytes(media.byteSize)}</span>}
+      {media.isViewOnce && <span className="viewOnceBadge">view once</span>}
+    </a>
+  );
+}
+
+// Offline link-preview card from stored sender-embedded data; never fetches
+// the link target.
+function LinkPreviewCard({ message }: { message: MessageListItem }) {
+  const preview = message.linkPreview!;
+  const href = preview.canonicalUrl
+    ? preview.canonicalUrl.startsWith("http")
+      ? preview.canonicalUrl
+      : `https://${preview.canonicalUrl}`
+    : null;
+  const body = (
+    <>
+      {preview.hasThumbnail && <img className="linkPreviewThumb" loading="lazy" src={linkPreviewThumbnailUrl(message.id)} alt="" />}
+      <span className="linkPreviewText">
+        {preview.title && <strong>{preview.title}</strong>}
+        {preview.description && <span>{preview.description}</span>}
+        {preview.canonicalUrl && <span className="linkPreviewUrl">{preview.canonicalUrl}</span>}
+      </span>
+    </>
+  );
+  return href ? (
+    <a className="linkPreviewCard" href={href} target="_blank" rel="noopener noreferrer">
+      {body}
+    </a>
+  ) : (
+    <div className="linkPreviewCard">{body}</div>
+  );
+}
+
+// WhatsApp-style grid for runs of consecutive media from one sender: 2x2 with
+// a "+N" overflow tile; expanding and opening items is display-only.
+function MediaGridBubble({ messages, isGroup, onOpenMedia }: { messages: MessageListItem[]; isGroup: boolean; onOpenMedia: OnOpenMedia }) {
+  const [expanded, setExpanded] = useState(false);
+  const first = messages[0];
+  const visible = expanded ? messages : messages.slice(0, 4);
+  const overflow = messages.length - 4;
+  return (
+    <article className={`messageBubble mediaGridBubble ${first.direction}`}>
+      <div className="messageMeta">
+        {isGroup && first.direction !== "outgoing" && <span>{first.senderDisplayName ?? "Unresolved contact"}</span>}
+        <span className="metaRight">
+          <span className="gridCount">{messages.length} media</span>
+          <time>{formatTime(first.sentAt)}</time>
+        </span>
+      </div>
+      <div className="mediaGrid">
+        {visible.map((message, index) => {
+          const media = message.media!;
+          const isOverflowTile = !expanded && overflow > 0 && index === 3;
+          return (
+            <button
+              key={message.id}
+              className="gridTile"
+              type="button"
+              onClick={() => (isOverflowTile ? setExpanded(true) : onOpenMedia(media.assetId!, media.mimeType))}
+            >
+              <img
+                loading="lazy"
+                src={media.hasThumbnail ? mediaThumbnailUrl(media.assetId!) : mediaAssetUrl(media.assetId!)}
+                alt=""
+              />
+              {media.mimeType?.startsWith("video/") && !isOverflowTile && (
+                <span className="gridPlay">
+                  <Play size={18} />
+                </span>
+              )}
+              {message.isDeleted && !isOverflowTile && <span className="deletedChip gridDeleted">deleted</span>}
+              {isOverflowTile && <span className="gridOverflow">+{overflow}</span>}
+            </button>
+          );
+        })}
+      </div>
+    </article>
+  );
+}
+
+function MediaLightbox({ assetId, mimeType, onClose }: { assetId: number; mimeType: string | null; onClose: () => void }) {
+  return (
+    <div className="modalBackdrop lightboxBackdrop" role="dialog" aria-modal="true" onClick={onClose}>
+      <button className="iconButton lightboxClose" type="button" aria-label="Close media view" onClick={onClose}>
+        <X size={18} />
+      </button>
+      <div className="lightboxContent" onClick={(event) => event.stopPropagation()}>
+        {mimeType?.startsWith("video/") ? (
+          <video controls autoPlay src={mediaAssetUrl(assetId)} />
+        ) : (
+          <img src={mediaAssetUrl(assetId)} alt="Archived media, full size" />
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Display-only grouping: 4+ consecutive stored image/video items from the same
+// sender within a tight window collapse into one grid entry. Captioned or
+// unavailable media stays a normal bubble, and storage is untouched.
+type ThreadEntry = { kind: "single"; message: MessageListItem } | { kind: "grid"; messages: MessageListItem[] };
+
+const MEDIA_GRID_MIN_RUN = 4;
+const MEDIA_GRID_WINDOW_MS = 3 * 60_000;
+
+function isGridMedia(message: MessageListItem): boolean {
+  const mime = message.media?.mimeType ?? "";
+  return (
+    message.media?.availability === "stored" &&
+    message.media.assetId != null &&
+    (mime.startsWith("image/") || mime.startsWith("video/")) &&
+    message.messageType !== "sticker" &&
+    !message.body &&
+    !message.caption
+  );
+}
+
+function sameGridRun(previous: MessageListItem, next: MessageListItem): boolean {
+  return (
+    previous.senderSourceJid === next.senderSourceJid &&
+    previous.direction === next.direction &&
+    Math.abs((next.timestampMs ?? 0) - (previous.timestampMs ?? 0)) <= MEDIA_GRID_WINDOW_MS
+  );
+}
+
+function groupConsecutiveMedia(messages: MessageListItem[]): ThreadEntry[] {
+  const entries: ThreadEntry[] = [];
+  let run: MessageListItem[] = [];
+  const flush = () => {
+    if (run.length >= MEDIA_GRID_MIN_RUN) {
+      entries.push({ kind: "grid", messages: run });
+    } else {
+      for (const message of run) {
+        entries.push({ kind: "single", message });
+      }
+    }
+    run = [];
+  };
+  for (const message of messages) {
+    if (!isGridMedia(message)) {
+      flush();
+      entries.push({ kind: "single", message });
+      continue;
+    }
+    if (run.length > 0 && !sameGridRun(run[run.length - 1], message)) {
+      flush();
+    }
+    run.push(message);
+  }
+  flush();
+  return entries;
+}
+
+function formatDuration(durationMs: number): string {
+  const totalSeconds = Math.round(durationMs / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
 }
 
 function isSystemEvent(message: MessageListItem): boolean {
@@ -2008,6 +2532,13 @@ function msToIso(value: number | null | undefined): string | null {
 function formatTime(value: string | null | undefined): string {
   if (!value) return "No time";
   return new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(new Date(value));
+}
+
+// Date + time for the edit-history timeline, where distinguishing when each
+// version became active (possibly across days) matters.
+function formatDateTime(ms: number | null | undefined): string {
+  if (ms == null || !Number.isFinite(ms)) return "Unknown time";
+  return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }).format(new Date(ms));
 }
 
 function formatBytes(value: number): string {

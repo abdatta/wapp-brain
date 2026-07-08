@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
-import { decryptEventResponse, decryptPollVote } from "@whiskeysockets/baileys";
+import { createDecipheriv, createHash, createHmac } from "node:crypto";
+import { decryptEventResponse, decryptPollVote, proto } from "@whiskeysockets/baileys";
 import type { RetainedPayloadRecord } from "../../shared/types";
 import type { ArchiveRepository } from "../db/repository";
 import { messageKey } from "../identity/keys";
@@ -12,9 +12,17 @@ import { messageKey } from "../identity/keys";
 // whose actors we only know in a different identity form fails closed and
 // remains retained — never mislabeled.
 //
-// Kinds: poll_vote and event_response have first-class Baileys decryptors;
-// secret_encrypted (message/event edits) has no public decryptor yet and is
-// retained until one exists.
+// Kinds: poll_vote and event_response have first-class Baileys decryptors.
+// secret_encrypted covers message-secret modifications; MESSAGE_EDIT is
+// decrypted here (Baileys has no built-in for it) and applied as a normal edit
+// so the target message updates in place with retained history.
+
+// SecretEncryptedMessage.SecretEncType (WhatsApp proto): 1 = EVENT_EDIT,
+// 2 = MESSAGE_EDIT.
+const SECRET_ENC_MESSAGE_EDIT = 2;
+// The message-secret HKDF info string for a message edit (matches whatsmeow's
+// EncSecretMessageEdit and WhatsApp's own derivation).
+const MESSAGE_EDIT_INFO = "Message Edit";
 
 export interface SecretsPassResult {
   attempted: number;
@@ -29,11 +37,15 @@ export async function runRetainedPayloadDecryptionPass(
   let attempted = 0;
   let decrypted = 0;
   for (const payload of payloads) {
-    if (payload.kind === "secret_encrypted") {
-      continue;
+    const update =
+      payload.kind === "secret_encrypted"
+        ? await tryDecryptSecretEdit(repository, payload, options.meJid ?? null)
+        : await tryDecryptRetainedPayload(repository, payload, options.meJid ?? null);
+    // secret_encrypted payloads we don't yet handle (e.g. event edits) stay
+    // retained silently rather than counting as an attempt.
+    if (payload.kind !== "secret_encrypted") {
+      attempted += 1;
     }
-    attempted += 1;
-    const update = await tryDecryptRetainedPayload(repository, payload, options.meJid ?? null);
     if (!update) {
       continue;
     }
@@ -47,6 +59,144 @@ export async function runRetainedPayloadDecryptionPass(
 }
 
 type TargetedUpdate = Parameters<ArchiveRepository["applyLiveMessageUpdates"]>[0][number];
+
+// Decrypt a retained secret-encrypted MESSAGE_EDIT and turn it into a normal
+// edit update. WhatsApp encrypts the new content with a key derived from the
+// original message's secret and the editor's LID; because a user can only edit
+// their own message, the original sender and the editor are the same identity.
+// We try the LID forms known for that identity and accept whichever the GCM
+// auth tag validates, so a wrong candidate can never yield a wrong result.
+async function tryDecryptSecretEdit(
+  repository: ArchiveRepository,
+  payload: RetainedPayloadRecord,
+  meJid: string | null
+): Promise<TargetedUpdate | null> {
+  if (Number(payload.metadata?.secretEncType) !== SECRET_ENC_MESSAGE_EDIT) {
+    return null;
+  }
+  if (!payload.encIv) {
+    return null;
+  }
+  const secret = await repository.getMessageSecret(payload.chatSourceId, payload.targetMessageId);
+  if (!secret) {
+    return null;
+  }
+  const context = await repository.getMessageInterpretationContext(payload.chatSourceId, payload.targetMessageId);
+  const editorCanonical = context?.fromMe ? meJid : context?.senderSourceJid ?? null;
+  const candidates = await editorIdentityCandidates(repository, editorCanonical, payload);
+  for (const identity of candidates) {
+    const plaintext = decryptMessageEdit(secret, payload.encPayload, payload.encIv, payload.targetMessageId, identity);
+    if (!plaintext) {
+      continue;
+    }
+    const body = editedBodyFromPlaintext(plaintext);
+    // A decrypt that authenticates but carries no readable body is still a real
+    // edit (e.g. media-only). Apply it so the target reflects the edited state;
+    // body stays whatever it was when there is no new text.
+    return {
+      eventKey: `decrypted:${payload.eventKey}`,
+      chatSourceId: payload.chatSourceId,
+      sourceMessageKey: messageKey(payload.chatSourceId, payload.targetMessageId),
+      updateType: "edit",
+      occurredAtMs: payload.occurredAtMs,
+      metadata: body == null ? { edited: 1 } : { body }
+    };
+  }
+  return null;
+}
+
+// Candidate LID identities for the editor, most-likely first. The derivation
+// binds the LID the sender used; we reverse-map the canonical phone JID and
+// include any raw actor form captured at ingestion.
+async function editorIdentityCandidates(
+  repository: ArchiveRepository,
+  editorCanonical: string | null,
+  payload: RetainedPayloadRecord
+): Promise<string[]> {
+  const candidates = new Set<string>();
+  const rawActor = typeof payload.metadata?.rawActorJid === "string" ? payload.metadata.rawActorJid : null;
+  if (rawActor) {
+    candidates.add(rawActor);
+  }
+  if (editorCanonical && editorCanonical !== "me") {
+    for (const lid of await repository.getIdentityLidsForJid(editorCanonical)) {
+      candidates.add(lid);
+    }
+    // The phone form itself is a last-resort candidate for older senders.
+    candidates.add(editorCanonical);
+  }
+  return [...candidates];
+}
+
+// The message-secret AES-GCM scheme WhatsApp uses for edits: identical to poll
+// votes/event responses except the info string ("Message Edit") and an empty
+// AAD. Returns the plaintext protobuf, or null on auth failure.
+function decryptMessageEdit(
+  secret: Uint8Array,
+  encPayload: Uint8Array,
+  encIv: Uint8Array,
+  targetMessageId: string,
+  identity: string
+): Buffer | null {
+  try {
+    const useCaseSecret = Buffer.concat([
+      Buffer.from(targetMessageId),
+      Buffer.from(identity),
+      Buffer.from(identity),
+      Buffer.from(MESSAGE_EDIT_INFO)
+    ]);
+    const prk = createHmac("sha256", Buffer.alloc(32)).update(Buffer.from(secret)).digest();
+    const decKey = createHmac("sha256", prk).update(Buffer.concat([useCaseSecret, Buffer.from([1])])).digest();
+    const payloadBuffer = Buffer.from(encPayload);
+    const enc = payloadBuffer.subarray(0, payloadBuffer.length - 16);
+    const tag = payloadBuffer.subarray(payloadBuffer.length - 16);
+    const decipher = createDecipheriv("aes-256-gcm", decKey, Buffer.from(encIv));
+    decipher.setAuthTag(tag);
+    return Buffer.concat([decipher.update(enc), decipher.final()]);
+  } catch {
+    return null;
+  }
+}
+
+// The edit plaintext is a Message carrying protocolMessage.editedMessage with
+// the new content; pull the new text (or caption) from it.
+function editedBodyFromPlaintext(plaintext: Buffer): string | null {
+  try {
+    const message = proto.Message.decode(plaintext) as {
+      protocolMessage?: { editedMessage?: EditedContent | null } | null;
+    };
+    const edited = message.protocolMessage?.editedMessage;
+    if (!edited) {
+      return null;
+    }
+    return firstNonEmpty(
+      edited.conversation,
+      edited.extendedTextMessage?.text,
+      edited.imageMessage?.caption,
+      edited.videoMessage?.caption,
+      edited.documentMessage?.caption
+    );
+  } catch {
+    return null;
+  }
+}
+
+interface EditedContent {
+  conversation?: string | null;
+  extendedTextMessage?: { text?: string | null } | null;
+  imageMessage?: { caption?: string | null } | null;
+  videoMessage?: { caption?: string | null } | null;
+  documentMessage?: { caption?: string | null } | null;
+}
+
+function firstNonEmpty(...values: Array<string | null | undefined>): string | null {
+  for (const value of values) {
+    if (typeof value === "string" && value.length > 0) {
+      return value;
+    }
+  }
+  return null;
+}
 
 async function tryDecryptRetainedPayload(
   repository: ArchiveRepository,

@@ -6,7 +6,7 @@ Historical import accepts:
 - `msgstore.db` for plaintext fixtures or already-decrypted databases.
 - `msgstore.db.crypt15` with a matching 64-character key or `encrypted_backup.key`.
 - Optional `wa.db` or `wa.db.crypt15` for contact/name enrichment.
-- Optional media directory path for context only.
+- Optional WhatsApp media folder (picker upload for small selections, or a direct local path for the real multi-GB folder) whose files are matched to media messages and archived.
 
 ## UI Import Wizard
 
@@ -110,8 +110,10 @@ The default REM command consolidates completed messages up to the previous local
 
 ## Media Status
 
-Media is not imported as files yet.
+Media is archived as first-class local content.
 
-The app preserves message/media type metadata and displays placeholders. Future media work should copy or index media locally without exposing a public static directory by accident.
-
-The live maintainer follows the same first-pass rule: preserve media metadata and missing-media state, but do not download or expose media files unless a future explicit feature adds that behavior.
+- **Import backfill**: the importer reads the backup's media sidecar tables (`message_media`, `message_view_once_media`, thumbnail tables), matches each media message to a file in the provided WhatsApp media folder (content hash first, then recorded path, then unique name), copies matches into a content-addressed store under `.wapp-brain/media/`, and links them to messages with import provenance. Missing/unreadable/ambiguous files warn (privacy-safe counts) and mark the message `import_missing`; media problems never abort a message import, and a wrong media-folder path degrades to a warning. The media phase reports live progress in the wizard and server terminal.
+- **Live capture**: the live maintainer captures the downloadable descriptor of every incoming media message (image, video, voice/audio, document, sticker, GIF, and view-once variants) at the event boundary, queues it durably, and downloads + decrypts it in the background with bounded batches, retries, and backoff. View-once media downloads at the highest priority and — because the app never sends read/played receipts — remains unopened and viewable on the phone. For expired CDN links the app may send a scoped WhatsApp media re-upload request (the single sanctioned outbound; never a receipt).
+- **Storage**: blobs are stored once by `sha256(plaintext)` (forwards/re-sends dedupe), written atomically, retained across sender delete/revoke, and never evicted. Deleted messages keep their held text, caption, and media with a deleted marker.
+- **Serving**: original media and thumbnails stream from loopback-only endpoints (`/api/media/assets/:id` with HTTP range support); media bytes never leave the machine by default, and no media paths or bytes are logged.
+- **Honesty**: every media message resolves to a server-computed availability state — `stored`, `downloading`, `pending`, `expired_unrecoverable`, `not_captured` (arrived while offline), or `import_missing` — surfaced through interpretation to every consumer instead of a fixed "media is not kept" claim.

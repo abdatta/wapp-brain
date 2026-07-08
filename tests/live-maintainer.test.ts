@@ -718,7 +718,10 @@ describe("live WhatsApp maintainer", () => {
     expect(template?.messageType).toBe("template");
     expect(template?.body).toBe("Your order has shipped");
     expect(interactiveTemplate?.body).toBe("Choose a delivery slot");
-    expect(secret?.messageType).toBe("encrypted_update");
+    // A secret-encrypted edit targets another message (it carries the new
+    // content for that message), so it is never a standalone row — it flows
+    // through payload retention and is applied in place once decrypted.
+    expect(secret).toBeNull();
     // Polls joined the shared vocabulary; the messageContextInfo rider still
     // never names the type.
     expect(poll?.messageType).toBe("poll");

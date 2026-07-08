@@ -2,7 +2,11 @@
 // itself: a human label naming the kind, plus a reason when the content is
 // genuinely unreadable. Every consumer — thread view, second-brain evidence,
 // search indexing, future MCP/agent surfaces — reads this instead of
-// reimplementing string logic. A bare "Unsupported message" is never produced.
+// reimplementing string logic. A bare "Unsupported message" is never produced,
+// and media availability is reported honestly: no "not kept" claim when the
+// bytes are stored, and a specific reason when they are not.
+
+import type { MediaAvailabilityState } from "../../shared/types";
 
 export interface MessageInterpretation {
   label: string;
@@ -38,9 +42,16 @@ const TYPE_LABELS: Record<string, MessageInterpretation> = {
   status_mention: { label: "Mentioned in a status", reason: null },
   bot_feedback: { label: "Feedback on an AI response", reason: null },
   history_share: { label: "Shared message history", reason: null },
-  view_once_image: { label: "View once photo", reason: "Media is not kept in backups." },
-  view_once_video: { label: "View once video", reason: "Media is not kept in backups." },
-  view_once_audio: { label: "View once voice message", reason: "Media is not kept in backups." },
+  view_once_image: { label: "View once photo", reason: null },
+  view_once_video: { label: "View once video", reason: null },
+  view_once_audio: { label: "View once voice message", reason: null },
+  // Live view-once whose content WhatsApp withheld from linked devices: the
+  // envelope arrives explicitly marked unavailable, with no ciphertext, so
+  // there was never anything to capture. Platform reality, stated honestly.
+  view_once: {
+    label: "View once media",
+    reason: "WhatsApp delivers view-once content only to your phone; linked devices never receive it."
+  },
   waiting_for_message: {
     label: "Waiting for this message",
     reason: "The phone never received or decrypted it; it never became readable."
@@ -52,16 +63,36 @@ const TYPE_LABELS: Record<string, MessageInterpretation> = {
   }
 };
 
-export function interpretMessage(input: { messageType: string; isDeleted?: boolean }): MessageInterpretation | null {
-  if (input.isDeleted) {
+// Honest per-availability reasons for media whose bytes are not present.
+// `stored` intentionally maps to no reason — the media is right there.
+const MEDIA_AVAILABILITY_REASONS: Record<Exclude<MediaAvailabilityState, "stored">, string> = {
+  pending: "Media download is queued.",
+  downloading: "Media is downloading.",
+  expired_unrecoverable: "The media could not be recovered before its link expired.",
+  not_captured: "The media arrived while the archive was offline and was not captured.",
+  import_missing: "The media file was not found in the imported media folder."
+};
+
+export function interpretMessage(input: {
+  messageType: string;
+  isDeleted?: boolean;
+  // True when the archive holds content for this message (text, caption, or
+  // stored media) — deleted messages with held content keep it visible.
+  hasHeldContent?: boolean;
+  mediaAvailability?: MediaAvailabilityState | null;
+}): MessageInterpretation | null {
+  if (input.isDeleted && !input.hasHeldContent) {
     return input.messageType === "admin_revoked" ? TYPE_LABELS.admin_revoked : { label: "Deleted message", reason: null };
   }
+  // Deleted with held content falls through: the content (and its media
+  // availability) speaks for itself; the deleted state rides on the record so
+  // consumers can decorate it.
   if (input.messageType === "text") {
     return null;
   }
   const known = TYPE_LABELS[input.messageType];
   if (known) {
-    return known;
+    return input.mediaAvailability ? withMediaReason(known, input.mediaAvailability) : known;
   }
   if (input.messageType.startsWith("unknown")) {
     const code = input.messageType.replace(/^unknown_?/, "");
@@ -70,7 +101,15 @@ export function interpretMessage(input: { messageType: string; isDeleted?: boole
       reason: code ? `Unrecognized message type (${code}); kept exactly as stored.` : "Unrecognized message type; kept exactly as stored."
     };
   }
-  return { label: `${humanizeType(input.messageType)} message`, reason: null };
+  const fallback = { label: `${humanizeType(input.messageType)} message`, reason: null };
+  return input.mediaAvailability ? withMediaReason(fallback, input.mediaAvailability) : fallback;
+}
+
+function withMediaReason(base: MessageInterpretation, availability: MediaAvailabilityState): MessageInterpretation {
+  if (availability === "stored") {
+    return { label: base.label, reason: null };
+  }
+  return { label: base.label, reason: MEDIA_AVAILABILITY_REASONS[availability] };
 }
 
 function humanizeType(value: string): string {

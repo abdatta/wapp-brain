@@ -2,8 +2,10 @@ import http from "node:http";
 import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import QRCode from "qrcode";
+import type { MediaDownloadQueueRecord } from "../../shared/types";
 import { config } from "../config";
 import { configuredTraceRecorder } from "../diagnostics/traceRecorder";
+import { downloadQueuedMedia } from "../media/downloader";
 import { assertLiveDependencySafe } from "./dependency";
 import {
   normalizeBaileysChatsWithJidResolver,
@@ -24,7 +26,8 @@ import type {
   LiveHistoryResult,
   LiveMessageEvent,
   LiveProofResult,
-  LiveWhatsAppClient
+  LiveWhatsAppClient,
+  MediaDownloadOutcome
 } from "./types";
 
 type Handler<T> = (value: T) => void | Promise<void>;
@@ -329,6 +332,21 @@ export class BaileysLiveWhatsAppClient implements LiveWhatsAppClient {
     return { subject: metadata.subject ?? null, participants, identityLinks };
   }
 
+  // Passive fetch + decrypt of a queued media item. The only outbound this can
+  // produce is the scoped media re-upload request (updateMediaMessage) when the
+  // CDN link expired and the caller allows it — never a receipt or presence.
+  async downloadMedia(task: MediaDownloadQueueRecord, options: { allowReupload: boolean }): Promise<MediaDownloadOutcome> {
+    const socket = this.socket;
+    if (!socket) {
+      return { status: "transient", usedReupload: false, error: "Live socket is not connected." };
+    }
+    const requestReupload =
+      typeof socket.updateMediaMessage === "function"
+        ? (message: Record<string, unknown>) => socket.updateMediaMessage(message)
+        : null;
+    return downloadQueuedMedia(task, options, { requestReupload });
+  }
+
   private async emitConnection(update: LiveConnectionUpdate): Promise<void> {
     for (const handler of this.connectionHandlers) {
       await handler(update);
@@ -529,27 +547,41 @@ function pairingPageHtml(): string {
 </html>`;
 }
 
-function installReadOnlySocketGuards(socket: Record<string, unknown>): void {
-  const blocked = [
-    "sendMessage",
-    "relayMessage",
-    "readMessages",
-    "sendReceipt",
-    "sendReceipts",
-    "sendPresenceUpdate",
-    "presenceSubscribe",
-    "chatModify",
-    "groupUpdateSubject",
-    "groupUpdateDescription",
-    "groupParticipantsUpdate",
-    "groupLeave",
-    "updateProfileName",
-    "updateProfileStatus",
-    "updateProfilePicture",
-    "removeProfilePicture",
-    "rejectCall"
-  ];
-  for (const method of blocked) {
+// Every receipt-, presence-, send-, delete-, group-, and profile-related
+// socket method stays blocked: the linked device is a silent observer, and —
+// critically — never sending a read/played receipt is what keeps archived
+// view-once media unopened on the phone.
+export const READ_ONLY_BLOCKED_METHODS = [
+  "sendMessage",
+  "relayMessage",
+  "readMessages",
+  "sendReceipt",
+  "sendReceipts",
+  "sendPresenceUpdate",
+  "presenceSubscribe",
+  "chatModify",
+  "groupUpdateSubject",
+  "groupUpdateDescription",
+  "groupParticipantsUpdate",
+  "groupLeave",
+  "updateProfileName",
+  "updateProfileStatus",
+  "updateProfilePicture",
+  "removeProfilePicture",
+  "rejectCall"
+] as const;
+
+// The single, deliberate exception to the read-only posture (user-approved):
+// `updateMediaMessage` sends a media re-upload request so expired media can be
+// recovered. It transmits no message content and is NOT a read/played receipt
+// — it must never appear in the blocklist above, and nothing else is allowed.
+export const MEDIA_RETRY_ALLOWED_METHODS = ["updateMediaMessage"] as const;
+
+export function installReadOnlySocketGuards(socket: Record<string, unknown>): void {
+  for (const method of READ_ONLY_BLOCKED_METHODS) {
+    if ((MEDIA_RETRY_ALLOWED_METHODS as readonly string[]).includes(method)) {
+      throw new Error(`Read-only guard misconfiguration: ${method} cannot be both blocked and allowed.`);
+    }
     if (typeof socket[method] === "function") {
       socket[method] = () => {
         throw new Error(`Read-only live maintainer blocked WhatsApp write method: ${method}`);

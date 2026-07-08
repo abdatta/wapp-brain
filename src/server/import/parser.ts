@@ -73,6 +73,24 @@ const MODERN_MESSAGE_COLUMNS = [
   "forwarded"
 ];
 
+// One media message's backup-side mapping: where its file lived, how to
+// verify it (content hash), and enough metadata to link the stored asset.
+export interface ImportMediaRef {
+  chatSourceId: string;
+  sourceMessageId: string;
+  messageType: string;
+  filePath: string | null;
+  fileSize: number | null;
+  mimeType: string | null;
+  mediaName: string | null;
+  fileHashB64: string | null;
+  width: number | null;
+  height: number | null;
+  durationMs: number | null;
+  isViewOnce: boolean;
+  thumbnail: Buffer | null;
+}
+
 export interface ParsedWhatsAppSource {
   contacts: ContactRecord[];
   chats: ChatRecord[];
@@ -85,6 +103,9 @@ export interface ParsedWhatsAppSource {
   // Per-message secrets carried by the backup (message_secret), keyed by the
   // message's canonical identity — arms late decryption retroactively.
   iterateMessageSecrets: () => IterableIterator<MessageSecretRecord>;
+  // Media sidecar mappings (message_media, message_view_once_media, thumbnail
+  // tables) used to match files in the user-provided media folder.
+  iterateMediaRefs: () => IterableIterator<ImportMediaRef>;
   // Available after iterateMessages completes: stale edit-key identities to
   // collapse onto their canonical (original-key) rows.
   getEditRekeys: () => Array<{ chatSourceId: string; staleMessageId: string; canonicalMessageId: string }>;
@@ -93,6 +114,7 @@ export interface ParsedWhatsAppSource {
   schemaReport: Record<string, string[]>;
   supported: boolean;
   messageCountEstimate: number | null;
+  mediaRefCountEstimate: number;
 }
 
 export function parseWhatsAppSource(
@@ -191,10 +213,58 @@ export function parseWhatsAppSource(
         yield { chatSourceId: chatJid, sourceMessageId: messageId, secret, source: "backup" };
       }
     },
+    iterateMediaRefs: function* () {
+      // Media-folder mapping requires the modern sidecar tables; legacy
+      // schemas keep their inline mime/name and are honestly import_missing.
+      if (adapter !== "modern" || sidecars.media.size === 0 || !hasColumns(msgInspection, "message", ["_id", "chat_row_id"])) {
+        return;
+      }
+      const thumbnailStmt = hasColumns(msgInspection, "message_thumbnail", ["message_row_id", "thumbnail"])
+        ? msgstoreDb.prepare(`SELECT thumbnail FROM message_thumbnail WHERE message_row_id = ?`)
+        : null;
+      const columns = columnsFor(msgInspection, "message");
+      const selected = ["_id", "chat_row_id", "key_id", "message_type"].filter((column) => columns.has(column));
+      const rows = msgstoreDb
+        .prepare(`SELECT ${selected.map(quoteIdentifier).join(", ")} FROM message ORDER BY _id ASC`)
+        .iterate() as Iterable<SqlRow>;
+      for (const row of rows) {
+        const rowId = Number(row._id);
+        const media = sidecars.media.get(rowId);
+        if (!media) {
+          continue;
+        }
+        const chatJid = chatRowJidMap.get(Number(row.chat_row_id));
+        if (!chatJid) {
+          continue;
+        }
+        // Media links target the message's canonical identity — the original
+        // key for edited rows, matching how the message itself was archived.
+        const edit = sidecars.edits.get(rowId);
+        const messageId = edit?.originalKeyId ?? stringOrNull(row.key_id) ?? surrogateMessageId("modern", String(rowId), sourceFingerprint ?? null);
+        const messageType = messageTypeFromCode(row.message_type ?? 0);
+        const thumbnailRow = thumbnailStmt ? (thumbnailStmt.get(rowId) as { thumbnail: Buffer | null } | undefined) : undefined;
+        yield {
+          chatSourceId: chatJid,
+          sourceMessageId: messageId,
+          messageType,
+          filePath: media.filePath,
+          fileSize: media.fileSize,
+          mimeType: media.mimeType,
+          mediaName: media.mediaName,
+          fileHashB64: media.fileHashB64,
+          width: media.width,
+          height: media.height,
+          durationMs: media.durationMs,
+          isViewOnce: media.viewOnce || messageType.startsWith("view_once"),
+          thumbnail: thumbnailRow?.thumbnail instanceof Buffer && thumbnailRow.thumbnail.length > 0 ? thumbnailRow.thumbnail : null
+        };
+      }
+    },
     getParticipants: () => [...participantMap.values()],
     getSkippedRows: () => skippedRows,
     schemaReport: tableColumnNames(msgInspection),
-    messageCountEstimate
+    messageCountEstimate,
+    mediaRefCountEstimate: adapter === "modern" ? sidecars.media.size : 0
   };
 }
 
@@ -579,6 +649,22 @@ interface InterpretationSidecars {
   // written by earlier importer versions hold edited rows under their edit
   // key; these pairs let the importer collapse them onto the canonical row.
   editRekeys: Array<{ chatSourceId: string; staleMessageId: string; canonicalMessageId: string }>;
+  // Media sidecar (message_media / message_view_once_media): file path, size,
+  // mime, name, and content hash used both to keep modern mime/name on the
+  // message row and to match files in the user-provided media folder.
+  media: Map<number, MediaSidecarInfo>;
+}
+
+interface MediaSidecarInfo {
+  filePath: string | null;
+  fileSize: number | null;
+  mimeType: string | null;
+  mediaName: string | null;
+  fileHashB64: string | null;
+  width: number | null;
+  height: number | null;
+  durationMs: number | null;
+  viewOnce: boolean;
 }
 
 function loadInterpretationSidecars(
@@ -596,7 +682,8 @@ function loadInterpretationSidecars(
     revoked: new Map(),
     calls: new Map(),
     edits: new Map(),
-    editRekeys: []
+    editRekeys: [],
+    media: new Map()
   };
   const rowsOf = (table: string, columns: string[]): SqlRow[] => {
     if (!hasColumns(inspection, table, columns)) {
@@ -687,7 +774,51 @@ function loadInterpretationSidecars(
       editedAtMs: normalizeTimestampMs(row.edited_timestamp ?? row.sender_timestamp)
     });
   }
+  // Media mappings can run to hundreds of thousands of rows; stream only the
+  // columns that exist. message_view_once_media mirrors message_media's shape
+  // where present and marks its rows as view-once.
+  loadMediaSidecarTable(db, inspection, "message_media", false, sidecars.media);
+  loadMediaSidecarTable(db, inspection, "message_view_once_media", true, sidecars.media);
   return sidecars;
+}
+
+function loadMediaSidecarTable(
+  db: Database.Database,
+  inspection: SQLiteInspection,
+  table: string,
+  viewOnce: boolean,
+  target: Map<number, MediaSidecarInfo>
+): void {
+  if (!hasColumns(inspection, table, ["message_row_id"])) {
+    return;
+  }
+  const columns = columnsFor(inspection, table);
+  const optional = ["file_path", "file_size", "mime_type", "media_name", "file_hash", "width", "height", "media_duration"];
+  const selected = ["message_row_id", ...optional.filter((column) => columns.has(column))];
+  try {
+    const rows = db.prepare(`SELECT ${selected.map(quoteIdentifier).join(", ")} FROM ${quoteIdentifier(table)}`).iterate() as Iterable<SqlRow>;
+    for (const row of rows) {
+      const rowId = Number(row.message_row_id);
+      if (!Number.isFinite(rowId)) {
+        continue;
+      }
+      const durationSeconds = row.media_duration == null ? null : Number(row.media_duration);
+      const existing = target.get(rowId);
+      target.set(rowId, {
+        filePath: stringOrNull(row.file_path) ?? existing?.filePath ?? null,
+        fileSize: row.file_size == null ? existing?.fileSize ?? null : Number(row.file_size),
+        mimeType: stringOrNull(row.mime_type) ?? existing?.mimeType ?? null,
+        mediaName: stringOrNull(row.media_name) ?? existing?.mediaName ?? null,
+        fileHashB64: stringOrNull(row.file_hash) ?? existing?.fileHashB64 ?? null,
+        width: row.width == null ? existing?.width ?? null : Number(row.width),
+        height: row.height == null ? existing?.height ?? null : Number(row.height),
+        durationMs: durationSeconds == null || !Number.isFinite(durationSeconds) ? existing?.durationMs ?? null : Math.round(durationSeconds * 1000),
+        viewOnce: viewOnce || existing?.viewOnce === true
+      });
+    }
+  } catch {
+    // Optional enrichment only; a missing/odd table shape must not fail import.
+  }
 }
 
 // Body/caption fill only when the main row had none; structured extras land in
@@ -978,9 +1109,9 @@ function* iterateModernMessages(
       rawTypeCode: rawTypeCode == null ? null : String(rawTypeCode),
       body,
       caption,
-      hasMedia: isMediaMessageType(messageType),
-      mediaMimeType: null,
-      mediaName: null,
+      hasMedia: isMediaMessageType(messageType) || sidecars.media.has(rowIdNumber),
+      mediaMimeType: sidecars.media.get(rowIdNumber)?.mimeType ?? null,
+      mediaName: sidecars.media.get(rowIdNumber)?.mediaName ?? null,
       quotedSourceMessageId: row.quoted_message_row_id == null ? null : surrogateMessageId("modern", String(row.quoted_message_row_id), sourceFingerprint),
       // Deletion is a fact (revocation records), never inferred from an
       // unrecognized type — unknowns render as honest legacy placeholders.

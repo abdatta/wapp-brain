@@ -1,4 +1,5 @@
 import type {
+  CapturedLinkPreview,
   ChatListItem,
   ChatRecord,
   ChatSyncStateRecord,
@@ -15,6 +16,10 @@ import type {
   LiveSessionSummary,
   LiveSyncRunSummary,
   LiveSyncTotals,
+  MediaAssetRecord,
+  MediaDownloadQueueRecord,
+  MediaQueueSummary,
+  MessageEditRevisionRecord,
   MemoryCitationRecord,
   MemoryEvidenceMessage,
   MemoryEvidencePackRecord,
@@ -46,6 +51,10 @@ export interface ArchiveRepository {
   upsertMessages(messages: MessageRecord[]): Promise<number>;
   recordIdentityLinks(links: Array<{ lid: string; pn: string; source?: string | null }>): Promise<string[]>;
   resolveIdentityJid(jid: string): Promise<string>;
+  // Reverse of resolveIdentityJid: the LID form(s) known for a phone JID (or the
+  // JID itself if it is already a LID). Secret-encrypted edit decryption binds
+  // the exact LID the sender used, so it needs the LID, not the canonical phone.
+  getIdentityLidsForJid(jid: string): Promise<string[]>;
   listUnmergedLidIdentities(limit?: number): Promise<Array<{ lid: string; pn: string }>>;
   mergeIdentity(lid: string, pn: string): Promise<{ chatsMerged: number; contactsMerged: number; messagesCollapsed: number }>;
   // Collapse rows stored under a superseded identity (e.g. an edited message's
@@ -55,6 +64,10 @@ export interface ArchiveRepository {
     pairs: Array<{ chatSourceId: string; staleMessageId: string; canonicalMessageId: string }>
   ): Promise<number>;
   listUnnamedGroupChats(limit?: number): Promise<string[]>;
+  // One-time hygiene: live rows archived from Signal-protocol transport
+  // envelopes (sender-key distribution) before they were filtered at
+  // normalization. They are protocol noise, never user messages.
+  removeProtocolNoiseMessages(): Promise<number>;
   // Unknown-type worksheet source: per-code counts with example locations
   // (chat display labels and timestamps only — never message content).
   listUnknownTypeCodes(): Promise<Array<{ code: string; count: number; examples: Array<{ chatLabel: string; timestampMs: number | null }> }>>;
@@ -91,6 +104,30 @@ export interface ArchiveRepository {
     chatSourceId: string,
     sourceMessageId: string
   ): Promise<{ senderSourceJid: string | null; fromMe: boolean | null; rawMetadata: Record<string, unknown> | null } | null>;
+  // Durable media download queue (mirrors retained payloads / gap windows):
+  // descriptors persist here — never on the messages table — until stored.
+  enqueueMediaDownloads(
+    items: Array<Pick<MediaDownloadQueueRecord, "messageKey" | "chatSourceId" | "sourceMessageId" | "descriptor" | "thumbnail" | "isViewOnce" | "priority">>
+  ): Promise<number>;
+  claimDueMediaDownloads(limit: number, nowMs?: number): Promise<MediaDownloadQueueRecord[]>;
+  // Success path: writes the media_assets row (deduped by content hash) and
+  // marks the queue entry terminal, dropping its descriptor. Returns asset id.
+  completeMediaDownload(queueId: number, asset: MediaAssetRecord): Promise<number>;
+  markMediaDownloadRetry(queueId: number, error: string, nextAttemptAtMs: number, options?: { countReupload?: boolean }): Promise<void>;
+  markMediaDownloadTerminal(queueId: number, status: "expired_unrecoverable" | "failed", error: string | null): Promise<void>;
+  // Import backfill path: link an asset directly (no queue entry involved).
+  linkMediaAsset(asset: MediaAssetRecord): Promise<number>;
+  getMediaAsset(assetId: number): Promise<MediaAssetRecord | null>;
+  getMediaAssetForMessage(messageId: number): Promise<MediaAssetRecord | null>;
+  getMediaQueueSummary(): Promise<MediaQueueSummary>;
+  // User-facing retry control for stuck items; returns re-queued count.
+  retryStuckMediaDownloads(): Promise<number>;
+  // Restart recovery: claimed-but-unfinished downloads return to pending.
+  resetInFlightMediaDownloads(): Promise<number>;
+  recordLinkPreviews(previews: CapturedLinkPreview[]): Promise<number>;
+  getLinkPreviewThumbnail(messageId: number): Promise<Uint8Array | null>;
+  // Edit history: snapshot rides applyLiveMessageUpdates; this reads it back.
+  listMessageEditRevisions(messageId: number): Promise<MessageEditRevisionRecord[]>;
   getLiveStatus(): Promise<LiveMaintainerStatusSummary>;
   listChats(options: ChatListOptions): Promise<ChatListItem[]>;
   listMessages(

@@ -90,10 +90,16 @@ under.
 
 Message secrets (WhatsApp's per-message key layer) are stored by default —
 captured live from envelopes and backfilled from the backup's `message_secret`
-table — so secret-encrypted updates (poll votes, event responses via Baileys'
-decryptors) decrypt immediately or retroactively; undecryptable payloads are
-retained keyed to their target until their secret (or decryptor) exists.
-Secrets never appear in logs, DTOs, exports, or diagnostics.
+table — so secret-encrypted updates decrypt immediately or retroactively. Poll
+votes and event responses use Baileys' decryptors; secret-encrypted message
+edits (`secretEncryptedMessage`, `MESSAGE_EDIT`) are decrypted locally with the
+same message-secret AES-GCM scheme (HKDF info `"Message Edit"`, empty AAD, keyed
+on the editor's LID) and applied in place as normal edits with retained history,
+so a modern encrypted edit updates the original message rather than showing a
+placeholder. The edit envelope is never a standalone row — it targets another
+message, like poll votes. Undecryptable payloads are retained keyed to their
+target until their secret (or LID) is known. Secrets never appear in logs, DTOs,
+exports, or diagnostics.
 
 Second-brain memory flow:
 

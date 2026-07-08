@@ -51,6 +51,7 @@ interface ImportJobState extends ImportJobSummary {
   terminalProgress: ImportTerminalProgressLike | null;
   lastFileLogAt: number;
   lastMessageLogAt: number;
+  lastMediaLogAt: number;
 }
 
 interface ImportTerminalProgressLike {
@@ -243,7 +244,8 @@ export function startImportJob(repository: ArchiveRepository, input: StartImport
     abortController: new AbortController(),
     terminalProgress: shouldShowTerminalProgress() ? createImportTerminalProgress("Starting UI import.") : null,
     lastFileLogAt: 0,
-    lastMessageLogAt: 0
+    lastMessageLogAt: 0,
+    lastMediaLogAt: 0
   };
   jobs.set(job.id, job);
   void runJob(repository, job, request, session?.id ?? null, callbacks);
@@ -473,6 +475,22 @@ function logProgressEvent(job: ImportJobSummary, event: ImportProgressEvent): vo
         job,
         "info",
         `messages processed=${event.processedMessages.toLocaleString()} persisted=${event.persistedMessages.toLocaleString()} total=${total}`
+      );
+      return;
+    }
+    case "media-progress": {
+      const state = job as Partial<ImportJobState>;
+      const now = Date.now();
+      const done = event.totalRefs != null && event.processedRefs >= event.totalRefs;
+      if (!done && state.lastMediaLogAt && now - state.lastMediaLogAt < PROGRESS_LOG_INTERVAL_MS) {
+        return;
+      }
+      state.lastMediaLogAt = now;
+      const total = event.totalRefs == null ? "unknown" : event.totalRefs.toLocaleString();
+      logJob(
+        job,
+        "info",
+        `media processed=${event.processedRefs.toLocaleString()} matched=${event.matchedRefs.toLocaleString()} copied=${event.copiedAssets.toLocaleString()} missing=${event.missingRefs.toLocaleString()} total=${total}`
       );
       return;
     }

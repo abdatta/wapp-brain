@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
 import type {
+  CapturedLinkPreview,
   ChatListItem,
   ChatListOptions,
   ChatRecord,
@@ -10,6 +11,7 @@ import type {
   ImportRunSummary,
   ImportTotals,
   ImportWarning,
+  LinkPreviewSummary,
   LiveChatCheckpointRecord,
   LiveEventReceiptRecord,
   LiveGapReason,
@@ -22,6 +24,14 @@ import type {
   LiveSessionSummary,
   LiveSyncRunSummary,
   LiveSyncTotals,
+  MediaAssetRecord,
+  MediaAvailabilityState,
+  MediaDownloadDescriptor,
+  MediaDownloadQueueRecord,
+  MediaDownloadStatus,
+  MediaQueueSummary,
+  MessageEditRevisionRecord,
+  MessageMediaSummary,
   MemoryCitationRecord,
   MemoryEvidenceMessage,
   MemoryEvidencePackRecord,
@@ -106,6 +116,161 @@ const DELETE_TABLE_ORDER = [
 
 const LIVE_SESSION_STATUSES = ["not_configured", "pairing", "connected", "disconnected", "stopped", "error", "logged_out"] as const;
 const MESSAGE_UPDATE_TYPES = ["delete", "edit", "reaction", "poll_vote", "event_response", "receipt", "call", "unknown"] as const;
+
+// Shared per-message media-state projection: the asset (bytes stored) and the
+// download-queue row, from which every read path derives the same honest
+// availability. Expects the messages table aliased as `m`.
+const MEDIA_STATE_SELECT = `ma.id AS media_asset_id, ma.mime_type AS media_mime, ma.byte_size AS media_byte_size,
+                ma.width AS media_width, ma.height AS media_height, ma.duration_ms AS media_duration_ms,
+                ma.is_view_once AS media_asset_view_once, (ma.thumbnail IS NOT NULL) AS media_has_thumbnail,
+                q.status AS media_queue_status, q.is_view_once AS media_queue_view_once`;
+const MEDIA_STATE_JOINS = `LEFT JOIN media_assets ma
+           ON ma.id = (SELECT id FROM media_assets pick WHERE pick.message_key = m.source_message_key ORDER BY pick.id ASC LIMIT 1)
+         LEFT JOIN media_download_queue q ON q.message_key = m.source_message_key`;
+
+interface SqliteMediaStateColumns {
+  has_media: number;
+  source_table: string;
+  media_asset_id: number | null;
+  media_mime?: string | null;
+  media_byte_size?: number | null;
+  media_width?: number | null;
+  media_height?: number | null;
+  media_duration_ms?: number | null;
+  media_asset_view_once?: number | null;
+  media_has_thumbnail?: number | null;
+  media_queue_status: string | null;
+  media_queue_view_once?: number | null;
+}
+
+// One derivation of availability for every consumer: stored beats everything;
+// queued work reports its live state; otherwise the absence is explained by
+// where the message came from (live → not captured while offline; backup →
+// missing from the import folder).
+function deriveMediaAvailability(row: SqliteMediaStateColumns): MediaAvailabilityState | null {
+  if (row.media_asset_id != null) {
+    return "stored";
+  }
+  if (!row.has_media) {
+    return null;
+  }
+  switch (row.media_queue_status) {
+    case "pending":
+      return "pending";
+    case "downloading":
+    case "retry":
+      return "downloading";
+    case "failed":
+    case "expired_unrecoverable":
+      return "expired_unrecoverable";
+  }
+  return row.source_table.startsWith("wa-web") ? "not_captured" : "import_missing";
+}
+
+function deriveMediaSummary(row: SqliteMediaStateColumns, messageType: string): MessageMediaSummary | null {
+  const availability = deriveMediaAvailability(row);
+  if (!availability) {
+    return null;
+  }
+  const isViewOnceType = messageType.startsWith("view_once");
+  if (availability === "stored") {
+    return {
+      availability,
+      assetId: Number(row.media_asset_id),
+      mimeType: row.media_mime ?? null,
+      byteSize: nullableNumber(row.media_byte_size),
+      width: nullableNumber(row.media_width),
+      height: nullableNumber(row.media_height),
+      durationMs: nullableNumber(row.media_duration_ms),
+      hasThumbnail: Boolean(row.media_has_thumbnail),
+      isViewOnce: Boolean(row.media_asset_view_once) || isViewOnceType
+    };
+  }
+  return {
+    availability,
+    assetId: null,
+    mimeType: null,
+    byteSize: null,
+    width: null,
+    height: null,
+    durationMs: null,
+    hasThumbnail: false,
+    isViewOnce: Boolean(row.media_queue_view_once) || isViewOnceType
+  };
+}
+
+interface SqliteMediaQueueRow {
+  id: number;
+  message_key: string;
+  chat_source_id: string;
+  source_message_id: string;
+  descriptor_json: string | null;
+  thumbnail: Buffer | null;
+  is_view_once: number;
+  status: MediaDownloadStatus;
+  attempts: number;
+  reupload_attempts: number;
+  next_attempt_at_ms: number | null;
+  last_error: string | null;
+  priority: number;
+}
+
+function rowToMediaQueueRecord(row: SqliteMediaQueueRow): MediaDownloadQueueRecord | null {
+  if (!row.descriptor_json) {
+    return null;
+  }
+  return {
+    id: Number(row.id),
+    messageKey: row.message_key,
+    chatSourceId: row.chat_source_id,
+    sourceMessageId: row.source_message_id,
+    descriptor: JSON.parse(row.descriptor_json) as MediaDownloadDescriptor,
+    thumbnail: row.thumbnail ?? null,
+    isViewOnce: Boolean(row.is_view_once),
+    status: row.status,
+    attempts: Number(row.attempts ?? 0),
+    reuploadAttempts: Number(row.reupload_attempts ?? 0),
+    nextAttemptAtMs: nullableNumber(row.next_attempt_at_ms),
+    lastError: row.last_error,
+    priority: Number(row.priority ?? 0)
+  };
+}
+
+interface SqliteMediaAssetRow {
+  id: number;
+  message_key: string;
+  chat_source_id: string;
+  sha256: string;
+  storage_path: string;
+  mime_type: string | null;
+  byte_size: number;
+  width: number | null;
+  height: number | null;
+  duration_ms: number | null;
+  thumbnail: Buffer | null;
+  source: MediaAssetRecord["source"];
+  is_view_once: number;
+  created_at: string;
+}
+
+function rowToMediaAsset(row: SqliteMediaAssetRow): MediaAssetRecord {
+  return {
+    id: Number(row.id),
+    messageKey: row.message_key,
+    chatSourceId: row.chat_source_id,
+    sha256: row.sha256,
+    storagePath: row.storage_path,
+    mimeType: row.mime_type,
+    byteSize: Number(row.byte_size),
+    width: nullableNumber(row.width),
+    height: nullableNumber(row.height),
+    durationMs: nullableNumber(row.duration_ms),
+    thumbnail: row.thumbnail ?? null,
+    source: row.source,
+    isViewOnce: Boolean(row.is_view_once),
+    createdAt: row.created_at
+  };
+}
 
 function liveMessageUpdatesTableDdl(tableName: string): string {
   return `CREATE TABLE IF NOT EXISTS ${tableName} (
@@ -344,6 +509,81 @@ const schemaStatements = [
 
   `CREATE INDEX IF NOT EXISTS idx_retained_payloads_target ON retained_encrypted_payloads (target_message_key)`,
 
+  // Message→asset linkage with provenance. One row per (message, content
+  // hash); identical media across messages shares the blob (and may share the
+  // hash across rows) — the blob store is the dedupe layer. Retained across
+  // deletes/revokes and across clear-and-replace: rows re-attach to re-imported
+  // messages through the canonical message key.
+  `CREATE TABLE IF NOT EXISTS media_assets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_key TEXT NOT NULL,
+    chat_source_id TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    storage_path TEXT NOT NULL,
+    mime_type TEXT NULL,
+    byte_size INTEGER NOT NULL,
+    width INTEGER NULL,
+    height INTEGER NULL,
+    duration_ms INTEGER NULL,
+    thumbnail BLOB NULL,
+    source TEXT NOT NULL CHECK (source IN ('live-download','media-retry','import-folder')),
+    is_view_once INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE (message_key, sha256)
+  )`,
+
+  `CREATE INDEX IF NOT EXISTS idx_media_assets_message ON media_assets (message_key)`,
+  `CREATE INDEX IF NOT EXISTS idx_media_assets_sha ON media_assets (sha256)`,
+
+  // Durable media download work: the captured descriptor lives here (never on
+  // the messages table) until the asset is stored, then it is dropped.
+  `CREATE TABLE IF NOT EXISTS media_download_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_key TEXT NOT NULL UNIQUE,
+    chat_source_id TEXT NOT NULL,
+    source_message_id TEXT NOT NULL,
+    descriptor_json TEXT NULL,
+    thumbnail BLOB NULL,
+    is_view_once INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL CHECK (status IN ('pending','downloading','stored','retry','expired_unrecoverable','failed')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    reupload_attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at_ms INTEGER NULL,
+    last_error TEXT NULL,
+    priority INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  )`,
+
+  `CREATE INDEX IF NOT EXISTS idx_media_queue_due ON media_download_queue (status, priority DESC, next_attempt_at_ms)`,
+
+  // Sender-embedded link previews captured with live text messages; thumbnail
+  // bytes are embedded message content, never fetched from the link target.
+  `CREATE TABLE IF NOT EXISTS message_link_previews (
+    message_key TEXT PRIMARY KEY,
+    chat_source_id TEXT NOT NULL,
+    title TEXT NULL,
+    description TEXT NULL,
+    canonical_url TEXT NULL,
+    thumbnail BLOB NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  )`,
+
+  // Prior versions of live-edited messages, snapshotted before each edit
+  // overwrites content. Backup imports never fabricate rows here.
+  `CREATE TABLE IF NOT EXISTS message_edit_revisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_key TEXT NOT NULL,
+    revision_index INTEGER NOT NULL,
+    body TEXT NULL,
+    caption TEXT NULL,
+    edited_at_ms INTEGER NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE (message_key, revision_index)
+  )`,
+
+  `CREATE INDEX IF NOT EXISTS idx_edit_revisions_message ON message_edit_revisions (message_key, revision_index)`,
+
   `CREATE TABLE IF NOT EXISTS memory_runs (
     id TEXT PRIMARY KEY,
     status TEXT NOT NULL CHECK (status IN ('running','completed','failed','blocked')),
@@ -565,6 +805,18 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     return this.canonicalJid(jid) ?? jid;
   }
 
+  async getIdentityLidsForJid(jid: string): Promise<string[]> {
+    const normalized = normalizeJid(jid);
+    if (!normalized) {
+      return [];
+    }
+    if (isLidFormJid(normalized)) {
+      return [normalized];
+    }
+    const rows = this.db.prepare(`SELECT lid FROM identity_links WHERE pn = ?`).all(normalized) as Array<{ lid: string }>;
+    return rows.map((row) => row.lid);
+  }
+
   async recordIdentityLinks(links: Array<{ lid: string; pn: string; source?: string | null }>): Promise<string[]> {
     const insert = this.db.prepare(
       `INSERT INTO identity_links (lid, pn, source, learned_at) VALUES (?, ?, ?, ?)
@@ -743,6 +995,35 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     return cleared;
   }
 
+  // Rows created from Signal-protocol transport envelopes before normalization
+  // filtered them: no user content by construction, safe to remove as noise.
+  async removeProtocolNoiseMessages(): Promise<number> {
+    // Live artifacts that were archived as standalone rows before normalization
+    // filtered them: Signal-protocol transport envelopes, and secret-encrypted
+    // edit envelopes (now applied in place as edits, so their placeholder card
+    // is stale). Both are never user messages of their own.
+    const noiseTypes = ["unknown_senderKeyDistributionMessage", "encrypted_update"];
+    const placeholders = noiseTypes.map(() => "?").join(",");
+    const affectedChats = this.db
+      .prepare(
+        `SELECT DISTINCT c.source_chat_id AS id
+         FROM messages m JOIN chats c ON c.id = m.chat_id
+         WHERE m.source_table LIKE 'wa-web%' AND m.message_type IN (${placeholders})`
+      )
+      .all(...noiseTypes) as Array<{ id: string }>;
+    if (affectedChats.length === 0) {
+      return 0;
+    }
+    const result = this.db
+      .prepare(`DELETE FROM messages WHERE source_table LIKE 'wa-web%' AND message_type IN (${placeholders})`)
+      .run(...noiseTypes);
+    if (result.changes > 0) {
+      await this.refreshChatStats(affectedChats.map((chat) => chat.id));
+      await this.markStaleMemoryForMissingMessages();
+    }
+    return result.changes;
+  }
+
   async listUnnamedGroupChats(limit = 20): Promise<string[]> {
     const rows = this.db
       .prepare(
@@ -911,8 +1192,8 @@ export class SqliteArchiveRepository implements ArchiveRepository {
          WHERE id = ?`
       )
       .run(dropId, dropId, dropId, dropId, dropId, dropId, dropId, dropId, contentSource, contentSource, dropId, dropId, dropId, contentSource, keepId);
-    // A merged tombstone hides content, matching delete-update semantics.
-    this.db.prepare(`UPDATE messages SET body = NULL, caption = NULL WHERE id = ? AND is_deleted = 1`).run(keepId);
+    // Merged tombstones keep their held content: deletion is a state marker,
+    // never a content eraser (backup-store semantics).
     this.db.prepare(`DELETE FROM messages WHERE id = ?`).run(dropId);
   }
 
@@ -1277,6 +1558,9 @@ export class SqliteArchiveRepository implements ArchiveRepository {
          message_type = CASE
            WHEN (excluded.message_type = 'system' OR excluded.message_type LIKE 'unknown%')
                 AND messages.message_type <> 'system' AND messages.message_type NOT LIKE 'unknown%' THEN messages.message_type
+           -- A contentless unknown re-delivery (e.g. an empty placeholder
+           -- response) must not erase a system stub's classification either.
+           WHEN excluded.message_type LIKE 'unknown%' AND messages.message_type = 'system' THEN messages.message_type
            ELSE excluded.message_type
          END,
          raw_type_code = COALESCE(excluded.raw_type_code, messages.raw_type_code),
@@ -1748,9 +2032,13 @@ export class SqliteArchiveRepository implements ArchiveRepository {
          metadata_json = COALESCE(excluded.metadata_json, live_message_updates.metadata_json),
          updated_at = excluded.updated_at`
     );
+    // Deletion tombstones only: held body/caption (and stored media) stay —
+    // the archive is a backup store, and blanking captured content would
+    // silently destroy it. The "Deleted message" placeholder appears only when
+    // nothing was ever captured.
     const markDeleted = this.db.prepare(
       `UPDATE messages
-       SET is_deleted = 1, body = NULL, caption = NULL,
+       SET is_deleted = 1,
            raw_metadata_json = COALESCE(raw_metadata_json, ?)
        WHERE source_message_key = ?`
     );
@@ -1759,6 +2047,17 @@ export class SqliteArchiveRepository implements ArchiveRepository {
        SET body = ?,
            raw_metadata_json = json_set(COALESCE(raw_metadata_json, '{}'), '$.edited', 1)
        WHERE source_message_key = ?`
+    );
+    // Edit history: snapshot the current content as a retained revision before
+    // the edit overwrites it, so pre-edit text is never lost.
+    const readCurrentContent = this.db.prepare(`SELECT body, caption FROM messages WHERE source_message_key = ?`);
+    const nextRevisionIndex = this.db.prepare(
+      `SELECT COALESCE(MAX(revision_index), -1) + 1 AS next FROM message_edit_revisions WHERE message_key = ?`
+    );
+    const insertRevision = this.db.prepare(
+      `INSERT INTO message_edit_revisions (message_key, revision_index, body, caption, edited_at_ms)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(message_key, revision_index) DO NOTHING`
     );
     const readMetadata = this.db.prepare(`SELECT raw_metadata_json FROM messages WHERE source_message_key = ?`);
     const writeMetadata = this.db.prepare(`UPDATE messages SET raw_metadata_json = ? WHERE source_message_key = ?`);
@@ -1787,6 +2086,13 @@ export class SqliteArchiveRepository implements ArchiveRepository {
             markDeleted.run(stringifyJson({ liveUpdate: "delete" }), targetKey);
           }
           if (update.updateType === "edit" && typeof update.metadata?.body === "string") {
+            const current = readCurrentContent.get(targetKey) as { body: string | null; caption: string | null } | undefined;
+            // Snapshot only real content changes; replayed identical edits and
+            // empty originals produce no fabricated revision.
+            if (current && current.body != null && current.body !== update.metadata.body) {
+              const next = (nextRevisionIndex.get(targetKey) as { next: number }).next;
+              insertRevision.run(targetKey, Number(next), current.body, current.caption, update.occurredAtMs ?? null);
+            }
             applyEdit.run(update.metadata.body, targetKey);
           }
           if (update.updateType === "poll_vote" || update.updateType === "event_response") {
@@ -1962,6 +2268,278 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     };
   }
 
+  async enqueueMediaDownloads(
+    items: Array<Pick<MediaDownloadQueueRecord, "messageKey" | "chatSourceId" | "sourceMessageId" | "descriptor" | "thumbnail" | "isViewOnce" | "priority">>
+  ): Promise<number> {
+    this.assertWritableIdentityVersion();
+    if (items.length === 0) {
+      return 0;
+    }
+    // First capture wins; a re-delivered message must not restart a stored or
+    // terminal download, but may raise priority of a still-pending one.
+    const insert = this.db.prepare(
+      `INSERT INTO media_download_queue
+       (message_key, chat_source_id, source_message_id, descriptor_json, thumbnail, is_view_once, status, priority, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+       ON CONFLICT(message_key) DO UPDATE SET
+         priority = MAX(media_download_queue.priority, excluded.priority),
+         updated_at = excluded.updated_at
+       WHERE media_download_queue.status IN ('pending','retry')`
+    );
+    let enqueued = 0;
+    const transaction = this.db.transaction(() => {
+      for (const item of items) {
+        const chatSourceId = this.canonicalJid(item.chatSourceId) ?? item.chatSourceId;
+        if (!chatSourceId || !item.sourceMessageId) {
+          continue;
+        }
+        const result = insert.run(
+          messageKey(chatSourceId, item.sourceMessageId),
+          chatSourceId,
+          item.sourceMessageId,
+          JSON.stringify(item.descriptor),
+          item.thumbnail?.length ? Buffer.from(item.thumbnail) : null,
+          Number(item.isViewOnce),
+          item.priority,
+          currentIso()
+        );
+        enqueued += result.changes;
+      }
+    });
+    transaction();
+    return enqueued;
+  }
+
+  async claimDueMediaDownloads(limit: number, nowMs = Date.now()): Promise<MediaDownloadQueueRecord[]> {
+    const rows = this.db
+      .prepare(
+        `SELECT id, message_key, chat_source_id, source_message_id, descriptor_json, thumbnail, is_view_once,
+                status, attempts, reupload_attempts, next_attempt_at_ms, last_error, priority
+         FROM media_download_queue
+         WHERE status IN ('pending','retry') AND (next_attempt_at_ms IS NULL OR next_attempt_at_ms <= ?)
+         ORDER BY priority DESC, id ASC
+         LIMIT ?`
+      )
+      .all(nowMs, Math.max(1, limit)) as SqliteMediaQueueRow[];
+    if (rows.length === 0) {
+      return [];
+    }
+    const claim = this.db.prepare(`UPDATE media_download_queue SET status = 'downloading', updated_at = ? WHERE id = ?`);
+    const transaction = this.db.transaction(() => {
+      for (const row of rows) {
+        claim.run(currentIso(), row.id);
+      }
+    });
+    transaction();
+    return rows.map(rowToMediaQueueRecord).filter((record): record is MediaDownloadQueueRecord => record !== null);
+  }
+
+  async completeMediaDownload(queueId: number, asset: MediaAssetRecord): Promise<number> {
+    let assetId = 0;
+    const transaction = this.db.transaction(() => {
+      assetId = this.upsertMediaAssetRow(asset);
+      // Stored is terminal: the descriptor (and its copy of the media key) has
+      // served its purpose and is dropped from the row.
+      this.db
+        .prepare(
+          `UPDATE media_download_queue
+           SET status = 'stored', descriptor_json = NULL, thumbnail = NULL, last_error = NULL, updated_at = ?
+           WHERE id = ?`
+        )
+        .run(currentIso(), queueId);
+    });
+    transaction();
+    return assetId;
+  }
+
+  async markMediaDownloadRetry(queueId: number, error: string, nextAttemptAtMs: number, options: { countReupload?: boolean } = {}): Promise<void> {
+    this.db
+      .prepare(
+        `UPDATE media_download_queue
+         SET status = 'retry', attempts = attempts + 1, reupload_attempts = reupload_attempts + ?,
+             next_attempt_at_ms = ?, last_error = ?, updated_at = ?
+         WHERE id = ?`
+      )
+      .run(options.countReupload ? 1 : 0, nextAttemptAtMs, error.slice(0, 300), currentIso(), queueId);
+  }
+
+  async markMediaDownloadTerminal(queueId: number, status: "expired_unrecoverable" | "failed", error: string | null): Promise<void> {
+    this.db
+      .prepare(
+        `UPDATE media_download_queue
+         SET status = ?, descriptor_json = NULL, thumbnail = NULL, last_error = ?, updated_at = ?
+         WHERE id = ?`
+      )
+      .run(status, error ? error.slice(0, 300) : null, currentIso(), queueId);
+  }
+
+  async linkMediaAsset(asset: MediaAssetRecord): Promise<number> {
+    this.assertWritableIdentityVersion();
+    return this.upsertMediaAssetRow(asset);
+  }
+
+  private upsertMediaAssetRow(asset: MediaAssetRecord): number {
+    const chatSourceId = this.canonicalJid(asset.chatSourceId) ?? asset.chatSourceId;
+    this.db
+      .prepare(
+        `INSERT INTO media_assets
+         (message_key, chat_source_id, sha256, storage_path, mime_type, byte_size, width, height, duration_ms, thumbnail, source, is_view_once)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(message_key, sha256) DO UPDATE SET
+           mime_type = COALESCE(media_assets.mime_type, excluded.mime_type),
+           width = COALESCE(media_assets.width, excluded.width),
+           height = COALESCE(media_assets.height, excluded.height),
+           duration_ms = COALESCE(media_assets.duration_ms, excluded.duration_ms),
+           thumbnail = COALESCE(media_assets.thumbnail, excluded.thumbnail),
+           is_view_once = MAX(media_assets.is_view_once, excluded.is_view_once)`
+      )
+      .run(
+        asset.messageKey,
+        chatSourceId,
+        asset.sha256,
+        asset.storagePath,
+        asset.mimeType ?? null,
+        asset.byteSize,
+        asset.width ?? null,
+        asset.height ?? null,
+        asset.durationMs ?? null,
+        asset.thumbnail?.length ? Buffer.from(asset.thumbnail) : null,
+        asset.source,
+        Number(asset.isViewOnce)
+      );
+    const row = this.db
+      .prepare(`SELECT id FROM media_assets WHERE message_key = ? AND sha256 = ?`)
+      .get(asset.messageKey, asset.sha256) as { id: number };
+    return Number(row.id);
+  }
+
+  async getMediaAsset(assetId: number): Promise<MediaAssetRecord | null> {
+    const row = this.db.prepare(`SELECT * FROM media_assets WHERE id = ?`).get(assetId) as SqliteMediaAssetRow | undefined;
+    return row ? rowToMediaAsset(row) : null;
+  }
+
+  async getMediaAssetForMessage(messageId: number): Promise<MediaAssetRecord | null> {
+    const row = this.db
+      .prepare(
+        `SELECT a.* FROM media_assets a
+         JOIN messages m ON m.source_message_key = a.message_key
+         WHERE m.id = ?
+         ORDER BY a.id ASC
+         LIMIT 1`
+      )
+      .get(messageId) as SqliteMediaAssetRow | undefined;
+    return row ? rowToMediaAsset(row) : null;
+  }
+
+  async getMediaQueueSummary(): Promise<MediaQueueSummary> {
+    const counts = this.db
+      .prepare(`SELECT status, COUNT(*) AS n FROM media_download_queue GROUP BY status`)
+      .all() as Array<{ status: MediaDownloadStatus; n: number }>;
+    const byStatus = new Map(counts.map((row) => [row.status, Number(row.n)]));
+    const assets = this.db.prepare(`SELECT COUNT(*) AS n FROM media_assets`).get() as { n: number };
+    return {
+      assets: Number(assets.n ?? 0),
+      pending: byStatus.get("pending") ?? 0,
+      downloading: byStatus.get("downloading") ?? 0,
+      retry: byStatus.get("retry") ?? 0,
+      stored: byStatus.get("stored") ?? 0,
+      failed: byStatus.get("failed") ?? 0,
+      expiredUnrecoverable: byStatus.get("expired_unrecoverable") ?? 0
+    };
+  }
+
+  async retryStuckMediaDownloads(): Promise<number> {
+    // Terminal rows whose descriptor was already dropped cannot be retried —
+    // only rows still holding a descriptor go back to pending.
+    const result = this.db
+      .prepare(
+        `UPDATE media_download_queue
+         SET status = 'pending', attempts = 0, reupload_attempts = 0, next_attempt_at_ms = NULL, updated_at = ?
+         WHERE status IN ('failed','expired_unrecoverable','retry') AND descriptor_json IS NOT NULL`
+      )
+      .run(currentIso());
+    return result.changes;
+  }
+
+  async resetInFlightMediaDownloads(): Promise<number> {
+    const result = this.db
+      .prepare(`UPDATE media_download_queue SET status = 'pending', updated_at = ? WHERE status = 'downloading'`)
+      .run(currentIso());
+    return result.changes;
+  }
+
+  async recordLinkPreviews(previews: CapturedLinkPreview[]): Promise<number> {
+    this.assertWritableIdentityVersion();
+    if (previews.length === 0) {
+      return 0;
+    }
+    const insert = this.db.prepare(
+      `INSERT INTO message_link_previews (message_key, chat_source_id, title, description, canonical_url, thumbnail)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(message_key) DO NOTHING`
+    );
+    let recorded = 0;
+    const transaction = this.db.transaction(() => {
+      for (const preview of previews) {
+        const chatSourceId = this.canonicalJid(preview.chatSourceId) ?? preview.chatSourceId;
+        if (!chatSourceId || !preview.sourceMessageId) {
+          continue;
+        }
+        const result = insert.run(
+          messageKey(chatSourceId, preview.sourceMessageId),
+          chatSourceId,
+          preview.title ?? null,
+          preview.description ?? null,
+          preview.canonicalUrl ?? null,
+          preview.thumbnail?.length ? Buffer.from(preview.thumbnail) : null
+        );
+        recorded += result.changes;
+      }
+    });
+    transaction();
+    return recorded;
+  }
+
+  async getLinkPreviewThumbnail(messageId: number): Promise<Uint8Array | null> {
+    const row = this.db
+      .prepare(
+        `SELECT p.thumbnail FROM message_link_previews p
+         JOIN messages m ON m.source_message_key = p.message_key
+         WHERE m.id = ?`
+      )
+      .get(messageId) as { thumbnail: Buffer | null } | undefined;
+    return row?.thumbnail ?? null;
+  }
+
+  async listMessageEditRevisions(messageId: number): Promise<MessageEditRevisionRecord[]> {
+    const rows = this.db
+      .prepare(
+        `SELECT r.id, r.message_key, r.revision_index, r.body, r.caption, r.edited_at_ms, r.created_at
+         FROM message_edit_revisions r
+         JOIN messages m ON m.source_message_key = r.message_key
+         WHERE m.id = ?
+         ORDER BY r.revision_index ASC`
+      )
+      .all(messageId) as Array<{
+      id: number;
+      message_key: string;
+      revision_index: number;
+      body: string | null;
+      caption: string | null;
+      edited_at_ms: number | null;
+      created_at: string;
+    }>;
+    return rows.map((row) => ({
+      id: Number(row.id),
+      messageKey: row.message_key,
+      revisionIndex: Number(row.revision_index),
+      body: row.body,
+      caption: row.caption,
+      editedAtMs: nullableNumber(row.edited_at_ms),
+      createdAt: row.created_at
+    }));
+  }
+
   async listPendingLiveMessageUpdates(limit = 500): Promise<LiveMessageUpdateRecord[]> {
     const rows = this.db
       .prepare(
@@ -1993,6 +2571,9 @@ export class SqliteArchiveRepository implements ArchiveRepository {
 
   async reconcileLiveState(): Promise<{ staleSessions: number; staleRuns: number }> {
     const now = currentIso();
+    // Media downloads claimed by a previous process resume from pending; the
+    // atomic blob write guarantees no partial file registered as stored.
+    await this.resetInFlightMediaDownloads();
     const sessions = this.db
       .prepare(
         `UPDATE live_sessions
@@ -2060,7 +2641,8 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         oldestVerifiedAt: isoFromMs(row.oldest_verified_at_ms),
         openGapCount: Number(row.open_gap_count ?? 0),
         nextRecoveryAt: row.next_recovery_at ?? null
-      }))
+      })),
+      media: await this.getMediaQueueSummary()
     };
   }
 
@@ -2199,9 +2781,17 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         `SELECT m.id, m.source_message_id,
                 COALESCE(NULLIF(TRIM(COALESCE(c.display_name, '')), ''), NULLIF(TRIM(COALESCE(c.push_name, '')), ''), c.phone_number) AS sender_display_name,
                 m.sender_source_jid, m.timestamp_ms, m.sent_at, m.direction, m.message_type, m.body, m.caption,
-                m.has_media, m.media_mime_type, m.media_name, m.is_deleted, m.is_forwarded, m.is_starred
+                m.has_media, m.media_mime_type, m.media_name, m.is_deleted, m.is_forwarded, m.is_starred,
+                m.source_table,
+                COALESCE(json_extract(m.raw_metadata_json, '$.edited'), 0) AS edited_flag,
+                (SELECT COUNT(*) FROM message_edit_revisions r WHERE r.message_key = m.source_message_key) AS edit_revision_count,
+                ${MEDIA_STATE_SELECT},
+                lp.title AS preview_title, lp.description AS preview_description, lp.canonical_url AS preview_url,
+                (lp.thumbnail IS NOT NULL) AS preview_has_thumbnail
          FROM messages m
          LEFT JOIN contacts c ON c.source_jid = m.sender_source_jid
+         ${MEDIA_STATE_JOINS}
+         LEFT JOIN message_link_previews lp ON lp.message_key = m.source_message_key
          WHERE ${where.join(" AND ")}
          ORDER BY m.timestamp_ms ${orderDirection}, m.id ${orderDirection}
          LIMIT ? OFFSET ?`
@@ -2209,31 +2799,52 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       .all(...params) as SqliteMessageRow[];
     const groupSelfSender = chat?.chat_type === "group" ? chat.source_chat_id : null;
     const mentionLabels = this.resolveMentionLabels(rows.flatMap((row) => [row.body, row.caption]));
-    return rows.map((row) => ({
-      id: Number(row.id),
-      sourceMessageId: row.source_message_id,
-      // Saved name, else push name, else phone number; a raw identifier is
-      // never surfaced as the sender label (NULL = unresolved).
-      senderDisplayName:
-        groupSelfSender && row.sender_source_jid === groupSelfSender
-          ? null
-          : row.sender_display_name ?? displayPhoneFromJid(row.sender_source_jid),
-      senderSourceJid: row.sender_source_jid,
-      timestampMs: row.timestamp_ms == null ? null : Number(row.timestamp_ms),
-      sentAt: row.sent_at,
-      direction: row.direction as MessageListItem["direction"],
-      messageType: row.message_type,
-      interpretation: interpretMessage({ messageType: row.message_type, isDeleted: Boolean(row.is_deleted) }),
-      body: applyMentionLabels(row.body, mentionLabels),
-      caption: applyMentionLabels(row.caption, mentionLabels),
-      mentions: appliedMentionLabels([row.body, row.caption], mentionLabels),
-      hasMedia: Boolean(row.has_media),
-      mediaMimeType: row.media_mime_type,
-      mediaName: row.media_name,
-      isDeleted: Boolean(row.is_deleted),
-      isForwarded: Boolean(row.is_forwarded),
-      isStarred: Boolean(row.is_starred)
-    }));
+    return rows.map((row) => {
+      const media = deriveMediaSummary(row, row.message_type);
+      const hasHeldContent = Boolean(row.body?.trim() || row.caption?.trim() || media?.availability === "stored");
+      return {
+        id: Number(row.id),
+        sourceMessageId: row.source_message_id,
+        // Saved name, else push name, else phone number; a raw identifier is
+        // never surfaced as the sender label (NULL = unresolved).
+        senderDisplayName:
+          groupSelfSender && row.sender_source_jid === groupSelfSender
+            ? null
+            : row.sender_display_name ?? displayPhoneFromJid(row.sender_source_jid),
+        senderSourceJid: row.sender_source_jid,
+        timestampMs: row.timestamp_ms == null ? null : Number(row.timestamp_ms),
+        sentAt: row.sent_at,
+        direction: row.direction as MessageListItem["direction"],
+        messageType: row.message_type,
+        interpretation: interpretMessage({
+          messageType: row.message_type,
+          isDeleted: Boolean(row.is_deleted),
+          hasHeldContent,
+          mediaAvailability: media?.availability ?? null
+        }),
+        body: applyMentionLabels(row.body, mentionLabels),
+        caption: applyMentionLabels(row.caption, mentionLabels),
+        mentions: appliedMentionLabels([row.body, row.caption], mentionLabels),
+        hasMedia: Boolean(row.has_media),
+        mediaMimeType: row.media_mime_type,
+        mediaName: row.media_name,
+        media,
+        linkPreview:
+          row.preview_title || row.preview_description || row.preview_url || row.preview_has_thumbnail
+            ? {
+                title: row.preview_title ?? null,
+                description: row.preview_description ?? null,
+                canonicalUrl: row.preview_url ?? null,
+                hasThumbnail: Boolean(row.preview_has_thumbnail)
+              }
+            : null,
+        isEdited: Boolean(row.edited_flag) || Number(row.edit_revision_count ?? 0) > 0,
+        editRevisionCount: Number(row.edit_revision_count ?? 0),
+        isDeleted: Boolean(row.is_deleted),
+        isForwarded: Boolean(row.is_forwarded),
+        isStarred: Boolean(row.is_starred)
+      };
+    });
   }
 
   async getMemoryStatus(provider: MemoryProviderStatus): Promise<MemoryStatusSummary> {
@@ -2408,11 +3019,13 @@ export class SqliteArchiveRepository implements ArchiveRepository {
                 NULLIF(TRIM(COALESCE(chats.display_name, '')), '') AS chat_display_name, chats.jid AS chat_jid,
                 m.sender_source_jid,
                 COALESCE(NULLIF(TRIM(COALESCE(c.display_name, '')), ''), NULLIF(TRIM(COALESCE(c.push_name, '')), ''), c.phone_number) AS sender_display_name,
-                m.timestamp_ms, m.sent_at, m.direction, m.message_type,
-                COALESCE(NULLIF(m.body, ''), NULLIF(m.caption, '')) AS text
+                m.timestamp_ms, m.sent_at, m.direction, m.message_type, m.is_deleted, m.has_media, m.source_table,
+                COALESCE(NULLIF(m.body, ''), NULLIF(m.caption, '')) AS text,
+                ${MEDIA_STATE_SELECT}
          FROM messages m
          JOIN chats ON chats.id = m.chat_id
          LEFT JOIN contacts c ON c.source_jid = m.sender_source_jid
+         ${MEDIA_STATE_JOINS}
          WHERE ${where.join(" AND ")}
          ORDER BY m.timestamp_ms ASC, m.id ASC
          LIMIT ?`
@@ -2614,11 +3227,13 @@ export class SqliteArchiveRepository implements ArchiveRepository {
                 NULLIF(TRIM(COALESCE(chats.display_name, '')), '') AS chat_display_name, chats.jid AS chat_jid,
                 m.sender_source_jid,
                 COALESCE(NULLIF(TRIM(COALESCE(c.display_name, '')), ''), NULLIF(TRIM(COALESCE(c.push_name, '')), ''), c.phone_number) AS sender_display_name,
-                m.timestamp_ms, m.sent_at, m.direction, m.message_type,
-                COALESCE(NULLIF(m.body, ''), NULLIF(m.caption, '')) AS text
+                m.timestamp_ms, m.sent_at, m.direction, m.message_type, m.is_deleted, m.has_media, m.source_table,
+                COALESCE(NULLIF(m.body, ''), NULLIF(m.caption, '')) AS text,
+                ${MEDIA_STATE_SELECT}
          FROM messages m
          JOIN chats ON chats.id = m.chat_id
          LEFT JOIN contacts c ON c.source_jid = m.sender_source_jid
+         ${MEDIA_STATE_JOINS}
          WHERE m.chat_id = ? AND m.id BETWEEN ? AND ?
          ORDER BY m.timestamp_ms ASC, m.id ASC`
       )
@@ -2755,6 +3370,10 @@ function ensureSchema(db: Database.Database): void {
   migrateLiveMessageUpdateTypes(db);
   db.exec(schemaStatements.join(";\n"));
   migrateAdditiveColumns(db);
+  // Drop the removed view-once recovery queue if a prior build created it. It
+  // only ever held transient request state (message keys, no content), so this
+  // is safe cleanup, not a data migration.
+  db.exec(`DROP TABLE IF EXISTS view_once_recovery`);
 }
 
 // SQLite cannot alter CHECK constraints in place; rebuild live_message_updates
@@ -2998,6 +3617,7 @@ function rowToMemoryWindow(row: SqliteMemoryWindowRow): MemorySourceWindowRecord
 }
 
 function rowToMemoryEvidence(row: SqliteMemoryEvidenceRow, index: number): MemoryEvidenceMessage {
+  const availability = deriveMediaAvailability(row);
   return {
     citationLabel: `m${index + 1}`,
     messageId: Number(row.id),
@@ -3012,7 +3632,12 @@ function rowToMemoryEvidence(row: SqliteMemoryEvidenceRow, index: number): Memor
     sentAt: row.sent_at,
     direction: row.direction as MemoryEvidenceMessage["direction"],
     messageType: row.message_type,
-    interpretation: interpretMessage({ messageType: row.message_type }),
+    interpretation: interpretMessage({
+      messageType: row.message_type,
+      isDeleted: Boolean(row.is_deleted),
+      hasHeldContent: Boolean(row.text) || availability === "stored",
+      mediaAvailability: availability
+    }),
     text: row.text
   };
 }
@@ -3172,7 +3797,7 @@ interface SqliteChatRow {
   last_message_at: string | null;
 }
 
-interface SqliteMessageRow {
+interface SqliteMessageRow extends SqliteMediaStateColumns {
   id: number;
   source_message_id: string;
   sender_display_name: string | null;
@@ -3189,6 +3814,13 @@ interface SqliteMessageRow {
   is_deleted: number;
   is_forwarded: number;
   is_starred: number;
+  source_table: string;
+  edited_flag: number;
+  edit_revision_count: number;
+  preview_title: string | null;
+  preview_description: string | null;
+  preview_url: string | null;
+  preview_has_thumbnail: number;
 }
 
 interface SqliteLiveSessionRow {
@@ -3288,7 +3920,7 @@ interface SqliteMemoryWindowRow {
   created_at: string;
 }
 
-interface SqliteMemoryEvidenceRow {
+interface SqliteMemoryEvidenceRow extends SqliteMediaStateColumns {
   id: number;
   source_message_key: string;
   source_message_id: string;
@@ -3302,6 +3934,7 @@ interface SqliteMemoryEvidenceRow {
   sent_at: string | null;
   direction: string;
   message_type: string;
+  is_deleted: number;
   text: string | null;
 }
 

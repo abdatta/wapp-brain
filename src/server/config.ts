@@ -48,6 +48,11 @@ export const config = {
     host: parsed.APP_HOST,
     port: parsed.APP_PORT
   },
+  media: {
+    // Content-addressed decrypted media blobs beside archive.sqlite; the whole
+    // workDir (and any media/ directory) is gitignored.
+    rootDir: path.join(workDir, "media")
+  },
   live: {
     autoResume: Boolean(parsed.LIVE_AUTO_RESUME ?? true),
     client: parsed.LIVE_WHATSAPP_CLIENT,

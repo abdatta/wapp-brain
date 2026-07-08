@@ -32,7 +32,7 @@ Initial approach:
 Current limits:
 - the maintainer is opt-in and CLI-first for real pairing/running
 - on-demand history reliability must be verified with a real linked-device spike
-- media files are not downloaded by the live maintainer yet
+- media is downloaded and archived by the live maintainer (view-once included); the single write exception to the read-only posture is the scoped media re-upload request
 - browser automation clients are intentionally out of scope
 
 Open questions:
