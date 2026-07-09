@@ -138,6 +138,7 @@ export function normalizeBaileysMessage(message: BaileysLikeMessage, sourceTable
     isDeleted: false,
     isForwarded: Boolean(nestedContext(content)?.isForwarded),
     isStarred: false,
+    mentionedJids: extractMentionedJids(content),
     rawMetadata: {
       source: "wa-web",
       pushName: message.pushName ?? null,
@@ -1155,6 +1156,17 @@ function extractMediaName(content: Record<string, unknown> | null): string | nul
 function extractQuotedMessageId(content: Record<string, unknown> | null): string | null {
   const stanzaId = nestedContext(content)?.stanzaId;
   return typeof stanzaId === "string" ? stanzaId : null;
+}
+
+// Explicit mentioned JIDs from the transport contextInfo — the authoritative
+// identity behind each "@digits" token in the text. Bounded defensively.
+function extractMentionedJids(content: Record<string, unknown> | null): string[] | null {
+  const mentioned = nestedContext(content)?.mentionedJid;
+  if (!Array.isArray(mentioned)) {
+    return null;
+  }
+  const jids = mentioned.filter((jid): jid is string => typeof jid === "string" && jid.includes("@")).slice(0, 64);
+  return jids.length > 0 ? jids : null;
 }
 
 function hasMediaContent(content: Record<string, unknown> | null): boolean {

@@ -37,14 +37,20 @@ import type {
   MemorySourceWindowRecord,
   MemoryStatusSummary,
   MemoryValidationIssue,
+  MessageContextWindow,
   MessageListItem,
   MessageRecord,
   MessageSecretRecord,
   ParticipantRecord,
   RecoveryAnchorRecord,
   RetainedPayloadRecord,
+  SearchIndexStatus,
+  SearchQueryOptions,
+  SearchResponse,
+  SearchResultItem,
   StatusSummary
 } from "../../shared/types";
+import { SEARCH_HIGHLIGHT_END, SEARCH_HIGHLIGHT_START } from "../../shared/types";
 import { config } from "../config";
 import { baselineFromStatus } from "../live/baseline";
 import { messageIdFromKey, messageKey } from "../identity/keys";
@@ -1233,6 +1239,148 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       });
   }
 
+  async listMessagesAround(chatId: number, messageId: number, radius: number): Promise<MessageContextWindow | null> {
+    const chat = [...this.chats.values()].find((candidate) => candidate.id === chatId);
+    if (!chat) {
+      return null;
+    }
+    const all = [...this.messages.values()]
+      .filter((message) => message.chatSourceId === chat.sourceChatId)
+      .sort((a, b) => (a.timestampMs ?? 0) - (b.timestampMs ?? 0) || a.id - b.id);
+    const anchorIndex = all.findIndex((message) => message.id === messageId);
+    if (anchorIndex < 0) {
+      return null;
+    }
+    const start = Math.max(0, anchorIndex - radius);
+    const messages = await this.listMessages(chatId, { limit: radius * 2 + 1, offset: start, order: "asc" });
+    return {
+      messages,
+      newerCount: Math.max(0, all.length - (start + messages.length)),
+      anchorMessageId: messageId
+    };
+  }
+
+  async getSearchIndexStatus(): Promise<SearchIndexStatus> {
+    // The in-memory adapter scans live data; there is no separate index to
+    // fall out of date, so search is always available.
+    return { state: "ready", totalMessages: this.messages.size };
+  }
+
+  async rebuildSearchIndex(onProgress?: (processedMessages: number, totalMessages: number) => void): Promise<{ indexedMessages: number }> {
+    onProgress?.(this.messages.size, this.messages.size);
+    return { indexedMessages: this.messages.size };
+  }
+
+  async searchMessages(options: SearchQueryOptions): Promise<SearchResponse> {
+    const index = await this.getSearchIndexStatus();
+    const tokens = (options.query.match(/"[^"]*"|\S+/g) ?? [])
+      .map((token) => token.replace(/^"|"$/g, "").trim().toLowerCase())
+      .filter(Boolean);
+    if (tokens.length === 0) {
+      return { index, totalMatches: 0, results: [] };
+    }
+    const chatBysourceId = new Map([...this.chats.values()].map((chat) => [chat.sourceChatId, chat]));
+    const scored: Array<{ item: SearchResultItem; score: number }> = [];
+    const nowMs = Date.now();
+    for (const message of this.messages.values()) {
+      const chat = chatBysourceId.get(message.chatSourceId);
+      if (!chat) {
+        continue;
+      }
+      if (options.chatId != null && chat.id !== options.chatId) {
+        continue;
+      }
+      if (options.afterMs != null && (message.timestampMs ?? 0) < options.afterMs) {
+        continue;
+      }
+      if (options.beforeMs != null && (message.timestampMs ?? Number.MAX_SAFE_INTEGER) > options.beforeMs) {
+        continue;
+      }
+      if (options.direction && message.direction !== options.direction) {
+        continue;
+      }
+      const isMediaLike =
+        message.hasMedia || ["image", "video", "audio", "document", "sticker", "view_once", "ptv"].includes(message.messageType);
+      if (options.type === "text" && (message.hasMedia || message.messageType === "call")) {
+        continue;
+      }
+      if (options.type === "media" && !isMediaLike) {
+        continue;
+      }
+      if (options.type === "call" && message.messageType !== "call") {
+        continue;
+      }
+      if (!options.includeNoise && !isVisibleExchangeMessage(message)) {
+        continue;
+      }
+      const sender = message.senderSourceJid ? this.contacts.get(message.senderSourceJid) : null;
+      const senderLabel =
+        sender?.displayName?.trim() || sender?.pushName?.trim() || sender?.phoneNumber || displayPhoneFromJid(message.senderSourceJid) || null;
+      if (options.sender) {
+        const wanted = options.sender.trim().toLowerCase();
+        const senderMatches = wanted.includes("@")
+          ? message.senderSourceJid === options.sender.trim()
+          : Boolean(senderLabel && senderLabel.toLowerCase().includes(wanted));
+        if (!senderMatches) {
+          continue;
+        }
+      }
+      const mentionLabels = this.resolveMentionLabels([message.body ?? null, message.caption ?? null]);
+      const haystackFields = [
+        applyMentionLabels(message.body ?? null, mentionLabels),
+        applyMentionLabels(message.caption ?? null, mentionLabels),
+        message.body ?? null,
+        message.caption ?? null,
+        message.mediaName ?? null,
+        senderLabel
+      ];
+      const haystack = haystackFields.filter(Boolean).join("\n").toLowerCase();
+      if (!tokens.every((token) => haystack.includes(token))) {
+        continue;
+      }
+      const ageDays = message.timestampMs != null ? Math.max(0, (nowMs - message.timestampMs) / 86_400_000) : 365;
+      const recency = 0.2 + 0.8 * Math.pow(0.5, ageDays / 90);
+      const score = tokens.length * recency;
+      const snippetSource =
+        haystackFields.find((field) => field && field.toLowerCase().includes(tokens[0])) ?? haystackFields.find(Boolean) ?? "";
+      scored.push({
+        score,
+        item: {
+          layer: "message",
+          messageId: message.id,
+          sourceMessageKey: message.sourceMessageKey,
+          sourceMessageId: message.sourceMessageId,
+          chatId: chat.id,
+          chatSourceId: chat.sourceChatId,
+          chatDisplayName: chat.displayName ?? null,
+          chatType: chat.chatType,
+          senderDisplayName: senderLabel,
+          senderSourceJid: message.senderSourceJid ?? null,
+          timestampMs: message.timestampMs ?? null,
+          sentAt: message.timestampMs ? new Date(message.timestampMs).toISOString() : null,
+          direction: message.direction,
+          messageType: message.messageType,
+          interpretation: interpretMessage({
+            messageType: message.messageType,
+            isDeleted: message.isDeleted,
+            hasHeldContent: Boolean(message.body?.trim() || message.caption?.trim() || message.hasMedia),
+            mediaAvailability: null
+          }),
+          snippet: buildMemorySnippet(snippetSource ?? "", tokens[0]),
+          score,
+          hasMedia: message.hasMedia,
+          isDeleted: message.isDeleted
+        }
+      });
+    }
+    scored.sort((a, b) => b.score - a.score || (b.item.timestampMs ?? 0) - (a.item.timestampMs ?? 0));
+    return {
+      index,
+      totalMatches: scored.length,
+      results: scored.slice(options.offset, options.offset + options.limit).map((entry) => entry.item)
+    };
+  }
+
   async getMemoryStatus(provider: MemoryProviderStatus): Promise<MemoryStatusSummary> {
     const currentPages = [...this.memoryPages.values()].filter((page) => page.status === "current");
     const stalePages = [...this.memoryPages.values()].filter((page) => page.status === "stale");
@@ -1516,6 +1664,48 @@ function displayPhoneFromJid(jid: string | null | undefined): string | null {
   }
   const digits = user?.split(":")[0]?.replace(/\D/g, "");
   return digits ? `+${digits}` : null;
+}
+
+// Mirrors the SQLite visibleExchangePredicate: what a user would recognize as
+// conversation, driving the default search noise filter.
+function isVisibleExchangeMessage(message: MessageRecord): boolean {
+  if (["system", "status", "reaction", "encrypted_update"].includes(message.messageType)) {
+    return false;
+  }
+  return (
+    message.direction === "incoming" ||
+    message.direction === "outgoing" ||
+    Boolean(message.body?.trim()) ||
+    Boolean(message.caption?.trim()) ||
+    message.hasMedia ||
+    message.isDeleted ||
+    message.messageType === "call"
+  );
+}
+
+// Highlighted excerpt around the first occurrence of the leading query token.
+function buildMemorySnippet(source: string, token: string): string {
+  if (!source) {
+    return "";
+  }
+  const lower = source.toLowerCase();
+  const at = lower.indexOf(token);
+  if (at < 0) {
+    return source.slice(0, 160);
+  }
+  const start = Math.max(0, at - 60);
+  const end = Math.min(source.length, at + token.length + 60);
+  const prefix = start > 0 ? "…" : "";
+  const suffix = end < source.length ? "…" : "";
+  return (
+    prefix +
+    source.slice(start, at) +
+    SEARCH_HIGHLIGHT_START +
+    source.slice(at, at + token.length) +
+    SEARCH_HIGHLIGHT_END +
+    source.slice(at + token.length, end) +
+    suffix
+  );
 }
 
 function maxNullableMs(left: number | null, right: number | null): number | null {

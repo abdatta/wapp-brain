@@ -15,6 +15,7 @@
     "inspect": "tsx src/server/cli.ts inspect",
     "import": "tsx src/server/cli.ts import",
     "unknown-report": "tsx src/server/cli.ts unknown-report",
+    "search:reindex": "tsx src/server/cli.ts search-reindex",
     "live:proof": "tsx src/server/cli.ts live-proof",
     "live:start": "tsx src/server/cli.ts live-start",
     "live:status": "tsx src/server/cli.ts live-status",

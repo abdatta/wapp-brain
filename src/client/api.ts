@@ -16,10 +16,15 @@ import type {
   MemoryProviderStatus,
   MemoryQueryResult,
   MemoryStatusSummary,
+  MessageContextWindow,
   MessageEditRevisionRecord,
   MessageListItem,
   MessageListOrder,
   PickKind,
+  SearchIndexStatus,
+  SearchReindexProgress,
+  SearchResponse,
+  SearchTypeFilter,
   StatusSummary,
   BackupDetectionManifest
 } from "../shared/types";
@@ -232,4 +237,39 @@ export function listMessages(
   if (params.query) query.set("query", params.query);
   if (params.order) query.set("order", params.order);
   return request<MessageListItem[]>(`/api/chats/${chatId}/messages?${query}`);
+}
+
+// Thread window centered on a message (search deep links).
+export function getMessageContext(chatId: number, anchorId: number, radius = 75): Promise<MessageContextWindow> {
+  return request<MessageContextWindow>(`/api/chats/${chatId}/messages/context?anchorId=${anchorId}&radius=${radius}`);
+}
+
+export function searchArchive(params: {
+  query: string;
+  sender?: string | null;
+  afterMs?: number | null;
+  beforeMs?: number | null;
+  type?: SearchTypeFilter | null;
+  direction?: "incoming" | "outgoing" | null;
+  limit?: number;
+  offset?: number;
+}): Promise<SearchResponse> {
+  const query = new URLSearchParams();
+  query.set("query", params.query);
+  if (params.sender) query.set("sender", params.sender);
+  if (params.afterMs != null) query.set("afterMs", String(params.afterMs));
+  if (params.beforeMs != null) query.set("beforeMs", String(params.beforeMs));
+  if (params.type) query.set("type", params.type);
+  if (params.direction) query.set("direction", params.direction);
+  query.set("limit", String(params.limit ?? 25));
+  query.set("offset", String(params.offset ?? 0));
+  return request<SearchResponse>(`/api/search?${query}`);
+}
+
+export function getSearchStatus(): Promise<{ index: SearchIndexStatus; reindex: SearchReindexProgress }> {
+  return request<{ index: SearchIndexStatus; reindex: SearchReindexProgress }>("/api/search/status");
+}
+
+export function startSearchReindex(): Promise<{ ok: boolean; reindex: SearchReindexProgress }> {
+  return request<{ ok: boolean; reindex: SearchReindexProgress }>("/api/search/reindex", { method: "POST", body: "{}" });
 }

@@ -98,6 +98,35 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === "search-reindex") {
+    const repository = createArchiveRepository();
+    try {
+      const status = await repository.getSearchIndexStatus();
+      console.log(`Search index state: ${status.state} (${status.totalMessages.toLocaleString()} messages).`);
+      const { default: cliProgress } = await import("cli-progress");
+      const bar = new cliProgress.SingleBar(
+        { format: "Reindexing [{bar}] {percentage}% | {value}/{total} messages" },
+        cliProgress.Presets.shades_classic
+      );
+      let started = false;
+      const result = await repository.rebuildSearchIndex((processed, total) => {
+        if (!started) {
+          bar.start(Math.max(total, 1), Math.min(processed, total));
+          started = true;
+        }
+        bar.setTotal(Math.max(total, 1));
+        bar.update(Math.min(processed, total));
+      });
+      if (started) {
+        bar.stop();
+      }
+      console.log(`Search index rebuilt: ${result.indexedMessages.toLocaleString()} messages indexed.`);
+    } finally {
+      await repository.close?.();
+    }
+    return;
+  }
+
   if (command === "unknown-report") {
     const repository = createArchiveRepository();
     try {

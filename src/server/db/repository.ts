@@ -29,6 +29,7 @@ import type {
   MemorySourceWindowRecord,
   MemoryStatusSummary,
   MemoryValidationIssue,
+  MessageContextWindow,
   MessageListItem,
   MessageRecord,
   MessageSecretRecord,
@@ -36,6 +37,9 @@ import type {
   RetainedPayloadRecord,
   ChatListOptions,
   RecoveryAnchorRecord,
+  SearchIndexStatus,
+  SearchQueryOptions,
+  SearchResponse,
   StatusSummary
 } from "../../shared/types";
 
@@ -134,6 +138,16 @@ export interface ArchiveRepository {
     chatId: number,
     options: { limit: number; offset: number; sender?: string; query?: string; order?: "asc" | "desc" }
   ): Promise<MessageListItem[]>;
+  // Thread window centered on one message, for search deep links; null when
+  // the anchor does not exist in the chat.
+  listMessagesAround(chatId: number, messageId: number, radius: number): Promise<MessageContextWindow | null>;
+  // Indexed full-text search across all chats (brain hot tier). Refuses with a
+  // PublicError while the index needs a rebuild — never a linear-scan fallback.
+  searchMessages(options: SearchQueryOptions): Promise<SearchResponse>;
+  getSearchIndexStatus(): Promise<SearchIndexStatus>;
+  // Chunked recompute of derived resolved text + full FTS rebuild; yields to
+  // the event loop between chunks and reports progress.
+  rebuildSearchIndex(onProgress?: (processedMessages: number, totalMessages: number) => void): Promise<{ indexedMessages: number }>;
   getMemoryStatus(provider: MemoryProviderStatus): Promise<MemoryStatusSummary>;
   startMemoryRun(input: {
     kind: MemoryRunSummary["kind"];

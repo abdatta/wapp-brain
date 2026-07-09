@@ -27,6 +27,7 @@ import { LiveMaintainer } from "./live/maintainer";
 import { queryMemory, resolveMemoryCitation, runMemoryConsolidation, validateMemoryStore } from "./memory/consolidation";
 import { disableRemoteMemoryProvider, enableCodexProvider, getMemoryProviderStatus } from "./memory/provider";
 import { isLocalDatabaseError, publicErrorMessage } from "./privacy";
+import { getSearchReindexProgress, startSearchReindex } from "./search/reindexJob";
 import { withGuidedSetup } from "./onboarding";
 import type { ArchiveChangeEvent, LivePairingSummary, PickKind } from "../shared/types";
 import type { LiveMessageEvent } from "./live/types";
@@ -464,6 +465,75 @@ app.get("/api/chats/:id/messages", async (req, res) => {
   }
 });
 
+// Thread window centered on one message — search deep links land here so the
+// viewer opens positioned at the hit instead of paging from the newest row.
+app.get("/api/chats/:id/messages/context", async (req, res) => {
+  try {
+    const chatId = Number(req.params.id);
+    const anchorId = Number(req.query.anchorId);
+    if (!Number.isInteger(chatId) || !Number.isInteger(anchorId)) {
+      res.status(400).json({ error: "A chat id and anchor message id are required." });
+      return;
+    }
+    const radius = clampNumber(req.query.radius, 5, 150, 75);
+    const window = await repository.listMessagesAround(chatId, anchorId, radius);
+    if (!window) {
+      res.status(404).json({ error: "The anchor message was not found in this chat." });
+      return;
+    }
+    res.json(window);
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+app.get("/api/search", async (req, res) => {
+  try {
+    const query = stringQuery(req.query.query);
+    if (!query) {
+      res.json({ index: await repository.getSearchIndexStatus(), totalMatches: 0, results: [] });
+      return;
+    }
+    const type = req.query.type === "text" || req.query.type === "media" || req.query.type === "call" ? req.query.type : null;
+    const direction = req.query.direction === "incoming" || req.query.direction === "outgoing" ? req.query.direction : null;
+    res.json(
+      await repository.searchMessages({
+        query,
+        chatId: optionalNumberQuery(req.query.chatId),
+        sender: stringQuery(req.query.sender) ?? null,
+        afterMs: optionalNumberQuery(req.query.afterMs),
+        beforeMs: optionalNumberQuery(req.query.beforeMs),
+        type,
+        direction,
+        includeNoise: booleanQuery(req.query.includeNoise),
+        limit: clampNumber(req.query.limit, 1, 100, 25),
+        offset: clampNumber(req.query.offset, 0, 200, 0)
+      })
+    );
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+app.get("/api/search/status", async (_req, res) => {
+  try {
+    res.json({ index: await repository.getSearchIndexStatus(), reindex: getSearchReindexProgress() });
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+app.post("/api/search/reindex", async (_req, res) => {
+  try {
+    const reindex = startSearchReindex(repository, () => {
+      broadcastArchiveChanged({ source: "manual", chatSourceIds: [], messageCount: 0, contactCount: 0 });
+    });
+    res.json({ ok: true, reindex });
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
 // Local-only media serving (the whole app binds to loopback). Streams original
 // blobs with HTTP range support for audio/video scrubbing. Content-addressed
 // blobs are immutable, so aggressive private caching is safe. No media paths
@@ -637,6 +707,14 @@ function clampNumber(value: unknown, min: number, max: number, fallback: number)
     return fallback;
   }
   return Math.min(max, Math.max(min, Math.floor(number)));
+}
+
+function optionalNumberQuery(value: unknown): number | null {
+  if (value == null || value === "") {
+    return null;
+  }
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
 }
 
 // Single-range parser for media scrubbing ("bytes=start-end", open ends

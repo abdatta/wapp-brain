@@ -299,6 +299,9 @@ export interface MessageRecord {
   isDeleted: boolean;
   isForwarded: boolean;
   isStarred: boolean;
+  // Explicit mentioned JIDs from the transport envelope (live contextInfo);
+  // text-token "@digits" mentions are additionally derived at write time.
+  mentionedJids?: string[] | null;
   rawMetadata?: Record<string, unknown> | null;
 }
 
@@ -541,6 +544,95 @@ export interface MemoryCitationResolution {
 }
 
 export type MessageListOrder = "asc" | "desc";
+
+// --- Archive full-text search (brain hot tier) ---
+
+// Where the search index stands relative to the archive. "needs_rebuild"
+// appears when the index was added (or invalidated) on an archive that already
+// held messages; search refuses honestly until a reindex job runs.
+export type SearchIndexState = "ready" | "needs_rebuild";
+
+export interface SearchIndexStatus {
+  state: SearchIndexState;
+  totalMessages: number;
+}
+
+export type SearchTypeFilter = "text" | "media" | "call";
+
+export interface SearchQueryOptions {
+  query: string;
+  chatId?: number | null;
+  // Free-text sender match: canonical JID, saved name, or push name.
+  sender?: string | null;
+  afterMs?: number | null;
+  beforeMs?: number | null;
+  type?: SearchTypeFilter | null;
+  direction?: "incoming" | "outgoing" | null;
+  // Default false: only visible-exchange (conversation) rows are returned.
+  includeNoise?: boolean;
+  limit: number;
+  offset: number;
+}
+
+// Snippet highlight markers: private-use codepoints that cannot occur in real
+// message text; consumers replace them with their own emphasis markup.
+export const SEARCH_HIGHLIGHT_START = "\uE000";
+export const SEARCH_HIGHLIGHT_END = "\uE001";
+
+// One search hit. Layer is fixed to "message" until brain documents (episodes,
+// pages) join the same result shape in later phases.
+export interface SearchResultItem {
+  layer: "message";
+  messageId: number;
+  sourceMessageKey: string;
+  sourceMessageId: string;
+  chatId: number;
+  chatSourceId: string;
+  chatDisplayName: string | null;
+  chatType: ChatType;
+  senderDisplayName: string | null;
+  senderSourceJid: string | null;
+  timestampMs: number | null;
+  sentAt: string | null;
+  direction: "incoming" | "outgoing" | "system" | "unknown";
+  messageType: string;
+  interpretation: MessageInterpretationSummary | null;
+  // Match locality with highlight markers around matched terms; mention tokens
+  // arrive resolved where the index carried resolved text.
+  snippet: string;
+  // Relevance after recency decay; higher is better, comparable only within
+  // one result set.
+  score: number;
+  hasMedia: boolean;
+  isDeleted: boolean;
+}
+
+export interface SearchResponse {
+  index: SearchIndexStatus;
+  // Exact number of messages matching the query and filters across the whole
+  // archive; results carries only the requested page of the ranked top pool.
+  totalMatches: number;
+  results: SearchResultItem[];
+}
+
+// Window of a chat's thread centered on one message, for search deep links.
+// newerCount is how many chat messages are newer than the window's newest row,
+// so offset-based "load older/newer" paging continues from the jump position.
+export interface MessageContextWindow {
+  messages: MessageListItem[];
+  newerCount: number;
+  anchorMessageId: number;
+}
+
+// Progress of a search reindex job (chunked FTS rebuild).
+export interface SearchReindexProgress {
+  state: "idle" | "running" | "finalizing" | "completed" | "failed";
+  processedMessages: number;
+  totalMessages: number;
+  startedAt: string | null;
+  finishedAt: string | null;
+  error: string | null;
+}
 
 export interface ImportRequest {
   msgstorePath: string;

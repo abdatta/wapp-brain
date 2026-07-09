@@ -41,14 +41,21 @@ import type {
   MemorySourceWindowRecord,
   MemoryStatusSummary,
   MemoryValidationIssue,
+  MessageContextWindow,
   MessageListItem,
   MessageRecord,
   MessageSecretRecord,
   ParticipantRecord,
   RecoveryAnchorRecord,
   RetainedPayloadRecord,
+  SearchIndexState,
+  SearchIndexStatus,
+  SearchQueryOptions,
+  SearchResponse,
+  SearchResultItem,
   StatusSummary
 } from "../../shared/types";
+import { SEARCH_HIGHLIGHT_END, SEARCH_HIGHLIGHT_START } from "../../shared/types";
 import { config } from "../config";
 import { baselineFromStatus } from "../live/baseline";
 import { messageIdFromKey, messageKey } from "../identity/keys";
@@ -74,6 +81,7 @@ const ARCHIVE_TABLES = [
   "chats",
   "chat_participants",
   "messages",
+  "message_mentions",
   "import_warnings",
   "live_sessions",
   "live_sync_runs",
@@ -106,6 +114,7 @@ const DELETE_TABLE_ORDER = [
   "live_chat_checkpoints",
   "live_sync_runs",
   "live_sessions",
+  "message_mentions",
   "messages",
   "chat_participants",
   "chats",
@@ -127,6 +136,28 @@ const MEDIA_STATE_SELECT = `ma.id AS media_asset_id, ma.mime_type AS media_mime,
 const MEDIA_STATE_JOINS = `LEFT JOIN media_assets ma
            ON ma.id = (SELECT id FROM media_assets pick WHERE pick.message_key = m.source_message_key ORDER BY pick.id ASC LIMIT 1)
          LEFT JOIN media_download_queue q ON q.message_key = m.source_message_key`;
+
+// The full thread-view row projection, shared by offset paging and
+// anchor-centered context windows.
+function messageListSelectSql(whereClause: string, orderClause: string, limitClause: string): string {
+  return `SELECT m.id, m.source_message_id,
+                COALESCE(NULLIF(TRIM(COALESCE(c.display_name, '')), ''), NULLIF(TRIM(COALESCE(c.push_name, '')), ''), c.phone_number) AS sender_display_name,
+                m.sender_source_jid, m.timestamp_ms, m.sent_at, m.direction, m.message_type, m.body, m.caption,
+                m.has_media, m.media_mime_type, m.media_name, m.is_deleted, m.is_forwarded, m.is_starred,
+                m.source_table,
+                COALESCE(json_extract(m.raw_metadata_json, '$.edited'), 0) AS edited_flag,
+                (SELECT COUNT(*) FROM message_edit_revisions r WHERE r.message_key = m.source_message_key) AS edit_revision_count,
+                ${MEDIA_STATE_SELECT},
+                lp.title AS preview_title, lp.description AS preview_description, lp.canonical_url AS preview_url,
+                (lp.thumbnail IS NOT NULL) AS preview_has_thumbnail
+         FROM messages m
+         LEFT JOIN contacts c ON c.source_jid = m.sender_source_jid
+         ${MEDIA_STATE_JOINS}
+         LEFT JOIN message_link_previews lp ON lp.message_key = m.source_message_key
+         ${whereClause}
+         ${orderClause}
+         ${limitClause}`;
+}
 
 interface SqliteMediaStateColumns {
   has_media: number;
@@ -411,10 +442,23 @@ const schemaStatements = [
     is_forwarded INTEGER NOT NULL DEFAULT 0,
     is_starred INTEGER NOT NULL DEFAULT 0,
     raw_metadata_json TEXT NULL,
+    -- Derived search text: body/caption with mentions swapped for display
+    -- names, plus media file name and sender label. Recomputed by write paths
+    -- and the reindex job; stored raw content is never touched.
+    resolved_text TEXT NULL,
     imported_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE,
     FOREIGN KEY (sender_contact_id) REFERENCES contacts(id) ON DELETE SET NULL
   )`,
+
+  // Canonicalized mentioned identities per message (identity-aware inference):
+  // explicit transport mentions unioned with text-token "@digits" mentions.
+  `CREATE TABLE IF NOT EXISTS message_mentions (
+    message_id INTEGER NOT NULL,
+    mentioned_jid TEXT NOT NULL,
+    PRIMARY KEY (message_id, mentioned_jid),
+    FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
+  ) WITHOUT ROWID`,
 
   liveSessionsTableDdl("live_sessions"),
 
@@ -710,7 +754,39 @@ const schemaStatements = [
   `CREATE INDEX IF NOT EXISTS idx_memory_windows_end ON memory_source_windows (status, end_at_ms)`,
   `CREATE INDEX IF NOT EXISTS idx_memory_revisions_page ON memory_page_revisions (page_id, status, created_at)`,
   `CREATE INDEX IF NOT EXISTS idx_memory_citations_message ON memory_citations (source_message_key, message_id)`,
-  `CREATE INDEX IF NOT EXISTS idx_memory_issues_run ON memory_validation_issues (run_id, severity, code)`
+  `CREATE INDEX IF NOT EXISTS idx_memory_issues_run ON memory_validation_issues (run_id, severity, code)`,
+  `CREATE INDEX IF NOT EXISTS idx_message_mentions_jid ON message_mentions (mentioned_jid, message_id)`
+];
+
+// Full-text search over messages (brain hot tier): a content-storing FTS5
+// table kept in sync by rowid-keyed triggers, so every write path — imports,
+// live ingest, edits, tombstones, merges, collapses — maintains the index
+// without call-site code. Deliberately NOT external-content: external-content
+// deletes must replay the exact previously-indexed values, and any mismatch
+// (e.g. rows that predate the index) corrupts the FTS shadow tables — observed
+// as "database disk image is malformed" on a real archive. Rowid-keyed deletes
+// on a content-storing table are no-ops when the row is absent, which makes
+// the triggers safe in every index state, at the cost of duplicating message
+// text inside the private archive file. Created after additive column
+// migration because the triggers reference messages.resolved_text.
+const searchSchemaStatements = [
+  `CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    resolved_text, body, caption,
+    tokenize='unicode61 remove_diacritics 2', prefix='2 3'
+  )`,
+  `CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
+    DELETE FROM messages_fts WHERE rowid = new.id;
+    INSERT INTO messages_fts(rowid, resolved_text, body, caption)
+    VALUES (new.id, new.resolved_text, new.body, new.caption);
+  END`,
+  `CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
+    DELETE FROM messages_fts WHERE rowid = old.id;
+  END`,
+  `CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE OF resolved_text, body, caption ON messages BEGIN
+    DELETE FROM messages_fts WHERE rowid = new.id;
+    INSERT INTO messages_fts(rowid, resolved_text, body, caption)
+    VALUES (new.id, new.resolved_text, new.body, new.caption);
+  END`
 ];
 
 export function initializeSqliteArchive(dbPath = config.archive.sqlitePath): void {
@@ -747,6 +823,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
   private readonly db: Database.Database;
   private legacyArchive = false;
   private readonly identityLinks = new Map<string, string>();
+  private cachedFtsState: SearchIndexState | null = null;
 
   constructor(private readonly dbPath = config.archive.sqlitePath) {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
@@ -908,6 +985,336 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       }
     }
     return labels;
+  }
+
+  // Write-time mention resolution: digits → the canonical identity the mention
+  // most plausibly refers to. A candidate that is a known contact wins;
+  // otherwise the phone-form candidate stands in until identity links improve.
+  private resolveMentionJids(texts: Array<string | null>): Map<string, string> {
+    const digitsSet = extractMentionDigits(texts);
+    if (digitsSet.size === 0) {
+      return new Map();
+    }
+    const candidatesByDigits = new Map<string, string[]>();
+    const allJids = new Set<string>();
+    for (const digits of digitsSet) {
+      const canonicals = [...new Set(mentionJidCandidates(digits).map((candidate) => this.canonicalJid(candidate) ?? candidate))];
+      candidatesByDigits.set(digits, canonicals);
+      for (const jid of canonicals) {
+        allJids.add(jid);
+      }
+    }
+    const known = new Set<string>();
+    const jids = [...allJids];
+    for (let index = 0; index < jids.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = jids.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      const rows = this.db
+        .prepare(`SELECT source_jid FROM contacts WHERE source_jid IN (${batch.map(() => "?").join(",")})`)
+        .all(...batch) as Array<{ source_jid: string }>;
+      for (const row of rows) {
+        known.add(row.source_jid);
+      }
+    }
+    const resolved = new Map<string, string>();
+    for (const [digits, canonicals] of candidatesByDigits) {
+      const hit = canonicals.find((jid) => known.has(jid));
+      resolved.set(digits, hit ?? canonicals[0]);
+    }
+    return resolved;
+  }
+
+  // Contact display chain (saved name → push name → phone) for a JID batch.
+  private resolveContactLabels(jids: string[]): Map<string, string> {
+    const labels = new Map<string, string>();
+    const unique = [...new Set(jids)].filter(Boolean);
+    for (let index = 0; index < unique.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = unique.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      const rows = this.db
+        .prepare(
+          `SELECT source_jid,
+                  COALESCE(NULLIF(TRIM(COALESCE(display_name, '')), ''), NULLIF(TRIM(COALESCE(push_name, '')), ''), phone_number) AS label
+           FROM contacts
+           WHERE source_jid IN (${batch.map(() => "?").join(",")})`
+        )
+        .all(...batch) as Array<{ source_jid: string; label: string | null }>;
+      for (const row of rows) {
+        if (row.label) {
+          labels.set(row.source_jid, row.label);
+        }
+      }
+    }
+    return labels;
+  }
+
+  // Recompute derived search state (resolved_text + message_mentions) for a
+  // set of messages from their FINAL stored content. Runs inside the caller's
+  // transaction; FTS follows via the update trigger. Rows whose derived state
+  // is already correct are left untouched (no index churn).
+  private syncMessageDerivedState(messageIds: number[], explicitMentionsById?: Map<number, string[]>): void {
+    if (messageIds.length === 0) {
+      return;
+    }
+    const rows: Array<{
+      id: number;
+      body: string | null;
+      caption: string | null;
+      media_name: string | null;
+      sender_source_jid: string | null;
+      resolved_text: string | null;
+    }> = [];
+    const unique = [...new Set(messageIds)];
+    for (let index = 0; index < unique.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = unique.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      rows.push(
+        ...(this.db
+          .prepare(
+            `SELECT id, body, caption, media_name, sender_source_jid, resolved_text
+             FROM messages WHERE id IN (${batch.map(() => "?").join(",")})`
+          )
+          .all(...batch) as typeof rows)
+      );
+    }
+    const texts = rows.flatMap((row) => [row.body, row.caption]);
+    const mentionLabels = this.resolveMentionLabels(texts);
+    const mentionJids = this.resolveMentionJids(texts);
+    const senderLabels = this.resolveContactLabels(
+      rows.map((row) => row.sender_source_jid).filter((jid): jid is string => Boolean(jid))
+    );
+    const updateResolved = this.db.prepare(`UPDATE messages SET resolved_text = ? WHERE id = ?`);
+    const selectMentions = this.db.prepare(`SELECT mentioned_jid FROM message_mentions WHERE message_id = ?`);
+    const deleteMentions = this.db.prepare(`DELETE FROM message_mentions WHERE message_id = ?`);
+    const insertMention = this.db.prepare(`INSERT OR IGNORE INTO message_mentions (message_id, mentioned_jid) VALUES (?, ?)`);
+    for (const row of rows) {
+      const senderLabel = row.sender_source_jid
+        ? senderLabels.get(row.sender_source_jid) ?? displayPhoneFromJid(row.sender_source_jid)
+        : null;
+      const resolved = composeResolvedText(row.body, row.caption, row.media_name, senderLabel, mentionLabels);
+      if ((resolved ?? null) !== (row.resolved_text ?? null)) {
+        updateResolved.run(resolved, row.id);
+      }
+      const desired = new Set<string>(explicitMentionsById?.get(row.id) ?? []);
+      for (const digits of extractMentionDigits([row.body, row.caption])) {
+        const jid = mentionJids.get(digits);
+        if (jid) {
+          desired.add(jid);
+        }
+      }
+      const existing = (selectMentions.all(row.id) as Array<{ mentioned_jid: string }>).map((mention) => mention.mentioned_jid);
+      if (existing.length !== desired.size || existing.some((jid) => !desired.has(jid))) {
+        deleteMentions.run(row.id);
+        for (const jid of desired) {
+          insertMention.run(row.id, jid);
+        }
+      }
+    }
+  }
+
+  private getFtsState(): SearchIndexState {
+    if (this.cachedFtsState === null) {
+      const row = this.db.prepare(`SELECT value FROM schema_meta WHERE key = 'fts_state'`).get() as { value: string } | undefined;
+      this.cachedFtsState = row?.value === "ready" ? "ready" : "needs_rebuild";
+    }
+    return this.cachedFtsState;
+  }
+
+  private setFtsState(state: SearchIndexState): void {
+    this.db
+      .prepare(
+        `INSERT INTO schema_meta (key, value, updated_at) VALUES ('fts_state', ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+      )
+      .run(state, currentIso());
+    this.cachedFtsState = state;
+  }
+
+  async getSearchIndexStatus(): Promise<SearchIndexStatus> {
+    const totals = this.db.prepare(`SELECT COUNT(*) AS count FROM messages`).get() as { count: number };
+    return { state: this.getFtsState(), totalMessages: Number(totals.count ?? 0) };
+  }
+
+  async searchMessages(options: SearchQueryOptions): Promise<SearchResponse> {
+    const index = await this.getSearchIndexStatus();
+    if (index.state !== "ready") {
+      throw new PublicError(
+        "SEARCH_INDEX_NOT_BUILT",
+        "The search index has not been built for this archive yet. Run the search reindex to enable global search."
+      );
+    }
+    const match = buildFtsMatchQuery(options.query);
+    if (!match) {
+      return { index, totalMatches: 0, results: [] };
+    }
+    const where = ["messages_fts MATCH ?"];
+    const params: unknown[] = [match];
+    if (options.chatId != null) {
+      where.push("m.chat_id = ?");
+      params.push(options.chatId);
+    }
+    if (options.sender) {
+      const sender = options.sender.trim();
+      if (sender.includes("@")) {
+        where.push("m.sender_source_jid = ?");
+        params.push(this.canonicalJid(sender) ?? sender);
+      } else {
+        where.push("(c.display_name LIKE ? OR c.push_name LIKE ? OR c.phone_number LIKE ?)");
+        params.push(`%${sender}%`, `%${sender}%`, `%${sender.replace(/\D/g, "") || sender}%`);
+      }
+    }
+    if (options.afterMs != null) {
+      where.push("m.timestamp_ms >= ?");
+      params.push(options.afterMs);
+    }
+    if (options.beforeMs != null) {
+      where.push("m.timestamp_ms <= ?");
+      params.push(options.beforeMs);
+    }
+    if (options.type === "text") {
+      where.push("m.has_media = 0 AND m.message_type <> 'call'");
+    } else if (options.type === "media") {
+      where.push("(m.has_media = 1 OR m.message_type IN ('image','video','audio','document','sticker','view_once','ptv'))");
+    } else if (options.type === "call") {
+      where.push("m.message_type = 'call'");
+    }
+    if (options.direction) {
+      where.push("m.direction = ?");
+      params.push(options.direction);
+    }
+    if (!options.includeNoise) {
+      where.push(visibleExchangePredicate("m"));
+    }
+    // Exact archive-wide match count (same predicate, no ranking work).
+    const totalMatches = Number(
+      (
+        this.db
+          .prepare(
+            `SELECT COUNT(*) AS count
+             FROM messages_fts
+             JOIN messages m ON m.id = messages_fts.rowid
+             JOIN chats ch ON ch.id = m.chat_id
+             LEFT JOIN contacts c ON c.source_jid = m.sender_source_jid
+             WHERE ${where.join(" AND ")}`
+          )
+          .get(...params) as { count: number }
+      ).count ?? 0
+    );
+    // Candidate pool: top matches by BM25, reranked in JS with recency decay.
+    // Deterministic paging inside the pool; offsets beyond it return empty.
+    const rows = this.db
+      .prepare(
+        `SELECT m.id, m.source_message_key, m.source_message_id, m.chat_id, m.sender_source_jid,
+                m.timestamp_ms, m.sent_at, m.direction, m.message_type, m.is_deleted, m.has_media, m.body,
+                ch.source_chat_id AS chat_source_id, ch.display_name AS chat_display_name, ch.chat_type,
+                COALESCE(NULLIF(TRIM(COALESCE(c.display_name, '')), ''), NULLIF(TRIM(COALESCE(c.push_name, '')), ''), c.phone_number) AS sender_display_name,
+                bm25(messages_fts, 3.0, 2.0, 1.0) AS rank,
+                snippet(messages_fts, 0, ?, ?, '…', 14) AS snip_resolved,
+                snippet(messages_fts, 1, ?, ?, '…', 14) AS snip_body,
+                snippet(messages_fts, 2, ?, ?, '…', 14) AS snip_caption
+         FROM messages_fts
+         JOIN messages m ON m.id = messages_fts.rowid
+         JOIN chats ch ON ch.id = m.chat_id
+         LEFT JOIN contacts c ON c.source_jid = m.sender_source_jid
+         WHERE ${where.join(" AND ")}
+         ORDER BY rank
+         LIMIT ${SEARCH_CANDIDATE_POOL}`
+      )
+      .all(
+        SEARCH_HIGHLIGHT_START,
+        SEARCH_HIGHLIGHT_END,
+        SEARCH_HIGHLIGHT_START,
+        SEARCH_HIGHLIGHT_END,
+        SEARCH_HIGHLIGHT_START,
+        SEARCH_HIGHLIGHT_END,
+        ...params
+      ) as SqliteSearchRow[];
+    const nowMs = Date.now();
+    const mentionLabels = this.resolveMentionLabels(rows.map((row) => row.body));
+    const scored = rows.map((row) => {
+      // FTS5 bm25() is negative for matches; smaller = better.
+      const relevance = Math.max(0, -Number(row.rank));
+      const ageDays = row.timestamp_ms != null ? Math.max(0, (nowMs - Number(row.timestamp_ms)) / 86_400_000) : 365;
+      const recency = 0.2 + 0.8 * Math.pow(0.5, ageDays / 90);
+      const snippetRaw = pickSnippet(row);
+      return {
+        item: {
+          layer: "message" as const,
+          messageId: Number(row.id),
+          sourceMessageKey: row.source_message_key,
+          sourceMessageId: row.source_message_id,
+          chatId: Number(row.chat_id),
+          chatSourceId: row.chat_source_id,
+          chatDisplayName: row.chat_display_name ?? null,
+          chatType: row.chat_type as SearchResultItem["chatType"],
+          senderDisplayName: row.sender_display_name ?? displayPhoneFromJid(row.sender_source_jid),
+          senderSourceJid: row.sender_source_jid,
+          timestampMs: row.timestamp_ms == null ? null : Number(row.timestamp_ms),
+          sentAt: row.sent_at,
+          direction: row.direction as SearchResultItem["direction"],
+          messageType: row.message_type,
+          interpretation: interpretMessage({
+            messageType: row.message_type,
+            isDeleted: Boolean(row.is_deleted),
+            hasHeldContent: Boolean(row.body?.trim() || row.has_media),
+            mediaAvailability: null
+          }),
+          snippet: applyMentionLabels(snippetRaw, mentionLabels) ?? snippetRaw,
+          score: relevance * recency,
+          hasMedia: Boolean(row.has_media),
+          isDeleted: Boolean(row.is_deleted)
+        },
+        score: relevance * recency
+      };
+    });
+    scored.sort((a, b) => b.score - a.score);
+    const results = scored.slice(options.offset, options.offset + options.limit).map((entry) => entry.item);
+    return { index, totalMatches, results };
+  }
+
+  async rebuildSearchIndex(onProgress?: (processedMessages: number, totalMessages: number) => void): Promise<{ indexedMessages: number }> {
+    const total = (this.db.prepare(`SELECT COUNT(*) AS count FROM messages`).get() as { count: number }).count;
+    onProgress?.(0, total);
+    // Honest state while the index is incomplete; searches refuse instead of
+    // answering from a half-built index.
+    this.setFtsState("needs_rebuild");
+    // Start from a fresh table: erases any prior index state wholesale,
+    // including shadow-table corruption left by the retired external-content
+    // design. Triggers keep rows written during the rebuild indexed (rowid-
+    // keyed writes are safe in any state), and the ascending id cursor
+    // re-covers them idempotently.
+    this.db.exec(
+      `DROP TABLE IF EXISTS messages_fts;
+       ${searchSchemaStatements[0]}`
+    );
+    let processed = 0;
+    let lastId = 0;
+    const pageStmt = this.db.prepare(`SELECT id FROM messages WHERE id > ? ORDER BY id LIMIT ${SEARCH_REINDEX_CHUNK}`);
+    for (;;) {
+      const ids = (pageStmt.all(lastId) as Array<{ id: number }>).map((row) => Number(row.id));
+      if (ids.length === 0) {
+        break;
+      }
+      this.db.transaction(() => {
+        this.syncMessageDerivedState(ids);
+        for (let index = 0; index < ids.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+          const batch = ids.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+          const placeholders = batch.map(() => "?").join(",");
+          this.db.prepare(`DELETE FROM messages_fts WHERE rowid IN (${placeholders})`).run(...batch);
+          this.db
+            .prepare(
+              `INSERT INTO messages_fts(rowid, resolved_text, body, caption)
+               SELECT id, resolved_text, body, caption FROM messages WHERE id IN (${placeholders})`
+            )
+            .run(...batch);
+        }
+      })();
+      processed += ids.length;
+      lastId = ids[ids.length - 1];
+      onProgress?.(Math.min(processed, total), total);
+      // Yield between chunks so live ingestion and HTTP stay responsive.
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    this.setFtsState("ready");
+    onProgress?.(total, total);
+    return { indexedMessages: total };
   }
 
   async collapseSupersededMessages(
@@ -1133,6 +1540,10 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         .prepare(`DELETE FROM chat_participants WHERE source_jid = ? AND EXISTS (SELECT 1 FROM chat_participants p2 WHERE p2.chat_id = chat_participants.chat_id AND p2.source_jid = ?)`)
         .run(lid, pn);
       this.db.prepare(`UPDATE chat_participants SET source_jid = ? WHERE source_jid = ?`).run(pn, lid);
+      // Mentions recorded under the LID collapse onto the canonical identity;
+      // rows that would duplicate an existing canonical mention just drop.
+      this.db.prepare(`UPDATE OR IGNORE message_mentions SET mentioned_jid = ? WHERE mentioned_jid = ?`).run(pn, lid);
+      this.db.prepare(`DELETE FROM message_mentions WHERE mentioned_jid = ?`).run(lid);
 
       // Live bookkeeping follows the merge.
       const pnCheckpoint = this.db.prepare(`SELECT chat_source_id FROM live_chat_checkpoints WHERE chat_source_id = ?`).get(pn);
@@ -1148,6 +1559,25 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     transaction();
     await this.refreshChatStats([pn]);
     await this.markStaleMemoryForMissingMessages();
+    // The merge may have improved name resolution for this identity: refresh
+    // derived search text for its messages and the messages that mention it,
+    // chunked with yields so a heavy sender never stalls ingestion.
+    const affected = (
+      this.db
+        .prepare(
+          `SELECT id FROM messages WHERE sender_source_jid = ?
+           UNION
+           SELECT message_id AS id FROM message_mentions WHERE mentioned_jid = ?`
+        )
+        .all(pn, pn) as Array<{ id: number }>
+    ).map((row) => Number(row.id));
+    for (let index = 0; index < affected.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const chunk = affected.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      this.db.transaction(() => this.syncMessageDerivedState(chunk))();
+      if (index + SQLITE_IN_QUERY_BATCH_SIZE < affected.length) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    }
     return result;
   }
 
@@ -1503,12 +1933,21 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     const senderIds = this.getContactIds([
       ...new Set(canonical.map((message) => message.senderSourceJid).filter((jid): jid is string => Boolean(jid)))
     ]);
+    // Derived search text for the insert path, computed from the incoming
+    // values; conflict-merged rows are recomputed from final state below.
+    const incomingMentionLabels = this.resolveMentionLabels(canonical.flatMap((message) => [message.body ?? null, message.caption ?? null]));
+    const incomingSenderLabels = this.resolveContactLabels(
+      canonical.map((message) => message.senderSourceJid).filter((jid): jid is string => Boolean(jid))
+    );
     const rows = canonical
       .map((message) => {
         const chatId = chatIds.get(message.chatSourceId);
         if (!chatId) {
           return null;
         }
+        const senderLabel = message.senderSourceJid
+          ? incomingSenderLabels.get(message.senderSourceJid) ?? displayPhoneFromJid(message.senderSourceJid)
+          : null;
         return {
           sourceMessageKey: message.sourceMessageKey,
           sourceMessageId: message.sourceMessageId,
@@ -1532,7 +1971,17 @@ export class SqliteArchiveRepository implements ArchiveRepository {
           isDeleted: Number(message.isDeleted),
           isForwarded: Number(message.isForwarded),
           isStarred: Number(message.isStarred),
-          rawMetadata: stringifyJson(message.rawMetadata ?? null)
+          rawMetadata: stringifyJson(message.rawMetadata ?? null),
+          resolvedText: composeResolvedText(
+            message.body ?? null,
+            message.caption ?? null,
+            message.mediaName ?? null,
+            senderLabel,
+            incomingMentionLabels
+          ),
+          mentionedJids: [
+            ...new Set((message.mentionedJids ?? []).map((jid) => this.canonicalJid(jid)).filter((jid): jid is string => Boolean(jid)))
+          ]
         };
       })
       .filter((row): row is NonNullable<typeof row> => row !== null);
@@ -1545,8 +1994,8 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       `INSERT INTO messages
        (source_message_key, source_message_id, source_table, source_row_id, chat_id, sender_contact_id, sender_source_jid,
         timestamp_ms, sent_at, direction, from_me, message_type, raw_type_code, body, caption, has_media, media_mime_type,
-        media_name, quoted_source_message_id, is_deleted, is_forwarded, is_starred, raw_metadata_json)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        media_name, quoted_source_message_id, is_deleted, is_forwarded, is_starred, raw_metadata_json, resolved_text)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(source_message_key) DO UPDATE SET
          chat_id = excluded.chat_id,
          sender_contact_id = COALESCE(excluded.sender_contact_id, messages.sender_contact_id),
@@ -1621,9 +2070,32 @@ export class SqliteArchiveRepository implements ArchiveRepository {
           row.isDeleted,
           row.isForwarded,
           row.isStarred,
-          row.rawMetadata
+          row.rawMetadata,
+          row.resolvedText
         );
       }
+      // Conflict-merged rows may have kept older body/caption (tombstones,
+      // contentless re-deliveries); recompute derived search state from the
+      // FINAL stored content so the index never diverges from the row.
+      const keys = rows.map((row) => row.sourceMessageKey);
+      const explicitMentionsById = new Map<number, string[]>();
+      const idsByKey = new Map<string, number>();
+      for (let index = 0; index < keys.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+        const batch = keys.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+        const found = this.db
+          .prepare(`SELECT id, source_message_key FROM messages WHERE source_message_key IN (${batch.map(() => "?").join(",")})`)
+          .all(...batch) as Array<{ id: number; source_message_key: string }>;
+        for (const row of found) {
+          idsByKey.set(row.source_message_key, Number(row.id));
+        }
+      }
+      for (const row of rows) {
+        const id = idsByKey.get(row.sourceMessageKey);
+        if (id != null && row.mentionedJids.length > 0) {
+          explicitMentionsById.set(id, row.mentionedJids);
+        }
+      }
+      this.syncMessageDerivedState([...idsByKey.values()], explicitMentionsById);
     });
     transaction();
     return rows.length;
@@ -1668,6 +2140,9 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     })();
     // A cleared archive is a valid fresh start under the current identity scheme.
     this.stampIdentityVersion();
+    // Deleting messages emptied the FTS index through its triggers, so a
+    // cleared archive is consistent and searchable from the start.
+    this.setFtsState("ready");
     this.identityLinks.clear();
   }
 
@@ -2072,6 +2547,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
        WHERE c.source_chat_id = ? AND m.source_message_id = ?
        LIMIT 1`
     );
+    const editedKeys: string[] = [];
     const transaction = this.db.transaction(() => {
       for (const update of updates) {
         let targetKey: string | null = update.sourceMessageKey;
@@ -2094,6 +2570,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
               insertRevision.run(targetKey, Number(next), current.body, current.caption, update.occurredAtMs ?? null);
             }
             applyEdit.run(update.metadata.body, targetKey);
+            editedKeys.push(targetKey);
           }
           if (update.updateType === "poll_vote" || update.updateType === "event_response") {
             const row = readMetadata.get(targetKey) as { raw_metadata_json: string | null } | undefined;
@@ -2117,6 +2594,19 @@ export class SqliteArchiveRepository implements ArchiveRepository {
           stringifyJson(update.metadata ?? null),
           currentIso()
         );
+      }
+      // Edits changed stored body: bring derived search text and mentions back
+      // in line with the final content inside the same transaction.
+      if (editedKeys.length > 0) {
+        const editedIds: number[] = [];
+        const lookup = this.db.prepare(`SELECT id FROM messages WHERE source_message_key = ?`);
+        for (const key of new Set(editedKeys)) {
+          const row = lookup.get(key) as { id: number } | undefined;
+          if (row) {
+            editedIds.push(Number(row.id));
+          }
+        }
+        this.syncMessageDerivedState(editedIds);
       }
     });
     transaction();
@@ -2778,25 +3268,54 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       | undefined;
     const rows = this.db
       .prepare(
-        `SELECT m.id, m.source_message_id,
-                COALESCE(NULLIF(TRIM(COALESCE(c.display_name, '')), ''), NULLIF(TRIM(COALESCE(c.push_name, '')), ''), c.phone_number) AS sender_display_name,
-                m.sender_source_jid, m.timestamp_ms, m.sent_at, m.direction, m.message_type, m.body, m.caption,
-                m.has_media, m.media_mime_type, m.media_name, m.is_deleted, m.is_forwarded, m.is_starred,
-                m.source_table,
-                COALESCE(json_extract(m.raw_metadata_json, '$.edited'), 0) AS edited_flag,
-                (SELECT COUNT(*) FROM message_edit_revisions r WHERE r.message_key = m.source_message_key) AS edit_revision_count,
-                ${MEDIA_STATE_SELECT},
-                lp.title AS preview_title, lp.description AS preview_description, lp.canonical_url AS preview_url,
-                (lp.thumbnail IS NOT NULL) AS preview_has_thumbnail
-         FROM messages m
-         LEFT JOIN contacts c ON c.source_jid = m.sender_source_jid
-         ${MEDIA_STATE_JOINS}
-         LEFT JOIN message_link_previews lp ON lp.message_key = m.source_message_key
-         WHERE ${where.join(" AND ")}
-         ORDER BY m.timestamp_ms ${orderDirection}, m.id ${orderDirection}
-         LIMIT ? OFFSET ?`
+        messageListSelectSql(
+          `WHERE ${where.join(" AND ")}`,
+          `ORDER BY m.timestamp_ms ${orderDirection}, m.id ${orderDirection}`,
+          `LIMIT ? OFFSET ?`
+        )
       )
       .all(...params) as SqliteMessageRow[];
+    return this.mapMessageRows(rows, chat);
+  }
+
+  async listMessagesAround(chatId: number, messageId: number, radius: number): Promise<MessageContextWindow | null> {
+    const anchor = this.db
+      .prepare(`SELECT id, timestamp_ms FROM messages WHERE id = ? AND chat_id = ?`)
+      .get(messageId, chatId) as { id: number; timestamp_ms: number | null } | undefined;
+    if (!anchor) {
+      return null;
+    }
+    const chat = this.db.prepare(`SELECT source_chat_id, chat_type FROM chats WHERE id = ?`).get(chatId) as
+      | { source_chat_id: string; chat_type: string }
+      | undefined;
+    const anchorTs = anchor.timestamp_ms ?? 0;
+    const newerPredicate = `m.chat_id = ? AND (COALESCE(m.timestamp_ms, 0) > ? OR (COALESCE(m.timestamp_ms, 0) = ? AND m.id > ?))`;
+    const olderEqPredicate = `m.chat_id = ? AND (COALESCE(m.timestamp_ms, 0) < ? OR (COALESCE(m.timestamp_ms, 0) = ? AND m.id <= ?))`;
+    const predicateParams = [chatId, anchorTs, anchorTs, messageId];
+    // Anchor + up to `radius` older rows, and up to `radius` newer rows.
+    const olderRows = this.db
+      .prepare(messageListSelectSql(`WHERE ${olderEqPredicate}`, `ORDER BY m.timestamp_ms DESC, m.id DESC`, `LIMIT ?`))
+      .all(...predicateParams, radius + 1) as SqliteMessageRow[];
+    const newerRows = this.db
+      .prepare(messageListSelectSql(`WHERE ${newerPredicate}`, `ORDER BY m.timestamp_ms ASC, m.id ASC`, `LIMIT ?`))
+      .all(...predicateParams, radius) as SqliteMessageRow[];
+    const newerTotal = (
+      this.db.prepare(`SELECT COUNT(*) AS count FROM messages m WHERE ${newerPredicate}`).get(...predicateParams) as { count: number }
+    ).count;
+    // Chronological ascending window: reversed older block, then newer block.
+    const rows = [...olderRows.reverse(), ...newerRows];
+    return {
+      messages: this.mapMessageRows(rows, chat),
+      newerCount: Math.max(0, Number(newerTotal) - newerRows.length),
+      anchorMessageId: messageId
+    };
+  }
+
+  // Shared MessageListItem projection for thread pages and context windows.
+  private mapMessageRows(
+    rows: SqliteMessageRow[],
+    chat: { source_chat_id: string; chat_type: string } | undefined
+  ): MessageListItem[] {
     const groupSelfSender = chat?.chat_type === "group" ? chat.source_chat_id : null;
     const mentionLabels = this.resolveMentionLabels(rows.flatMap((row) => [row.body, row.caption]));
     return rows.map((row) => {
@@ -3349,6 +3868,13 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     // Recompute the legacy gate and rebuild the identity-link cache from the
     // restored tables, discarding anything learned during the aborted run.
     this.initializeIdentityState();
+    // Re-read the restored fts_state stamp; if the index was invalid before the
+    // restore, its garbage survived the replay and the stamp must stay honest.
+    const stateBefore = this.cachedFtsState;
+    this.cachedFtsState = null;
+    if (stateBefore === "needs_rebuild") {
+      this.setFtsState("needs_rebuild");
+    }
   }
 
   private clearSqliteSequence(): void {
@@ -3370,6 +3896,7 @@ function ensureSchema(db: Database.Database): void {
   migrateLiveMessageUpdateTypes(db);
   db.exec(schemaStatements.join(";\n"));
   migrateAdditiveColumns(db);
+  ensureSearchSchema(db);
   // Drop the removed view-once recovery queue if a prior build created it. It
   // only ever held transient request state (message keys, no content), so this
   // is safe cleanup, not a data migration.
@@ -3401,13 +3928,45 @@ function migrateLiveMessageUpdateTypes(db: Database.Database): void {
 
 function migrateAdditiveColumns(db: Database.Database): void {
   const additions: Array<{ table: string; column: string; ddl: string }> = [
-    { table: "chats", column: "platform_recency_ms", ddl: "ALTER TABLE chats ADD COLUMN platform_recency_ms INTEGER NULL" }
+    { table: "chats", column: "platform_recency_ms", ddl: "ALTER TABLE chats ADD COLUMN platform_recency_ms INTEGER NULL" },
+    { table: "messages", column: "resolved_text", ddl: "ALTER TABLE messages ADD COLUMN resolved_text TEXT NULL" }
   ];
   for (const addition of additions) {
     const columns = db.prepare(`SELECT name FROM pragma_table_info(?)`).all(addition.table) as Array<{ name: string }>;
     if (!columns.some((column) => column.name === addition.column)) {
       db.exec(addition.ddl);
     }
+  }
+}
+
+// FTS + triggers land after column migration (they reference resolved_text).
+// The state stamp is written once: an archive that already held messages when
+// the index appeared must run a reindex before search answers — the empty
+// index would otherwise silently pretend those messages do not exist.
+function ensureSearchSchema(db: Database.Database): void {
+  // Migration from the retired external-content design: drop it (including
+  // any shadow-table corruption its delete-by-value triggers accumulated) and
+  // force a rebuild under the rowid-keyed scheme.
+  const existingFts = db
+    .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts'`)
+    .get() as { sql: string } | undefined;
+  const legacyExternalContent = Boolean(existingFts?.sql && existingFts.sql.includes("content="));
+  if (legacyExternalContent) {
+    db.exec(
+      `DROP TRIGGER IF EXISTS messages_fts_ai;
+       DROP TRIGGER IF EXISTS messages_fts_ad;
+       DROP TRIGGER IF EXISTS messages_fts_au;
+       DROP TABLE IF EXISTS messages_fts;`
+    );
+  }
+  db.exec(searchSchemaStatements.join(";\n"));
+  const stamped = db.prepare(`SELECT value FROM schema_meta WHERE key = 'fts_state'`).get() as { value: string } | undefined;
+  if (!stamped || legacyExternalContent) {
+    const messageCount = (db.prepare(`SELECT COUNT(*) AS count FROM messages`).get() as { count: number }).count;
+    db.prepare(
+      `INSERT INTO schema_meta (key, value, updated_at) VALUES ('fts_state', ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+    ).run(messageCount > 0 ? "needs_rebuild" : "ready", new Date().toISOString());
   }
 }
 
@@ -3717,6 +4276,101 @@ function displayPhoneFromJid(jid: string | null | undefined): string | null {
   }
   const digits = user?.split(":")[0]?.replace(/\D/g, "");
   return digits ? `+${digits}` : null;
+}
+
+// Search tuning: candidate pool reranked in JS (BM25 × recency decay) and the
+// reindex chunk size (rows recomputed per transaction between event-loop
+// yields).
+const SEARCH_CANDIDATE_POOL = 240;
+const SEARCH_REINDEX_CHUNK = 2000;
+
+interface SqliteSearchRow {
+  id: number;
+  source_message_key: string;
+  source_message_id: string;
+  chat_id: number;
+  sender_source_jid: string | null;
+  timestamp_ms: number | null;
+  sent_at: string | null;
+  direction: string;
+  message_type: string;
+  is_deleted: number;
+  has_media: number;
+  body: string | null;
+  chat_source_id: string;
+  chat_display_name: string | null;
+  chat_type: string;
+  sender_display_name: string | null;
+  rank: number;
+  snip_resolved: string | null;
+  snip_body: string | null;
+  snip_caption: string | null;
+}
+
+// User text → FTS5 MATCH expression. Every token becomes a quoted phrase so
+// FTS operators in user input are inert; the final unquoted token gets prefix
+// matching so search-as-you-type works. Returns null for queries with no
+// searchable tokens.
+function buildFtsMatchQuery(raw: string): string | null {
+  const tokens = raw.match(/"[^"]*"|\S+/g) ?? [];
+  const parts: string[] = [];
+  tokens.forEach((token, index) => {
+    let phrase = token;
+    let quoted = false;
+    if (phrase.length >= 2 && phrase.startsWith('"') && phrase.endsWith('"')) {
+      quoted = true;
+      phrase = phrase.slice(1, -1);
+    }
+    const cleaned = phrase.replace(/"/g, " ").trim();
+    if (!cleaned) {
+      return;
+    }
+    const prefix = !quoted && index === tokens.length - 1 && /[\p{L}\p{N}]{2,}$/u.test(cleaned);
+    parts.push(`"${cleaned}"${prefix ? "*" : ""}`);
+  });
+  return parts.length > 0 ? parts.join(" ") : null;
+}
+
+// Prefer the snippet closest to what the user sees (body, then caption), then
+// the resolved-text snippet (which may have matched a name or file name).
+function pickSnippet(row: SqliteSearchRow): string {
+  for (const candidate of [row.snip_body, row.snip_caption, row.snip_resolved]) {
+    if (candidate && candidate.includes(SEARCH_HIGHLIGHT_START)) {
+      return candidate;
+    }
+  }
+  return row.snip_body?.trim() || row.snip_caption?.trim() || row.snip_resolved?.trim() || (row.body ?? "").slice(0, 160);
+}
+
+// Derived search text for one message: resolved body/caption (mentions as
+// names), media file name, and the sender label. Content-less rows stay null
+// so system noise never matches person-name queries.
+function composeResolvedText(
+  body: string | null,
+  caption: string | null,
+  mediaName: string | null,
+  senderLabel: string | null,
+  mentionLabels: Map<string, string>
+): string | null {
+  const parts: string[] = [];
+  const resolvedBody = applyMentionLabels(body, mentionLabels)?.trim();
+  const resolvedCaption = applyMentionLabels(caption, mentionLabels)?.trim();
+  if (resolvedBody) {
+    parts.push(resolvedBody);
+  }
+  if (resolvedCaption) {
+    parts.push(resolvedCaption);
+  }
+  if (mediaName?.trim()) {
+    parts.push(mediaName.trim());
+  }
+  if (parts.length === 0) {
+    return null;
+  }
+  if (senderLabel?.trim()) {
+    parts.push(senderLabel.trim());
+  }
+  return parts.join("\n");
 }
 
 // A "visible exchange" is a message a user would recognize as conversation:

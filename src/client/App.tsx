@@ -26,6 +26,7 @@ import {
   Search,
   ShieldCheck,
   Signal,
+  SlidersHorizontal,
   Sparkles,
   Trash2,
   Unlink,
@@ -51,8 +52,13 @@ import type {
   MessageEditRevisionRecord,
   MessageListItem,
   PickKind,
+  SearchIndexStatus,
+  SearchReindexProgress,
+  SearchResultItem,
+  SearchTypeFilter,
   StatusSummary
 } from "../shared/types";
+import { SEARCH_HIGHLIGHT_END, SEARCH_HIGHLIGHT_START } from "../shared/types";
 import {
   cancelImportJob,
   cleanupTempFiles,
@@ -63,6 +69,8 @@ import {
   getImportJob,
   getLivePairing,
   getLiveProgress,
+  getMessageContext,
+  getSearchStatus,
   getStatus,
   initDatabase,
   linkLiveSession,
@@ -79,8 +87,10 @@ import {
   resumeLiveSession,
   retryLiveGap,
   retryStuckMedia,
+  searchArchive,
   startMemoryRun,
   startImportJob,
+  startSearchReindex,
   stopLiveSession,
   unlinkLiveSession,
   verifyImportKey
@@ -117,10 +127,27 @@ export function App() {
   const [memoryResult, setMemoryResult] = useState<MemoryQueryResult | null>(null);
   const [memoryCitation, setMemoryCitation] = useState<MemoryCitationResolution | null>(null);
   const [lightbox, setLightbox] = useState<{ assetId: number; mimeType: string | null } | null>(null);
+  const [globalQuery, setGlobalQuery] = useState("");
+  const [globalResults, setGlobalResults] = useState<SearchResultItem[]>([]);
+  const [globalTotalMatches, setGlobalTotalMatches] = useState(0);
+  const [globalSearching, setGlobalSearching] = useState(false);
+  const [globalSearchError, setGlobalSearchError] = useState<string | null>(null);
+  const [searchIndex, setSearchIndex] = useState<SearchIndexStatus | null>(null);
+  const [reindexProgress, setReindexProgress] = useState<SearchReindexProgress | null>(null);
+  const [searchSender, setSearchSender] = useState("");
+  const [searchType, setSearchType] = useState<"all" | SearchTypeFilter>("all");
+  const [searchDirection, setSearchDirection] = useState<"all" | "incoming" | "outgoing">("all");
+  const [searchAfter, setSearchAfter] = useState("");
+  const [searchBefore, setSearchBefore] = useState("");
+  // Search deep-link state: a thread window centered on a hit, with enough
+  // bookkeeping to page older (offset side) and newer (toward the present).
+  const [jumpContext, setJumpContext] = useState<{ anchorId: number; newerCount: number } | null>(null);
   const messageListRef = useRef<HTMLDivElement | null>(null);
   const loadingMessagesRef = useRef(false);
-  const scrollActionRef = useRef<"bottom" | "preserve" | null>(null);
+  const scrollActionRef = useRef<"bottom" | "preserve" | "anchor" | null>(null);
   const previousScrollHeightRef = useRef(0);
+  const pendingJumpRef = useRef<{ chatId: number; anchorId: number } | null>(null);
+  const anchorScrollRef = useRef<number | null>(null);
 
   useEffect(() => {
     void refreshStatus();
@@ -133,6 +160,15 @@ export function App() {
 
   useEffect(() => {
     if (selectedChat) {
+      const jump = pendingJumpRef.current;
+      if (jump && jump.chatId === selectedChat.id) {
+        pendingJumpRef.current = null;
+        setMessages([]);
+        void loadMessagesAroundAnchor(selectedChat, jump.anchorId);
+        return;
+      }
+      setJumpContext(null);
+      anchorScrollRef.current = null;
       setMessageOffset(0);
       setMessageHasMore(false);
       setMessages([]);
@@ -140,6 +176,88 @@ export function App() {
       void loadMessages(selectedChat, true);
     }
   }, [selectedChat?.id, messageQuery]);
+
+  // Debounced global archive search; index state rides on every response so a
+  // needs-rebuild archive shows the reindex call to action instead of results.
+  useEffect(() => {
+    const query = globalQuery.trim();
+    if (!query) {
+      setGlobalResults([]);
+      setGlobalSearchError(null);
+      setGlobalSearching(false);
+      return;
+    }
+    let cancelled = false;
+    setGlobalSearching(true);
+    const timer = window.setTimeout(() => {
+      searchArchive({
+        query,
+        sender: searchSender.trim() || null,
+        type: searchType === "all" ? null : searchType,
+        direction: searchDirection === "all" ? null : searchDirection,
+        afterMs: searchAfter ? Date.parse(`${searchAfter}T00:00:00`) : null,
+        beforeMs: searchBefore ? Date.parse(`${searchBefore}T23:59:59.999`) : null,
+        limit: 50
+      })
+        .then((response) => {
+          if (cancelled) return;
+          // Defensive against server/client version skew mid-deploy: older
+          // servers may answer without newer fields.
+          setGlobalResults(response.results ?? []);
+          setGlobalTotalMatches(response.totalMatches ?? response.results?.length ?? 0);
+          setSearchIndex(response.index ?? null);
+          setGlobalSearchError(null);
+        })
+        .catch((err) => {
+          if (cancelled) return;
+          setGlobalResults([]);
+          setGlobalTotalMatches(0);
+          setGlobalSearchError(err instanceof Error ? err.message : "Search failed.");
+          getSearchStatus()
+            .then((status) => {
+              if (!cancelled) {
+                setSearchIndex(status.index);
+                setReindexProgress(status.reindex);
+              }
+            })
+            .catch(() => undefined);
+        })
+        .finally(() => {
+          if (!cancelled) setGlobalSearching(false);
+        });
+    }, 250);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [globalQuery, searchSender, searchType, searchDirection, searchAfter, searchBefore, searchIndex?.state]);
+
+  // Poll reindex progress while the job runs; completion flips the index state
+  // which re-fires the search effect above.
+  useEffect(() => {
+    if (!reindexProgress || (reindexProgress.state !== "running" && reindexProgress.state !== "finalizing")) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      getSearchStatus()
+        .then((status) => {
+          setReindexProgress(status.reindex);
+          setSearchIndex(status.index);
+        })
+        .catch(() => undefined);
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [reindexProgress?.state]);
+
+  // Failures are never silent: a failed index build raises the global error
+  // toast no matter which panel the user is looking at.
+  useEffect(() => {
+    if (reindexProgress?.state === "failed") {
+      setError(
+        `Search index build failed${reindexProgress.error ? `: ${reindexProgress.error}` : "."} Retry from the search panel.`
+      );
+    }
+  }, [reindexProgress?.state]);
 
   useEffect(() => {
     const events = new EventSource("/api/archive/events");
@@ -158,8 +276,9 @@ export function App() {
           ? change.chatSourceIds.length === 0 || change.chatSourceIds.includes(currentSelectedChat.sourceChatId)
           : false;
         // WhatsApp behavior: live updates follow the conversation only when the
-        // user is already at the bottom; never move them while reading history.
-        if (currentSelectedChat && selectedChatChanged && isNearBottom(messageListRef.current)) {
+        // user is already at the bottom; never move them while reading history
+        // (including a search-jump window, which is history by definition).
+        if (currentSelectedChat && selectedChatChanged && !jumpContext && isNearBottom(messageListRef.current)) {
           setMessageOffset(0);
           setMessageHasMore(false);
           scrollActionRef.current = "bottom";
@@ -184,7 +303,7 @@ export function App() {
       }
       events.close();
     };
-  }, [selectedChat?.sourceChatId, messageQuery, chatSearch, chatType, includeEventOnly]);
+  }, [selectedChat?.sourceChatId, messageQuery, chatSearch, chatType, includeEventOnly, jumpContext]);
 
   useEffect(() => {
     if (!pairingOpen) {
@@ -243,6 +362,14 @@ export function App() {
     }
     if (action === "bottom") {
       list.scrollTop = list.scrollHeight;
+    } else if (action === "anchor") {
+      const anchorId = anchorScrollRef.current;
+      const target = anchorId != null ? list.querySelector(`[data-mid="${anchorId}"]`) : null;
+      if (target) {
+        (target as HTMLElement).scrollIntoView({ block: "center" });
+      } else {
+        list.scrollTop = list.scrollHeight / 2;
+      }
     } else {
       const heightDelta = list.scrollHeight - previousScrollHeightRef.current;
       list.scrollTop += heightDelta;
@@ -256,6 +383,14 @@ export function App() {
       const next = await getStatus();
       setStatus(next);
       setLiveGaps(await listLiveGaps().catch(() => []));
+      // Discover index/job state independently of the search panel, so a
+      // build started earlier (or before a page reload) stays visible.
+      getSearchStatus()
+        .then((search) => {
+          setSearchIndex(search.index);
+          setReindexProgress(search.reindex);
+        })
+        .catch(() => undefined);
     } catch (err) {
       setStatusError(err instanceof Error ? err.message : "Status unavailable.");
     }
@@ -309,12 +444,105 @@ export function App() {
   }
 
   function handleMessageScroll() {
-    if (!selectedChat || !messageHasMore || loadingMessagesRef.current) {
+    if (!selectedChat || loadingMessagesRef.current) {
       return;
     }
     const list = messageListRef.current;
-    if (list && list.scrollTop < 96) {
+    if (!list) {
+      return;
+    }
+    if (messageHasMore && list.scrollTop < 96) {
       void loadMessages(selectedChat, false);
+      return;
+    }
+    // In a search-jump window, scrolling down pages toward the present.
+    if (jumpContext && jumpContext.newerCount > 0 && list.scrollHeight - list.scrollTop - list.clientHeight < 96) {
+      void loadNewerMessages();
+    }
+  }
+
+  // Open a thread window centered on a message (search deep link).
+  async function loadMessagesAroundAnchor(chat: ChatListItem, anchorId: number) {
+    if (loadingMessagesRef.current) {
+      return;
+    }
+    loadingMessagesRef.current = true;
+    setLoadingMessages(true);
+    try {
+      const window = await getMessageContext(chat.id, anchorId, 75);
+      setMessages(sortMessagesChronologically(window.messages));
+      // Older-side paging continues from below the window: the newest-first
+      // offset equals everything newer than the window plus the window itself.
+      setMessageOffset(window.newerCount + window.messages.length);
+      setMessageHasMore(true);
+      setJumpContext({ anchorId, newerCount: window.newerCount });
+      anchorScrollRef.current = anchorId;
+      scrollActionRef.current = "anchor";
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not open the message in its chat.");
+    } finally {
+      loadingMessagesRef.current = false;
+      setLoadingMessages(false);
+    }
+  }
+
+  async function loadNewerMessages() {
+    if (!selectedChat || !jumpContext || jumpContext.newerCount <= 0 || loadingMessagesRef.current) {
+      return;
+    }
+    loadingMessagesRef.current = true;
+    setLoadingMessages(true);
+    try {
+      const pageSize = Math.min(MESSAGE_LIMIT, jumpContext.newerCount);
+      const offset = jumpContext.newerCount - pageSize;
+      const next = await listMessages(selectedChat.id, { limit: pageSize, offset, order: "desc" });
+      setMessages((current) => sortMessagesChronologically([...current, ...next]));
+      setJumpContext((current) => (current ? { ...current, newerCount: Math.max(0, current.newerCount - pageSize) } : current));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not load newer messages.");
+    } finally {
+      loadingMessagesRef.current = false;
+      setLoadingMessages(false);
+    }
+  }
+
+  function exitJumpContext() {
+    if (!selectedChat) {
+      return;
+    }
+    setJumpContext(null);
+    anchorScrollRef.current = null;
+    setMessageOffset(0);
+    setMessageHasMore(false);
+    scrollActionRef.current = "bottom";
+    void loadMessages(selectedChat, true);
+  }
+
+  function openSearchHit(hit: SearchResultItem) {
+    const chat: ChatListItem = chats.find((candidate) => candidate.id === hit.chatId) ?? {
+      id: hit.chatId,
+      sourceChatId: hit.chatSourceId,
+      jid: hit.chatSourceId,
+      displayName: hit.chatDisplayName,
+      chatType: hit.chatType,
+      messageCount: 0,
+      participantCount: 0,
+      lastMessageAt: null
+    };
+    if (selectedChat?.id === hit.chatId) {
+      void loadMessagesAroundAnchor(chat, hit.messageId);
+    } else {
+      pendingJumpRef.current = { chatId: hit.chatId, anchorId: hit.messageId };
+      setSelectedChat(chat);
+    }
+  }
+
+  async function handleStartReindex() {
+    try {
+      const response = await startSearchReindex();
+      setReindexProgress(response.reindex);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not start the search reindex.");
     }
   }
 
@@ -637,59 +865,100 @@ export function App() {
 
           <ImportLauncher status={status} onOpen={() => setImportWizardOpen(true)} />
 
-          <div className="filterPanel">
+          <div className="filterPanel globalSearchPanel">
             <div className="searchBox">
               <Search size={16} />
-              <input value={chatSearch} onChange={(event) => setChatSearch(event.target.value)} placeholder="Search chats" />
-            </div>
-            <div className="segmented">
-              {["all", "dm", "group", "broadcast", "status"].map((type) => (
-                <button key={type} className={chatType === type ? "active" : ""} onClick={() => setChatType(type)} type="button">
-                  {type}
-                </button>
-              ))}
-            </div>
-            <label className="filterToggle">
               <input
-                type="checkbox"
-                checked={includeEventOnly}
-                onChange={(event) => {
-                  setIncludeEventOnly(event.target.checked);
-                  setChatOffset(0);
-                }}
+                value={globalQuery}
+                onChange={(event) => setGlobalQuery(event.target.value)}
+                placeholder="Search all messages"
               />
-              <span>Show event-only chats</span>
-            </label>
+              {globalQuery && (
+                <button className="clearSearchButton" onClick={() => setGlobalQuery("")} type="button" aria-label="Clear search">
+                  <X size={14} />
+                </button>
+              )}
+            </div>
           </div>
 
-          <div className="chatList" aria-live="polite">
-            {chats.map((chat) => (
-              <button
-                key={chat.id}
-                className={`chatRow ${selectedChat?.id === chat.id ? "selected" : ""}`}
-                onClick={() => {
-                  setSelectedChat(chat);
-                  setMessageOffset(0);
-                  setMessageHasMore(false);
-                }}
-                type="button"
-              >
-                <span className="chatName">{chatDisplayLabel(chat)}</span>
-                <span className="chatMeta">
-                  <span>{chat.chatType}</span>
-                  <span>{chat.messageCount.toLocaleString()}</span>
-                  <span>{formatDate(chat.lastMessageAt)}</span>
-                </span>
-              </button>
-            ))}
-            {loadingChats && <SkeletonRows />}
-            {!loadingChats && chats.length === 0 && <EmptyState icon={<Eye size={20} />} text="No chats loaded" />}
-            {chats.length > 0 && (
-              <button className="loadButton" onClick={() => void loadChats(false)} disabled={loadingChats} type="button">
-                Load more
-              </button>
-            )}
-          </div>
+          {globalQuery.trim() ? (
+            <GlobalSearchResults
+              results={globalResults}
+              totalMatches={globalTotalMatches}
+              searching={globalSearching}
+              error={globalSearchError}
+              index={searchIndex}
+              reindex={reindexProgress}
+              sender={searchSender}
+              type={searchType}
+              direction={searchDirection}
+              after={searchAfter}
+              before={searchBefore}
+              onSenderChange={setSearchSender}
+              onTypeChange={setSearchType}
+              onDirectionChange={setSearchDirection}
+              onAfterChange={setSearchAfter}
+              onBeforeChange={setSearchBefore}
+              onOpen={openSearchHit}
+              onReindex={() => void handleStartReindex()}
+            />
+          ) : (
+            <>
+              <div className="filterPanel">
+                <div className="searchBox">
+                  <Search size={16} />
+                  <input value={chatSearch} onChange={(event) => setChatSearch(event.target.value)} placeholder="Search chats" />
+                </div>
+                <div className="segmented">
+                  {["all", "dm", "group", "broadcast", "status"].map((type) => (
+                    <button key={type} className={chatType === type ? "active" : ""} onClick={() => setChatType(type)} type="button">
+                      {type}
+                    </button>
+                  ))}
+                </div>
+                <label className="filterToggle">
+                  <input
+                    type="checkbox"
+                    checked={includeEventOnly}
+                    onChange={(event) => {
+                      setIncludeEventOnly(event.target.checked);
+                      setChatOffset(0);
+                    }}
+                  />
+                  <span>Show event-only chats</span>
+                </label>
+              </div>
+
+              <div className="chatList" aria-live="polite">
+                {chats.map((chat) => (
+                  <button
+                    key={chat.id}
+                    className={`chatRow ${selectedChat?.id === chat.id ? "selected" : ""}`}
+                    onClick={() => {
+                      setSelectedChat(chat);
+                      setMessageOffset(0);
+                      setMessageHasMore(false);
+                    }}
+                    type="button"
+                  >
+                    <span className="chatName">{chatDisplayLabel(chat)}</span>
+                    <span className="chatMeta">
+                      <span>{chat.chatType}</span>
+                      <span>{chat.messageCount.toLocaleString()}</span>
+                      <span>{formatDate(chat.lastMessageAt)}</span>
+                    </span>
+                  </button>
+                ))}
+                {loadingChats && <SkeletonRows />}
+                {!loadingChats && chats.length === 0 && <EmptyState icon={<Eye size={20} />} text="No chats loaded" />}
+                {chats.length > 0 && (
+                  <button className="loadButton" onClick={() => void loadChats(false)} disabled={loadingChats} type="button">
+                    Load more
+                  </button>
+                )}
+              </div>
+            </>
+          )}
         </aside>
 
         <section className="messagePane">
@@ -697,6 +966,17 @@ export function App() {
             <div className={`toastLine ${error ? "error" : "notice"}`}>
               {error ? <AlertTriangle size={16} /> : <CheckCircle2 size={16} />}
               <span>{error ?? notice}</span>
+            </div>
+          )}
+          {reindexProgress && (reindexProgress.state === "running" || reindexProgress.state === "finalizing") && (
+            <div className="toastLine notice">
+              <Loader2 className="spin" size={16} />
+              <span>
+                Building search index —{" "}
+                {reindexProgress.totalMessages > 0
+                  ? `${reindexProgress.processedMessages.toLocaleString()} / ${reindexProgress.totalMessages.toLocaleString()} messages`
+                  : "preparing…"}
+              </span>
             </div>
           )}
 
@@ -740,6 +1020,7 @@ export function App() {
                           message={entry.message}
                           isGroup={selectedChat.chatType === "group"}
                           onOpenMedia={(assetId, mimeType) => setLightbox({ assetId, mimeType })}
+                          highlighted={jumpContext?.anchorId === entry.message.id}
                         />
                       )
                     )}
@@ -749,10 +1030,18 @@ export function App() {
                 {!loadingMessages && messages.length === 0 && <EmptyState icon={<MessageCircle size={22} />} text="No messages loaded" />}
                 {messages.length > 0 && (
                   <div className="messageWindowNote">
-                    Showing {messages.length.toLocaleString()} newest matching messages in chronological order.
+                    {jumpContext
+                      ? "Showing a window around the selected search result. Scroll down for newer messages."
+                      : `Showing ${messages.length.toLocaleString()} newest matching messages in chronological order.`}
                   </div>
                 )}
               </div>
+              {jumpContext && (
+                <button className="jumpLatestButton" type="button" onClick={exitJumpContext}>
+                  <ChevronDown size={14} />
+                  <span>Latest messages</span>
+                </button>
+              )}
             </>
           ) : (
             <div className="emptyThread">
@@ -780,6 +1069,183 @@ export function App() {
       {lightbox && <MediaLightbox assetId={lightbox.assetId} mimeType={lightbox.mimeType} onClose={() => setLightbox(null)} />}
     </div>
   );
+}
+
+function GlobalSearchResults({
+  results,
+  totalMatches,
+  searching,
+  error,
+  index,
+  reindex,
+  sender,
+  type,
+  direction,
+  after,
+  before,
+  onSenderChange,
+  onTypeChange,
+  onDirectionChange,
+  onAfterChange,
+  onBeforeChange,
+  onOpen,
+  onReindex
+}: {
+  results: SearchResultItem[];
+  totalMatches: number;
+  searching: boolean;
+  error: string | null;
+  index: SearchIndexStatus | null;
+  reindex: SearchReindexProgress | null;
+  sender: string;
+  type: "all" | SearchTypeFilter;
+  direction: "all" | "incoming" | "outgoing";
+  after: string;
+  before: string;
+  onSenderChange: (value: string) => void;
+  onTypeChange: (value: "all" | SearchTypeFilter) => void;
+  onDirectionChange: (value: "all" | "incoming" | "outgoing") => void;
+  onAfterChange: (value: string) => void;
+  onBeforeChange: (value: string) => void;
+  onOpen: (hit: SearchResultItem) => void;
+  onReindex: () => void;
+}) {
+  const needsRebuild = index?.state === "needs_rebuild";
+  const reindexRunning = reindex?.state === "running" || reindex?.state === "finalizing";
+  const [filtersOpen, setFiltersOpen] = useState(false);
+  const activeFilterCount = [sender.trim(), type !== "all", direction !== "all", after, before].filter(Boolean).length;
+  return (
+    <div className="searchResultsPanel">
+      <div className="searchResultsHeader">
+        <span className="searchMatchCount">
+          {searching
+            ? "Searching…"
+            : needsRebuild
+              ? ""
+              : `${(totalMatches ?? 0).toLocaleString()} ${totalMatches === 1 ? "match" : "matches"}${
+                  totalMatches > results.length && results.length > 0 ? ` · showing top ${results.length}` : ""
+                }`}
+        </span>
+        <button
+          className={`filterToggleButton ${activeFilterCount > 0 ? "hasActive" : ""}`}
+          type="button"
+          onClick={() => setFiltersOpen((open) => !open)}
+          aria-expanded={filtersOpen}
+          title={filtersOpen ? "Hide filters" : "Show filters"}
+        >
+          <SlidersHorizontal size={14} />
+          <span>Filters</span>
+          {activeFilterCount > 0 && <span className="filterBadge">{activeFilterCount}</span>}
+        </button>
+      </div>
+      {filtersOpen && (
+        <div className="searchFilters">
+          <input value={sender} onChange={(event) => onSenderChange(event.target.value)} placeholder="Sender" />
+          <select value={type} onChange={(event) => onTypeChange(event.target.value as "all" | SearchTypeFilter)}>
+            <option value="all">All types</option>
+            <option value="text">Text</option>
+            <option value="media">Media</option>
+            <option value="call">Calls</option>
+          </select>
+          <select
+            value={direction}
+            onChange={(event) => onDirectionChange(event.target.value as "all" | "incoming" | "outgoing")}
+          >
+            <option value="all">Both ways</option>
+            <option value="incoming">Incoming</option>
+            <option value="outgoing">Outgoing</option>
+          </select>
+          <label className="dateFilter">
+            <span>From</span>
+            <input type="date" value={after} onChange={(event) => onAfterChange(event.target.value)} />
+          </label>
+          <label className="dateFilter">
+            <span>To</span>
+            <input type="date" value={before} onChange={(event) => onBeforeChange(event.target.value)} />
+          </label>
+        </div>
+      )}
+      {needsRebuild && (
+        <div className="reindexBanner">
+          <p>Global search needs a one-time index build for this archive.</p>
+          {reindex?.state === "failed" && (
+            <p className="reindexError">
+              The last index build failed{reindex.error ? `: ${reindex.error}` : "."} It is safe to retry — the build
+              restarts from a clean slate.
+            </p>
+          )}
+          {reindexRunning ? (
+            <p className="reindexProgress">
+              <Loader2 className="spin" size={14} />
+              <span>
+                {reindex && reindex.totalMessages > 0
+                  ? `Indexing ${reindex.processedMessages.toLocaleString()} / ${reindex.totalMessages.toLocaleString()} messages`
+                  : "Preparing index build…"}
+              </span>
+            </p>
+          ) : (
+            <button type="button" onClick={onReindex}>
+              {reindex?.state === "failed" ? "Retry index build" : "Build search index"}
+            </button>
+          )}
+        </div>
+      )}
+      <div className="searchResults chatList" aria-live="polite">
+        {searching && <SkeletonRows />}
+        {!searching && error && !needsRebuild && <div className="searchError">{error}</div>}
+        {!searching && !error && !needsRebuild && results.length === 0 && (
+          <EmptyState icon={<Search size={20} />} text="No matching messages" />
+        )}
+        {!searching &&
+          results.map((hit) => (
+            <button key={hit.messageId} className="searchHit" type="button" onClick={() => onOpen(hit)}>
+              <span className="searchHitTop">
+                <span className="searchHitChat">
+                  {hit.chatDisplayName ?? (hit.chatType === "group" ? "Unnamed group" : "Unresolved contact")}
+                </span>
+                <span className="searchHitTime">{formatDate(hit.sentAt)}</span>
+              </span>
+              <span className="searchHitMeta">
+                {hit.direction === "outgoing" ? "You" : hit.senderDisplayName ?? "Unknown sender"}
+                {hit.interpretation ? ` · ${hit.interpretation.label}` : ""}
+                {hit.isDeleted ? " · deleted" : ""}
+              </span>
+              <span className="searchHitSnippet">{renderSearchSnippet(hit.snippet)}</span>
+            </button>
+          ))}
+      </div>
+    </div>
+  );
+}
+
+// Snippets carry private-use highlight markers around matched terms; render
+// them as <mark> spans without ever treating snippet text as markup.
+function renderSearchSnippet(snippet: string): ReactNode {
+  if (!snippet.includes(SEARCH_HIGHLIGHT_START)) {
+    return snippet;
+  }
+  const nodes: ReactNode[] = [];
+  let rest = snippet;
+  let key = 0;
+  while (rest.length > 0) {
+    const start = rest.indexOf(SEARCH_HIGHLIGHT_START);
+    if (start < 0) {
+      nodes.push(rest);
+      break;
+    }
+    if (start > 0) {
+      nodes.push(rest.slice(0, start));
+    }
+    const afterStart = rest.slice(start + SEARCH_HIGHLIGHT_START.length);
+    const end = afterStart.indexOf(SEARCH_HIGHLIGHT_END);
+    if (end < 0) {
+      nodes.push(afterStart);
+      break;
+    }
+    nodes.push(<mark key={key++}>{afterStart.slice(0, end)}</mark>);
+    rest = afterStart.slice(end + SEARCH_HIGHLIGHT_END.length);
+  }
+  return nodes;
 }
 
 function LivePanel({
@@ -2122,7 +2588,17 @@ function mediaDisplayWidth(media: MessageListItem["media"], messageType: string)
   return Math.round(Math.min(MEDIA_MAX_W, Math.max(MEDIA_MIN_W, w)));
 }
 
-function MessageBubble({ message, isGroup, onOpenMedia }: { message: MessageListItem; isGroup: boolean; onOpenMedia: OnOpenMedia }) {
+function MessageBubble({
+  message,
+  isGroup,
+  onOpenMedia,
+  highlighted
+}: {
+  message: MessageListItem;
+  isGroup: boolean;
+  onOpenMedia: OnOpenMedia;
+  highlighted?: boolean;
+}) {
   const text = message.body || message.caption;
   const placeholder = messagePlaceholder(message);
   const mediaWidth = mediaDisplayWidth(message.media, message.messageType);
@@ -2131,7 +2607,7 @@ function MessageBubble({ message, isGroup, onOpenMedia }: { message: MessageList
 
   if (isSystemEvent(message)) {
     return (
-      <article className="systemChip">
+      <article className={`systemChip ${highlighted ? "jumpHighlight" : ""}`} data-mid={message.id}>
         <span>{text ? renderInlineText(text, message.mentions) : placeholder.label}</span>
         <time>{formatTime(message.sentAt)}</time>
       </article>
@@ -2139,7 +2615,8 @@ function MessageBubble({ message, isGroup, onOpenMedia }: { message: MessageList
   }
   return (
     <article
-      className={`messageBubble ${message.direction} ${message.isDeleted ? "deleted" : ""}`}
+      className={`messageBubble ${message.direction} ${message.isDeleted ? "deleted" : ""} ${highlighted ? "jumpHighlight" : ""}`}
+      data-mid={message.id}
       style={mediaWidth ? { width: `${mediaWidth + BUBBLE_H_CHROME}px` } : undefined}
     >
       <div className="messageMeta">
