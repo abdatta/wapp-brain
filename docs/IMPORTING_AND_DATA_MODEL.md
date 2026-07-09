@@ -6,27 +6,29 @@ Historical import accepts:
 - `msgstore.db` for plaintext fixtures or already-decrypted databases.
 - `msgstore.db.crypt15` with a matching 64-character key or `encrypted_backup.key`.
 - Optional `wa.db` or `wa.db.crypt15` for contact/name enrichment.
-- Optional WhatsApp media folder (picker upload for small selections, or a direct local path for the real multi-GB folder) whose files are matched to media messages and archived.
+- Optional WhatsApp media folder, read in place from disk (any size, including the real multi-GB folder) and matched to media messages and archived.
 
 ## UI Import Wizard
 
-The local web UI now treats backup load as a guided wizard instead of asking for raw paths first.
+The local web UI treats backup load as a guided wizard. You point it at a single WhatsApp backup folder and the server auto-detects the rest — nothing is uploaded, because the browser and the local server share the machine (`127.0.0.1`).
 
 The wizard flow is:
-- pick `msgstore.db.crypt15` or `msgstore.db` with a file picker
-- optionally pick `wa.db` or `wa.db.crypt15`, a key file, and media inputs
-- paste a 64-character key or use the selected key file
-- verify the key locally before import starts
-- choose merge or clear-and-replace
-- watch phase progress for validation, verification/decryption, schema parsing, message import, warnings, and completion
+- **Browse for your WhatsApp backup folder** — a native OS folder dialog opens (Windows today) and returns the folder's absolute path. Where the native picker is unavailable (non-Windows / headless), type the folder path instead.
+- The server **auto-detects** the folder: `msgstore.db.crypt15` (or a dated rotation / plain `msgstore.db`), optional `wa.db`, and the `Media/` folder, searching the root and the standard `Databases/` / `Media/` subfolders. It shows a detection summary before import, and lists any recognized auxiliary backup databases (`chatsettingsbackup`, `status_backup`, `offloaded-media`, `backup_settings`, `commerce_backup`, `stickers_db`) as **detected and reserved for a follow-up** — they are not ingested yet.
+- **Paste the 64-character key** in the text field. The key is text only (the same key decrypts the whole backup); there is no key-file picker in the UI.
+- Verify the key locally before import starts.
+- Choose merge or clear-and-replace.
+- Watch phase progress for validation, verification/decryption, schema parsing, message import, media, warnings, and completion.
 
-Selected files are staged only under `.wapp-brain/import-staging/` on the local server. The server binds to `127.0.0.1` by default, so the browser upload is local to the machine. Manual path fallback remains available for environments where browser file picking is not enough.
+All inputs are **read in place** from the detected paths; nothing is copied or uploaded into the app. Only the importer's decrypted intermediates live under the local work dir and are cleaned up afterward. An **advanced override** lets you set individual `msgstore` / `wa.db` / media paths for non-standard layouts (still read in place, still no upload). The picker, folder scan, and key verification each show a busy indicator and run without blocking the server.
+
+> The CLI `npm run import` still accepts a `--key-file` for scripted imports; only the browser wizard is key-text-only.
 
 Merge mode keeps existing archive rows and relies on idempotent upserts. Clear-and-replace mode removes archive data and live recovery state before importing the selected backup as the new baseline. It requires explicit confirmation in the UI.
 
 Once a UI import starts, the work runs in the local server process. Refreshing the browser does not stop that in-process job; the UI asks the server for the current import job and reopens the progress screen when one is active. If the local server process itself is stopped, the import stops with that process.
 
-The progress screen includes a confirmed stop action for active UI imports. Before the job begins writing, the server captures a local archive restore point. If the user stops the import, the server aborts the job, restores that snapshot, removes staged files, and reports the job as cancelled. This prevents partially imported contacts, chats, messages, or replace-mode clears from being left behind.
+The progress screen includes a confirmed stop action for active UI imports. Before the job begins writing, the server captures a local archive restore point. If the user stops the import, the server aborts the job, restores that snapshot, removes any decrypted intermediates, and reports the job as cancelled. This prevents partially imported contacts, chats, messages, or replace-mode clears from being left behind.
 
 UI import jobs also emit privacy-safe progress to the local server log. Log lines include the short import job id, mode, lifecycle step, file byte counts, message processed/persisted counts, warning codes, and terminal status. They intentionally do not include backup keys, local file paths, message bodies, decrypted rows, or raw database dumps.
 
@@ -112,8 +114,9 @@ The default REM command consolidates completed messages up to the previous local
 
 Media is archived as first-class local content.
 
-- **Import backfill**: the importer reads the backup's media sidecar tables (`message_media`, `message_view_once_media`, thumbnail tables), matches each media message to a file in the provided WhatsApp media folder (content hash first, then recorded path, then unique name), copies matches into a content-addressed store under `.wapp-brain/media/`, and links them to messages with import provenance. Missing/unreadable/ambiguous files warn (privacy-safe counts) and mark the message `import_missing`; media problems never abort a message import, and a wrong media-folder path degrades to a warning. The media phase reports live progress in the wizard and server terminal.
+- **Import backfill**: the importer reads the backup's media sidecar tables (`message_media`, `message_view_once_media`, thumbnail tables), matches each media message to a file in the provided WhatsApp media folder (content hash first, then recorded path, then unique name), copies matches into a content-addressed store under `.wapp-brain/media/`, and links them to messages with import provenance. Missing/unreadable/ambiguous files warn (privacy-safe counts); media problems never abort a message import, and a wrong media-folder path degrades to a warning. The media phase reports live progress in the wizard and server terminal, including the recovery breakdown (archived / queued for recovery / no recoverable copy).
+- **Import CDN recovery**: much WhatsApp media has no local file in the backup (`message_media.file_path` is NULL) because the phone never downloaded it or later freed the space — but the backup still holds the encrypted download descriptor (`media_key`, `direct_path`, hashes). For those, the importer extracts the descriptor and enqueues the message into the same durable media download queue used by live sync, so the background worker fetches and decrypts it from WhatsApp's CDN (and falls back to a media re-upload request for expired links). Recovery runs while live sync is connected; queued media reports `pending`/`downloading` rather than a false "missing from your folder" claim. Media with no local file and no recovery key stays honestly unrecoverable.
 - **Live capture**: the live maintainer captures the downloadable descriptor of every incoming media message (image, video, voice/audio, document, sticker, GIF, and view-once variants) at the event boundary, queues it durably, and downloads + decrypts it in the background with bounded batches, retries, and backoff. View-once media downloads at the highest priority and — because the app never sends read/played receipts — remains unopened and viewable on the phone. For expired CDN links the app may send a scoped WhatsApp media re-upload request (the single sanctioned outbound; never a receipt).
 - **Storage**: blobs are stored once by `sha256(plaintext)` (forwards/re-sends dedupe), written atomically, retained across sender delete/revoke, and never evicted. Deleted messages keep their held text, caption, and media with a deleted marker.
 - **Serving**: original media and thumbnails stream from loopback-only endpoints (`/api/media/assets/:id` with HTTP range support); media bytes never leave the machine by default, and no media paths or bytes are logged.
-- **Honesty**: every media message resolves to a server-computed availability state — `stored`, `downloading`, `pending`, `expired_unrecoverable`, `not_captured` (arrived while offline), or `import_missing` — surfaced through interpretation to every consumer instead of a fixed "media is not kept" claim.
+- **Honesty**: every media message resolves to a server-computed availability state — `stored`, `downloading`, `pending`, `expired_unrecoverable`, `not_captured` (arrived while offline), or `import_missing` — surfaced through interpretation to every consumer instead of a fixed "media is not kept" claim. `import_missing` now means the media was never saved on the phone and carries no recovery keys ("no recoverable copy"); it never blames the media folder the user selected, and recoverable media reports `pending`/`downloading` instead.

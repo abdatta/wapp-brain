@@ -33,16 +33,15 @@ import {
   X
 } from "lucide-react";
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { ReactNode } from "react";
+import type { MouseEvent as ReactMouseEvent, ReactNode, RefObject } from "react";
 import { parseInlineSegments, parseWhatsAppBlocks, type InlineSegment } from "./whatsappFormat";
 import type {
   ArchiveChangeEvent,
+  BackupDetectionManifest,
   ChatListItem,
   ImportJobSummary,
   ImportMode,
   ImportProgressEvent,
-  ImportStagingFileKind,
-  ImportStagingSessionSummary,
   ImportVerificationSummary,
   LiveGapWindowRecord,
   LivePairingSummary,
@@ -51,13 +50,13 @@ import type {
   MemoryQueryResult,
   MessageEditRevisionRecord,
   MessageListItem,
+  PickKind,
   StatusSummary
 } from "../shared/types";
 import {
   cancelImportJob,
-  cancelImportSession,
   cleanupTempFiles,
-  createImportSession,
+  detectBackupFolder,
   disableMemoryProvider,
   enableCodexMemoryProvider,
   getCurrentImportJob,
@@ -74,6 +73,7 @@ import {
   listMessages,
   mediaAssetUrl,
   mediaThumbnailUrl,
+  pickImportPath,
   queryMemory,
   resolveMemoryCitation,
   resumeLiveSession,
@@ -83,7 +83,6 @@ import {
   startImportJob,
   stopLiveSession,
   unlinkLiveSession,
-  uploadImportFile,
   verifyImportKey
 } from "./api";
 
@@ -1178,14 +1177,15 @@ function ImportWizard({
   onComplete: (job: ImportJobSummary) => void;
   onStopped: (job: ImportJobSummary) => void;
 }) {
-  const [step, setStep] = useState<"files" | "key" | "mode" | "import">(initialJob ? "import" : "files");
-  const [session, setSession] = useState<ImportStagingSessionSummary | null>(null);
-  const [manualOpen, setManualOpen] = useState(false);
-  const [paths, setPaths] = useState({ msgstorePath: "", waPath: "", mediaPath: "", keyPath: "" });
+  const pickerAvailable = Boolean(status?.pickerAvailable);
+  const [step, setStep] = useState<"folder" | "key" | "mode" | "import">(initialJob ? "import" : "folder");
+  const [backupPath, setBackupPath] = useState("");
+  const [manifest, setManifest] = useState<BackupDetectionManifest | null>(null);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [overrides, setOverrides] = useState({ msgstorePath: "", waPath: "", mediaPath: "" });
   const [key, setKey] = useState("");
-  const [useStagedKey, setUseStagedKey] = useState(false);
   const [verification, setVerification] = useState<ImportVerificationSummary | null>(null);
-  const [mode, setMode] = useState<ImportMode>(hasArchiveData(status) ? "merge" : "merge");
+  const [mode, setMode] = useState<ImportMode>("merge");
   const [replaceConfirm, setReplaceConfirm] = useState("");
   const [keepDecrypted, setKeepDecrypted] = useState(false);
   const [job, setJob] = useState<ImportJobSummary | null>(initialJob);
@@ -1221,23 +1221,6 @@ function ImportWizard({
   }, [initialJob?.id]);
 
   useEffect(() => {
-    if (initialJob) {
-      return;
-    }
-    let cancelled = false;
-    createImportSession()
-      .then((result) => {
-        if (!cancelled) setSession(result.session);
-      })
-      .catch((err) => {
-        if (!cancelled) setError(err instanceof Error ? err.message : "Could not create import session.");
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [initialJob]);
-
-  useEffect(() => {
     if (!job || job.status === "completed" || job.status === "failed" || job.status === "cancelled") {
       return;
     }
@@ -1256,28 +1239,64 @@ function ImportWizard({
     return () => window.clearInterval(timer);
   }, [job?.id, job?.status, onComplete, onStopped]);
 
-  const hasSelectedBackup = Boolean(session?.files.msgstore || paths.msgstorePath.trim());
+  const resolvedMsgstore = overrides.msgstorePath.trim() || manifest?.msgstore?.path || "";
+  const resolvedWa = overrides.waPath.trim() || manifest?.wa?.path || "";
+  const resolvedMedia = overrides.mediaPath.trim() || manifest?.media?.path || "";
+  const hasSelectedBackup = Boolean(resolvedMsgstore);
   const needsReplaceConfirmation = hasArchiveData(status) && mode === "replace";
   const canStart = verification?.ok && (!needsReplaceConfirmation || replaceConfirm.trim().toLowerCase() === "replace");
 
-  async function upload(kind: ImportStagingFileKind, fileList: FileList | null) {
-    if (!session || !fileList?.length) return;
-    setBusy(`Uploading ${kind}`);
+  // Scan a folder (native-picked or typed) into a detection manifest. Shallow and
+  // async on the server, so it never blocks; the wizard shows a busy indicator.
+  async function detect(root: string) {
+    const trimmed = root.trim();
+    if (!trimmed) return;
+    setBusy("Scanning backup folder…");
     setError(null);
+    setVerification(null);
     try {
-      let next = session;
-      const files = Array.from(fileList);
-      for (const file of files) {
-        const relative = (file as File & { webkitRelativePath?: string }).webkitRelativePath;
-        next = (await uploadImportFile(session.id, kind, file, relative)).session;
+      const result = await detectBackupFolder(trimmed);
+      setManifest(result.manifest);
+      if (!result.manifest.valid) {
+        setError("No msgstore backup was found in that folder. Pick the folder that contains msgstore.db.crypt15, or set an advanced path override.");
       }
-      setSession(next);
-      if (kind === "key") setUseStagedKey(true);
-      setVerification(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not stage selected file.");
+      setManifest(null);
+      setError(err instanceof Error ? err.message : "Could not scan the backup folder.");
     } finally {
       setBusy(null);
+    }
+  }
+
+  async function browseFolder() {
+    setBusy("Waiting for you to choose a folder…");
+    setError(null);
+    try {
+      const result = await pickImportPath("backup-root", backupPath || null);
+      if (result.path) {
+        setBackupPath(result.path);
+        await detect(result.path);
+      } else if (result.unavailable) {
+        setError(
+          result.reason && result.reason !== "busy"
+            ? result.reason
+            : "The native folder picker is unavailable. Type the backup folder path instead."
+        );
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not open the folder picker.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function browseOverride(kind: PickKind, field: "msgstorePath" | "waPath" | "mediaPath") {
+    setError(null);
+    const result = await pickImportPath(kind, backupPath || null).catch(() => null);
+    if (result?.path) {
+      const picked = result.path;
+      setOverrides((current) => ({ ...current, [field]: picked }));
+      setVerification(null);
     }
   }
 
@@ -1286,12 +1305,9 @@ function ImportWizard({
     setError(null);
     try {
       const result = await verifyImportKey({
-        sessionId: session?.id ?? null,
-        msgstorePath: paths.msgstorePath || null,
-        waPath: paths.waPath || null,
-        key: key || null,
-        keyPath: paths.keyPath || null,
-        useStagedKey
+        msgstorePath: resolvedMsgstore || null,
+        waPath: resolvedWa || null,
+        key: key || null
       });
       setVerification(result.verification);
       if (result.verification.ok) setStep("mode");
@@ -1308,15 +1324,13 @@ function ImportWizard({
     setError(null);
     try {
       const result = await startImportJob({
-        sessionId: session?.id ?? null,
         mode,
         key: key || null,
         keepDecrypted,
         paths: {
-          msgstorePath: paths.msgstorePath || undefined,
-          waPath: paths.waPath || undefined,
-          mediaPath: paths.mediaPath || undefined,
-          keyPath: paths.keyPath || undefined
+          msgstorePath: resolvedMsgstore || undefined,
+          waPath: resolvedWa || undefined,
+          mediaPath: resolvedMedia || undefined
         }
       });
       setKey("");
@@ -1335,7 +1349,7 @@ function ImportWizard({
     }
     if (
       !window.confirm(
-        "Stop this import and roll back any archive changes written by this job? Your selected staging files will be removed, and you can start again afterward."
+        "Stop this import and roll back any archive changes written by this job? You can start again afterward."
       )
     ) {
       return;
@@ -1358,9 +1372,6 @@ function ImportWizard({
         return;
       }
     }
-    if (session && !job) {
-      await cancelImportSession(session.id).catch(() => undefined);
-    }
     onClose();
   }
 
@@ -1374,17 +1385,17 @@ function ImportWizard({
               Local import wizard
             </span>
             <h2 id="import-title">Load WhatsApp backup</h2>
-            <p>Pick files, verify the key locally, choose merge or replace, then watch the import phases.</p>
+            <p>Pick your backup folder, verify the key locally, choose merge or replace, then watch the import phases.</p>
           </div>
           <button className="iconButton" onClick={() => void close()} type="button" aria-label="Close import wizard">
             <X size={16} />
           </button>
         </div>
         <div className="wizardSteps">
-          {["files", "key", "mode", "import"].map((item, index) => (
+          {["folder", "key", "mode", "import"].map((item, index) => (
             <div className={`wizardStep ${step === item ? "active" : ""}`} key={item}>
               <span>{index + 1}</span>
-              <strong>{item === "files" ? "Files" : item === "key" ? "Verify" : item === "mode" ? "Mode" : "Import"}</strong>
+              <strong>{item === "folder" ? "Folder" : item === "key" ? "Verify" : item === "mode" ? "Mode" : "Import"}</strong>
             </div>
           ))}
         </div>
@@ -1394,57 +1405,76 @@ function ImportWizard({
             <span>{error}</span>
           </div>
         )}
-        {step === "files" && (
+        {step === "folder" && (
           <div className="wizardBody">
-            <FilePickRow
-              icon={<Database size={18} />}
-              title="Encrypted msgstore"
-              description="Required. Select msgstore.db.crypt15 or an already decrypted msgstore.db."
-              file={session?.files.msgstore}
-              accept=".crypt15,.db"
-              onPick={(files) => void upload("msgstore", files)}
-            />
-            <FilePickRow
-              icon={<HardDrive size={18} />}
-              title="Contacts database"
-              description="Optional. wa.db or wa.db.crypt15 improves saved contact names."
-              file={session?.files.wa}
-              accept=".crypt15,.db"
-              onPick={(files) => void upload("wa", files)}
-            />
-            <FilePickRow
-              icon={<KeyRound size={18} />}
-              title="Backup key file"
-              description="Optional. You can also paste the 64-character key in the next step."
-              file={session?.files.key}
-              accept=".key,*"
-              onPick={(files) => void upload("key", files)}
-            />
-            <FilePickRow
-              icon={<FolderOpen size={18} />}
-              title="Media folder"
-              description="Optional. Your WhatsApp media is archived and shown in chats. For the real multi-GB folder, type its local path below — the server reads it directly from disk."
-              file={session?.files.media}
-              directory
-              onPick={(files) => void upload("media", files)}
-            />
-            <label className="wizardField mediaPathField">
-              <span>Media folder path (recommended for large folders — nothing is uploaded; a wrong path never blocks the import)</span>
-              <input
-                value={paths.mediaPath}
-                onChange={(event) => setPaths((current) => ({ ...current, mediaPath: event.target.value }))}
-                autoComplete="off"
-                placeholder="e.g. D:\\Backups\\WhatsApp\\Media"
-              />
+            <div className="filePickRow">
+              <div className="fileIcon"><FolderOpen size={18} /></div>
+              <div>
+                <strong>WhatsApp backup folder</strong>
+                <p>
+                  {backupPath ||
+                    "Select the folder holding msgstore.db.crypt15, wa.db.crypt15, and your Media folder. Everything is read in place — nothing is uploaded."}
+                </p>
+              </div>
+              {pickerAvailable && (
+                <button className="fileButton" type="button" onClick={() => void browseFolder()} disabled={Boolean(busy)}>
+                  Browse…
+                </button>
+              )}
+            </div>
+            <label className="wizardField">
+              <span>{pickerAvailable ? "Or type the backup folder path" : "Backup folder path"}</span>
+              <div className="pathWithButton">
+                <input
+                  value={backupPath}
+                  onChange={(event) => setBackupPath(event.target.value)}
+                  onBlur={() => (backupPath.trim() ? void detect(backupPath) : undefined)}
+                  autoComplete="off"
+                  placeholder="e.g. D:\\Backups\\WhatsApp"
+                />
+                <button
+                  className="textButton"
+                  type="button"
+                  onClick={() => void detect(backupPath)}
+                  disabled={!backupPath.trim() || Boolean(busy)}
+                >
+                  Detect
+                </button>
+              </div>
             </label>
-            <button className="textButton" type="button" onClick={() => setManualOpen((current) => !current)}>
-              {manualOpen ? "Hide advanced paths" : "Use advanced path fallback"}
+            {busy && (
+              <div className="wizardBusy">
+                <Loader2 className="spin" size={16} />
+                <span>{busy}</span>
+              </div>
+            )}
+            {manifest && <DetectionSummary manifest={manifest} />}
+            <button className="textButton" type="button" onClick={() => setAdvancedOpen((current) => !current)}>
+              {advancedOpen ? "Hide advanced overrides" : "Advanced: set file paths manually"}
             </button>
-            {manualOpen && (
+            {advancedOpen && (
               <div className="manualPathGrid">
-                <PathInput label="msgstore path" value={paths.msgstorePath} onChange={(value) => setPaths((current) => ({ ...current, msgstorePath: value }))} />
-                <PathInput label="wa.db or wa.db.crypt15 path" value={paths.waPath} onChange={(value) => setPaths((current) => ({ ...current, waPath: value }))} />
-                <PathInput label="key file path" value={paths.keyPath} onChange={(value) => setPaths((current) => ({ ...current, keyPath: value }))} />
+                <OverrideInput
+                  label="msgstore path"
+                  value={overrides.msgstorePath}
+                  pickerAvailable={pickerAvailable}
+                  onChange={(value) => setOverrides((current) => ({ ...current, msgstorePath: value }))}
+                  onBrowse={() => void browseOverride("msgstore", "msgstorePath")}
+                />
+                <OverrideInput
+                  label="wa.db path"
+                  value={overrides.waPath}
+                  pickerAvailable={pickerAvailable}
+                  onChange={(value) => setOverrides((current) => ({ ...current, waPath: value }))}
+                  onBrowse={() => void browseOverride("wa", "waPath")}
+                />
+                <OverrideInput
+                  label="Media folder path"
+                  value={overrides.mediaPath}
+                  pickerAvailable={pickerAvailable}
+                  onChange={(value) => setOverrides((current) => ({ ...current, mediaPath: value }))}
+                  onBrowse={() => void browseOverride("media", "mediaPath")}
+                />
               </div>
             )}
             <WizardActions
@@ -1470,11 +1500,11 @@ function ImportWizard({
               <span>64-character backup key</span>
               <input value={key} onChange={(event) => setKey(event.target.value)} type="password" autoComplete="off" placeholder="Paste key here" />
             </label>
-            {session?.files.key && (
-              <label className="checkRow wizardCheck">
-                <input type="checkbox" checked={useStagedKey} onChange={(event) => setUseStagedKey(event.target.checked)} />
-                <span>Use selected key file: {session.files.key.name}</span>
-              </label>
+            {busy === "Verifying key" && (
+              <div className="wizardBusy">
+                <Loader2 className="spin" size={16} />
+                <span>Verifying key locally…</span>
+              </div>
             )}
             {verification && (
               <div className="verifySuccess">
@@ -1486,9 +1516,9 @@ function ImportWizard({
               busy={busy}
               primaryLabel="Verify locally"
               primaryIcon={<ShieldCheck size={16} />}
-              primaryDisabled={Boolean(busy) || (!key && !useStagedKey && !paths.keyPath)}
+              primaryDisabled={Boolean(busy) || !key}
               onPrimary={() => void verify()}
-              onBack={() => setStep("files")}
+              onBack={() => setStep("folder")}
             />
           </div>
         )}
@@ -1558,49 +1588,83 @@ function ImportWizard({
   );
 }
 
-function FilePickRow({
-  icon,
-  title,
-  description,
-  file,
-  accept,
-  directory,
-  onPick
-}: {
-  icon: ReactNode;
-  title: string;
-  description: string;
-  file?: { name: string; size: number } | null;
-  accept?: string;
-  directory?: boolean;
-  onPick: (files: FileList | null) => void;
-}) {
+function DetectionSummary({ manifest }: { manifest: BackupDetectionManifest }) {
+  const rows: Array<{ icon: ReactNode; label: string; value: string; ok: boolean }> = [
+    {
+      icon: <Database size={16} />,
+      label: "Messages",
+      value: manifest.msgstore ? manifest.msgstore.name : "Not found — required",
+      ok: Boolean(manifest.msgstore)
+    },
+    {
+      icon: <HardDrive size={16} />,
+      label: "Contacts",
+      value: manifest.wa ? manifest.wa.name : "Not found — optional",
+      ok: Boolean(manifest.wa)
+    },
+    {
+      icon: <FolderOpen size={16} />,
+      label: "Media",
+      value: manifest.media ? manifest.media.name : "Not found — optional",
+      ok: Boolean(manifest.media)
+    }
+  ];
   return (
-    <div className="filePickRow">
-      <div className="fileIcon">{icon}</div>
-      <div>
-        <strong>{title}</strong>
-        <p>{file ? `${file.name} | ${formatBytes(file.size)}` : description}</p>
-      </div>
-      <label className="fileButton">
-        Pick
-        <input
-          type="file"
-          accept={accept}
-          multiple={directory}
-          {...(directory ? { webkitdirectory: "true" } : {})}
-          onChange={(event) => onPick(event.target.files)}
-        />
-      </label>
+    <div className={`detectionSummary ${manifest.valid ? "" : "invalid"}`}>
+      {rows.map((row) => (
+        <div className="detectionRow" key={row.label}>
+          <span className="detectionIcon">{row.icon}</span>
+          <span className="detectionLabel">{row.label}</span>
+          <span className="detectionValue">{row.value}</span>
+          {row.ok ? (
+            <CheckCircle2 size={16} className="detectionOk" />
+          ) : (
+            <Circle size={16} className="detectionMissing" />
+          )}
+        </div>
+      ))}
+      {manifest.auxiliary.length > 0 && (
+        <div className="detectionAux">
+          <FileText size={14} />
+          <span>
+            {manifest.auxiliary.length} other backup file{manifest.auxiliary.length === 1 ? "" : "s"} detected (
+            {manifest.auxiliary.map((file) => file.kind).join(", ")}) — reserved for a follow-up, not imported yet.
+          </span>
+        </div>
+      )}
+      {manifest.notes.map((note) => (
+        <div className="detectionNote" key={note}>
+          {note}
+        </div>
+      ))}
     </div>
   );
 }
 
-function PathInput({ label, value, onChange }: { label: string; value: string; onChange: (value: string) => void }) {
+function OverrideInput({
+  label,
+  value,
+  pickerAvailable,
+  onChange,
+  onBrowse
+}: {
+  label: string;
+  value: string;
+  pickerAvailable: boolean;
+  onChange: (value: string) => void;
+  onBrowse: () => void;
+}) {
   return (
     <label className="wizardField">
       <span>{label}</span>
-      <input value={value} onChange={(event) => onChange(event.target.value)} autoComplete="off" />
+      <div className="pathWithButton">
+        <input value={value} onChange={(event) => onChange(event.target.value)} autoComplete="off" />
+        {pickerAvailable && (
+          <button className="textButton" type="button" onClick={onBrowse}>
+            Browse…
+          </button>
+        )}
+      </div>
     </label>
   );
 }
@@ -2032,9 +2096,36 @@ function renderRichText(text: string, mentions: string[]): ReactNode {
 
 type OnOpenMedia = (assetId: number, mimeType: string | null) => void;
 
+// WhatsApp-style media sizing: pin the bubble to the media's display width (the
+// image/video aspect-fit within caps) so the media fills it and the caption
+// wraps to that width, instead of a long caption stretching the bubble and
+// stranding the media in a corner.
+const MEDIA_MIN_W = 220;
+const MEDIA_MAX_W = 360;
+const MEDIA_MAX_H = 400;
+const BUBBLE_H_CHROME = 20; // 2×9px padding + 2×1px border (border-box)
+
+function mediaDisplayWidth(media: MessageListItem["media"], messageType: string): number | null {
+  if (!media || media.availability !== "stored" || messageType === "sticker") return null;
+  const mime = media.mimeType ?? "";
+  if (mime === "image/webp" || !(mime.startsWith("image/") || mime.startsWith("video/"))) return null;
+  let w = media.width ?? 0;
+  let h = media.height ?? 0;
+  if (!w || !h) return MEDIA_MAX_W;
+  if (w > MEDIA_MAX_W) {
+    h = (h * MEDIA_MAX_W) / w;
+    w = MEDIA_MAX_W;
+  }
+  if (h > MEDIA_MAX_H) {
+    w = (w * MEDIA_MAX_H) / h;
+  }
+  return Math.round(Math.min(MEDIA_MAX_W, Math.max(MEDIA_MIN_W, w)));
+}
+
 function MessageBubble({ message, isGroup, onOpenMedia }: { message: MessageListItem; isGroup: boolean; onOpenMedia: OnOpenMedia }) {
   const text = message.body || message.caption;
   const placeholder = messagePlaceholder(message);
+  const mediaWidth = mediaDisplayWidth(message.media, message.messageType);
   const [historyOpen, setHistoryOpen] = useState(false);
   const hasHistory = message.editRevisionCount > 0;
 
@@ -2047,9 +2138,12 @@ function MessageBubble({ message, isGroup, onOpenMedia }: { message: MessageList
     );
   }
   return (
-    <article className={`messageBubble ${message.direction} ${message.isDeleted ? "deleted" : ""}`}>
+    <article
+      className={`messageBubble ${message.direction} ${message.isDeleted ? "deleted" : ""}`}
+      style={mediaWidth ? { width: `${mediaWidth + BUBBLE_H_CHROME}px` } : undefined}
+    >
       <div className="messageMeta">
-        {isGroup && message.direction !== "outgoing" && <span>{message.senderDisplayName ?? "Unresolved contact"}</span>}
+        {isGroup && message.direction !== "outgoing" && <span className="metaName">{message.senderDisplayName ?? "Unresolved contact"}</span>}
         <span className="metaRight">
           {message.isDeleted && <span className="deletedChip">deleted</span>}
           {message.isEdited &&
@@ -2244,27 +2338,10 @@ function MessageMediaView({ message, onOpenMedia }: { message: MessageListItem; 
     );
   }
   if (mime.startsWith("video/")) {
-    return (
-      <div className="mediaFrame">
-        <video
-          className="mediaVideo"
-          controls
-          preload="none"
-          poster={media.hasThumbnail ? mediaThumbnailUrl(assetId) : undefined}
-          src={mediaAssetUrl(assetId)}
-        />
-        {media.isViewOnce && <span className="viewOnceBadge">view once</span>}
-      </div>
-    );
+    return <VideoBubble assetId={assetId} media={media} />;
   }
   if (mime.startsWith("audio/")) {
-    return (
-      <div className="mediaAudio">
-        {media.isViewOnce && <span className="viewOnceBadge">view once</span>}
-        <audio controls preload="none" src={mediaAssetUrl(assetId)} />
-        {media.durationMs != null && <span className="mediaDuration">{formatDuration(media.durationMs)}</span>}
-      </div>
-    );
+    return <AudioBubble assetId={assetId} media={media} />;
   }
   return (
     <a className="documentRow" href={mediaAssetUrl(assetId)} target="_blank" rel="noopener noreferrer">
@@ -2273,6 +2350,147 @@ function MessageMediaView({ message, onOpenMedia }: { message: MessageListItem; 
       {media.byteSize != null && <span className="documentSize">{formatBytes(media.byteSize)}</span>}
       {media.isViewOnce && <span className="viewOnceBadge">view once</span>}
     </a>
+  );
+}
+
+// A static waveform baseline for the audio player; the played portion fills.
+const AUDIO_WAVE = [
+  26, 40, 58, 34, 72, 90, 50, 64, 82, 44, 30, 54, 76, 96, 60, 38, 68, 88, 46, 32,
+  70, 52, 84, 42, 28, 60, 80, 50, 66, 92, 48, 36, 74, 56, 86, 44, 30, 62, 78, 52,
+  68, 94, 46, 34, 72, 54, 82, 40, 26, 58, 76, 50, 64, 88, 44, 32, 70, 48, 60, 36
+];
+
+// Shared inline playback state for the custom players: one media element driven
+// by our own controls, so the modern UI never swaps to the browser's player.
+function useInlinePlayer(mediaRef: RefObject<HTMLMediaElement | null>) {
+  const [playing, setPlaying] = useState(false);
+  const [currentMs, setCurrentMs] = useState(0);
+  const [elementDurationMs, setElementDurationMs] = useState(0);
+  useEffect(() => {
+    const el = mediaRef.current;
+    if (!el) return;
+    const onTime = () => setCurrentMs(el.currentTime * 1000);
+    const onDuration = () => setElementDurationMs(Number.isFinite(el.duration) ? el.duration * 1000 : 0);
+    const onPlay = () => setPlaying(true);
+    const onPause = () => setPlaying(false);
+    const onEnded = () => {
+      el.currentTime = 0;
+      setCurrentMs(0);
+      setPlaying(false);
+    };
+    el.addEventListener("timeupdate", onTime);
+    el.addEventListener("loadedmetadata", onDuration);
+    el.addEventListener("durationchange", onDuration);
+    el.addEventListener("play", onPlay);
+    el.addEventListener("pause", onPause);
+    el.addEventListener("ended", onEnded);
+    return () => {
+      el.removeEventListener("timeupdate", onTime);
+      el.removeEventListener("loadedmetadata", onDuration);
+      el.removeEventListener("durationchange", onDuration);
+      el.removeEventListener("play", onPlay);
+      el.removeEventListener("pause", onPause);
+      el.removeEventListener("ended", onEnded);
+    };
+  }, [mediaRef]);
+  const toggle = () => {
+    const el = mediaRef.current;
+    if (!el) return;
+    if (el.paused) void el.play();
+    else el.pause();
+  };
+  const seekToFraction = (fraction: number) => {
+    const el = mediaRef.current;
+    if (!el) return;
+    const seconds = Number.isFinite(el.duration) ? el.duration : elementDurationMs / 1000;
+    if (seconds > 0) {
+      el.currentTime = Math.max(0, Math.min(1, fraction)) * seconds;
+    }
+  };
+  return { playing, currentMs, elementDurationMs, toggle, seekToFraction };
+}
+
+function seekFractionFromEvent(event: ReactMouseEvent<HTMLElement>): number {
+  const rect = event.currentTarget.getBoundingClientRect();
+  return rect.width > 0 ? (event.clientX - rect.left) / rect.width : 0;
+}
+
+// Custom audio player: the waveform fills with playback progress and is
+// click-to-seek; the UI stays identical whether stopped or playing.
+function AudioBubble({ assetId, media }: { assetId: number; media: NonNullable<MessageListItem["media"]> }) {
+  const ref = useRef<HTMLAudioElement>(null);
+  const { playing, currentMs, elementDurationMs, toggle, seekToFraction } = useInlinePlayer(ref);
+  const totalMs = elementDurationMs || media.durationMs || 0;
+  const fraction = totalMs > 0 ? Math.min(1, currentMs / totalMs) : 0;
+  return (
+    <div className="audioBubble">
+      {media.isViewOnce && <span className="viewOnceBadge audioViewOnce">view once</span>}
+      <audio ref={ref} preload="none" src={mediaAssetUrl(assetId)} />
+      <button className="audioPlayButton" type="button" onClick={toggle} aria-label={playing ? "Pause" : "Play"}>
+        {playing ? <Pause size={15} fill="currentColor" /> : <Play size={15} fill="currentColor" />}
+      </button>
+      <span className="audioWave" onClick={(event) => seekToFraction(seekFractionFromEvent(event))}>
+        <span className="audioWaveRow audioWaveBase">
+          {AUDIO_WAVE.map((height, index) => (
+            <span key={index} style={{ height: `${height}%` }} />
+          ))}
+        </span>
+        <span className="audioWaveRow audioWaveFill" style={{ clipPath: `inset(0 ${(1 - fraction) * 100}% 0 0)` }}>
+          {AUDIO_WAVE.map((height, index) => (
+            <span key={index} style={{ height: `${height}%` }} />
+          ))}
+        </span>
+      </span>
+      <span className="audioDuration">{formatDuration(currentMs > 0 ? currentMs : totalMs)}</span>
+    </div>
+  );
+}
+
+// Custom video player: poster + centered play at the start, then inline
+// playback with our own bottom controls (a filling, seekable progress bar) —
+// never the native player, and a constant width.
+function VideoBubble({ assetId, media }: { assetId: number; media: NonNullable<MessageListItem["media"]> }) {
+  const ref = useRef<HTMLVideoElement>(null);
+  const { playing, currentMs, elementDurationMs, toggle, seekToFraction } = useInlinePlayer(ref);
+  const totalMs = elementDurationMs || media.durationMs || 0;
+  const fraction = totalMs > 0 ? Math.min(1, currentMs / totalMs) : 0;
+  const atStart = currentMs === 0 && !playing;
+  const aspectRatio = media.width && media.height ? `${media.width} / ${media.height}` : "4 / 3";
+  return (
+    <div className="videoPlayer" style={{ aspectRatio }}>
+      <video
+        ref={ref}
+        className="videoEl"
+        preload="none"
+        playsInline
+        poster={media.hasThumbnail ? mediaThumbnailUrl(assetId) : undefined}
+        src={mediaAssetUrl(assetId)}
+        onClick={toggle}
+      />
+      {atStart && !media.hasThumbnail && <span className="videoPosterFallback" />}
+      <span className="videoScrim" />
+      {atStart ? (
+        <>
+          <button className="videoCenterPlay" type="button" onClick={toggle} aria-label="Play video">
+            <Play size={24} fill="currentColor" />
+          </button>
+          {media.durationMs ? <span className="videoDurationPill">{formatDuration(media.durationMs)}</span> : null}
+        </>
+      ) : (
+        <div className="videoControls">
+          <button className="videoCtlBtn" type="button" onClick={toggle} aria-label={playing ? "Pause" : "Play"}>
+            {playing ? <Pause size={13} fill="currentColor" /> : <Play size={13} fill="currentColor" />}
+          </button>
+          <span className="videoProgress" onClick={(event) => seekToFraction(seekFractionFromEvent(event))}>
+            <span className="videoProgressFill" style={{ width: `${fraction * 100}%` }} />
+          </span>
+          <span className="videoTime">
+            {formatDuration(currentMs)} / {formatDuration(totalMs)}
+          </span>
+        </div>
+      )}
+      {media.isViewOnce && <span className="viewOnceBadge">view once</span>}
+    </div>
   );
 }
 

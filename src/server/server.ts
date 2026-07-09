@@ -12,15 +12,13 @@ import { BaileysLiveWhatsAppClient } from "./live/baileysClient";
 import { runImport } from "./import/importer";
 import {
   cancelImportJob,
-  cancelImportStagingSession,
-  createImportStagingSession,
   getCurrentImportJob,
   getImportJob,
-  getImportStagingSession,
-  stageImportFile,
   startImportJob,
   verifyImportKey
 } from "./import/staging";
+import { detectBackupFolder } from "./import/detectBackup";
+import { isPickerAvailable, pickImportPath } from "./import/nativePicker";
 import { closeLegacyWallClockGaps } from "./live/auditor";
 import { assertLiveBaselineExists } from "./live/baseline";
 import { ensureUsableLiveCreds } from "./live/baileysClient";
@@ -30,7 +28,7 @@ import { queryMemory, resolveMemoryCitation, runMemoryConsolidation, validateMem
 import { disableRemoteMemoryProvider, enableCodexProvider, getMemoryProviderStatus } from "./memory/provider";
 import { isLocalDatabaseError, publicErrorMessage } from "./privacy";
 import { withGuidedSetup } from "./onboarding";
-import type { ArchiveChangeEvent, LivePairingSummary } from "../shared/types";
+import type { ArchiveChangeEvent, LivePairingSummary, PickKind } from "../shared/types";
 import type { LiveMessageEvent } from "./live/types";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -48,19 +46,22 @@ const archiveEventClients = new Set<Response>();
 
 app.get("/api/status", async (_req, res) => {
   try {
-    res.json(withGuidedSetup(await repository.getStatus()));
+    res.json({ ...withGuidedSetup(await repository.getStatus()), pickerAvailable: isPickerAvailable() });
   } catch {
-    res.json(withGuidedSetup({
-      database: {
-        configured: true,
-        initialized: false,
-        adapter: config.archive.adapter,
-        error: "Local archive database is not initialized or not reachable."
-      },
-      counts: { chats: 0, contacts: 0, participants: 0, messages: 0, warnings: 0 },
-      latestImport: null,
-      latestWarnings: []
-    }));
+    res.json({
+      ...withGuidedSetup({
+        database: {
+          configured: true,
+          initialized: false,
+          adapter: config.archive.adapter,
+          error: "Local archive database is not initialized or not reachable."
+        },
+        counts: { chats: 0, contacts: 0, participants: 0, messages: 0, warnings: 0 },
+        latestImport: null,
+        latestWarnings: []
+      }),
+      pickerAvailable: isPickerAvailable()
+    });
   }
 });
 
@@ -285,7 +286,6 @@ app.post("/api/import", async (req, res) => {
       waPath: req.body?.waPath ? String(req.body.waPath) : null,
       mediaPath: req.body?.mediaPath ? String(req.body.mediaPath) : null,
       key: req.body?.key ? String(req.body.key) : null,
-      keyPath: req.body?.keyPath ? String(req.body.keyPath) : null,
       keepDecrypted: Boolean(req.body?.keepDecrypted),
       mode: req.body?.mode === "replace" ? "replace" : "merge"
     });
@@ -302,38 +302,42 @@ app.post("/api/import", async (req, res) => {
   }
 });
 
-app.post("/api/import/staging", async (_req, res) => {
+// Opens a native OS file/folder dialog on the machine running the server and
+// returns the absolute path the user selects — nothing is uploaded. Request
+// abort (client closed the wizard) cancels the pending dialog.
+app.post("/api/import/pick", async (req, res) => {
   try {
-    res.json({ ok: true, session: await createImportStagingSession() });
+    const kind = pickKind(req.body?.kind);
+    const controller = new AbortController();
+    req.on("close", () => controller.abort());
+    const result = await pickImportPath(kind, {
+      startIn: req.body?.startIn ? String(req.body.startIn) : null,
+      signal: controller.signal
+    });
+    if ("path" in result) {
+      res.json({ ok: true, path: result.path });
+    } else if ("cancelled" in result) {
+      res.json({ ok: true, cancelled: true });
+    } else {
+      res.json({ ok: false, unavailable: true, reason: result.reason });
+    }
   } catch (error) {
     res.status(400).json({ ok: false, error: publicErrorMessage(error) });
   }
 });
 
-app.get("/api/import/staging/:sessionId", (req, res) => {
+// Scans a selected backup folder and returns a manifest of the detected inputs
+// plus recognized (reserved) auxiliary files. Works for native-picked and typed
+// paths alike.
+app.post("/api/import/detect", async (req, res) => {
   try {
-    res.json(getImportStagingSession(req.params.sessionId));
-  } catch (error) {
-    res.status(400).json({ error: publicErrorMessage(error) });
-  }
-});
-
-app.post("/api/import/staging/:sessionId/:kind", async (req, res) => {
-  try {
-    const kind = importFileKind(req.params.kind);
-    const fileName = stringQuery(req.query.name) ?? `${kind}.bin`;
-    const relativePath = stringQuery(req.query.relativePath);
-    const session = await stageImportFile(req.params.sessionId, kind, fileName, req, relativePath);
-    res.json({ ok: true, session });
-  } catch (error) {
-    res.status(400).json({ ok: false, error: publicErrorMessage(error) });
-  }
-});
-
-app.delete("/api/import/staging/:sessionId", async (req, res) => {
-  try {
-    await cancelImportStagingSession(req.params.sessionId);
-    res.json({ ok: true });
+    const root = req.body?.root ? String(req.body.root) : "";
+    if (!root || /^https?:\/\//i.test(root)) {
+      res.status(400).json({ ok: false, error: "Provide a local backup folder path." });
+      return;
+    }
+    const manifest = await detectBackupFolder(root);
+    res.json({ ok: true, manifest });
   } catch (error) {
     res.status(400).json({ ok: false, error: publicErrorMessage(error) });
   }
@@ -344,12 +348,9 @@ app.post("/api/import/verify-key", async (req, res) => {
     res.json({
       ok: true,
       verification: await verifyImportKey({
-        sessionId: req.body?.sessionId ? String(req.body.sessionId) : null,
         msgstorePath: req.body?.msgstorePath ? String(req.body.msgstorePath) : null,
         waPath: req.body?.waPath ? String(req.body.waPath) : null,
-        key: req.body?.key ? String(req.body.key) : null,
-        keyPath: req.body?.keyPath ? String(req.body.keyPath) : null,
-        useStagedKey: Boolean(req.body?.useStagedKey)
+        key: req.body?.key ? String(req.body.key) : null
       })
     });
   } catch (error) {
@@ -362,15 +363,13 @@ app.post("/api/import/jobs", async (req, res) => {
     res.json({
       ok: true,
       job: startImportJob(repository, {
-        sessionId: req.body?.sessionId ? String(req.body.sessionId) : null,
         mode: req.body?.mode === "replace" ? "replace" : "merge",
         key: req.body?.key ? String(req.body.key) : null,
         keepDecrypted: Boolean(req.body?.keepDecrypted),
         paths: {
           msgstorePath: req.body?.paths?.msgstorePath ? String(req.body.paths.msgstorePath) : undefined,
           waPath: req.body?.paths?.waPath ? String(req.body.paths.waPath) : undefined,
-          mediaPath: req.body?.paths?.mediaPath ? String(req.body.paths.mediaPath) : undefined,
-          keyPath: req.body?.paths?.keyPath ? String(req.body.paths.keyPath) : undefined
+          mediaPath: req.body?.paths?.mediaPath ? String(req.body.paths.mediaPath) : undefined
         }
       }, {
         onArchiveChanged: (summary) => {
@@ -670,11 +669,11 @@ function parseRangeHeader(header: string | undefined, totalSize: number): { star
   return { start, end: Math.min(end, totalSize - 1) };
 }
 
-function importFileKind(value: string) {
-  if (value === "msgstore" || value === "wa" || value === "media" || value === "key") {
+function pickKind(value: unknown): PickKind {
+  if (value === "backup-root" || value === "media" || value === "msgstore" || value === "wa") {
     return value;
   }
-  throw new Error("Unsupported import file kind.");
+  throw new Error("Unsupported picker kind.");
 }
 
 async function startLiveMaintainer(phoneNumber: string | null): Promise<void> {

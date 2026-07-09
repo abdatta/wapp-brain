@@ -4,6 +4,7 @@ import type {
   ContactRecord,
   ImportWarning,
   LiveMessageUpdateRecord,
+  MediaDownloadDescriptor,
   MessageRecord,
   MessageSecretRecord,
   ParticipantRecord
@@ -89,6 +90,9 @@ export interface ImportMediaRef {
   durationMs: number | null;
   isViewOnce: boolean;
   thumbnail: Buffer | null;
+  // Present only for media with no local file but a usable CDN descriptor: the
+  // importer enqueues it for background recovery instead of leaving it missing.
+  downloadDescriptor?: MediaDownloadDescriptor | null;
 }
 
 export interface ParsedWhatsAppSource {
@@ -223,7 +227,9 @@ export function parseWhatsAppSource(
         ? msgstoreDb.prepare(`SELECT thumbnail FROM message_thumbnail WHERE message_row_id = ?`)
         : null;
       const columns = columnsFor(msgInspection, "message");
-      const selected = ["_id", "chat_row_id", "key_id", "message_type"].filter((column) => columns.has(column));
+      const selected = ["_id", "chat_row_id", "key_id", "message_type", "from_me", "key_from_me", "sender_jid_row_id"].filter(
+        (column) => columns.has(column)
+      );
       const rows = msgstoreDb
         .prepare(`SELECT ${selected.map(quoteIdentifier).join(", ")} FROM message ORDER BY _id ASC`)
         .iterate() as Iterable<SqlRow>;
@@ -243,6 +249,16 @@ export function parseWhatsAppSource(
         const messageId = edit?.originalKeyId ?? stringOrNull(row.key_id) ?? surrogateMessageId("modern", String(rowId), sourceFingerprint ?? null);
         const messageType = messageTypeFromCode(row.message_type ?? 0);
         const thumbnailRow = thumbnailStmt ? (thumbnailStmt.get(rowId) as { thumbnail: Buffer | null } | undefined) : undefined;
+        // No local file recorded, but the backup may still hold the CDN
+        // descriptor — surface it so the importer can enqueue a recovery.
+        const downloadDescriptor = media.filePath
+          ? null
+          : buildImportDownloadDescriptor(media, messageType, {
+              chatJid,
+              keyId: stringOrNull(row.key_id),
+              fromMe: boolish(row.from_me ?? row.key_from_me),
+              senderJid: jidMap.get(Number(row.sender_jid_row_id)) ?? null
+            });
         yield {
           chatSourceId: chatJid,
           sourceMessageId: messageId,
@@ -256,7 +272,8 @@ export function parseWhatsAppSource(
           height: media.height,
           durationMs: media.durationMs,
           isViewOnce: media.viewOnce || messageType.startsWith("view_once"),
-          thumbnail: thumbnailRow?.thumbnail instanceof Buffer && thumbnailRow.thumbnail.length > 0 ? thumbnailRow.thumbnail : null
+          thumbnail: thumbnailRow?.thumbnail instanceof Buffer && thumbnailRow.thumbnail.length > 0 ? thumbnailRow.thumbnail : null,
+          downloadDescriptor
         };
       }
     },
@@ -665,6 +682,14 @@ interface MediaSidecarInfo {
   height: number | null;
   durationMs: number | null;
   viewOnce: boolean;
+  // Encrypted CDN download descriptor — used to recover media the phone never
+  // saved locally (file_path NULL). media_key is the only binary column.
+  mediaKeyB64: string | null;
+  encFileHashB64: string | null;
+  directPath: string | null;
+  url: string | null;
+  mediaKeyTimestamp: number | null;
+  fileLength: number | null;
 }
 
 function loadInterpretationSidecars(
@@ -793,7 +818,12 @@ function loadMediaSidecarTable(
     return;
   }
   const columns = columnsFor(inspection, table);
-  const optional = ["file_path", "file_size", "mime_type", "media_name", "file_hash", "width", "height", "media_duration"];
+  const optional = [
+    "file_path", "file_size", "mime_type", "media_name", "file_hash", "width", "height", "media_duration",
+    // CDN descriptor columns (present on modern message_media): used to recover
+    // media whose phone never saved a local file.
+    "media_key", "enc_file_hash", "direct_path", "message_url", "media_key_timestamp", "file_length"
+  ];
   const selected = ["message_row_id", ...optional.filter((column) => columns.has(column))];
   try {
     const rows = db.prepare(`SELECT ${selected.map(quoteIdentifier).join(", ")} FROM ${quoteIdentifier(table)}`).iterate() as Iterable<SqlRow>;
@@ -813,12 +843,86 @@ function loadMediaSidecarTable(
         width: row.width == null ? existing?.width ?? null : Number(row.width),
         height: row.height == null ? existing?.height ?? null : Number(row.height),
         durationMs: durationSeconds == null || !Number.isFinite(durationSeconds) ? existing?.durationMs ?? null : Math.round(durationSeconds * 1000),
-        viewOnce: viewOnce || existing?.viewOnce === true
+        viewOnce: viewOnce || existing?.viewOnce === true,
+        mediaKeyB64: blobToBase64(row.media_key) ?? existing?.mediaKeyB64 ?? null,
+        encFileHashB64: stringOrNull(row.enc_file_hash) ?? existing?.encFileHashB64 ?? null,
+        directPath: stringOrNull(row.direct_path) ?? existing?.directPath ?? null,
+        url: stringOrNull(row.message_url) ?? existing?.url ?? null,
+        mediaKeyTimestamp: row.media_key_timestamp == null ? existing?.mediaKeyTimestamp ?? null : Number(row.media_key_timestamp),
+        fileLength: row.file_length == null ? existing?.fileLength ?? null : Number(row.file_length)
       });
     }
   } catch {
     // Optional enrichment only; a missing/odd table shape must not fail import.
   }
+}
+
+// message_media stores media_key as a BLOB; the other hash/path columns are
+// already base64/text. The queue descriptor keeps binary fields as base64.
+function blobToBase64(value: unknown): string | null {
+  if (value == null) return null;
+  if (Buffer.isBuffer(value)) return value.length > 0 ? value.toString("base64") : null;
+  if (value instanceof Uint8Array) return value.length > 0 ? Buffer.from(value).toString("base64") : null;
+  const text = String(value).trim();
+  return text.length > 0 ? text : null;
+}
+
+// Android msgstore message-type → the Baileys media type used to derive the
+// decrypt key. Only the kinds a passive CDN fetch can recover are mapped;
+// anything else yields no descriptor (stays honestly missing).
+const DESCRIPTOR_MEDIA_TYPE: Record<string, MediaDownloadDescriptor["mediaType"]> = {
+  image: "image",
+  view_once_image: "image",
+  video: "video",
+  gif: "video",
+  view_once_video: "video",
+  audio: "audio",
+  view_once_audio: "audio",
+  document: "document",
+  sticker: "sticker"
+};
+
+// Build a recovery descriptor for a file-less media row. Returns null unless the
+// media key is present AND the media is actionable — either a CDN path/url to
+// download now, or a raw stanza key to request a re-upload for.
+function buildImportDownloadDescriptor(
+  media: MediaSidecarInfo,
+  messageType: string,
+  message: { chatJid: string; keyId: string | null; fromMe: boolean; senderJid: string | null }
+): MediaDownloadDescriptor | null {
+  const mediaType = DESCRIPTOR_MEDIA_TYPE[messageType];
+  if (!mediaType || !media.mediaKeyB64) {
+    return null;
+  }
+  // A media re-upload request must reference the message exactly as the sender
+  // addressed it; only the raw stanza key (never a surrogate id) can do that.
+  const retryKey = message.keyId
+    ? {
+        remoteJid: message.chatJid,
+        id: message.keyId,
+        fromMe: message.fromMe,
+        participant: message.fromMe ? null : message.senderJid && message.senderJid !== "me" ? message.senderJid : null
+      }
+    : null;
+  if (!media.directPath && !media.url && !retryKey) {
+    return null;
+  }
+  return {
+    mediaType,
+    mediaKey: media.mediaKeyB64,
+    directPath: media.directPath,
+    url: media.url,
+    fileEncSha256: media.encFileHashB64,
+    fileSha256: media.fileHashB64,
+    mediaKeyTimestamp: media.mediaKeyTimestamp,
+    mimeType: media.mimeType,
+    fileName: media.mediaName,
+    fileLength: media.fileLength ?? media.fileSize,
+    width: media.width,
+    height: media.height,
+    durationSeconds: media.durationMs != null ? media.durationMs / 1000 : null,
+    retryKey
+  };
 }
 
 // Body/caption fill only when the main row had none; structured extras land in

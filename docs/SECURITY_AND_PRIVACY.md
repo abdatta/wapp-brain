@@ -27,7 +27,7 @@ The app should:
 - remove decrypted databases by default
 - warn when `--keep-decrypted` is used
 
-The UI import wizard verifies keys locally before import. Raw key text is used for the local verification/import request and is not persisted in the archive. Selected backup files, optional key files, and temporary import rollback snapshots are staged under `.wapp-brain/import-staging/` and should be treated as sensitive local data until the job or cleanup removes them.
+The UI import wizard verifies keys locally before import. The key is provided as text only (no key file in the UI) and is used for the local verification/import request without being persisted in the archive. Backup files are read in place from the folder you select — nothing is uploaded or copied into the app. Only the importer's decrypted intermediates and temporary import rollback snapshots are written under the local work dir, and should be treated as sensitive local data until the job or cleanup removes them.
 
 ## Logging
 

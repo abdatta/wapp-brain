@@ -4,8 +4,6 @@ import type {
   ImportJobSummary,
   ImportMode,
   ImportRequest,
-  ImportStagingFileKind,
-  ImportStagingSessionSummary,
   ImportTotals,
   ImportVerificationSummary,
   LiveGapWindowRecord,
@@ -21,7 +19,9 @@ import type {
   MessageEditRevisionRecord,
   MessageListItem,
   MessageListOrder,
-  StatusSummary
+  PickKind,
+  StatusSummary,
+  BackupDetectionManifest
 } from "../shared/types";
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
@@ -61,41 +61,30 @@ export function cleanupTempFiles(): Promise<{ ok: boolean; summary: { removedFil
   });
 }
 
-export function createImportSession(): Promise<{ ok: boolean; session: ImportStagingSessionSummary }> {
-  return request<{ ok: boolean; session: ImportStagingSessionSummary }>("/api/import/staging", { method: "POST", body: "{}" });
-}
-
-export async function uploadImportFile(
-  sessionId: string,
-  kind: ImportStagingFileKind,
-  file: File,
-  relativePath?: string
-): Promise<{ ok: boolean; session: ImportStagingSessionSummary }> {
-  const query = new URLSearchParams({ name: file.name });
-  if (relativePath) query.set("relativePath", relativePath);
-  const response = await fetch(`/api/import/staging/${sessionId}/${kind}?${query}`, {
+// Opens a native OS dialog on the local server and returns the absolute path the
+// user selects. `cancelled` when dismissed, `unavailable` when the picker can't
+// run (the wizard then falls back to a typed path).
+export function pickImportPath(
+  kind: PickKind,
+  startIn?: string | null
+): Promise<{ ok: boolean; path?: string; cancelled?: boolean; unavailable?: boolean; reason?: string }> {
+  return request("/api/import/pick", {
     method: "POST",
-    headers: { "Content-Type": "application/octet-stream" },
-    body: file
+    body: JSON.stringify({ kind, startIn: startIn ?? null })
   });
-  const payload = await response.json().catch(() => null);
-  if (!response.ok) {
-    throw new Error(payload?.error ?? "Could not stage selected file.");
-  }
-  return payload as { ok: boolean; session: ImportStagingSessionSummary };
 }
 
-export function cancelImportSession(sessionId: string): Promise<{ ok: boolean }> {
-  return request<{ ok: boolean }>(`/api/import/staging/${sessionId}`, { method: "DELETE", body: "{}" });
+export function detectBackupFolder(root: string): Promise<{ ok: boolean; manifest: BackupDetectionManifest }> {
+  return request<{ ok: boolean; manifest: BackupDetectionManifest }>("/api/import/detect", {
+    method: "POST",
+    body: JSON.stringify({ root })
+  });
 }
 
 export function verifyImportKey(requestBody: {
-  sessionId?: string | null;
   msgstorePath?: string | null;
   waPath?: string | null;
   key?: string | null;
-  keyPath?: string | null;
-  useStagedKey?: boolean;
 }): Promise<{ ok: boolean; verification: ImportVerificationSummary }> {
   return request<{ ok: boolean; verification: ImportVerificationSummary }>("/api/import/verify-key", {
     method: "POST",
@@ -104,11 +93,10 @@ export function verifyImportKey(requestBody: {
 }
 
 export function startImportJob(requestBody: {
-  sessionId?: string | null;
   mode: ImportMode;
   key?: string | null;
   keepDecrypted?: boolean;
-  paths?: Partial<Pick<ImportRequest, "msgstorePath" | "waPath" | "mediaPath" | "keyPath">>;
+  paths?: Partial<Pick<ImportRequest, "msgstorePath" | "waPath" | "mediaPath">>;
 }): Promise<{ ok: boolean; job: ImportJobSummary }> {
   return request<{ ok: boolean; job: ImportJobSummary }>("/api/import/jobs", {
     method: "POST",

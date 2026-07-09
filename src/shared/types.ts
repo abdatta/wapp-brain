@@ -142,7 +142,6 @@ export interface MediaQueueSummary {
 
 export type ImportRunStatus = "running" | "completed" | "failed";
 export type ImportMode = "merge" | "replace";
-export type ImportStagingFileKind = "msgstore" | "wa" | "media" | "key";
 export type ImportJobStatus = "queued" | "running" | "cancelling" | "completed" | "failed" | "cancelled";
 export type LiveConnectionState = "not_configured" | "pairing" | "connected" | "disconnected" | "stopped" | "error" | "logged_out";
 export type LiveHealthState = "healthy" | "catching_up" | "uncertain" | "disconnected" | "needs_user_action";
@@ -186,6 +185,9 @@ export interface StatusSummary {
   live?: LiveMaintainerStatusSummary;
   memory?: MemoryStatusSummary;
   setup?: GuidedSetupSummary;
+  // True when the local server can open a native OS file/folder dialog (Windows
+  // today); the import wizard shows "Browse…" only when this is true.
+  pickerAvailable?: boolean;
 }
 
 export interface GuidedSetupSummary {
@@ -550,23 +552,48 @@ export interface ImportRequest {
   mode?: ImportMode;
 }
 
-export interface ImportStagingFileSummary {
-  kind: ImportStagingFileKind;
-  name: string;
-  size: number;
-  stagedAt: string;
-}
-
-export interface ImportStagingSessionSummary {
-  id: string;
-  createdAt: string;
-  files: Partial<Record<ImportStagingFileKind, ImportStagingFileSummary>>;
-}
-
 export interface ImportVerificationSummary {
   ok: boolean;
   encrypted: boolean;
   message: string;
+}
+
+// Native OS file/folder picker (see server/import/nativePicker.ts). The picker
+// returns an absolute path the server reads in place — nothing is uploaded.
+export type PickKind = "backup-root" | "media" | "msgstore" | "wa";
+
+export type PickResult =
+  | { path: string }
+  | { cancelled: true }
+  | { unavailable: true; reason: string };
+
+// Backup-folder auto-detection (see server/import/detectBackup.ts).
+export type BackupInputKind = "msgstore" | "wa" | "media";
+
+export interface BackupDetectionFile {
+  kind: BackupInputKind;
+  name: string;
+  path: string;
+  encrypted: boolean;
+}
+
+export interface BackupAuxiliaryFile {
+  // A recognized auxiliary WhatsApp backup file, detected and reserved for a
+  // future ingestion — never ingested by this import.
+  kind: string;
+  name: string;
+  path: string;
+}
+
+export interface BackupDetectionManifest {
+  root: string;
+  // valid === (msgstore !== null); a folder with no msgstore cannot be imported.
+  valid: boolean;
+  msgstore: BackupDetectionFile | null;
+  wa: BackupDetectionFile | null;
+  media: { name: string; path: string } | null;
+  auxiliary: BackupAuxiliaryFile[];
+  notes: string[];
 }
 
 export type ImportProgressStep =
@@ -611,6 +638,9 @@ export type ImportProgressEvent =
       matchedRefs: number;
       copiedAssets: number;
       missingRefs: number;
+      // Of the unmatched: queued for CDN recovery vs. genuinely unrecoverable.
+      queuedForRecovery?: number;
+      unrecoverable?: number;
       warningCount: number;
       totalRefs: number | null;
     }

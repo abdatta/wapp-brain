@@ -454,10 +454,11 @@ describe("message interpretation", () => {
 
     expect(byId.get("m1")?.interpretation?.label).toBe("Poll");
     // Media availability is honest per message: an imported view-once with no
-    // matched file reports import_missing, never a blanket "not kept" claim.
+    // matched file and no recoverable descriptor reports import_missing with a
+    // truthful "never saved on your phone" reason, never a folder-blame claim.
     expect(byId.get("m2")?.interpretation).toEqual({
       label: "View once photo",
-      reason: "The media file was not found in the imported media folder."
+      reason: "This media was never saved on your phone, so the backup has no copy of it."
     });
     expect(byId.get("m2")?.media?.availability).toBe("import_missing");
     expect(byId.get("m3")?.interpretation?.label).toBe("Legacy message");

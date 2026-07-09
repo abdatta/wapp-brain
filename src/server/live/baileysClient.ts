@@ -76,7 +76,15 @@ export class BaileysLiveWhatsAppClient implements LiveWhatsAppClient {
       logger: pino({ level: "silent" }),
       printQRInTerminal: false,
       syncFullHistory: true,
-      markOnlineOnConnect: false
+      markOnlineOnConnect: false,
+      // Identify this linked device as WappBrain in WhatsApp's Linked Devices
+      // list. WhatsApp derives the bold primary label from a fixed platform
+      // enum (browser[1] -> DESKTOP -> a generic desktop label + computer
+      // icon), so it does not print an arbitrary app name; the only free-text
+      // field is browser[0] (the companion `os`), shown in parentheses. So this
+      // renders as "<desktop> (WappBrain)" — the parenthetical is what honestly
+      // attributes the session to this app.
+      browser: ["WappBrain", "Desktop", "0.1.0"]
     });
     if (this.options.readOnly !== false) {
       installReadOnlySocketGuards(socket);

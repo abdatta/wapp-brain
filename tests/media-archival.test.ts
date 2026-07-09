@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import type { MediaDownloadQueueRecord, MessageRecord } from "../src/shared/types";
+import type { MediaDownloadDescriptor, MediaDownloadQueueRecord, MessageRecord } from "../src/shared/types";
 import { SqliteArchiveRepository } from "../src/server/db/sqliteRepository";
 import { MemoryArchiveRepository } from "../src/server/db/memoryRepository";
 import { MediaBlobStore } from "../src/server/media/blobStore";
@@ -451,6 +451,139 @@ describe("media archival", () => {
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }
+  });
+
+  it("enqueues file-less media with a descriptor for CDN recovery, leaves keyless media honestly missing, and is dedup-safe", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-media-recover-"));
+    let repository: SqliteArchiveRepository | null = null;
+    try {
+      repository = new SqliteArchiveRepository(path.join(tempDir, "archive.sqlite"));
+      const store = new MediaBlobStore(path.join(tempDir, "media"));
+      const mediaRoot = path.join(tempDir, "Media");
+      await mkdir(mediaRoot, { recursive: true });
+      await repository.upsertChats("run", [{ sourceChatId: CHAT, jid: CHAT, displayName: null, chatType: "dm" }]);
+      // Two imported (non-wa-web) media messages with no local file.
+      await repository.upsertMessages([
+        { ...liveMediaMessage("RECOVER", 1000), sourceTable: "message" },
+        { ...liveMediaMessage("GONE", 2000), sourceTable: "message" }
+      ]);
+
+      const descriptor: MediaDownloadDescriptor = {
+        mediaType: "image",
+        mediaKey: Buffer.from("k".repeat(32)).toString("base64"),
+        directPath: "/v/t62/recoverable",
+        url: null,
+        fileEncSha256: null,
+        fileSha256: null,
+        mediaKeyTimestamp: 0,
+        mimeType: "image/jpeg",
+        fileName: null,
+        fileLength: 42,
+        width: null,
+        height: null,
+        durationSeconds: null,
+        retryKey: null
+      };
+      const fileless = (id: string, downloadDescriptor: MediaDownloadDescriptor | null) => ({
+        chatSourceId: CHAT,
+        sourceMessageId: id,
+        messageType: "image",
+        filePath: null,
+        fileSize: null,
+        mimeType: "image/jpeg",
+        mediaName: null,
+        fileHashB64: null,
+        width: null,
+        height: null,
+        durationMs: null,
+        isViewOnce: false,
+        thumbnail: null,
+        downloadDescriptor
+      });
+
+      const summary = await runImportMediaBackfill({
+        repository,
+        store,
+        mediaRoot,
+        totalRefs: 2,
+        refs: [fileless("RECOVER", descriptor), fileless("GONE", null)]
+      });
+      expect(summary.matchedRefs).toBe(0);
+      expect(summary.queuedForRecovery).toBe(1);
+      expect(summary.unrecoverable).toBe(1);
+      expect((await repository.getMediaQueueSummary()).pending).toBe(1);
+
+      // Availability is honest: recoverable → pending; keyless → import_missing
+      // with the "never saved on your phone" reason (never folder-blame).
+      const chats = await repository.listChats({ limit: 10, offset: 0, includeEventOnly: true });
+      const messages = await repository.listMessages(chats[0].id, { limit: 10, offset: 0 });
+      const byId = new Map(messages.map((message) => [message.sourceMessageId, message]));
+      expect(byId.get("RECOVER")?.media?.availability).toBe("pending");
+      expect(byId.get("GONE")?.media?.availability).toBe("import_missing");
+      expect(byId.get("GONE")?.interpretation?.reason).toBe(
+        "This media was never saved on your phone, so the backup has no copy of it."
+      );
+
+      // Re-running the backfill does not double-enqueue.
+      const again = await runImportMediaBackfill({
+        repository,
+        store,
+        mediaRoot,
+        totalRefs: 1,
+        refs: [fileless("RECOVER", descriptor)]
+      });
+      expect(again.queuedForRecovery).toBe(1);
+      expect((await repository.getMediaQueueSummary()).pending).toBe(1);
+
+      // The enqueued descriptor round-trips for the worker to fetch.
+      const claimed = await repository.claimDueMediaDownloads(10);
+      expect(claimed).toHaveLength(1);
+      expect(claimed[0].messageKey).toBe(messageKey(CHAT, "RECOVER"));
+      expect(claimed[0].descriptor.directPath).toBe("/v/t62/recoverable");
+    } finally {
+      await repository?.close();
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("mirrors recovery availability in the memory repository", async () => {
+    const repository = new MemoryArchiveRepository();
+    await repository.upsertChats("run", [{ sourceChatId: CHAT, jid: CHAT, displayName: null, chatType: "dm" }]);
+    await repository.upsertMessages([
+      { ...liveMediaMessage("RECOVER", 1000), sourceTable: "message" },
+      { ...liveMediaMessage("GONE", 2000), sourceTable: "message" }
+    ]);
+    await repository.enqueueMediaDownloads([
+      {
+        messageKey: messageKey(CHAT, "RECOVER"),
+        chatSourceId: CHAT,
+        sourceMessageId: "RECOVER",
+        descriptor: {
+          mediaType: "image",
+          mediaKey: Buffer.from("k".repeat(32)).toString("base64"),
+          directPath: "/v/x",
+          url: null,
+          fileEncSha256: null,
+          fileSha256: null,
+          mediaKeyTimestamp: 0,
+          mimeType: "image/jpeg",
+          fileName: null,
+          fileLength: 1,
+          width: null,
+          height: null,
+          durationSeconds: null,
+          retryKey: null
+        },
+        thumbnail: null,
+        isViewOnce: false,
+        priority: 0
+      }
+    ]);
+    const chats = await repository.listChats({ limit: 10, offset: 0, includeEventOnly: true });
+    const messages = await repository.listMessages(chats[0].id, { limit: 10, offset: 0 });
+    const byId = new Map(messages.map((message) => [message.sourceMessageId, message]));
+    expect(byId.get("RECOVER")?.media?.availability).toBe("pending");
+    expect(byId.get("GONE")?.media?.availability).toBe("import_missing");
   });
 
   it("labels view-once envelopes withheld from linked devices honestly instead of unknown", () => {

@@ -1,8 +1,5 @@
-import { createWriteStream } from "node:fs";
-import { mkdir, rm, stat } from "node:fs/promises";
+import { mkdir, rm } from "node:fs/promises";
 import path from "node:path";
-import { pipeline } from "node:stream/promises";
-import type { Readable } from "node:stream";
 import { config } from "../config";
 import { ensureManagedWorkDir } from "../cleanup";
 import type { ArchiveRepository } from "../db/repository";
@@ -11,35 +8,23 @@ import { prepareMsgstore, prepareSidecarDatabase } from "./decrypt";
 import { openReadableSQLite } from "./sqlite";
 import { runImport } from "./importer";
 import { ImportTerminalProgress } from "./progress";
-import { PublicError, publicErrorMessage, safeBasename } from "../privacy";
+import { PublicError, publicErrorMessage } from "../privacy";
 import type {
   ImportJobSummary,
   ImportMode,
   ImportProgressEvent,
   ImportRequest,
-  ImportStagingFileKind,
-  ImportStagingFileSummary,
-  ImportStagingSessionSummary,
   ImportVerificationSummary
 } from "../../shared/types";
 
-interface StagedFile extends ImportStagingFileSummary {
-  path: string;
-}
-
-interface ImportStagingSession {
-  id: string;
-  createdAt: string;
-  root: string;
-  files: Partial<Record<ImportStagingFileKind, StagedFile>>;
-}
-
+// Inputs are read in place from disk (the native picker / typed paths resolve to
+// absolute paths). Nothing is uploaded or copied into the app; the only staged
+// artifacts are the importer's decrypted intermediates under the work dir.
 interface StartImportJobInput {
-  sessionId?: string | null;
   mode: ImportMode;
   key?: string | null;
   keepDecrypted?: boolean;
-  paths?: Partial<Pick<ImportRequest, "msgstorePath" | "waPath" | "mediaPath" | "keyPath">>;
+  paths: Partial<Pick<ImportRequest, "msgstorePath" | "waPath" | "mediaPath">>;
 }
 
 interface StartImportJobCallbacks {
@@ -66,7 +51,6 @@ interface ImportJobLogger {
   error(message: string): void;
 }
 
-const sessions = new Map<string, ImportStagingSession>();
 const jobs = new Map<string, ImportJobState>();
 const MAX_RETAINED_EVENTS = 80;
 const PROGRESS_LOG_INTERVAL_MS = 5000;
@@ -89,82 +73,15 @@ export function setImportTerminalProgressFactoryForTests(factory: (label: string
   };
 }
 
-export async function createImportStagingSession(): Promise<ImportStagingSessionSummary> {
-  await ensureManagedWorkDir();
-  const id = crypto.randomUUID();
-  const root = path.resolve(config.workDir, "import-staging", id);
-  await mkdir(root, { recursive: true });
-  const session: ImportStagingSession = {
-    id,
-    createdAt: new Date().toISOString(),
-    root,
-    files: {}
-  };
-  sessions.set(id, session);
-  return publicSession(session);
-}
-
-export async function stageImportFile(
-  sessionId: string,
-  kind: ImportStagingFileKind,
-  fileName: string,
-  source: Readable,
-  relativePath?: string | null
-): Promise<ImportStagingSessionSummary> {
-  const session = requireSession(sessionId);
-  const safeName = sanitizeFileName(fileName || `${kind}.bin`);
-  const target =
-    kind === "media"
-      ? path.join(session.root, "media", sanitizeRelativePath(relativePath ?? safeName))
-      : path.join(session.root, `${kind}-${safeName}`);
-  assertWithin(session.root, target);
-  await mkdir(path.dirname(target), { recursive: true });
-  await pipeline(source, createWriteStream(target, { flags: "w" }));
-  const size = (await stat(target)).size;
-  if (kind === "media") {
-    const current = session.files.media;
-    session.files.media = {
-      kind,
-      name: current?.name ?? "Selected media folder",
-      size: (current?.size ?? 0) + size,
-      stagedAt: new Date().toISOString(),
-      path: path.join(session.root, "media")
-    };
-  } else {
-    session.files[kind] = {
-      kind,
-      name: safeName,
-      size,
-      stagedAt: new Date().toISOString(),
-      path: target
-    };
-  }
-  return publicSession(session);
-}
-
-export function getImportStagingSession(sessionId: string): ImportStagingSessionSummary {
-  return publicSession(requireSession(sessionId));
-}
-
-export async function cancelImportStagingSession(sessionId: string): Promise<void> {
-  const session = sessions.get(sessionId);
-  if (!session) return;
-  sessions.delete(sessionId);
-  await rm(session.root, { recursive: true, force: true });
-}
-
+// Verifies the text key locally against the detected msgstore (and optional
+// contacts DB), reading the files in place. Key files are not accepted.
 export async function verifyImportKey(input: {
-  sessionId?: string | null;
   msgstorePath?: string | null;
   waPath?: string | null;
   key?: string | null;
-  keyPath?: string | null;
-  useStagedKey?: boolean;
 }): Promise<ImportVerificationSummary> {
-  const session = input.sessionId ? requireSession(input.sessionId) : null;
-  const msgstorePath = session?.files.msgstore?.path ?? input.msgstorePath;
-  const waPath = session?.files.wa?.path ?? input.waPath;
-  const keyPath = input.useStagedKey ? session?.files.key?.path : input.keyPath;
+  const msgstorePath = input.msgstorePath;
+  const waPath = input.waPath;
   if (!msgstorePath) {
     throw new PublicError("IMPORT_VERIFY_MISSING_BACKUP", "Select a msgstore backup before verifying the key.");
   }
@@ -180,7 +97,8 @@ export async function verifyImportKey(input: {
     openPlaintextInputs(plaintextInputs);
     return { ok: true, encrypted: false, message: "Plain SQLite databases opened successfully. No backup key is required." };
   }
-  const verifyDir = path.join(session?.root ?? path.resolve(config.workDir, "import-staging", "manual"), "verify");
+  await ensureManagedWorkDir();
+  const verifyDir = path.resolve(config.workDir, "import-verify", crypto.randomUUID());
   await mkdir(verifyDir, { recursive: true });
   const prepared: Array<Awaited<ReturnType<typeof prepareMsgstore>>> = [];
   try {
@@ -190,14 +108,12 @@ export async function verifyImportKey(input: {
           ? await prepareMsgstore({
               encryptedPath: inputFile.path,
               key: input.key ?? null,
-              keyPath: keyPath ?? null,
               outputDir: verifyDir,
               keepDecrypted: false
             })
           : await prepareSidecarDatabase({
               encryptedPath: inputFile.path,
               key: input.key ?? null,
-              keyPath: keyPath ?? null,
               outputDir: verifyDir,
               keepDecrypted: false,
               label: inputFile.label,
@@ -221,13 +137,11 @@ export function startImportJob(repository: ArchiveRepository, input: StartImport
   if (active) {
     throw new PublicError("IMPORT_JOB_ACTIVE", "An import is already running. Reopen the progress screen to monitor or stop it.");
   }
-  const session = input.sessionId ? requireSession(input.sessionId) : null;
   const request: ImportRequest = {
-    msgstorePath: session?.files.msgstore?.path ?? input.paths?.msgstorePath ?? "",
-    waPath: session?.files.wa?.path ?? input.paths?.waPath ?? null,
-    mediaPath: session?.files.media?.path ?? input.paths?.mediaPath ?? null,
+    msgstorePath: input.paths.msgstorePath ?? "",
+    waPath: input.paths.waPath ?? null,
+    mediaPath: input.paths.mediaPath ?? null,
     key: input.key ?? null,
-    keyPath: session?.files.key?.path ?? input.paths?.keyPath ?? null,
     keepDecrypted: Boolean(input.keepDecrypted),
     mode: input.mode
   };
@@ -248,7 +162,7 @@ export function startImportJob(repository: ArchiveRepository, input: StartImport
     lastMediaLogAt: 0
   };
   jobs.set(job.id, job);
-  void runJob(repository, job, request, session?.id ?? null, callbacks);
+  void runJob(repository, job, request, callbacks);
   return publicJob(job);
 }
 
@@ -290,7 +204,6 @@ async function runJob(
   repository: ArchiveRepository,
   job: ImportJobState,
   request: ImportRequest,
-  sessionId: string | null,
   callbacks: StartImportJobCallbacks
 ): Promise<void> {
   let restorePoint: Awaited<ReturnType<ArchiveRepository["createRestorePoint"]>> | null = null;
@@ -316,9 +229,6 @@ async function runJob(
     await configuredTraceRecorder?.snapshotArchive(`after-import-job-${job.id}`, config.archive.sqlitePath);
     await callbacks.onArchiveChanged?.({ source: "import", messageCount: totals.messages, contactCount: totals.contacts });
     logJob(job, "info", `completed messages=${totals.messages.toLocaleString()} warnings=${totals.warnings.toLocaleString()}`);
-    if (sessionId) {
-      await cancelImportStagingSession(sessionId);
-    }
   } catch (error) {
     // A legacy-gate refusal happens before anything is written; skip the
     // (expensive) full-archive rollback in that case.
@@ -334,9 +244,6 @@ async function runJob(
       job.terminalProgress?.fail(job.error);
     }
     logJob(job, job.status === "cancelled" ? "warn" : "error", job.error);
-    if (sessionId) {
-      await cancelImportStagingSession(sessionId);
-    }
   } finally {
     await restorePoint?.dispose();
   }
@@ -374,34 +281,6 @@ function retainProgressMilestones(events: ImportProgressEvent[]): void {
     events.length,
     ...events.filter((event) => recent.has(event))
   );
-}
-
-function requireSession(sessionId: string): ImportStagingSession {
-  const session = sessions.get(sessionId);
-  if (!session) {
-    throw new PublicError("IMPORT_SESSION_MISSING", "Import staging session was not found.");
-  }
-  return session;
-}
-
-function publicSession(session: ImportStagingSession): ImportStagingSessionSummary {
-  return {
-    id: session.id,
-    createdAt: session.createdAt,
-    files: Object.fromEntries(
-      Object.entries(session.files).map(([kind, file]) => [
-        kind,
-        file
-          ? {
-              kind: file.kind,
-              name: file.name,
-              size: file.size,
-              stagedAt: file.stagedAt
-            }
-          : undefined
-      ])
-    ) as ImportStagingSessionSummary["files"]
-  };
 }
 
 function publicJob(job: ImportJobSummary): ImportJobSummary {
@@ -522,23 +401,4 @@ function formatBytes(bytes: number): string {
     unit = units.shift() ?? unit;
   }
   return `${value >= 10 ? value.toFixed(0) : value.toFixed(1)} ${unit}`;
-}
-
-function sanitizeFileName(value: string): string {
-  return (safeBasename(value) ?? "selected-file").replace(/[^A-Za-z0-9_. -]/g, "_").slice(0, 120) || "selected-file";
-}
-
-function sanitizeRelativePath(value: string): string {
-  return value
-    .split(/[\\/]+/)
-    .map((part) => sanitizeFileName(part))
-    .filter(Boolean)
-    .join(path.sep);
-}
-
-function assertWithin(root: string, target: string): void {
-  const relative = path.relative(path.resolve(root), path.resolve(target));
-  if (relative.startsWith("..") || path.isAbsolute(relative)) {
-    throw new PublicError("IMPORT_STAGING_UNSAFE_PATH", "Selected file could not be staged safely.");
-  }
 }

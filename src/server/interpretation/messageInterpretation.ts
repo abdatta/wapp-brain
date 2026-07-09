@@ -70,7 +70,7 @@ const MEDIA_AVAILABILITY_REASONS: Record<Exclude<MediaAvailabilityState, "stored
   downloading: "Media is downloading.",
   expired_unrecoverable: "The media could not be recovered before its link expired.",
   not_captured: "The media arrived while the archive was offline and was not captured.",
-  import_missing: "The media file was not found in the imported media folder."
+  import_missing: "This media was never saved on your phone, so the backup has no copy of it."
 };
 
 export function interpretMessage(input: {

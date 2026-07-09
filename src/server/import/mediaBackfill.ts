@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import type { ImportProgressEvent, ImportWarning } from "../../shared/types";
+import type { ImportProgressEvent, ImportWarning, MediaDownloadDescriptor } from "../../shared/types";
 import type { ArchiveRepository } from "../db/repository";
 import type { MediaBlobStore } from "../media/blobStore";
 import { messageKey } from "../identity/keys";
@@ -29,10 +29,26 @@ export interface MediaBackfillSummary {
   matchedRefs: number;
   copiedAssets: number;
   missingRefs: number;
+  // Of the unmatched refs: those with a usable CDN descriptor (enqueued for
+  // background recovery) vs. those with no recoverable copy at all.
+  queuedForRecovery: number;
+  unrecoverable: number;
   ambiguousRefs: number;
   unreadableFiles: number;
   warningCount: number;
 }
+
+type MediaEnqueueItem = {
+  messageKey: string;
+  chatSourceId: string;
+  sourceMessageId: string;
+  descriptor: MediaDownloadDescriptor;
+  thumbnail: Uint8Array | null;
+  isViewOnce: boolean;
+  priority: number;
+};
+
+const ENQUEUE_CHUNK = 1000;
 
 export interface MediaBackfillOptions {
   repository: ArchiveRepository;
@@ -64,12 +80,15 @@ export async function runImportMediaBackfill(options: MediaBackfillOptions): Pro
     matchedRefs: 0,
     copiedAssets: 0,
     missingRefs: 0,
+    queuedForRecovery: 0,
+    unrecoverable: 0,
     ambiguousRefs: 0,
     unreadableFiles: 0,
     warningCount: 0
   };
   const index = walkMediaFolder(options.mediaRoot, summary);
   const hashCache = new Map<string, string | null>();
+  const recoverable: MediaEnqueueItem[] = [];
   const emitProgress = () => {
     options.onProgress?.({
       type: "media-progress",
@@ -77,6 +96,8 @@ export async function runImportMediaBackfill(options: MediaBackfillOptions): Pro
       matchedRefs: summary.matchedRefs,
       copiedAssets: summary.copiedAssets,
       missingRefs: summary.missingRefs,
+      queuedForRecovery: summary.queuedForRecovery,
+      unrecoverable: summary.unrecoverable,
       warningCount: summary.warningCount,
       totalRefs: options.totalRefs ?? null
     });
@@ -88,6 +109,24 @@ export async function runImportMediaBackfill(options: MediaBackfillOptions): Pro
     const match = matchRefToFile(ref, index, hashCache, summary);
     if (!match) {
       summary.missingRefs += 1;
+      // No local file, but the backup may still hold the encrypted CDN
+      // descriptor — enqueue those for background recovery; the rest have no
+      // recoverable copy (the phone never saved the media, no download keys).
+      if (ref.downloadDescriptor) {
+        const chatSourceId = options.resolveChatSourceId ? await options.resolveChatSourceId(ref.chatSourceId) : ref.chatSourceId;
+        recoverable.push({
+          messageKey: messageKey(chatSourceId, ref.sourceMessageId),
+          chatSourceId,
+          sourceMessageId: ref.sourceMessageId,
+          descriptor: ref.downloadDescriptor,
+          thumbnail: ref.thumbnail ?? null,
+          isViewOnce: ref.isViewOnce,
+          priority: 0
+        });
+        summary.queuedForRecovery += 1;
+      } else {
+        summary.unrecoverable += 1;
+      }
     } else {
       try {
         const blob = await options.store.putFile(match.absolutePath);
@@ -121,20 +160,41 @@ export async function runImportMediaBackfill(options: MediaBackfillOptions): Pro
       await new Promise((resolve) => setImmediate(resolve));
     }
   }
-  summary.warningCount = summary.missingRefs > 0 || summary.ambiguousRefs > 0 || summary.unreadableFiles > 0 ? 1 : 0;
+  await enqueueRecoverable(options.repository, recoverable, options.signal);
+  // Queued-for-recovery is not a warning (it will be fetched); only a genuine
+  // no-recoverable-copy / ambiguous / unreadable result warrants a warning.
+  summary.warningCount = summary.unrecoverable > 0 || summary.ambiguousRefs > 0 || summary.unreadableFiles > 0 ? 1 : 0;
   emitProgress();
   return summary;
+}
+
+// Enqueue recoverable media into the durable download queue in chunks. Best-
+// effort bookkeeping: an enqueue failure warns by omission but never aborts the
+// import (message import already stands); cancellation still propagates.
+async function enqueueRecoverable(repository: ArchiveRepository, items: MediaEnqueueItem[], signal?: AbortSignal): Promise<void> {
+  for (let start = 0; start < items.length; start += ENQUEUE_CHUNK) {
+    throwIfAborted(signal);
+    try {
+      await repository.enqueueMediaDownloads(items.slice(start, start + ENQUEUE_CHUNK));
+    } catch (error) {
+      if (error instanceof PublicError && error.code === "IMPORT_CANCELLED") {
+        throw error;
+      }
+      break;
+    }
+  }
 }
 
 // Privacy-safe summary warning for the import run (counts only, no paths).
 export function mediaBackfillWarning(summary: MediaBackfillSummary): ImportWarning {
   return {
-    severity: summary.missingRefs > 0 ? "warning" : "info",
+    severity: summary.unrecoverable > 0 ? "warning" : "info",
     code: "MEDIA_INGEST_SUMMARY",
     entityType: "message",
     message:
-      `Media ingestion: ${summary.matchedRefs.toLocaleString()} of ${summary.processedRefs.toLocaleString()} media messages matched and archived` +
-      `${summary.missingRefs ? `, ${summary.missingRefs.toLocaleString()} missing from the folder` : ""}` +
+      `Media ingestion: ${summary.matchedRefs.toLocaleString()} of ${summary.processedRefs.toLocaleString()} media messages archived from the folder` +
+      `${summary.queuedForRecovery ? `, ${summary.queuedForRecovery.toLocaleString()} queued to recover from WhatsApp` : ""}` +
+      `${summary.unrecoverable ? `, ${summary.unrecoverable.toLocaleString()} with no recoverable copy` : ""}` +
       `${summary.ambiguousRefs ? ` (${summary.ambiguousRefs.toLocaleString()} ambiguous)` : ""}` +
       `${summary.unreadableFiles ? `, ${summary.unreadableFiles.toLocaleString()} unreadable` : ""}.`,
     context: { ...summary }

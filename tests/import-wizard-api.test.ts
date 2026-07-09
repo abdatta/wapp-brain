@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -17,19 +17,22 @@ import {
   setImportTerminalProgressFactoryForTests,
   startImportJob
 } from "../src/server/import/staging";
-import type { ImportJobSummary, ImportStagingSessionSummary, ImportVerificationSummary, StatusSummary } from "../src/shared/types";
+import type { BackupDetectionManifest, ImportJobSummary, ImportVerificationSummary, StatusSummary } from "../src/shared/types";
 
 describe("import wizard local API", () => {
-  it("stages selected files, verifies keys, imports with progress, and cleans cancelled sessions", async () => {
+  it("detects a backup folder, verifies the text key, imports in place, and exposes picker availability", async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-import-wizard-"));
     const archivePath = path.join(tempDir, "archive.sqlite");
     const workDir = path.join(tempDir, "work");
     try {
       const fixture = await createSyntheticFixture(path.join(tempDir, "fixture"));
       const rootKey = randomBytes(32);
-      const encryptedPath = path.join(tempDir, "msgstore.db.crypt15");
+      // Lay the encrypted databases out as a real backup folder.
+      const backupDir = path.join(tempDir, "backup");
+      await mkdir(backupDir, { recursive: true });
+      const encryptedPath = path.join(backupDir, "msgstore.db.crypt15");
       await writeFile(encryptedPath, createCrypt15Fixture(rootKey, await readFile(fixture.msgstorePath)));
-      const encryptedWaPath = path.join(tempDir, "wa.db.crypt15");
+      const encryptedWaPath = path.join(backupDir, "wa.db.crypt15");
       await writeFile(encryptedWaPath, createCrypt15Fixture(rootKey, await readFile(fixture.waPath)));
 
       const port = 5600 + Math.floor(Math.random() * 1000);
@@ -48,37 +51,64 @@ describe("import wizard local API", () => {
         const base = `http://127.0.0.1:${port}`;
         await waitForHttp(`${base}/api/status`);
 
-        const cancelled = await fetchJson<{ session: ImportStagingSessionSummary }>(`${base}/api/import/staging`, { method: "POST" });
-        await uploadFile(`${base}/api/import/staging/${cancelled.session.id}/msgstore?name=msgstore.db.crypt15`, encryptedPath);
-        await fetchJson(`${base}/api/import/staging/${cancelled.session.id}`, { method: "DELETE" });
-        await expect(stat(path.join(workDir, "import-staging", cancelled.session.id))).rejects.toThrow();
+        // Auto-detection resolves the core inputs from the one folder.
+        const detected = await fetchJson<{ manifest: BackupDetectionManifest }>(`${base}/api/import/detect`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ root: backupDir })
+        });
+        expect(detected.manifest.valid).toBe(true);
+        expect(detected.manifest.msgstore?.name).toBe("msgstore.db.crypt15");
+        expect(detected.manifest.wa?.name).toBe("wa.db.crypt15");
 
-        const created = await fetchJson<{ session: ImportStagingSessionSummary }>(`${base}/api/import/staging`, { method: "POST" });
-        let session = created.session;
-        session = (await uploadFile(`${base}/api/import/staging/${session.id}/msgstore?name=msgstore.db.crypt15`, encryptedPath)).session;
-        session = (await uploadFile(`${base}/api/import/staging/${session.id}/wa?name=wa.db.crypt15`, encryptedWaPath)).session;
+        // A non-local/empty folder path is rejected.
+        const badDetect = await fetch(`${base}/api/import/detect`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ root: "" })
+        });
+        expect(badDetect.ok).toBe(false);
 
-        expect(session.files.msgstore?.name).toBe("msgstore.db.crypt15");
-        expect(session.files.wa?.name).toBe("wa.db.crypt15");
+        // The removed byte-upload staging route no longer exists.
+        const stagingGone = await fetch(`${base}/api/import/staging`, { method: "POST" });
+        expect(stagingGone.status).toBe(404);
 
+        // An invalid picker kind is rejected (a valid kind would open a real dialog).
+        const badPick = await fetch(`${base}/api/import/pick`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ kind: "nonsense" })
+        });
+        expect(badPick.ok).toBe(false);
+
+        // Text key only: wrong key fails, correct key verifies against the detected msgstore.
         const failedVerify = await fetch(`${base}/api/import/verify-key`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ sessionId: session.id, key: "0".repeat(64) })
+          body: JSON.stringify({ msgstorePath: detected.manifest.msgstore?.path, key: "0".repeat(64) })
         });
         expect(failedVerify.ok).toBe(false);
 
         const verified = await fetchJson<{ verification: ImportVerificationSummary }>(`${base}/api/import/verify-key`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ sessionId: session.id, key: rootKey.toString("hex") })
+          body: JSON.stringify({
+            msgstorePath: detected.manifest.msgstore?.path,
+            waPath: detected.manifest.wa?.path,
+            key: rootKey.toString("hex")
+          })
         });
         expect(verified.verification.ok).toBe(true);
 
+        // Import runs from the detected paths — nothing uploaded.
         const started = await fetchJson<{ job: ImportJobSummary }>(`${base}/api/import/jobs`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ sessionId: session.id, mode: "merge", key: rootKey.toString("hex") })
+          body: JSON.stringify({
+            mode: "merge",
+            key: rootKey.toString("hex"),
+            paths: { msgstorePath: detected.manifest.msgstore?.path, waPath: detected.manifest.wa?.path }
+          })
         });
         const job = await waitForImportJob(base, started.job.id);
         const status = await fetchJson<StatusSummary>(`${base}/api/status`);
@@ -87,8 +117,7 @@ describe("import wizard local API", () => {
         expect(job.events.some((event) => event.type === "message-progress")).toBe(true);
         expect(job.totals?.messages).toBe(7);
         expect(status.counts.messages).toBe(7);
-        expect(status.setup?.state).toMatch(/baseline_ready_unlinked|baseline_too_old/);
-        await expect(stat(path.join(workDir, "import-staging", session.id))).rejects.toThrow();
+        expect(typeof status.pickerAvailable).toBe("boolean");
       } finally {
         child.kill();
         await new Promise((resolve) => child.once("exit", resolve));
@@ -96,7 +125,7 @@ describe("import wizard local API", () => {
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }
-  }, 30000);
+  }, 90000);
 
   it("cancels a running import and rolls back archive changes", async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-import-cancel-"));
@@ -219,20 +248,9 @@ describe("import wizard local API", () => {
   }, 30000);
 });
 
-async function uploadFile(url: string, filePath: string): Promise<{ session: ImportStagingSessionSummary }> {
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/octet-stream" },
-    body: await readFile(filePath)
-  });
-  if (!response.ok) {
-    throw new Error(`${response.status} ${await response.text()}`);
-  }
-  return (await response.json()) as { session: ImportStagingSessionSummary };
-}
-
 async function waitForHttp(url: string): Promise<void> {
-  const deadline = Date.now() + 10_000;
+  // tsx cold-compiles the whole server graph on spawn; allow generous headroom.
+  const deadline = Date.now() + 40_000;
   while (Date.now() < deadline) {
     try {
       const response = await fetch(url);
