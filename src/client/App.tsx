@@ -1628,7 +1628,7 @@ function BrainPanel({
             <button
               className="primaryButton"
               type="button"
-              disabled={Boolean(busy) || running || !overview || overview.chatsWithBacklog === 0}
+              disabled={Boolean(busy) || running || !overview || overview.chatsWithBacklog === 0 || Boolean(provider?.sessionMissing)}
               onClick={() =>
                 onRun(
                   provider && provider.provider !== "extractive"

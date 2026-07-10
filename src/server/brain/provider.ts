@@ -116,11 +116,14 @@ export function getBrainProviderStatus(): BrainProviderStatus {
   const enabled = isEnabled(state, provider);
   const modelBacked = provider !== "extractive";
   const degraded = Boolean(health.degradedSince);
+  const sessionMissing = provider === "codex" && enabled && !codexSessionExists();
   const message = !modelBacked
     ? "Extractive-only: no model provider is enabled; brain output is mechanical but citation-complete."
     : !enabled
       ? `Provider ${provider} is configured but not opted in. Run brain-provider enable-${provider} to allow sending selected evidence to it.`
-      : degraded
+      : sessionMissing
+        ? "Codex is enabled but has no local session. Run `npm run brain:provider -- login-codex` in a terminal (interactive OAuth) before running."
+        : degraded
         ? `Provider ${provider} is DEGRADED since ${health.degradedSince} (${health.consecutiveFailures} consecutive failures; last error: ${health.lastError ?? "unknown"}). Brain output falls back to extractive until a probe succeeds.`
         : health.consecutiveFailures > 0
           ? `Provider ${provider} is enabled but the last ${health.consecutiveFailures} call(s) failed: ${health.lastError ?? "unknown"}`
@@ -129,12 +132,24 @@ export function getBrainProviderStatus(): BrainProviderStatus {
     provider,
     modelBacked,
     enabled,
+    sessionMissing,
     degraded,
     model: modelBacked ? selectedModel(state, provider as Exclude<BrainProviderName, "extractive">) : null,
     models: BRAIN_PROVIDER_MODELS,
     health,
     message
   };
+}
+
+// A stored OAuth session is a hard precondition for codex calls: without one
+// the client's connect() would start an INTERACTIVE login flow inside the
+// server (observed blocking the event loop). Login is a CLI-only action.
+export function codexSessionExists(): boolean {
+  try {
+    return fs.existsSync(config.memory.codexSessionPath);
+  } catch {
+    return false;
+  }
 }
 
 function selectedModel(state: BrainProviderFileState, provider: Exclude<BrainProviderName, "extractive">): string {
@@ -337,18 +352,48 @@ async function generateWithClaudeCli(request: BrainGenerationRequest, model: str
 // --- codex adapter (existing OAuth client, response parsed) ---
 
 async function generateWithCodex(request: BrainGenerationRequest, model: string): Promise<BrainGenerationResult> {
-  const client = await loadCodexClient();
-  const response = (await client.sendMessage(request.user, {
-    model,
-    instructions: `${request.system}\nRespond with ONLY the requested JSON object — no prose, no markdown fences.`,
-    reasoning: { effort: "medium", summary: "auto" },
-    text: { verbosity: "low" },
-    store: false
-  })) as { content?: string };
+  if (!codexSessionExists()) {
+    throw new PublicError(
+      "BRAIN_CODEX_NO_SESSION",
+      "Codex has no local session; run `npm run brain:provider -- login-codex` in a terminal first. Refusing rather than starting an interactive login inside the server."
+    );
+  }
+  const timeoutMs = request.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const client = await withTimeout(loadCodexClient(), timeoutMs, "BRAIN_CODEX_TIMEOUT", "The Codex client did not connect in time.");
+  const response = (await withTimeout(
+    client.sendMessage(request.user, {
+      model,
+      instructions: `${request.system}\nRespond with ONLY the requested JSON object — no prose, no markdown fences.`,
+      reasoning: { effort: "medium", summary: "auto" },
+      text: { verbosity: "low" },
+      store: false
+    }),
+    timeoutMs,
+    "BRAIN_CODEX_TIMEOUT",
+    `The Codex model did not answer within ${Math.round(timeoutMs / 1000)}s.`
+  )) as { content?: string };
   if (typeof response?.content !== "string") {
     throw new PublicError("BRAIN_CODEX_BAD_RESPONSE", "The Codex client returned no readable content.");
   }
   return { json: parseModelJson(response.content), usage: { inputTokens: 0, outputTokens: 0 } };
+}
+
+// Hangs are the enemy of visible progress: every provider await gets a hard
+// deadline so a stuck call becomes a reported failure, never a frozen run.
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, code: string, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new PublicError(code, message)), timeoutMs);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
 }
 
 interface CodexClientLike {

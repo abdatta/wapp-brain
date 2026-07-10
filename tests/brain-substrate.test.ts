@@ -302,6 +302,36 @@ process.stdin.on("end", () => {
     }
   });
 
+  it("refuses codex without a stored session instead of starting an interactive login", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-codex-nosession-"));
+    const previousSessionPath = config.memory.codexSessionPath;
+    const restore = configureBrain({
+      providerConfigPath: path.join(tempDir, "provider.json"),
+      provider: "codex"
+    });
+    // Point the session lookup at a file that does not exist.
+    config.memory.codexSessionPath = path.join(tempDir, "codex-session.json");
+    try {
+      enableBrainProvider("codex");
+      const status = getBrainProviderStatus();
+      expect(status.sessionMissing).toBe(true);
+      expect(status.message).toContain("login-codex");
+      // Generation refuses fast — the observed failure mode was connect()
+      // blocking the whole server in an interactive OAuth flow.
+      await expect(generateStructured({ system: "s", user: "u", maxOutputTokens: 64 })).rejects.toThrow(/no local session/i);
+      // Model-mode runs refuse up front with the same actionable message.
+      const repository = new MemoryArchiveRepository();
+      const { startBrainRun } = await import("../src/server/brain/runJob");
+      const refused = startBrainRun(repository, { mode: "model" });
+      expect(refused.started).toBe(false);
+      expect(refused.refusal).toContain("login-codex");
+    } finally {
+      config.memory.codexSessionPath = previousSessionPath;
+      restore();
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it("parses model JSON defensively and keeps provider state free of content", async () => {
     expect(parseModelJson('```json\n{"a":1}\n```')).toEqual({ a: 1 });
     expect(parseModelJson('noise before {"a":{"b":2}} noise after')).toEqual({ a: { b: 2 } });

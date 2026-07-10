@@ -702,6 +702,9 @@ export interface BrainProviderStatus {
   provider: BrainProviderName;
   modelBacked: boolean;
   enabled: boolean;
+  // Codex only: enabled but no local OAuth session; calls refuse fast with
+  // login instructions instead of hanging in an interactive flow.
+  sessionMissing: boolean;
   degraded: boolean;
   // Persisted model selection for the active provider (null for extractive).
   model: string | null;

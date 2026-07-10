@@ -1530,6 +1530,19 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     return summary;
   }
 
+  async reconcileBrainRuns(): Promise<number> {
+    let reconciled = 0;
+    for (const run of this.brainRuns.values()) {
+      if (run.status === "running") {
+        run.status = "interrupted";
+        run.finishedAt = new Date().toISOString();
+        run.errorMessage = "Interrupted by a server restart.";
+        reconciled += 1;
+      }
+    }
+    return reconciled;
+  }
+
   async startBrainRun(kind: BrainRunSummary["kind"], timezone?: string | null): Promise<string> {
     const id = crypto.randomUUID();
     this.brainRuns.set(id, {

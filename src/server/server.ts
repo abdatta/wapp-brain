@@ -744,6 +744,10 @@ try {
   if (reconciled.staleSessions || reconciled.staleRuns) {
     console.log(`Reconciled stale live state: ${reconciled.staleSessions} session(s), ${reconciled.staleRuns} run(s).`);
   }
+  const orphanedBrainRuns = await repository.reconcileBrainRuns();
+  if (orphanedBrainRuns > 0) {
+    console.log(`[brain] marked ${orphanedBrainRuns} orphaned run(s) interrupted (watermarks make interruption safe).`);
+  }
   const legacyClosed = await closeLegacyWallClockGaps(repository);
   if (legacyClosed) {
     console.log(`Closed ${legacyClosed} legacy wall-clock live gap(s) superseded by evidence-based auditing.`);

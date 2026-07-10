@@ -52,7 +52,7 @@ export function startBrainRun(
   }
   const provider = getBrainProviderStatus();
   if (request.mode === "model") {
-    if (!provider.modelBacked || !provider.enabled) {
+    if (!provider.modelBacked || !provider.enabled || provider.sessionMissing) {
       return { started: false, progress: getBrainRunProgress(), refusal: provider.message };
     }
     if (provider.degraded) {

@@ -129,6 +129,12 @@ async function main(): Promise<void> {
       console.log(enableBrainProvider("codex").message);
     } else if (action === "disable") {
       console.log(disableBrainProvider().message);
+    } else if (action === "login-codex") {
+      // Interactive OAuth belongs in a terminal, never inside the server.
+      console.log("Starting the interactive Codex login…");
+      await connectCodexProvider();
+      const { getBrainProviderStatus: statusAfterLogin } = await import("./brain/provider");
+      console.log(statusAfterLogin().message);
     } else if (action === "probe") {
       console.log("Probing the model provider end-to-end (this makes one tiny model call)…");
       const probe = await probeBrainProvider();

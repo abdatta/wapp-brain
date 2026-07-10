@@ -201,6 +201,9 @@ export interface ArchiveRepository {
   // Restart recovery: claimed-but-unfinished tasks return to pending.
   resetInFlightBrainTasks(staleClaimMs?: number): Promise<number>;
   getBrainTaskSummary(): Promise<BrainTaskSummary>;
+  // Startup sweep: a run left 'running' by a dead process becomes an honest
+  // 'interrupted' (watermarks make interruption free; the row must not lie).
+  reconcileBrainRuns(): Promise<number>;
   startBrainRun(kind: BrainRunSummary["kind"], timezone?: string | null): Promise<string>;
   completeBrainRun(runId: string, totals: Record<string, number>): Promise<void>;
   failBrainRun(runId: string, status: "failed" | "interrupted" | "budget_exceeded", message: string): Promise<void>;

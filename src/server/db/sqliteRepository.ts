@@ -1584,6 +1584,16 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     return summary;
   }
 
+  async reconcileBrainRuns(): Promise<number> {
+    const result = this.db
+      .prepare(
+        `UPDATE brain_runs SET status = 'interrupted', finished_at = ?, error_message = 'Interrupted by a server restart.'
+         WHERE status = 'running'`
+      )
+      .run(currentIso());
+    return result.changes;
+  }
+
   async startBrainRun(kind: BrainRunSummary["kind"], timezone?: string | null): Promise<string> {
     this.assertWritableIdentityVersion();
     const id = crypto.randomUUID();
