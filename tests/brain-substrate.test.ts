@@ -282,8 +282,8 @@ process.stdin.on("end", () => {
     const restore = configureBrain({ providerConfigPath: path.join(tempDir, "provider.json"), provider: "claude-cli" });
     try {
       enableBrainProvider("claude-cli");
-      // Cheapest model is the default; selection persists; catalog is exposed.
-      expect(getBrainProviderStatus().model).toBe("haiku");
+      // Sonnet is the default digest model; selection persists; catalog exposed.
+      expect(getBrainProviderStatus().model).toBe("sonnet");
       const status = setBrainProviderModel("claude-cli", "fable");
       expect(status.model).toBe("fable");
       expect(status.models["claude-cli"]).toContain("sonnet");

@@ -48,8 +48,13 @@ export const BRAIN_PROVIDER_MODELS: Record<Exclude<BrainProviderName, "extractiv
   codex: ["gpt-5.5", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
 };
 
+// Sonnet default: episode digests are comprehension + citation-discipline
+// work where Sonnet's gain over Haiku (code-switched chats, implicit context)
+// compounds into the permanent substrate, while staying light enough on
+// subscription rate windows for volume runs. Haiku remains selectable for
+// turbo backfill; Fable/Opus are better saved for low-volume rollup calls.
 const DEFAULT_MODEL: Record<Exclude<BrainProviderName, "extractive">, string> = {
-  "claude-cli": "haiku",
+  "claude-cli": "sonnet",
   codex: "gpt-5.5"
 };
 
