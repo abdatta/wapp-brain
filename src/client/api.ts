@@ -2,6 +2,7 @@ import type {
   BrainOverview,
   BrainProviderName,
   BrainProviderStatus,
+  BrainRunProgress,
   ChatListItem,
   ChatListOptions,
   ImportJobSummary,
@@ -279,6 +280,19 @@ export function startSearchReindex(): Promise<{ ok: boolean; reindex: SearchRein
 
 export function getBrainOverview(): Promise<BrainOverview> {
   return request<BrainOverview>("/api/brain/status");
+}
+
+export function startBrainRun(body: {
+  mode: "model" | "extractive";
+  model?: string | null;
+  chatSourceId?: string | null;
+  maxChats?: number;
+}): Promise<{ ok: boolean; progress: BrainRunProgress }> {
+  return request<{ ok: boolean; progress: BrainRunProgress }>("/api/brain/runs", { method: "POST", body: JSON.stringify(body) });
+}
+
+export function getBrainRunProgress(): Promise<BrainRunProgress> {
+  return request<BrainRunProgress>("/api/brain/runs/current");
 }
 
 export function brainProviderAction(body: {

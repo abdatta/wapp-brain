@@ -42,6 +42,7 @@ import type {
   BackupDetectionManifest,
   BrainOverview,
   BrainProviderName,
+  BrainRunProgress,
   ChatListItem,
   ImportJobSummary,
   ImportMode,
@@ -68,6 +69,7 @@ import {
   cleanupTempFiles,
   detectBackupFolder,
   getBrainOverview,
+  getBrainRunProgress,
   disableMemoryProvider,
   enableCodexMemoryProvider,
   getCurrentImportJob,
@@ -93,6 +95,7 @@ import {
   retryLiveGap,
   retryStuckMedia,
   searchArchive,
+  startBrainRun,
   startMemoryRun,
   startImportJob,
   startSearchReindex,
@@ -132,6 +135,7 @@ export function App() {
   const [memoryResult, setMemoryResult] = useState<MemoryQueryResult | null>(null);
   const [memoryCitation, setMemoryCitation] = useState<MemoryCitationResolution | null>(null);
   const [brainOverview, setBrainOverview] = useState<BrainOverview | null>(null);
+  const [brainRun, setBrainRun] = useState<BrainRunProgress | null>(null);
   const [lightbox, setLightbox] = useState<{ assetId: number; mimeType: string | null } | null>(null);
   const [globalQuery, setGlobalQuery] = useState("");
   const [globalResults, setGlobalResults] = useState<SearchResultItem[]>([]);
@@ -254,6 +258,31 @@ export function App() {
     }, 1000);
     return () => window.clearInterval(timer);
   }, [reindexProgress?.state]);
+
+  // Poll brain-run progress while one executes; refresh coverage when done.
+  useEffect(() => {
+    if (brainRun?.state !== "running") {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      getBrainRunProgress()
+        .then((next) => {
+          setBrainRun(next);
+          if (next.state !== "running") {
+            getBrainOverview().then(setBrainOverview).catch(() => undefined);
+            if (next.state === "failed") {
+              setError(`Brain run failed${next.error ? `: ${next.error}` : "."}`);
+            } else if (next.state === "budget_exceeded") {
+              setNotice("Brain run stopped at its model-call budget; remaining backlog stays pending.");
+            } else if (next.state === "completed") {
+              setNotice(`Brain run completed: ${next.episodesCommitted} episodes (${next.claimsCommitted} claims).`);
+            }
+          }
+        })
+        .catch(() => undefined);
+    }, 1200);
+    return () => window.clearInterval(timer);
+  }, [brainRun?.state]);
 
   // Failures are never silent: a failed index build raises the global error
   // toast no matter which panel the user is looking at.
@@ -399,6 +428,9 @@ export function App() {
         .catch(() => undefined);
       getBrainOverview()
         .then(setBrainOverview)
+        .catch(() => undefined);
+      getBrainRunProgress()
+        .then(setBrainRun)
         .catch(() => undefined);
     } catch (err) {
       setStatusError(err instanceof Error ? err.message : "Status unavailable.");
@@ -552,6 +584,17 @@ export function App() {
       setReindexProgress(response.reindex);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not start the search reindex.");
+    }
+  }
+
+  async function handleStartBrainRun(body: { mode: "model" | "extractive"; model?: string | null }) {
+    setError(null);
+    try {
+      const response = await startBrainRun({ ...body, maxChats: 10 });
+      setBrainRun(response.progress);
+      setNotice("Brain run started — progress shows below and in the Brain panel.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not start the brain run.");
     }
   }
 
@@ -895,7 +938,13 @@ export function App() {
             onEnableCodex={() => void handleEnableCodexMemory()}
             onDisableProvider={() => void handleDisableMemoryProvider()}
           />
-          <BrainPanel overview={brainOverview} busy={busy} onProviderAction={(body) => void handleBrainProviderAction(body)} />
+          <BrainPanel
+            overview={brainOverview}
+            run={brainRun}
+            busy={busy}
+            onProviderAction={(body) => void handleBrainProviderAction(body)}
+            onRun={(body) => void handleStartBrainRun(body)}
+          />
 
           <ImportLauncher status={status} onOpen={() => setImportWizardOpen(true)} />
 
@@ -1460,20 +1509,25 @@ function LivePanel({
 // control (opt-in, model choice, probe) — manual-first, everything from the UI.
 function BrainPanel({
   overview,
+  run,
   busy,
-  onProviderAction
+  onProviderAction,
+  onRun
 }: {
   overview: BrainOverview | null;
+  run: BrainRunProgress | null;
   busy: string | null;
   onProviderAction: (body: {
     action: "enable" | "disable" | "probe" | "set-model";
     provider?: Exclude<BrainProviderName, "extractive">;
     model?: string;
   }) => void;
+  onRun: (body: { mode: "model" | "extractive"; model?: string | null }) => void;
 }) {
   const [open, setOpen] = useState(false);
   const provider = overview?.provider;
   const runDue = Boolean(overview?.scheduler.runDue);
+  const running = run?.state === "running";
   const activeProviderName = provider?.provider ?? "extractive";
   const modelOptions = provider && provider.provider !== "extractive" ? provider.models[provider.provider] ?? [] : [];
   return (
@@ -1498,12 +1552,23 @@ function BrainPanel({
             />
             <Metric label="Calls today" value={overview?.usageToday.calls.toLocaleString() ?? "0"} />
           </div>
-          {runDue && (
+          {runDue && !running && (
             <div className="brainDueAlert">
               <AlertTriangle size={14} />
               <span>
-                {overview?.scheduler.dueReason} Automatic runs are {overview?.scheduler.mode} — trigger one manually when your
-                model quota allows. (Run controls arrive with the episode engine.)
+                {overview?.scheduler.dueReason} Automatic runs are {overview?.scheduler.mode} — pick a provider and model, then
+                run when your quota allows.
+              </span>
+            </div>
+          )}
+          {running && (
+            <div className="brainDueAlert">
+              <Loader2 className="spin" size={14} />
+              <span>
+                Run in progress ({run?.mode}
+                {run?.model ? `/${run.model}` : ""}): {run?.episodesCommitted ?? 0} episodes from {run?.processedChats ?? 0}/
+                {run?.totalChats ?? 0} chats{run?.currentChat ? ` — now: ${run.currentChat}` : ""}. {run?.modelCalls ?? 0} model
+                calls.
               </span>
             </div>
           )}
@@ -1553,13 +1618,33 @@ function BrainPanel({
               <button
                 className="miniButton"
                 type="button"
-                disabled={Boolean(busy)}
+                disabled={Boolean(busy) || running}
                 onClick={() => onProviderAction({ action: "probe" })}
                 title="Make one tiny model call to verify the provider end-to-end"
               >
                 Probe
               </button>
             )}
+            <button
+              className="primaryButton"
+              type="button"
+              disabled={Boolean(busy) || running || !overview || overview.chatsWithBacklog === 0}
+              onClick={() =>
+                onRun(
+                  provider && provider.provider !== "extractive"
+                    ? { mode: "model", model: provider.model }
+                    : { mode: "extractive" }
+                )
+              }
+              title={
+                provider && provider.provider !== "extractive"
+                  ? `Assimilate the top backlog chats with ${provider.provider}/${provider.model}`
+                  : "Assimilate with extractive placeholders (no model calls; regenerable later)"
+              }
+            >
+              {running ? <Loader2 className="spin" size={16} /> : <Play size={16} />}
+              Run
+            </button>
           </div>
           <div className={`statusLine ${provider?.degraded ? "degradedLine" : ""}`}>{provider?.message}</div>
         </>

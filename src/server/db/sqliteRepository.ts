@@ -3,6 +3,8 @@ import fs from "node:fs";
 import path from "node:path";
 import type {
   BrainChatBacklogItem,
+  BrainEpisodeInput,
+  BrainEpisodeRecord,
   BrainLlmUsageSummary,
   BrainRunSummary,
   BrainStatusSummary,
@@ -107,10 +109,16 @@ const ARCHIVE_TABLES = [
   "brain_chat_watermarks",
   "brain_tasks",
   "brain_runs",
-  "brain_llm_ledger"
+  "brain_llm_ledger",
+  "brain_episodes",
+  "brain_claims",
+  "brain_citations"
 ] as const;
 const DELETE_TABLE_ORDER = [
   "identity_links",
+  "brain_citations",
+  "brain_claims",
+  "brain_episodes",
   "brain_llm_ledger",
   "brain_runs",
   "brain_tasks",
@@ -792,6 +800,47 @@ const schemaStatements = [
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   )`,
 
+  // Episodic tier: cited per-chat conversation digests. Generator records how
+  // each episode was produced ('extractive' episodes are honest placeholders,
+  // regenerable by a model later). Episodes are the citation spine — statuses
+  // demote them from read surfaces but never delete them.
+  `CREATE TABLE IF NOT EXISTS brain_episodes (
+    id TEXT PRIMARY KEY,
+    chat_source_id TEXT NOT NULL,
+    start_at_ms INTEGER NOT NULL,
+    end_at_ms INTEGER NOT NULL,
+    message_count INTEGER NOT NULL DEFAULT 0,
+    participants_json TEXT NULL,
+    summary TEXT NOT NULL,
+    markdown TEXT NOT NULL,
+    generator TEXT NOT NULL CHECK (generator IN ('model','extractive')),
+    model TEXT NULL,
+    status TEXT NOT NULL DEFAULT 'current' CHECK (status IN ('current','superseded','stale','compressed')),
+    run_id TEXT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS brain_claims (
+    id TEXT PRIMARY KEY,
+    episode_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('fact','decision','commitment','question','event')),
+    text TEXT NOT NULL,
+    FOREIGN KEY (episode_id) REFERENCES brain_episodes(id) ON DELETE CASCADE
+  )`,
+
+  // Citation labels ARE message keys — stable, globally unique, resolvable.
+  `CREATE TABLE IF NOT EXISTS brain_citations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    claim_id TEXT NOT NULL,
+    source_message_key TEXT NOT NULL,
+    source_chat_id TEXT NOT NULL,
+    message_id INTEGER NULL,
+    sender_source_jid TEXT NULL,
+    timestamp_ms INTEGER NULL,
+    FOREIGN KEY (claim_id) REFERENCES brain_claims(id) ON DELETE CASCADE
+  )`,
+
   // Every model call's cost, by UTC day and purpose: budgets are enforced
   // from this ledger as hard named blocks, never silent degradation.
   `CREATE TABLE IF NOT EXISTS brain_llm_ledger (
@@ -827,7 +876,11 @@ const schemaStatements = [
   `CREATE INDEX IF NOT EXISTS idx_message_mentions_jid ON message_mentions (mentioned_jid, message_id)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_tasks_due ON brain_tasks (status, next_attempt_at_ms, priority, id)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_ledger_day ON brain_llm_ledger (day, purpose)`,
-  `CREATE INDEX IF NOT EXISTS idx_brain_runs_status ON brain_runs (status, started_at)`
+  `CREATE INDEX IF NOT EXISTS idx_brain_runs_status ON brain_runs (status, started_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_brain_episodes_chat ON brain_episodes (chat_source_id, status, end_at_ms)`,
+  `CREATE INDEX IF NOT EXISTS idx_brain_claims_episode ON brain_claims (episode_id, sequence)`,
+  `CREATE INDEX IF NOT EXISTS idx_brain_citations_claim ON brain_citations (claim_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_brain_citations_key ON brain_citations (source_message_key)`
 ];
 
 // Full-text search over messages (brain hot tier): a content-storing FTS5
@@ -1609,6 +1662,107 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       latestRun: runs[0] ? rowToBrainRun(runs[0]) : null,
       activeRun: runs.find((run) => run.status === "running") ? rowToBrainRun(runs.find((run) => run.status === "running")!) : null
     };
+  }
+
+  async commitBrainEpisode(episode: BrainEpisodeInput): Promise<BrainEpisodeRecord> {
+    this.assertWritableIdentityVersion();
+    const id = crypto.randomUUID();
+    const chatSourceId = this.canonicalJid(episode.chatSourceId) ?? episode.chatSourceId;
+    const insertEpisode = this.db.prepare(
+      `INSERT INTO brain_episodes
+       (id, chat_source_id, start_at_ms, end_at_ms, message_count, participants_json, summary, markdown, generator, model, run_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+    const insertClaim = this.db.prepare(`INSERT INTO brain_claims (id, episode_id, sequence, kind, text) VALUES (?, ?, ?, ?, ?)`);
+    const insertCitation = this.db.prepare(
+      `INSERT INTO brain_citations (claim_id, source_message_key, source_chat_id, message_id, sender_source_jid, timestamp_ms)
+       SELECT ?, ?, ?, m.id, m.sender_source_jid, m.timestamp_ms
+       FROM (SELECT 1) LEFT JOIN messages m ON m.source_message_key = ?`
+    );
+    const advance = this.db.prepare(
+      `INSERT INTO brain_chat_watermarks (chat_source_id, assimilated_through_ms, last_episode_at, updated_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(chat_source_id) DO UPDATE SET
+         assimilated_through_ms = MAX(brain_chat_watermarks.assimilated_through_ms, excluded.assimilated_through_ms),
+         last_episode_at = excluded.last_episode_at,
+         updated_at = excluded.updated_at`
+    );
+    const transaction = this.db.transaction(() => {
+      insertEpisode.run(
+        id,
+        chatSourceId,
+        episode.startAtMs,
+        episode.endAtMs,
+        episode.messageCount,
+        stringifyJson(episode.participants),
+        episode.summary,
+        episode.markdown,
+        episode.generator,
+        episode.model,
+        episode.runId
+      );
+      episode.claims.forEach((claim, index) => {
+        const claimId = crypto.randomUUID();
+        insertClaim.run(claimId, id, index + 1, claim.kind, claim.text);
+        for (const key of claim.citations) {
+          insertCitation.run(claimId, key, chatSourceId, key);
+        }
+      });
+      advance.run(chatSourceId, episode.endAtMs, currentIso(), currentIso());
+    });
+    transaction();
+    const committed = await this.listBrainEpisodes({ chatSourceId, limit: 50 });
+    return committed.find((candidate) => candidate.id === id)!;
+  }
+
+  async updateBrainEpisodeMarkdown(episodeId: string, markdown: string): Promise<void> {
+    this.db.prepare(`UPDATE brain_episodes SET markdown = ? WHERE id = ?`).run(markdown, episodeId);
+  }
+
+  async listBrainEpisodes(options: { chatSourceId?: string | null; limit: number }): Promise<BrainEpisodeRecord[]> {
+    const where = options.chatSourceId ? `WHERE e.chat_source_id = ?` : "";
+    const params: unknown[] = options.chatSourceId ? [options.chatSourceId, options.limit] : [options.limit];
+    const rows = this.db
+      .prepare(
+        `SELECT e.*, COALESCE(NULLIF(TRIM(COALESCE(ch.display_name, '')), ''), NULL) AS chat_display_name
+         FROM brain_episodes e
+         LEFT JOIN chats ch ON ch.source_chat_id = e.chat_source_id
+         ${where}
+         ORDER BY e.end_at_ms DESC
+         LIMIT ?`
+      )
+      .all(...params) as Array<Record<string, unknown>>;
+    const claimsStmt = this.db.prepare(`SELECT id, kind, text FROM brain_claims WHERE episode_id = ? ORDER BY sequence`);
+    const citationsStmt = this.db.prepare(
+      `SELECT source_message_key, source_chat_id, message_id, sender_source_jid, timestamp_ms FROM brain_citations WHERE claim_id = ?`
+    );
+    return rows.map((row) => ({
+      id: String(row.id),
+      chatSourceId: String(row.chat_source_id),
+      chatDisplayName: (row.chat_display_name as string | null) ?? null,
+      startAtMs: Number(row.start_at_ms),
+      endAtMs: Number(row.end_at_ms),
+      messageCount: Number(row.message_count),
+      participants: (parseJson(row.participants_json as string | null) as string[] | null) ?? [],
+      summary: String(row.summary),
+      markdown: String(row.markdown),
+      generator: row.generator as BrainEpisodeRecord["generator"],
+      model: (row.model as string | null) ?? null,
+      status: row.status as BrainEpisodeRecord["status"],
+      createdAt: String(row.created_at),
+      claims: (claimsStmt.all(row.id) as Array<{ id: string; kind: string; text: string }>).map((claim) => ({
+        id: claim.id,
+        kind: claim.kind as BrainEpisodeRecord["claims"][number]["kind"],
+        text: claim.text,
+        citations: (citationsStmt.all(claim.id) as Array<Record<string, unknown>>).map((citation) => ({
+          sourceMessageKey: String(citation.source_message_key),
+          sourceChatId: String(citation.source_chat_id),
+          messageId: citation.message_id == null ? null : Number(citation.message_id),
+          senderSourceJid: (citation.sender_source_jid as string | null) ?? null,
+          timestampMs: citation.timestamp_ms == null ? null : Number(citation.timestamp_ms)
+        }))
+      }))
+    }));
   }
 
   async collapseSupersededMessages(

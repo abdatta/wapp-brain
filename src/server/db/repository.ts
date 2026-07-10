@@ -1,5 +1,7 @@
 import type {
   BrainChatBacklogItem,
+  BrainEpisodeInput,
+  BrainEpisodeRecord,
   BrainLlmUsageSummary,
   BrainRunSummary,
   BrainStatusSummary,
@@ -205,6 +207,12 @@ export interface ArchiveRepository {
   recordBrainLlmUsage(entry: { purpose: string; provider: string; inputTokens: number; outputTokens: number }): Promise<void>;
   getBrainLlmUsage(options: { sinceMs: number }): Promise<BrainLlmUsageSummary>;
   getBrainStatus(): Promise<BrainStatusSummary>;
+  // Episode commit is atomic: episode + claims + citations + watermark advance
+  // in one transaction — coverage moves only when the evidence lands.
+  commitBrainEpisode(episode: BrainEpisodeInput): Promise<BrainEpisodeRecord>;
+  // Rendered markdown references committed claim ids, so it lands post-commit.
+  updateBrainEpisodeMarkdown(episodeId: string, markdown: string): Promise<void>;
+  listBrainEpisodes(options: { chatSourceId?: string | null; limit: number }): Promise<BrainEpisodeRecord[]>;
   close?(): Promise<void>;
 }
 

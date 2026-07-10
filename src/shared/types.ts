@@ -739,6 +739,75 @@ export interface BrainOverview extends BrainStatusSummary {
   scheduler: BrainSchedulerStatus;
 }
 
+// --- Episodic tier ---
+
+export type BrainClaimKind = "fact" | "decision" | "commitment" | "question" | "event";
+export type BrainEpisodeGenerator = "model" | "extractive";
+
+export interface BrainCitationRecord {
+  sourceMessageKey: string;
+  sourceChatId: string;
+  messageId: number | null;
+  senderSourceJid: string | null;
+  timestampMs: number | null;
+}
+
+export interface BrainClaimRecord {
+  id: string;
+  kind: BrainClaimKind;
+  text: string;
+  citations: BrainCitationRecord[];
+}
+
+export interface BrainEpisodeInput {
+  chatSourceId: string;
+  startAtMs: number;
+  endAtMs: number;
+  messageCount: number;
+  participants: string[];
+  summary: string;
+  markdown: string;
+  generator: BrainEpisodeGenerator;
+  model: string | null;
+  runId: string | null;
+  claims: Array<{ kind: BrainClaimKind; text: string; citations: string[] }>;
+}
+
+export interface BrainEpisodeRecord {
+  id: string;
+  chatSourceId: string;
+  chatDisplayName: string | null;
+  startAtMs: number;
+  endAtMs: number;
+  messageCount: number;
+  participants: string[];
+  summary: string;
+  markdown: string;
+  generator: BrainEpisodeGenerator;
+  model: string | null;
+  status: "current" | "superseded" | "stale" | "compressed";
+  createdAt: string;
+  claims: BrainClaimRecord[];
+}
+
+// In-memory progress of a manual/scheduled brain run (job + polling model).
+export interface BrainRunProgress {
+  state: "idle" | "running" | "completed" | "failed" | "budget_exceeded";
+  runId: string | null;
+  mode: BrainEpisodeGenerator;
+  provider: string | null;
+  model: string | null;
+  processedChats: number;
+  totalChats: number;
+  currentChat: string | null;
+  episodesCommitted: number;
+  claimsCommitted: number;
+  modelCalls: number;
+  startedAt: string | null;
+  finishedAt: string | null;
+  error: string | null;
+}
+
 // Progress of a search reindex job (chunked FTS rebuild).
 export interface SearchReindexProgress {
   state: "idle" | "running" | "finalizing" | "completed" | "failed";

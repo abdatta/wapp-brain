@@ -4,6 +4,8 @@ import type {
 } from "./repository";
 import type {
   BrainChatBacklogItem,
+  BrainEpisodeInput,
+  BrainEpisodeRecord,
   BrainLlmUsageSummary,
   BrainRunSummary,
   BrainStatusSummary,
@@ -91,6 +93,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
   private nextBrainTaskId = 1;
   private brainRuns = new Map<string, BrainRunSummary>();
   private brainLedger: Array<{ purpose: string; provider: string; inputTokens: number; outputTokens: number; atMs: number }> = [];
+  private brainEpisodes = new Map<string, BrainEpisodeRecord>();
   private editRevisions = new Map<string, MessageEditRevisionRecord[]>();
   private nextMediaQueueId = 1;
   private nextMediaAssetId = 1;
@@ -1593,6 +1596,59 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       latestRun: runs[0] ?? null,
       activeRun: runs.find((run) => run.status === "running") ?? null
     };
+  }
+
+  async commitBrainEpisode(episode: BrainEpisodeInput): Promise<BrainEpisodeRecord> {
+    const id = crypto.randomUUID();
+    const record: BrainEpisodeRecord = {
+      id,
+      chatSourceId: episode.chatSourceId,
+      chatDisplayName: this.chats.get(episode.chatSourceId)?.displayName ?? null,
+      startAtMs: episode.startAtMs,
+      endAtMs: episode.endAtMs,
+      messageCount: episode.messageCount,
+      participants: episode.participants,
+      summary: episode.summary,
+      markdown: episode.markdown,
+      generator: episode.generator,
+      model: episode.model,
+      status: "current",
+      createdAt: new Date().toISOString(),
+      claims: episode.claims.map((claim) => ({
+        id: crypto.randomUUID(),
+        kind: claim.kind,
+        text: claim.text,
+        citations: claim.citations.map((key) => {
+          const message = [...this.messages.values()].find((candidate) => candidate.sourceMessageKey === key) ?? null;
+          return {
+            sourceMessageKey: key,
+            sourceChatId: episode.chatSourceId,
+            messageId: message?.id ?? null,
+            senderSourceJid: message?.senderSourceJid ?? null,
+            timestampMs: message?.timestampMs ?? null
+          };
+        })
+      }))
+    };
+    this.brainEpisodes.set(id, record);
+    await this.advanceBrainWatermark(episode.chatSourceId, episode.endAtMs);
+    return structuredClone(record);
+  }
+
+  async updateBrainEpisodeMarkdown(episodeId: string, markdown: string): Promise<void> {
+    const episode = this.brainEpisodes.get(episodeId);
+    if (episode) {
+      episode.markdown = markdown;
+    }
+  }
+
+  async listBrainEpisodes(options: { chatSourceId?: string | null; limit: number }): Promise<BrainEpisodeRecord[]> {
+    return structuredClone(
+      [...this.brainEpisodes.values()]
+        .filter((episode) => !options.chatSourceId || episode.chatSourceId === options.chatSourceId)
+        .sort((a, b) => b.endAtMs - a.endAtMs)
+        .slice(0, options.limit)
+    );
   }
 
   async getMemoryStatus(provider: MemoryProviderStatus): Promise<MemoryStatusSummary> {

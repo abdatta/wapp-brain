@@ -556,6 +556,56 @@ app.get("/api/brain/status", async (_req, res) => {
   }
 });
 
+// Manual brain runs: start with an explicit generator/model, poll progress.
+app.post("/api/brain/runs", async (req, res) => {
+  try {
+    const { startBrainRun } = await import("./brain/runJob");
+    const mode = req.body?.mode === "model" || req.body?.mode === "extractive" ? req.body.mode : "model";
+    const result = startBrainRun(
+      repository,
+      {
+        mode,
+        model: typeof req.body?.model === "string" ? req.body.model : null,
+        chatSourceId: typeof req.body?.chatSourceId === "string" ? req.body.chatSourceId : null,
+        maxChats: clampNumber(req.body?.maxChats, 1, 5000, 10),
+        maxModelCalls: clampNumber(req.body?.maxModelCalls, 1, 1000, config.brain.maxCallsPerHour)
+      },
+      () => {
+        broadcastArchiveChanged({ source: "manual", chatSourceIds: [], messageCount: 0, contactCount: 0 });
+      }
+    );
+    if (!result.started) {
+      res.status(409).json({ error: result.refusal ?? "The brain run could not start.", progress: result.progress });
+      return;
+    }
+    res.json({ ok: true, progress: result.progress });
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+app.get("/api/brain/runs/current", async (_req, res) => {
+  try {
+    const { getBrainRunProgress } = await import("./brain/runJob");
+    res.json(getBrainRunProgress());
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+app.get("/api/brain/episodes", async (req, res) => {
+  try {
+    res.json(
+      await repository.listBrainEpisodes({
+        chatSourceId: stringQuery(req.query.chatSourceId) ?? null,
+        limit: clampNumber(req.query.limit, 1, 100, 20)
+      })
+    );
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
 // Provider control from the UI: opt-in/out, model selection, health probe.
 app.post("/api/brain/provider", async (req, res) => {
   try {
