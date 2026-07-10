@@ -12,6 +12,7 @@ import { createCrypt15Fixture, decryptCrypt15 } from "../src/server/import/decry
 import { createModernSyntheticFixture, createSyntheticFixture } from "../src/server/import/fixtures";
 import { inspectArchive } from "../src/server/import/inspect";
 import { runImport } from "../src/server/import/importer";
+import { parseWhatsAppSource } from "../src/server/import/parser";
 import { openReadableSQLite } from "../src/server/import/sqlite";
 import { verifyImportKey } from "../src/server/import/staging";
 
@@ -501,6 +502,231 @@ describe("WhatsApp import MVP", () => {
     }
   });
 });
+
+describe("msgstore LID identity resolution", () => {
+  it("reads jid_map links and lid_display_name names, and skips silently when absent", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-lid-parser-"));
+    try {
+      const withTablesPath = path.join(tempDir, "msgstore-lid.db");
+      createLidMsgstoreDb(withTablesPath, { withLidTables: true });
+      const withTables = new Database(withTablesPath, { readonly: true });
+      try {
+        const parsed = parseWhatsAppSource(withTables);
+        expect(parsed.identityLinks).toContainEqual({
+          lid: "987654321000001@lid",
+          pn: "15550000001@s.whatsapp.net",
+          source: "msgstore.jid_map"
+        });
+        const mapped = parsed.contacts.find((contact) => contact.sourceJid === "987654321000001@lid");
+        const cacheNamed = parsed.contacts.find((contact) => contact.sourceJid === "987654321000002@lid");
+        expect(mapped?.displayName).toBe("Mapped Person");
+        expect(cacheNamed?.displayName).toBe("Cache-Named Person");
+        expect(cacheNamed?.rawMetadata?.source).toBe("lid_display_name");
+      } finally {
+        withTables.close();
+      }
+
+      const plainPath = path.join(tempDir, "msgstore-plain.db");
+      createLidMsgstoreDb(plainPath, { withLidTables: false });
+      const plain = new Database(plainPath, { readonly: true });
+      try {
+        const parsed = parseWhatsAppSource(plain);
+        expect(parsed.identityLinks).toHaveLength(0);
+        expect(parsed.contacts.every((contact) => contact.rawMetadata?.source !== "lid_display_name")).toBe(true);
+        expect(parsed.warnings.map((warning) => warning.code)).toEqual(["WA_DB_NOT_PROVIDED"]);
+      } finally {
+        plain.close();
+      }
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("prefers wa.db address-book names over the msgstore LID display cache", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-lid-precedence-"));
+    let repository: SqliteArchiveRepository | null = null;
+    try {
+      const msgstorePath = path.join(tempDir, "msgstore.db");
+      createLidMsgstoreDb(msgstorePath, { withLidTables: true });
+      const waPath = path.join(tempDir, "wa.db");
+      const wa = new Database(waPath);
+      wa.exec(`
+        CREATE TABLE wa_contacts (
+          _id INTEGER PRIMARY KEY,
+          jid TEXT,
+          lid_jid TEXT,
+          display_name TEXT
+        );
+        INSERT INTO wa_contacts (jid, lid_jid, display_name)
+          VALUES ('15550000001@s.whatsapp.net', '987654321000001@lid', 'AddressBook Name');
+      `);
+      wa.close();
+      repository = new SqliteArchiveRepository(path.join(tempDir, "archive.sqlite"));
+
+      await runImport(repository, { msgstorePath, waPath });
+      const chats = await repository.listChats({ limit: 20, offset: 0 });
+
+      expect(chats.some((chat) => chat.displayName === "AddressBook Name")).toBe(true);
+      expect(chats.some((chat) => chat.displayName === "Mapped Person")).toBe(false);
+      expect(chats.some((chat) => chat.displayName === "Cache-Named Person")).toBe(true);
+    } finally {
+      await repository?.close();
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("heals a LID-keyed archive in place when a later backup carries jid_map", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-lid-heal-"));
+    let repository: SqliteArchiveRepository | null = null;
+    try {
+      // First import simulates the pre-jid_map archive: LID-keyed chats, no links.
+      const beforePath = path.join(tempDir, "msgstore-before.db");
+      createLidMsgstoreDb(beforePath, { withLidTables: false });
+      const afterPath = path.join(tempDir, "msgstore-after.db");
+      createLidMsgstoreDb(afterPath, { withLidTables: true });
+      repository = new SqliteArchiveRepository(path.join(tempDir, "archive.sqlite"));
+
+      await runImport(repository, { msgstorePath: beforePath });
+      const beforeChats = await repository.listChats({ limit: 20, offset: 0 });
+      expect(beforeChats.some((chat) => chat.jid === "987654321000001@lid")).toBe(true);
+
+      const healed = await runImport(repository, { msgstorePath: afterPath });
+      const status = await repository.getStatus();
+      const chats = await repository.listChats({ limit: 20, offset: 0 });
+      const pnChat = chats.find((chat) => chat.jid === "15550000001@s.whatsapp.net");
+      const pnMessages = pnChat ? await repository.listMessages(pnChat.id, { limit: 20, offset: 0 }) : [];
+
+      expect(healed.messages).toBe(3);
+      expect(status.counts.messages).toBe(3);
+      expect(status.counts.chats).toBe(2);
+      expect(chats.some((chat) => chat.jid === "987654321000001@lid")).toBe(false);
+      expect(pnChat?.displayName).toBe("Mapped Person");
+      expect(pnMessages).toHaveLength(2);
+      expect(new Set(pnMessages.map((message) => message.sourceMessageId)).size).toBe(2);
+
+      // Post-heal re-import is a no-op: nothing split, nothing merged, no new rows.
+      await runImport(repository, { msgstorePath: afterPath });
+      const finalStatus = await repository.getStatus();
+      const enrichment = finalStatus.latestWarnings.find((warning) => warning.code === "CONTACT_ENRICHMENT");
+      expect(finalStatus.counts.messages).toBe(3);
+      expect(finalStatus.counts.chats).toBe(2);
+      expect(enrichment?.context?.identityMerges).toBe(0);
+    } finally {
+      await repository?.close();
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports msgstore-derived enrichment even when wa.db is empty", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-lid-enrichment-"));
+    try {
+      const msgstorePath = path.join(tempDir, "msgstore.db");
+      createLidMsgstoreDb(msgstorePath, { withLidTables: true });
+      const waPath = path.join(tempDir, "wa.db");
+      const wa = new Database(waPath);
+      wa.exec("CREATE TABLE wa_contacts (_id INTEGER PRIMARY KEY, jid TEXT, display_name TEXT);");
+      wa.close();
+      const repository = new MemoryArchiveRepository();
+
+      await runImport(repository, { msgstorePath, waPath });
+      const status = await repository.getStatus();
+      const enrichment = status.latestWarnings.find((warning) => warning.code === "CONTACT_ENRICHMENT");
+
+      expect(enrichment).toBeTruthy();
+      expect(enrichment?.context?.jidMapLinks).toBe(1);
+      expect(enrichment?.context?.waDbLinks).toBe(0);
+      expect(enrichment?.context?.lidNamesRead).toBe(2);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// Modern msgstore schema plus the LID identity tables (jid_map, lid_display_name).
+// jid row 2 is a LID mapped to the phone row 1; jid row 3 is a LID the phone can
+// name but not map — the two coverage classes measured on the real archive.
+function createLidMsgstoreDb(filePath: string, options: { withLidTables: boolean }): void {
+  const db = new Database(filePath);
+  try {
+    db.exec(`
+      CREATE TABLE jid (
+        _id INTEGER PRIMARY KEY,
+        raw_string TEXT,
+        user TEXT,
+        server TEXT
+      );
+
+      CREATE TABLE chat (
+        _id INTEGER PRIMARY KEY,
+        jid_row_id INTEGER NOT NULL,
+        subject TEXT,
+        display_name TEXT,
+        sort_timestamp INTEGER
+      );
+
+      CREATE TABLE message (
+        _id INTEGER PRIMARY KEY,
+        chat_row_id INTEGER NOT NULL,
+        sender_jid_row_id INTEGER,
+        from_me INTEGER NOT NULL,
+        key_id TEXT NOT NULL,
+        timestamp INTEGER,
+        message_type INTEGER,
+        status INTEGER,
+        starred INTEGER,
+        forwarded INTEGER
+      );
+
+      CREATE TABLE message_text (
+        message_row_id INTEGER PRIMARY KEY,
+        text_data TEXT
+      );
+    `);
+    const insertJid = db.prepare("INSERT INTO jid (_id, raw_string, user, server) VALUES (?, ?, ?, ?)");
+    insertJid.run(1, "15550000001@s.whatsapp.net", "15550000001", "s.whatsapp.net");
+    insertJid.run(2, "987654321000001@lid", "987654321000001", "lid");
+    insertJid.run(3, "987654321000002@lid", "987654321000002", "lid");
+
+    const insertChat = db.prepare("INSERT INTO chat (_id, jid_row_id, subject, display_name, sort_timestamp) VALUES (?, ?, ?, ?, ?)");
+    insertChat.run(10, 2, null, null, 1711000002000);
+    insertChat.run(20, 3, null, null, 1711000004000);
+
+    const insertMessage = db.prepare(`
+      INSERT INTO message (_id, chat_row_id, sender_jid_row_id, from_me, key_id, timestamp, message_type, status, starred, forwarded)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const insertText = db.prepare("INSERT INTO message_text (message_row_id, text_data) VALUES (?, ?)");
+    insertMessage.run(100, 10, 2, 0, "lid-m1", 1711000001000, 0, 0, 0, 0);
+    insertText.run(100, "Hello from a departed number");
+    insertMessage.run(101, 10, null, 1, "lid-m2", 1711000002000, 0, 0, 0, 0);
+    insertText.run(101, "My reply");
+    insertMessage.run(102, 20, 3, 0, "lid-m3", 1711000003000, 0, 0, 0, 0);
+    insertText.run(102, "From the cache-named contact");
+
+    if (options.withLidTables) {
+      db.exec(`
+        CREATE TABLE jid_map (
+          _id INTEGER PRIMARY KEY,
+          lid_row_id INTEGER,
+          jid_row_id INTEGER,
+          sort_id INTEGER
+        );
+
+        CREATE TABLE lid_display_name (
+          lid_row_id INTEGER PRIMARY KEY,
+          display_name TEXT,
+          username TEXT
+        );
+      `);
+      db.prepare("INSERT INTO jid_map (lid_row_id, jid_row_id, sort_id) VALUES (?, ?, ?)").run(2, 1, 1);
+      const insertLidName = db.prepare("INSERT INTO lid_display_name (lid_row_id, display_name, username) VALUES (?, ?, ?)");
+      insertLidName.run(2, "Mapped Person", null);
+      insertLidName.run(3, "Cache-Named Person", null);
+    }
+  } finally {
+    db.close();
+  }
+}
 
 async function seedEventOnlyChatScenario(repository: ArchiveRepository): Promise<void> {
   const runId = await repository.startImportRun({ fixture: "event-only-chat-list" });

@@ -696,6 +696,7 @@ export type ImportProgressStep =
   | "opening"
   | "parsing"
   | "contacts"
+  | "identity-merge"
   | "chats"
   | "messages"
   | "addons"

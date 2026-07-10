@@ -142,7 +142,38 @@ export async function runImport(
     throwIfAborted(options.signal);
     options.onProgress?.({ type: "step", step: "contacts", message: "Importing contacts." });
     if (parsed.identityLinks.length) {
-      await repository.recordIdentityLinks(parsed.identityLinks.map((link) => ({ ...link, source: "wa.db" })));
+      await repository.recordIdentityLinks(parsed.identityLinks);
+    }
+    // Merge still-split LID identities before any ingest: message rows then
+    // land in already-canonical chats and the (chat, key_id) idempotency check
+    // sees the merged row. Deferring to the background sweep (3 per tick) would
+    // leave re-imported history transiently duplicated for hours. Post-heal
+    // re-imports find nothing split, so this pass is free when there is no work.
+    const splitIdentities = await repository.listUnmergedLidIdentities(100000);
+    let identityMerges = 0;
+    if (splitIdentities.length) {
+      options.onProgress?.({
+        type: "step",
+        step: "identity-merge",
+        message: `Merging ${splitIdentities.length} split identities.`
+      });
+      for (const { lid, pn } of splitIdentities) {
+        await repository.mergeIdentity(lid, pn);
+        identityMerges += 1;
+        if (identityMerges % 25 === 0) {
+          options.onProgress?.({
+            type: "step",
+            step: "identity-merge",
+            message: `Merging split identities (${identityMerges}/${splitIdentities.length}).`
+          });
+          await yieldToEventLoop(options.signal);
+        }
+      }
+      options.onProgress?.({
+        type: "step",
+        step: "identity-merge",
+        message: `Merged ${identityMerges} split identities.`
+      });
     }
     await repository.upsertContacts(runId, parsed.contacts);
     totals.contacts = parsed.contacts.length;
@@ -156,16 +187,25 @@ export async function runImport(
     const namedChatsAfter = await countResolvedChatNames(repository);
     // Informational summary entry; deliberately excluded from warning counters
     // (persistedWarningCount indexes into parsed.warnings for late additions).
+    // Per-source link and name counts make msgstore-derived enrichment visible
+    // even when wa.db is missing or empty.
+    const jidMapLinks = parsed.identityLinks.filter((link) => link.source === "msgstore.jid_map").length;
+    const waDbLinks = parsed.identityLinks.length - jidMapLinks;
+    const lidNamesRead = parsed.contacts.filter((contact) => contact.rawMetadata?.source === "lid_display_name").length;
     const enrichmentWarning: ImportWarning = {
       severity: "info",
       code: "CONTACT_ENRICHMENT",
       entityType: "contact",
-      message: `Contact enrichment: ${parsed.contacts.length} contacts read, ${namedChatsAfter} of ${parsed.chats.length} chats named (${Math.max(0, namedChatsAfter - namedChatsBefore)} improved by contact propagation), ${parsed.identityLinks.length} identity links learned.`,
+      message: `Contact enrichment: ${parsed.contacts.length} contacts read, ${namedChatsAfter} of ${parsed.chats.length} chats named (${Math.max(0, namedChatsAfter - namedChatsBefore)} improved by contact propagation), ${parsed.identityLinks.length} identity links read (${waDbLinks} wa.db, ${jidMapLinks} msgstore jid_map), ${lidNamesRead} LID display names read, ${identityMerges} split identities merged.`,
       context: {
         contactsRead: parsed.contacts.length,
         chatsNamed: namedChatsAfter,
         namesImproved: Math.max(0, namedChatsAfter - namedChatsBefore),
-        identityLinks: parsed.identityLinks.length
+        identityLinks: parsed.identityLinks.length,
+        waDbLinks,
+        jidMapLinks,
+        lidNamesRead,
+        identityMerges
       }
     };
     await repository.addWarnings(runId, [enrichmentWarning]);

@@ -95,10 +95,18 @@ export interface ImportMediaRef {
   downloadDescriptor?: MediaDownloadDescriptor | null;
 }
 
+// LID→phone links carry their origin so the archive records truthful
+// per-source provenance (links are irrevocable; provenance is the audit trail).
+export interface ImportIdentityLink {
+  lid: string;
+  pn: string;
+  source: "wa.db" | "msgstore.jid_map";
+}
+
 export interface ParsedWhatsAppSource {
   contacts: ContactRecord[];
   chats: ChatRecord[];
-  identityLinks: Array<{ lid: string; pn: string }>;
+  identityLinks: ImportIdentityLink[];
   warnings: ImportWarning[];
   iterateMessages: () => IterableIterator<MessageRecord>;
   // Backup add-on records (reactions, poll votes, event responses) as the same
@@ -135,8 +143,15 @@ export function parseWhatsAppSource(
 
   const jidMap = buildJidMap(msgstoreDb, msgInspection);
   const chatRowJidMap = buildChatRowJidMap(msgstoreDb, msgInspection, jidMap);
-  const identityLinks: Array<{ lid: string; pn: string }> = [];
+  const identityLinks: ImportIdentityLink[] = [];
+  // Source precedence is ordering: wa.db address-book names land first, the
+  // msgstore LID display cache only fills identities wa.db left unnamed, and
+  // bare JID stubs come last. msgstore's own tables (jid_map, lid_display_name)
+  // are what cover contacts wa.db no longer carries — numbers that left
+  // WhatsApp keep their chat-level mapping and phone-side label there.
   readWaContacts(waDb, waInspection, contactMap, warnings, identityLinks);
+  readMsgstoreIdentityLinks(msgstoreDb, msgInspection, jidMap, identityLinks);
+  readLidDisplayNames(msgstoreDb, msgInspection, jidMap, contactMap);
   readJidContacts(jidMap, contactMap);
   contactMap.set("me", {
     sourceJid: "me",
@@ -301,7 +316,7 @@ function readWaContacts(
   waInspection: SQLiteInspection | null,
   contactMap: Map<string, ContactRecord>,
   warnings: ImportWarning[],
-  identityLinks: Array<{ lid: string; pn: string }> = []
+  identityLinks: ImportIdentityLink[] = []
 ): void {
   if (!waDb || !waInspection) {
     warnings.push({
@@ -350,8 +365,8 @@ function readWaContacts(
     // first-class identity-link source for merging split records.
     if (lidColumn && jid.endsWith("@s.whatsapp.net")) {
       const lid = normalizeJid(row[lidColumn]);
-      if (lid && (lid.endsWith("@lid") || lid.endsWith("@hosted.lid"))) {
-        identityLinks.push({ lid, pn: jid });
+      if (lid && isLidJid(lid)) {
+        identityLinks.push({ lid, pn: jid, source: "wa.db" });
       }
     }
     const displayName = firstString(row, ["display_name", "wa_name", "notify_name", "given_name", "sort_name"]) ?? null;
@@ -417,6 +432,65 @@ function readJidContacts(jidMap: Map<number, string>, contactMap: Map<string, Co
         rawMetadata: { source: "jid" }
       });
     }
+  }
+}
+
+function isLidJid(jid: string): boolean {
+  return jid.endsWith("@lid") || jid.endsWith("@hosted.lid");
+}
+
+// msgstore's jid_map is the phone's own LID↔phone routing table. It keeps
+// mappings for every chat the phone has — including numbers no longer
+// registered on WhatsApp, which never appear in wa.db or app-state sync.
+function readMsgstoreIdentityLinks(
+  db: Database.Database,
+  inspection: SQLiteInspection,
+  jidMap: Map<number, string>,
+  identityLinks: ImportIdentityLink[]
+): void {
+  if (!hasTable(inspection, "jid_map") || !hasColumns(inspection, "jid_map", ["lid_row_id", "jid_row_id"])) {
+    return;
+  }
+  const rows = db.prepare(`SELECT lid_row_id, jid_row_id FROM jid_map`).iterate() as Iterable<SqlRow>;
+  for (const row of rows) {
+    const lid = jidMap.get(Number(row.lid_row_id));
+    const pn = jidMap.get(Number(row.jid_row_id));
+    if (lid && isLidJid(lid) && pn?.endsWith("@s.whatsapp.net")) {
+      identityLinks.push({ lid, pn, source: "msgstore.jid_map" });
+    }
+  }
+}
+
+// lid_display_name is the phone's display cache for LID users — the exact
+// label the phone shows. It only fills identities that have no name from a
+// stronger source (wa.db address-book names run first).
+function readLidDisplayNames(
+  db: Database.Database,
+  inspection: SQLiteInspection,
+  jidMap: Map<number, string>,
+  contactMap: Map<string, ContactRecord>
+): void {
+  if (!hasTable(inspection, "lid_display_name") || !hasColumns(inspection, "lid_display_name", ["lid_row_id", "display_name"])) {
+    return;
+  }
+  const rows = db.prepare(`SELECT lid_row_id, display_name FROM lid_display_name`).iterate() as Iterable<SqlRow>;
+  for (const row of rows) {
+    const lid = jidMap.get(Number(row.lid_row_id));
+    const displayName = stringOrNull(row.display_name)?.trim() || null;
+    if (!lid || !isLidJid(lid) || !displayName) {
+      continue;
+    }
+    const existing = contactMap.get(lid);
+    if (existing?.displayName) {
+      continue;
+    }
+    contactMap.set(lid, {
+      sourceJid: lid,
+      displayName,
+      pushName: existing?.pushName ?? null,
+      phoneNumber: existing?.phoneNumber ?? null,
+      rawMetadata: { source: "lid_display_name" }
+    });
   }
 }
 

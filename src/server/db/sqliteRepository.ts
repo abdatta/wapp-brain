@@ -1242,7 +1242,10 @@ export class SqliteArchiveRepository implements ArchiveRepository {
           sourceMessageId: row.source_message_id,
           chatId: Number(row.chat_id),
           chatSourceId: row.chat_source_id,
-          chatDisplayName: row.chat_display_name ?? null,
+          chatDisplayName:
+            row.chat_display_name && row.chat_display_name !== row.chat_source_id
+              ? row.chat_display_name
+              : displayPhoneFromJid(row.chat_source_id),
           chatType: row.chat_type as SearchResultItem["chatType"],
           senderDisplayName: row.sender_display_name ?? displayPhoneFromJid(row.sender_source_jid),
           senderSourceJid: row.sender_source_jid,

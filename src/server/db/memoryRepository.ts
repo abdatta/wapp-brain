@@ -412,12 +412,26 @@ export class MemoryArchiveRepository implements ArchiveRepository {
   }
 
   async upsertContacts(_runId: string, contacts: ContactRecord[]): Promise<Map<string, number>> {
+    // Mirror the SQLite adapter: canonicalize first, then merge field-wise
+    // within the batch with first-record-wins, so a LID display-cache name
+    // canonicalizing onto the same identity cannot clobber a stronger name
+    // that came earlier in source-precedence order.
+    const unique = new Map<string, ContactRecord>();
     for (const rawContact of contacts) {
       const sourceJid = this.canonicalJid(rawContact.sourceJid);
       if (!sourceJid) {
         continue;
       }
-      const contact = { ...rawContact, sourceJid };
+      const queued = unique.get(sourceJid);
+      unique.set(sourceJid, {
+        ...rawContact,
+        sourceJid,
+        displayName: queued?.displayName?.trim() || rawContact.displayName || null,
+        pushName: queued?.pushName?.trim() || rawContact.pushName || null,
+        phoneNumber: queued?.phoneNumber || rawContact.phoneNumber || null
+      });
+    }
+    for (const contact of unique.values()) {
       const existing = this.contacts.get(contact.sourceJid);
       this.contacts.set(contact.sourceJid, {
         ...existing,
@@ -1352,7 +1366,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
           sourceMessageId: message.sourceMessageId,
           chatId: chat.id,
           chatSourceId: chat.sourceChatId,
-          chatDisplayName: chat.displayName ?? null,
+          chatDisplayName: chat.displayName?.trim() && chat.displayName !== chat.jid ? chat.displayName : displayPhoneFromJid(chat.jid),
           chatType: chat.chatType,
           senderDisplayName: senderLabel,
           senderSourceJid: message.senderSourceJid ?? null,

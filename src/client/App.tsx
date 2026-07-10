@@ -986,7 +986,9 @@ export function App() {
                 <div>
                   <h2>{chatDisplayLabel(selectedChat)}</h2>
                   <p>
-                    {selectedChat.chatType} | {selectedChat.messageCount.toLocaleString()} messages
+                    {selectedChat.chatType}
+                    {/* Search-hit stubs carry messageCount 0 (unknown); showing "0 messages" over a full thread is a lie. */}
+                    {selectedChat.messageCount ? ` | ${selectedChat.messageCount.toLocaleString()} messages` : ""}
                     {selectedChat.participantCount ? ` | ${selectedChat.participantCount.toLocaleString()} participants` : ""}
                   </p>
                 </div>
@@ -2194,7 +2196,7 @@ function ImportProgress({ job }: { job: ImportJobSummary | null }) {
   const messagePreparing =
     job?.status === "running" &&
     !latestMessages &&
-    Boolean(latestStep && ["decrypting", "opening", "parsing", "contacts", "chats"].includes(latestStep.step));
+    Boolean(latestStep && ["decrypting", "opening", "parsing", "contacts", "identity-merge", "chats"].includes(latestStep.step));
   const messageDetail = latestMessages
     ? latestMessages.totalMessages
       ? `${messagePct}% | ${latestMessages.processedMessages.toLocaleString()} / ${latestMessages.totalMessages.toLocaleString()} processed | ${latestMessages.persistedMessages.toLocaleString()} persisted`
