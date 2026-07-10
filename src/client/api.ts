@@ -172,7 +172,6 @@ export function startMemoryRun(requestBody: {
   kind?: "rem" | "manual" | "rebuild";
   dryRun?: boolean;
   force?: boolean;
-  provider?: "local" | "codex";
 }): Promise<{ ok: boolean; result: MemoryConsolidationResult }> {
   return request<{ ok: boolean; result: MemoryConsolidationResult }>("/api/memory/runs", {
     method: "POST",

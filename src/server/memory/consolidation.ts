@@ -14,7 +14,7 @@ import type {
   MemorySourceWindowRecord,
   MemoryValidationIssue
 } from "../../shared/types";
-import { getMemoryProviderStatus, sendCodexMemoryPrompt } from "./provider";
+import { getMemoryProviderStatus } from "./provider";
 
 const MEMORY_LOCK_TTL_MS = 30 * 60_000;
 
@@ -31,8 +31,7 @@ export async function runMemoryConsolidation(
     sourceSummary: {
       dryRun: Boolean(request.dryRun),
       force: Boolean(request.force),
-      chatSourceIds: request.chatSourceIds ?? [],
-      provider: request.provider ?? "local"
+      chatSourceIds: request.chatSourceIds ?? []
     }
   });
   const locked = await repository.tryAcquireMemoryLock(runId, MEMORY_LOCK_TTL_MS);
@@ -42,22 +41,6 @@ export async function runMemoryConsolidation(
   }
 
   try {
-    const provider = request.provider ?? "local";
-    const providerStatus = await getMemoryProviderStatus();
-    if (provider === "codex" && (!providerStatus.remoteModelEnabled || providerStatus.provider !== "codex")) {
-      const issue = issueFor(runId, "REMOTE_MODEL_DISABLED", "Codex memory generation requires explicit provider opt-in.");
-      await repository.recordMemoryValidationIssues([issue]);
-      await repository.failMemoryRun(runId, "blocked", issue.message, 1);
-      return {
-        ok: false,
-        run: (await repository.getMemoryRun(runId))!,
-        window: null,
-        pages: [],
-        issues: [issue],
-        dryRun: Boolean(request.dryRun)
-      };
-    }
-
     const evidence = await repository.listMemoryEvidenceMessages({
       startAtMs: bounds.startAtMs,
       endAtMs: bounds.endAtMs,
@@ -114,7 +97,8 @@ export async function runMemoryConsolidation(
       };
     }
 
-    const pages = provider === "codex" ? await generateCodexPages(runId, window, evidence) : generateExtractivePages(runId, window, evidence);
+    // Pages are extractive-only: model-backed synthesis lives in the brain tier.
+    const pages = generateExtractivePages(runId, window, evidence);
     const issues = pages.flatMap((page) => validatePage(page.revision, page.citations, evidence));
     if (issues.some((issue) => issue.severity === "error")) {
       await repository.recordMemoryValidationIssues(issues);
@@ -244,24 +228,6 @@ function generateExtractivePages(runId: string, window: MemorySourceWindowRecord
     byChat.set(message.sourceChatId, messages);
   }
   return [...byChat].map(([chatSourceId, messages]) => pageFromMessages(runId, window, chatSourceId, messages));
-}
-
-async function generateCodexPages(runId: string, window: MemorySourceWindowRecord, evidence: MemoryEvidenceMessage[]) {
-  const prompt = JSON.stringify({
-    instruction: "Create a concise cited second-brain wiki update. Every claim must use citation labels from evidence.",
-    evidence: evidence.map((message) => ({
-      label: message.citationLabel,
-      chat: message.chatDisplayName ?? message.sourceChatId,
-      sender: message.senderDisplayName ?? message.senderSourceJid,
-      sentAt: message.sentAt,
-      text: message.text
-    }))
-  });
-  await sendCodexMemoryPrompt(
-    prompt,
-    "You maintain a private local WhatsApp second-brain wiki. Use only supplied evidence labels. Do not invent unsupported claims."
-  );
-  return generateExtractivePages(runId, window, evidence);
 }
 
 function pageFromMessages(runId: string, window: MemorySourceWindowRecord, chatSourceId: string, messages: MemoryEvidenceMessage[]) {

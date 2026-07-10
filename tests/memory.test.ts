@@ -6,6 +6,7 @@ import { config } from "../src/server/config";
 import { MemoryArchiveRepository } from "../src/server/db/memoryRepository";
 import { SqliteArchiveRepository } from "../src/server/db/sqliteRepository";
 import { queryMemory, resolveMemoryCitation, runMemoryConsolidation, validateMemoryStore } from "../src/server/memory/consolidation";
+import { enableCodexProvider } from "../src/server/memory/provider";
 import type { ArchiveRepository } from "../src/server/db/repository";
 import type { ChatRecord, ContactRecord, MessageRecord } from "../src/shared/types";
 
@@ -72,20 +73,24 @@ describe("second-brain memory", () => {
     }
   });
 
-  it("blocks Codex consolidation until remote model use is explicitly enabled", async () => {
+  it("consolidates extractively even when the codex session opt-in is enabled", async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-memory-provider-"));
     const restoreConfig = configureMemoryRoot(path.join(tempDir, "memory"));
     try {
       const repository = new MemoryArchiveRepository();
       await seedMemoryChat(repository, "codex@s.whatsapp.net", "Codex", [
-        { text: "Remote generation needs opt-in.", at: Date.now() - 2 * 86_400_000 }
+        { text: "Pages come from evidence, never a remote model.", at: Date.now() - 2 * 86_400_000 }
       ]);
+      // The codex opt-in only manages the brain's shared OAuth session; memory
+      // pages must stay extractive (a codex attempt would throw here — the
+      // OAuth client package is not installed in tests).
+      await enableCodexProvider();
 
-      const result = await runMemoryConsolidation(repository, { kind: "manual", provider: "codex" });
+      const result = await runMemoryConsolidation(repository, { kind: "manual" });
 
-      expect(result.ok).toBe(false);
-      expect(result.run.status).toBe("blocked");
-      expect(result.issues[0]?.code).toBe("REMOTE_MODEL_DISABLED");
+      expect(result.ok).toBe(true);
+      expect(result.run.status).toBe("completed");
+      expect(result.pages.length).toBeGreaterThan(0);
     } finally {
       restoreConfig();
       await rm(tempDir, { recursive: true, force: true });

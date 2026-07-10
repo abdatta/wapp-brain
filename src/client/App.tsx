@@ -94,6 +94,7 @@ import {
   resumeLiveSession,
   retryLiveGap,
   retryStuckMedia,
+  resetBrainData,
   searchArchive,
   setBrainOwner,
   startBrainRun,
@@ -588,6 +589,24 @@ export function App() {
     }
   }
 
+  async function handleResetBrain() {
+    if (
+      !window.confirm(
+        "Reset all brain data? This deletes every generated episode, claim, citation, and coverage watermark (raw messages are untouched). The next run re-assimilates from scratch."
+      )
+    ) {
+      return;
+    }
+    setError(null);
+    try {
+      const result = await resetBrainData();
+      setNotice(`Brain reset: ${result.episodesRemoved} episode(s) and ${result.filesRemoved} file(s) removed; coverage back to zero.`);
+      getBrainOverview().then(setBrainOverview).catch(() => undefined);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not reset brain data.");
+    }
+  }
+
   async function handleSetBrainOwner(displayName: string | null) {
     setError(null);
     try {
@@ -806,7 +825,7 @@ export function App() {
     setError(null);
     setNotice(null);
     try {
-      const result = await startMemoryRun({ kind: "rem", dryRun, provider: "local" });
+      const result = await startMemoryRun({ kind: "rem", dryRun });
       setNotice(
         dryRun
           ? `Memory evidence preview ready for ${result.result.run.messageCount.toLocaleString()} messages.`
@@ -855,7 +874,7 @@ export function App() {
     try {
       await enableCodexMemoryProvider();
       await refreshStatus();
-      setNotice("Codex memory provider enabled. Run CLI login before remote generation if no session exists.");
+      setNotice("Codex session opt-in enabled. Memory pages stay extractive; the session powers brain model runs (run the CLI login if none exists).");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not enable Codex memory.");
     } finally {
@@ -961,6 +980,7 @@ export function App() {
             onProviderAction={(body) => void handleBrainProviderAction(body)}
             onRun={(body) => void handleStartBrainRun(body)}
             onSetOwner={(displayName) => void handleSetBrainOwner(displayName)}
+            onReset={() => void handleResetBrain()}
           />
 
           <ImportLauncher status={status} onOpen={() => setImportWizardOpen(true)} />
@@ -1530,7 +1550,8 @@ function BrainPanel({
   busy,
   onProviderAction,
   onRun,
-  onSetOwner
+  onSetOwner,
+  onReset
 }: {
   overview: BrainOverview | null;
   run: BrainRunProgress | null;
@@ -1542,6 +1563,7 @@ function BrainPanel({
   }) => void;
   onRun: (body: { mode: "model" | "extractive"; model?: string | null }) => void;
   onSetOwner: (displayName: string | null) => void;
+  onReset: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const [ownerDraft, setOwnerDraft] = useState("");
@@ -1632,7 +1654,7 @@ function BrainPanel({
             </label>
             {provider && provider.provider !== "extractive" && (
               <label>
-                <span>Model</span>
+                <span>Model{provider.reasoningEffort ? ` · effort ${provider.reasoningEffort}` : ""}</span>
                 <select
                   value={provider.model ?? modelOptions[0] ?? ""}
                   disabled={Boolean(busy)}
@@ -1682,6 +1704,16 @@ function BrainPanel({
             >
               {running ? <Loader2 className="spin" size={16} /> : <Play size={16} />}
               Run
+            </button>
+            <button
+              className="miniButton dangerButton"
+              type="button"
+              disabled={Boolean(busy) || running}
+              onClick={onReset}
+              title="Delete all generated episodes, claims, citations, and coverage watermarks (raw messages untouched); the next run starts from scratch"
+            >
+              <Trash2 size={14} />
+              Reset
             </button>
           </div>
           <div className={`statusLine ${provider?.degraded ? "degradedLine" : ""}`}>{provider?.message}</div>

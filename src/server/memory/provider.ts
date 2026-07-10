@@ -15,15 +15,17 @@ export async function getMemoryProviderStatus(): Promise<MemoryProviderStatus> {
   const remoteModelEnabled = Boolean(config.memory.remoteModelEnabled || providerFile.remoteModelEnabled);
   const codexPackageAvailable = await hasCodexPackage();
   const codexSessionExists = fs.existsSync(config.memory.codexSessionPath);
+  // Memory pages are always extractive; the codex opt-in here only manages
+  // the shared OAuth session that model-backed brain runs use.
   const message =
     provider === "codex"
       ? remoteModelEnabled
         ? codexPackageAvailable
           ? codexSessionExists
-            ? "Codex provider is enabled with a local session."
-            : "Codex provider is enabled but no local session exists yet."
-          : "Codex provider is enabled but gpt-oauth-client is not available."
-        : "Codex provider is configured but remote model use is disabled."
+            ? "Codex session is connected (used by brain model runs). Memory pages are always extractive."
+            : "Codex is enabled but no local session exists yet. Run memory-provider login."
+          : "Codex is enabled but gpt-oauth-client is not available."
+        : "Codex is configured but not opted in."
       : "Local extractive memory is enabled. Remote model use is disabled.";
   return {
     provider,
@@ -52,28 +54,6 @@ export async function connectCodexProvider(): Promise<MemoryProviderStatus> {
   await client.connect();
   writeProviderFile({ provider: "codex", remoteModelEnabled: true });
   return getMemoryProviderStatus();
-}
-
-export async function sendCodexMemoryPrompt(prompt: string, instructions: string): Promise<string> {
-  const status = await getMemoryProviderStatus();
-  if (status.provider !== "codex" || !status.remoteModelEnabled) {
-    throw new Error("Codex memory provider is not enabled.");
-  }
-  const clientModule = await importCodexClient();
-  const Client = clientModule.GPTOAuthClient as new (options: { storagePath: string }) => {
-    connect: () => Promise<unknown>;
-    sendMessage: (prompt: string, options?: Record<string, unknown>) => Promise<{ content: string }>;
-  };
-  const client = new Client({ storagePath: config.memory.codexSessionPath });
-  await client.connect();
-  const response = await client.sendMessage(prompt, {
-    model: "gpt-5.2",
-    instructions,
-    reasoning: { effort: "high", summary: "auto" },
-    text: { verbosity: "medium" },
-    store: false
-  });
-  return response.content;
 }
 
 async function hasCodexPackage(): Promise<boolean> {

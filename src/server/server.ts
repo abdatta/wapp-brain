@@ -214,8 +214,7 @@ app.post("/api/memory/runs", async (req, res) => {
         endAtMs: numberBody(req.body?.endAtMs),
         chatSourceIds: Array.isArray(req.body?.chatSourceIds) ? req.body.chatSourceIds.filter((item: unknown): item is string => typeof item === "string") : undefined,
         dryRun: Boolean(req.body?.dryRun),
-        force: Boolean(req.body?.force),
-        provider: req.body?.provider === "codex" ? "codex" : "local"
+        force: Boolean(req.body?.force)
       })
     });
   } catch (error) {

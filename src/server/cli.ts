@@ -456,8 +456,7 @@ async function runMemoryConsolidationCommand(args: Args, kind: "rem" | "manual")
       endAtMs: numberArg(args["end-ms"]) ?? null,
       chatSourceIds: stringArg(args.chats)?.split(",").map((chat) => chat.trim()).filter(Boolean),
       dryRun: Boolean(args["dry-run"]),
-      force: Boolean(args.force),
-      provider: args.provider === "codex" ? "codex" : "local"
+      force: Boolean(args.force)
     });
     console.log(
       `Memory ${result.dryRun ? "dry run" : "run"} ${result.run.status}: run=${result.run.id} pages=${result.pages.length} messages=${result.run.messageCount} citations=${result.run.citationCount}`
@@ -631,7 +630,7 @@ function printHelp(): void {
   tsx src/server/cli.ts live-unlink
   tsx src/server/cli.ts memory-status
   tsx src/server/cli.ts memory-provider [status|enable-codex|login|disable]
-  tsx src/server/cli.ts memory-rem [--dry-run] [--provider local|codex] [--force]
+  tsx src/server/cli.ts memory-rem [--dry-run] [--force]
   tsx src/server/cli.ts memory-consolidate [--start-ms <ms>] [--end-ms <ms>] [--chats <source-chat-id,...>] [--dry-run] [--force]
   tsx src/server/cli.ts memory-query --query <text>
   tsx src/server/cli.ts memory-citation --citation <label-or-source-message-key>

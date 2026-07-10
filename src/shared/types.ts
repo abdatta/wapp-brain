@@ -504,7 +504,6 @@ export interface MemoryConsolidationRequest {
   chatSourceIds?: string[];
   dryRun?: boolean;
   force?: boolean;
-  provider?: MemoryProviderName;
 }
 
 export interface MemoryConsolidationResult {
@@ -698,6 +697,10 @@ export interface BrainProviderHealth {
   lastOkAt: string | null;
 }
 
+// GPT-5.6 reasoning-effort settings; the brain pins one explicitly so what
+// stamps permanent episodes never shifts with a provider-side default change.
+export type BrainReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh" | "max";
+
 export interface BrainProviderStatus {
   provider: BrainProviderName;
   modelBacked: boolean;
@@ -708,6 +711,9 @@ export interface BrainProviderStatus {
   degraded: boolean;
   // Persisted model selection for the active provider (null for extractive).
   model: string | null;
+  // Reasoning effort requested on every call for providers with an effort
+  // knob (codex); null when the provider has none (claude-cli, extractive).
+  reasoningEffort: BrainReasoningEffort | null;
   // Selectable models per provider, for UI pickers.
   models: Record<string, string[]>;
   health: BrainProviderHealth;

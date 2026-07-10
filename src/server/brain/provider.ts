@@ -21,11 +21,11 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import type { BrainProviderHealth, BrainProviderName, BrainProviderStatus } from "../../shared/types";
+import type { BrainProviderHealth, BrainProviderName, BrainProviderStatus, BrainReasoningEffort } from "../../shared/types";
 import { config } from "../config";
 import { PublicError, publicErrorMessage } from "../privacy";
 
-export type { BrainProviderHealth, BrainProviderName, BrainProviderStatus } from "../../shared/types";
+export type { BrainProviderHealth, BrainProviderName, BrainProviderStatus, BrainReasoningEffort } from "../../shared/types";
 
 export interface BrainTokenUsage {
   inputTokens: number;
@@ -38,6 +38,9 @@ export interface BrainGenerationRequest {
   maxOutputTokens: number;
   // Per-call model override; defaults to the user's persisted selection.
   model?: string | null;
+  // Per-call reasoning-effort override for providers with an effort knob
+  // (codex only; the claude-cli print mode has no equivalent flag).
+  effort?: BrainReasoningEffort;
   timeoutMs?: number;
 }
 
@@ -48,18 +51,26 @@ export interface BrainGenerationRequest {
 // every call until changed.
 export const BRAIN_PROVIDER_MODELS: Record<Exclude<BrainProviderName, "extractive">, string[]> = {
   "claude-cli": ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-4-8", "claude-fable-5"],
-  codex: ["gpt-5.5", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+  codex: ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"]
 };
 
-// Sonnet 5 default: episode digests are comprehension + citation-discipline
-// work where Sonnet's gain over Haiku (code-switched chats, implicit context)
-// compounds into the permanent substrate, while staying light enough on
-// subscription rate windows for volume runs. Haiku remains selectable for
-// turbo backfill; Fable/Opus are better saved for low-volume rollup calls.
+// Sonnet 5 / Terra defaults: episode digests are comprehension + citation-
+// discipline work where the mid tier already matches the flagship on what
+// digests need — long-context recall (Terra 89.6 vs Sol 91.5 MRCR) — at half
+// the subscription rate-window burn; Sol's edge only shows on long-horizon
+// agentic tasks digests never exercise. Haiku stays selectable for turbo
+// backfill; Fable/Opus and Sol are better saved for low-volume rollup calls.
+// Luna is deliberately last-resort: its long-context cliff (41.3 MRCR
+// 8-needle) risks missed citations in permanent episodes.
 const DEFAULT_MODEL: Record<Exclude<BrainProviderName, "extractive">, string> = {
   "claude-cli": "claude-sonnet-5",
-  codex: "gpt-5.5"
+  codex: "gpt-5.6-terra"
 };
+
+// Medium is enough for bounded digest calls (≤150-message packs, 1200-token
+// JSON answers); deeper effort only pays on long-horizon synthesis, which
+// future rollup calls can request per call via BrainGenerationRequest.effort.
+const DEFAULT_CODEX_REASONING_EFFORT: BrainReasoningEffort = "medium";
 
 export interface BrainGenerationResult {
   json: unknown;
@@ -135,6 +146,7 @@ export function getBrainProviderStatus(): BrainProviderStatus {
     sessionMissing,
     degraded,
     model: modelBacked ? selectedModel(state, provider as Exclude<BrainProviderName, "extractive">) : null,
+    reasoningEffort: provider === "codex" ? DEFAULT_CODEX_REASONING_EFFORT : null,
     models: BRAIN_PROVIDER_MODELS,
     health,
     message
@@ -364,7 +376,7 @@ async function generateWithCodex(request: BrainGenerationRequest, model: string)
     client.sendMessage(request.user, {
       model,
       instructions: `${request.system}\nRespond with ONLY the requested JSON object — no prose, no markdown fences.`,
-      reasoning: { effort: "medium", summary: "auto" },
+      reasoning: { effort: request.effort ?? DEFAULT_CODEX_REASONING_EFFORT, summary: "auto" },
       text: { verbosity: "low" },
       store: false
     }),
