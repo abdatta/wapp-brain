@@ -41,20 +41,23 @@ export interface BrainGenerationRequest {
   timeoutMs?: number;
 }
 
-// Selectable models per provider, cheapest-first. The UI offers these; the
-// persisted selection is the default for every call until changed.
+// Selectable models per provider, cheapest-first, as EXPLICIT model ids —
+// bare CLI aliases like "sonnet" resolve to whatever that CLI version
+// considers current, which must never silently change what stamps permanent
+// episodes. The UI offers these; the persisted selection is the default for
+// every call until changed.
 export const BRAIN_PROVIDER_MODELS: Record<Exclude<BrainProviderName, "extractive">, string[]> = {
-  "claude-cli": ["haiku", "sonnet", "opus", "fable"],
+  "claude-cli": ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-4-8", "claude-fable-5"],
   codex: ["gpt-5.5", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
 };
 
-// Sonnet default: episode digests are comprehension + citation-discipline
+// Sonnet 5 default: episode digests are comprehension + citation-discipline
 // work where Sonnet's gain over Haiku (code-switched chats, implicit context)
 // compounds into the permanent substrate, while staying light enough on
 // subscription rate windows for volume runs. Haiku remains selectable for
 // turbo backfill; Fable/Opus are better saved for low-volume rollup calls.
 const DEFAULT_MODEL: Record<Exclude<BrainProviderName, "extractive">, string> = {
-  "claude-cli": "sonnet",
+  "claude-cli": "claude-sonnet-5",
   codex: "gpt-5.5"
 };
 

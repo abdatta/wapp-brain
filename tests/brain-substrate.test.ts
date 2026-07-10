@@ -282,16 +282,17 @@ process.stdin.on("end", () => {
     const restore = configureBrain({ providerConfigPath: path.join(tempDir, "provider.json"), provider: "claude-cli" });
     try {
       enableBrainProvider("claude-cli");
-      // Sonnet is the default digest model; selection persists; catalog exposed.
-      expect(getBrainProviderStatus().model).toBe("sonnet");
-      const status = setBrainProviderModel("claude-cli", "fable");
-      expect(status.model).toBe("fable");
-      expect(status.models["claude-cli"]).toContain("sonnet");
+      // Sonnet 5 (explicit id, never a floating alias) is the default digest
+      // model; selection persists; catalog exposed.
+      expect(getBrainProviderStatus().model).toBe("claude-sonnet-5");
+      const status = setBrainProviderModel("claude-cli", "claude-fable-5");
+      expect(status.model).toBe("claude-fable-5");
+      expect(status.models["claude-cli"]).toContain("claude-sonnet-5");
       expect(status.models.codex).toContain("gpt-5.6-luna");
 
       // The model reaches the CLI invocation (WSL bridge string and args).
-      const bridged = claudeCliInvocation("fable");
-      expect(bridged.args.join(" ")).toContain("--model fable");
+      const bridged = claudeCliInvocation("claude-fable-5");
+      expect(bridged.args.join(" ")).toContain("--model claude-fable-5");
 
       // Unsafe names never reach a shell string.
       expect(() => setBrainProviderModel("claude-cli", 'fable"; rm -rf ~')).toThrow(/letters, digits/i);
