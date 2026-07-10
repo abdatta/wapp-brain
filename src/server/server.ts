@@ -523,6 +523,65 @@ app.get("/api/search/status", async (_req, res) => {
   }
 });
 
+// Brain substrate status: watermark coverage, task queue, budget ledger,
+// provider health, and run-dueness in one call — the operator dashboard for
+// "is the brain keeping itself updated" under manual-first control.
+app.get("/api/brain/status", async (_req, res) => {
+  try {
+    const { getBrainProviderStatus } = await import("./brain/provider");
+    const status = await repository.getBrainStatus();
+    // A run is due when backlog exists and no run has completed since the
+    // most recent nightly cutoff boundary. Paused mode alerts; auto executes.
+    const boundary = new Date();
+    boundary.setHours(config.brain.cutoffHour, 0, 0, 0);
+    if (boundary.getTime() > Date.now()) {
+      boundary.setDate(boundary.getDate() - 1);
+    }
+    const lastFinished = status.latestRun?.finishedAt ? Date.parse(status.latestRun.finishedAt) : null;
+    const pending = status.totalVisibleMessages - status.assimilatedVisibleMessages;
+    const runDue = status.chatsWithBacklog > 0 && (lastFinished == null || lastFinished < boundary.getTime());
+    res.json({
+      ...status,
+      provider: getBrainProviderStatus(),
+      scheduler: {
+        mode: config.brain.scheduler,
+        runDue,
+        dueReason: runDue
+          ? `${pending.toLocaleString()} messages across ${status.chatsWithBacklog.toLocaleString()} chats are waiting to be assimilated and no run has completed since the ${String(config.brain.cutoffHour).padStart(2, "0")}:00 cutoff.`
+          : null
+      }
+    });
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+// Provider control from the UI: opt-in/out, model selection, health probe.
+app.post("/api/brain/provider", async (req, res) => {
+  try {
+    const { disableBrainProvider, enableBrainProvider, getBrainProviderStatus, probeBrainProvider, setBrainProviderModel } =
+      await import("./brain/provider");
+    const action = typeof req.body?.action === "string" ? req.body.action : "";
+    const provider = req.body?.provider === "claude-cli" || req.body?.provider === "codex" ? req.body.provider : null;
+    if (action === "enable" && provider) {
+      res.json({ ok: true, provider: enableBrainProvider(provider) });
+    } else if (action === "disable") {
+      res.json({ ok: true, provider: disableBrainProvider() });
+    } else if (action === "set-model" && provider && typeof req.body?.model === "string") {
+      res.json({ ok: true, provider: setBrainProviderModel(provider, req.body.model) });
+    } else if (action === "probe") {
+      const probe = await probeBrainProvider();
+      res.json({ ok: probe.ok, provider: probe.status });
+    } else if (action === "status" || action === "") {
+      res.json({ ok: true, provider: getBrainProviderStatus() });
+    } else {
+      res.status(400).json({ error: "Unknown provider action." });
+    }
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
 app.post("/api/search/reindex", async (_req, res) => {
   try {
     const reindex = startSearchReindex(repository, () => {

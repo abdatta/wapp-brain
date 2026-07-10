@@ -1,4 +1,7 @@
 import type {
+  BrainOverview,
+  BrainProviderName,
+  BrainProviderStatus,
   ChatListItem,
   ChatListOptions,
   ImportJobSummary,
@@ -272,4 +275,19 @@ export function getSearchStatus(): Promise<{ index: SearchIndexStatus; reindex: 
 
 export function startSearchReindex(): Promise<{ ok: boolean; reindex: SearchReindexProgress }> {
   return request<{ ok: boolean; reindex: SearchReindexProgress }>("/api/search/reindex", { method: "POST", body: "{}" });
+}
+
+export function getBrainOverview(): Promise<BrainOverview> {
+  return request<BrainOverview>("/api/brain/status");
+}
+
+export function brainProviderAction(body: {
+  action: "enable" | "disable" | "probe" | "set-model" | "status";
+  provider?: Exclude<BrainProviderName, "extractive">;
+  model?: string;
+}): Promise<{ ok: boolean; provider: BrainProviderStatus }> {
+  return request<{ ok: boolean; provider: BrainProviderStatus }>("/api/brain/provider", {
+    method: "POST",
+    body: JSON.stringify(body)
+  });
 }

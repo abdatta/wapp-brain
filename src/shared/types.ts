@@ -624,6 +624,121 @@ export interface MessageContextWindow {
   anchorMessageId: number;
 }
 
+// --- Brain substrate (tiered assimilation) ---
+
+export type BrainTaskKind = "episode" | "rollup" | "overview" | "merge_adjudicate" | "reindex" | "project_pages";
+export type BrainTaskStatus = "pending" | "running" | "done" | "failed";
+export type BrainRunKind = "nightly" | "catchup" | "manual" | "backfill";
+export type BrainRunStatus = "running" | "completed" | "failed" | "interrupted" | "budget_exceeded";
+
+export interface BrainTaskInput {
+  kind: BrainTaskKind;
+  chatSourceId?: string | null;
+  payload?: Record<string, unknown> | null;
+  // Idempotency key: re-enqueueing known work is a no-op by construction.
+  dedupeKey: string;
+  priority?: number;
+}
+
+export interface BrainTaskRecord {
+  id: number;
+  kind: BrainTaskKind;
+  chatSourceId: string | null;
+  payload: Record<string, unknown> | null;
+  dedupeKey: string;
+  status: BrainTaskStatus;
+  priority: number;
+  attempts: number;
+  nextAttemptAtMs: number | null;
+  lastError: string | null;
+}
+
+export interface BrainTaskSummary {
+  pending: number;
+  running: number;
+  failed: number;
+  done: number;
+}
+
+// One chat's assimilation state: the watermark plus its live-derived backlog
+// (visible-exchange messages newer than the watermark — never a stored
+// counter that can drift).
+export interface BrainChatBacklogItem {
+  chatSourceId: string;
+  chatDisplayName: string | null;
+  assimilatedThroughMs: number;
+  lastEpisodeAt: string | null;
+  pendingVisibleMessages: number;
+  newestVisibleMs: number | null;
+}
+
+export interface BrainRunSummary {
+  id: string;
+  kind: BrainRunKind;
+  status: BrainRunStatus;
+  startedAt: string;
+  finishedAt: string | null;
+  timezone: string | null;
+  totals: Record<string, number> | null;
+  errorMessage: string | null;
+}
+
+export interface BrainLlmUsageSummary {
+  calls: number;
+  inputTokens: number;
+  outputTokens: number;
+}
+
+export type BrainProviderName = "claude-cli" | "codex" | "extractive";
+
+export interface BrainProviderHealth {
+  consecutiveFailures: number;
+  degradedSince: string | null;
+  lastError: string | null;
+  lastOkAt: string | null;
+}
+
+export interface BrainProviderStatus {
+  provider: BrainProviderName;
+  modelBacked: boolean;
+  enabled: boolean;
+  degraded: boolean;
+  // Persisted model selection for the active provider (null for extractive).
+  model: string | null;
+  // Selectable models per provider, for UI pickers.
+  models: Record<string, string[]>;
+  health: BrainProviderHealth;
+  message: string;
+}
+
+// Manual-first scheduling: paused mode computes dueness and alerts; only auto
+// mode executes runs unattended.
+export interface BrainSchedulerStatus {
+  mode: "paused" | "auto";
+  runDue: boolean;
+  dueReason: string | null;
+}
+
+// One-call brain overview: coverage, queue, budget, runs. Provider health is
+// attached by the server layer (it lives outside the repository).
+export interface BrainStatusSummary {
+  totalVisibleMessages: number;
+  assimilatedVisibleMessages: number;
+  coveragePercent: number;
+  chatsWithBacklog: number;
+  backlogSample: BrainChatBacklogItem[];
+  tasks: BrainTaskSummary;
+  usageToday: BrainLlmUsageSummary;
+  latestRun: BrainRunSummary | null;
+  activeRun: BrainRunSummary | null;
+}
+
+// The /api/brain/status response: repository status + provider + scheduler.
+export interface BrainOverview extends BrainStatusSummary {
+  provider: BrainProviderStatus;
+  scheduler: BrainSchedulerStatus;
+}
+
 // Progress of a search reindex job (chunked FTS rebuild).
 export interface SearchReindexProgress {
   state: "idle" | "running" | "finalizing" | "completed" | "failed";

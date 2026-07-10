@@ -2,6 +2,13 @@ import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
 import type {
+  BrainChatBacklogItem,
+  BrainLlmUsageSummary,
+  BrainRunSummary,
+  BrainStatusSummary,
+  BrainTaskInput,
+  BrainTaskRecord,
+  BrainTaskSummary,
   CapturedLinkPreview,
   ChatListItem,
   ChatListOptions,
@@ -96,10 +103,18 @@ const ARCHIVE_TABLES = [
   "memory_page_revisions",
   "memory_citations",
   "memory_validation_issues",
-  "memory_job_locks"
+  "memory_job_locks",
+  "brain_chat_watermarks",
+  "brain_tasks",
+  "brain_runs",
+  "brain_llm_ledger"
 ] as const;
 const DELETE_TABLE_ORDER = [
   "identity_links",
+  "brain_llm_ledger",
+  "brain_runs",
+  "brain_tasks",
+  "brain_chat_watermarks",
   "memory_job_locks",
   "memory_validation_issues",
   "memory_citations",
@@ -735,6 +750,60 @@ const schemaStatements = [
     expires_at_ms INTEGER NOT NULL
   )`,
 
+  // --- Brain substrate (tiered assimilation) ---
+  // Coverage truth: per-chat watermark advanced only when an episode commits.
+  // Pending work is always DERIVED from messages newer than the watermark —
+  // no stored counter that can drift from reality.
+  `CREATE TABLE IF NOT EXISTS brain_chat_watermarks (
+    chat_source_id TEXT PRIMARY KEY,
+    assimilated_through_ms INTEGER NOT NULL DEFAULT 0,
+    last_episode_at TEXT NULL,
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  )`,
+
+  // Durable work queue (cloned from media_download_queue semantics): unique
+  // dedupe keys make enqueues idempotent; claim/backoff/priority make
+  // interruption free — the next tick re-claims stale work.
+  `CREATE TABLE IF NOT EXISTS brain_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL CHECK (kind IN ('episode','rollup','overview','merge_adjudicate','reindex','project_pages')),
+    chat_source_id TEXT NULL,
+    payload_json TEXT NULL,
+    dedupe_key TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','running','done','failed')),
+    priority INTEGER NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at_ms INTEGER NULL,
+    claimed_at_ms INTEGER NULL,
+    last_error TEXT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS brain_runs (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('nightly','catchup','manual','backfill')),
+    status TEXT NOT NULL CHECK (status IN ('running','completed','failed','interrupted','budget_exceeded')),
+    started_at TEXT NOT NULL,
+    finished_at TEXT NULL,
+    timezone TEXT NULL,
+    totals_json TEXT NULL,
+    error_message TEXT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  )`,
+
+  // Every model call's cost, by UTC day and purpose: budgets are enforced
+  // from this ledger as hard named blocks, never silent degradation.
+  `CREATE TABLE IF NOT EXISTS brain_llm_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    day TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    at_ms INTEGER NOT NULL
+  )`,
+
   `CREATE INDEX IF NOT EXISTS idx_import_warnings_run ON import_warnings (import_run_id, severity, code)`,
   `CREATE INDEX IF NOT EXISTS idx_contacts_phone ON contacts (phone_number)`,
   `CREATE INDEX IF NOT EXISTS idx_chats_last_message ON chats (last_message_at_ms)`,
@@ -755,7 +824,10 @@ const schemaStatements = [
   `CREATE INDEX IF NOT EXISTS idx_memory_revisions_page ON memory_page_revisions (page_id, status, created_at)`,
   `CREATE INDEX IF NOT EXISTS idx_memory_citations_message ON memory_citations (source_message_key, message_id)`,
   `CREATE INDEX IF NOT EXISTS idx_memory_issues_run ON memory_validation_issues (run_id, severity, code)`,
-  `CREATE INDEX IF NOT EXISTS idx_message_mentions_jid ON message_mentions (mentioned_jid, message_id)`
+  `CREATE INDEX IF NOT EXISTS idx_message_mentions_jid ON message_mentions (mentioned_jid, message_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_brain_tasks_due ON brain_tasks (status, next_attempt_at_ms, priority, id)`,
+  `CREATE INDEX IF NOT EXISTS idx_brain_ledger_day ON brain_llm_ledger (day, purpose)`,
+  `CREATE INDEX IF NOT EXISTS idx_brain_runs_status ON brain_runs (status, started_at)`
 ];
 
 // Full-text search over messages (brain hot tier): a content-storing FTS5
@@ -1318,6 +1390,225 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     this.setFtsState("ready");
     onProgress?.(total, total);
     return { indexedMessages: total };
+  }
+
+  // --- Brain substrate ---
+
+  async getBrainChatBacklog(options: { limit: number; minPending?: number }): Promise<BrainChatBacklogItem[]> {
+    const rows = this.db
+      .prepare(
+        `SELECT ch.source_chat_id AS chat_source_id,
+                COALESCE(NULLIF(TRIM(COALESCE(ch.display_name, '')), ''), NULL) AS chat_display_name,
+                COALESCE(w.assimilated_through_ms, 0) AS assimilated_through_ms,
+                w.last_episode_at AS last_episode_at,
+                COUNT(m.id) AS pending,
+                MAX(m.timestamp_ms) AS newest_ms
+         FROM chats ch
+         LEFT JOIN brain_chat_watermarks w ON w.chat_source_id = ch.source_chat_id
+         JOIN messages m ON m.chat_id = ch.id
+         WHERE COALESCE(m.timestamp_ms, 0) > COALESCE(w.assimilated_through_ms, 0)
+           AND ${visibleExchangePredicate("m")}
+         GROUP BY ch.id
+         HAVING COUNT(m.id) >= ?
+         ORDER BY pending DESC
+         LIMIT ?`
+      )
+      .all(Math.max(1, options.minPending ?? 1), options.limit) as Array<{
+      chat_source_id: string;
+      chat_display_name: string | null;
+      assimilated_through_ms: number;
+      last_episode_at: string | null;
+      pending: number;
+      newest_ms: number | null;
+    }>;
+    return rows.map((row) => ({
+      chatSourceId: row.chat_source_id,
+      chatDisplayName: row.chat_display_name,
+      assimilatedThroughMs: Number(row.assimilated_through_ms ?? 0),
+      lastEpisodeAt: row.last_episode_at,
+      pendingVisibleMessages: Number(row.pending),
+      newestVisibleMs: row.newest_ms == null ? null : Number(row.newest_ms)
+    }));
+  }
+
+  // Watermarks never regress: a replayed commit can only move coverage forward.
+  async advanceBrainWatermark(chatSourceId: string, throughMs: number): Promise<void> {
+    const canonical = this.canonicalJid(chatSourceId) ?? chatSourceId;
+    this.db
+      .prepare(
+        `INSERT INTO brain_chat_watermarks (chat_source_id, assimilated_through_ms, last_episode_at, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(chat_source_id) DO UPDATE SET
+           assimilated_through_ms = MAX(brain_chat_watermarks.assimilated_through_ms, excluded.assimilated_through_ms),
+           last_episode_at = excluded.last_episode_at,
+           updated_at = excluded.updated_at`
+      )
+      .run(canonical, throughMs, currentIso(), currentIso());
+  }
+
+  async enqueueBrainTasks(tasks: BrainTaskInput[]): Promise<number> {
+    if (tasks.length === 0) {
+      return 0;
+    }
+    const insert = this.db.prepare(
+      `INSERT OR IGNORE INTO brain_tasks (kind, chat_source_id, payload_json, dedupe_key, priority)
+       VALUES (?, ?, ?, ?, ?)`
+    );
+    let enqueued = 0;
+    const transaction = this.db.transaction(() => {
+      for (const task of tasks) {
+        const result = insert.run(task.kind, task.chatSourceId ?? null, stringifyJson(task.payload ?? null), task.dedupeKey, task.priority ?? 0);
+        enqueued += result.changes;
+      }
+    });
+    transaction();
+    return enqueued;
+  }
+
+  async claimDueBrainTasks(limit: number, nowMs = Date.now()): Promise<BrainTaskRecord[]> {
+    const claimed: BrainTaskRecord[] = [];
+    const transaction = this.db.transaction(() => {
+      const rows = this.db
+        .prepare(
+          `SELECT id, kind, chat_source_id, payload_json, dedupe_key, status, priority, attempts, next_attempt_at_ms, last_error
+           FROM brain_tasks
+           WHERE status = 'pending' AND (next_attempt_at_ms IS NULL OR next_attempt_at_ms <= ?)
+           ORDER BY priority DESC, id ASC
+           LIMIT ?`
+        )
+        .all(nowMs, limit) as SqliteBrainTaskRow[];
+      const claim = this.db.prepare(`UPDATE brain_tasks SET status = 'running', claimed_at_ms = ?, updated_at = ? WHERE id = ?`);
+      for (const row of rows) {
+        claim.run(nowMs, currentIso(), row.id);
+        claimed.push(rowToBrainTask(row));
+      }
+    });
+    transaction();
+    return claimed;
+  }
+
+  async completeBrainTask(id: number): Promise<void> {
+    this.db.prepare(`UPDATE brain_tasks SET status = 'done', last_error = NULL, updated_at = ? WHERE id = ?`).run(currentIso(), id);
+  }
+
+  async failBrainTask(id: number, error: string, options?: { retryInMs?: number | null }): Promise<void> {
+    if (options?.retryInMs != null) {
+      this.db
+        .prepare(
+          `UPDATE brain_tasks
+           SET status = 'pending', attempts = attempts + 1, next_attempt_at_ms = ?, last_error = ?, claimed_at_ms = NULL, updated_at = ?
+           WHERE id = ?`
+        )
+        .run(Date.now() + options.retryInMs, error, currentIso(), id);
+    } else {
+      this.db
+        .prepare(`UPDATE brain_tasks SET status = 'failed', attempts = attempts + 1, last_error = ?, updated_at = ? WHERE id = ?`)
+        .run(error, currentIso(), id);
+    }
+  }
+
+  async resetInFlightBrainTasks(staleClaimMs = 30 * 60_000): Promise<number> {
+    const result = this.db
+      .prepare(
+        `UPDATE brain_tasks SET status = 'pending', claimed_at_ms = NULL, updated_at = ?
+         WHERE status = 'running' AND (claimed_at_ms IS NULL OR claimed_at_ms < ?)`
+      )
+      .run(currentIso(), Date.now() - staleClaimMs);
+    return result.changes;
+  }
+
+  async getBrainTaskSummary(): Promise<BrainTaskSummary> {
+    const rows = this.db.prepare(`SELECT status, COUNT(*) AS count FROM brain_tasks GROUP BY status`).all() as Array<{
+      status: string;
+      count: number;
+    }>;
+    const summary: BrainTaskSummary = { pending: 0, running: 0, failed: 0, done: 0 };
+    for (const row of rows) {
+      if (row.status in summary) {
+        summary[row.status as keyof BrainTaskSummary] = Number(row.count);
+      }
+    }
+    return summary;
+  }
+
+  async startBrainRun(kind: BrainRunSummary["kind"], timezone?: string | null): Promise<string> {
+    this.assertWritableIdentityVersion();
+    const id = crypto.randomUUID();
+    this.db
+      .prepare(`INSERT INTO brain_runs (id, kind, status, started_at, timezone) VALUES (?, ?, 'running', ?, ?)`)
+      .run(id, kind, currentIso(), timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone ?? null);
+    return id;
+  }
+
+  async completeBrainRun(runId: string, totals: Record<string, number>): Promise<void> {
+    this.db
+      .prepare(`UPDATE brain_runs SET status = 'completed', finished_at = ?, totals_json = ? WHERE id = ?`)
+      .run(currentIso(), stringifyJson(totals), runId);
+  }
+
+  async failBrainRun(runId: string, status: "failed" | "interrupted" | "budget_exceeded", message: string): Promise<void> {
+    this.db
+      .prepare(`UPDATE brain_runs SET status = ?, finished_at = ?, error_message = ? WHERE id = ?`)
+      .run(status, currentIso(), message, runId);
+  }
+
+  async recordBrainLlmUsage(entry: { purpose: string; provider: string; inputTokens: number; outputTokens: number }): Promise<void> {
+    const now = Date.now();
+    this.db
+      .prepare(`INSERT INTO brain_llm_ledger (day, purpose, provider, input_tokens, output_tokens, at_ms) VALUES (?, ?, ?, ?, ?, ?)`)
+      .run(new Date(now).toISOString().slice(0, 10), entry.purpose, entry.provider, entry.inputTokens, entry.outputTokens, now);
+  }
+
+  async getBrainLlmUsage(options: { sinceMs: number }): Promise<BrainLlmUsageSummary> {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS calls, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens
+         FROM brain_llm_ledger WHERE at_ms >= ?`
+      )
+      .get(options.sinceMs) as { calls: number; input_tokens: number; output_tokens: number };
+    return { calls: Number(row.calls), inputTokens: Number(row.input_tokens), outputTokens: Number(row.output_tokens) };
+  }
+
+  async getBrainStatus(): Promise<BrainStatusSummary> {
+    const coverage = this.db
+      .prepare(
+        `SELECT COUNT(*) AS total,
+                COALESCE(SUM(CASE WHEN COALESCE(m.timestamp_ms, 0) <= COALESCE(w.assimilated_through_ms, 0) THEN 1 ELSE 0 END), 0) AS assimilated
+         FROM messages m
+         JOIN chats ch ON ch.id = m.chat_id
+         LEFT JOIN brain_chat_watermarks w ON w.chat_source_id = ch.source_chat_id
+         WHERE ${visibleExchangePredicate("m")}`
+      )
+      .get() as { total: number; assimilated: number };
+    const chatsWithBacklog = this.db
+      .prepare(
+        `SELECT COUNT(*) AS count FROM (
+           SELECT ch.id
+           FROM chats ch
+           LEFT JOIN brain_chat_watermarks w ON w.chat_source_id = ch.source_chat_id
+           JOIN messages m ON m.chat_id = ch.id
+           WHERE COALESCE(m.timestamp_ms, 0) > COALESCE(w.assimilated_through_ms, 0)
+             AND ${visibleExchangePredicate("m")}
+           GROUP BY ch.id
+         )`
+      )
+      .get() as { count: number };
+    const utcMidnight = new Date();
+    utcMidnight.setUTCHours(0, 0, 0, 0);
+    const runs = this.db.prepare(`SELECT * FROM brain_runs ORDER BY started_at DESC LIMIT 5`).all() as SqliteBrainRunRow[];
+    const total = Number(coverage.total ?? 0);
+    const assimilated = Number(coverage.assimilated ?? 0);
+    return {
+      totalVisibleMessages: total,
+      assimilatedVisibleMessages: assimilated,
+      coveragePercent: total > 0 ? Math.round((assimilated / total) * 1000) / 10 : 100,
+      chatsWithBacklog: Number(chatsWithBacklog.count ?? 0),
+      backlogSample: await this.getBrainChatBacklog({ limit: 8 }),
+      tasks: await this.getBrainTaskSummary(),
+      usageToday: await this.getBrainLlmUsage({ sinceMs: utcMidnight.getTime() }),
+      latestRun: runs[0] ? rowToBrainRun(runs[0]) : null,
+      activeRun: runs.find((run) => run.status === "running") ? rowToBrainRun(runs.find((run) => run.status === "running")!) : null
+    };
   }
 
   async collapseSupersededMessages(
@@ -4452,6 +4743,58 @@ interface SqliteChatRow {
   message_count: number;
   participant_count: number;
   last_message_at: string | null;
+}
+
+interface SqliteBrainTaskRow {
+  id: number;
+  kind: string;
+  chat_source_id: string | null;
+  payload_json: string | null;
+  dedupe_key: string;
+  status: string;
+  priority: number;
+  attempts: number;
+  next_attempt_at_ms: number | null;
+  last_error: string | null;
+}
+
+interface SqliteBrainRunRow {
+  id: string;
+  kind: string;
+  status: string;
+  started_at: string;
+  finished_at: string | null;
+  timezone: string | null;
+  totals_json: string | null;
+  error_message: string | null;
+}
+
+function rowToBrainTask(row: SqliteBrainTaskRow): BrainTaskRecord {
+  return {
+    id: Number(row.id),
+    kind: row.kind as BrainTaskRecord["kind"],
+    chatSourceId: row.chat_source_id,
+    payload: parseJson(row.payload_json) as Record<string, unknown> | null,
+    dedupeKey: row.dedupe_key,
+    status: row.status as BrainTaskRecord["status"],
+    priority: Number(row.priority),
+    attempts: Number(row.attempts),
+    nextAttemptAtMs: row.next_attempt_at_ms == null ? null : Number(row.next_attempt_at_ms),
+    lastError: row.last_error
+  };
+}
+
+function rowToBrainRun(row: SqliteBrainRunRow): BrainRunSummary {
+  return {
+    id: row.id,
+    kind: row.kind as BrainRunSummary["kind"],
+    status: row.status as BrainRunSummary["status"],
+    startedAt: row.started_at,
+    finishedAt: row.finished_at,
+    timezone: row.timezone,
+    totals: parseJson(row.totals_json) as Record<string, number> | null,
+    errorMessage: row.error_message
+  };
 }
 
 interface SqliteMessageRow extends SqliteMediaStateColumns {

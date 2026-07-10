@@ -2475,3 +2475,67 @@ button.fileButton:disabled {
   padding: 8px 14px;
   cursor: pointer;
 }
+
+/* --- Brain panel --- */
+
+.dueBadge {
+  background: rgba(255, 200, 90, 0.22);
+  border: 1px solid rgba(255, 200, 90, 0.45);
+  color: #f4e8c8;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 1;
+  padding: 3px 8px;
+}
+
+.degradedIcon {
+  color: #e6a4a4;
+}
+
+.brainDueAlert {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin: 10px 0;
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 200, 90, 0.35);
+  border-radius: 8px;
+  background: rgba(255, 200, 90, 0.08);
+  color: #e8dcc0;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.brainDueAlert svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.brainProviderControls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px;
+  margin: 10px 0 6px;
+}
+
+.brainProviderControls label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: #aab5b1;
+}
+
+.brainProviderControls select {
+  background: #1a2225;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 6px;
+  color: #edf4f1;
+  font-size: 12px;
+  padding: 5px 8px;
+}
+
+.degradedLine {
+  color: #e6a4a4;
+}

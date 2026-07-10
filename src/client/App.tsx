@@ -1,6 +1,7 @@
 import {
   AlertTriangle,
   ArrowRight,
+  Brain,
   CheckCircle2,
   ChevronDown,
   ChevronRight,
@@ -39,6 +40,8 @@ import { parseInlineSegments, parseWhatsAppBlocks, type InlineSegment } from "./
 import type {
   ArchiveChangeEvent,
   BackupDetectionManifest,
+  BrainOverview,
+  BrainProviderName,
   ChatListItem,
   ImportJobSummary,
   ImportMode,
@@ -60,9 +63,11 @@ import type {
 } from "../shared/types";
 import { SEARCH_HIGHLIGHT_END, SEARCH_HIGHLIGHT_START } from "../shared/types";
 import {
+  brainProviderAction,
   cancelImportJob,
   cleanupTempFiles,
   detectBackupFolder,
+  getBrainOverview,
   disableMemoryProvider,
   enableCodexMemoryProvider,
   getCurrentImportJob,
@@ -126,6 +131,7 @@ export function App() {
   const [memoryQuery, setMemoryQuery] = useState("");
   const [memoryResult, setMemoryResult] = useState<MemoryQueryResult | null>(null);
   const [memoryCitation, setMemoryCitation] = useState<MemoryCitationResolution | null>(null);
+  const [brainOverview, setBrainOverview] = useState<BrainOverview | null>(null);
   const [lightbox, setLightbox] = useState<{ assetId: number; mimeType: string | null } | null>(null);
   const [globalQuery, setGlobalQuery] = useState("");
   const [globalResults, setGlobalResults] = useState<SearchResultItem[]>([]);
@@ -391,6 +397,9 @@ export function App() {
           setReindexProgress(search.reindex);
         })
         .catch(() => undefined);
+      getBrainOverview()
+        .then(setBrainOverview)
+        .catch(() => undefined);
     } catch (err) {
       setStatusError(err instanceof Error ? err.message : "Status unavailable.");
     }
@@ -543,6 +552,30 @@ export function App() {
       setReindexProgress(response.reindex);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not start the search reindex.");
+    }
+  }
+
+  async function handleBrainProviderAction(body: {
+    action: "enable" | "disable" | "probe" | "set-model";
+    provider?: Exclude<BrainProviderName, "extractive">;
+    model?: string;
+  }) {
+    setBusy(body.action === "probe" ? "Probing brain provider" : "Updating brain provider");
+    setError(null);
+    try {
+      const response = await brainProviderAction(body);
+      setBrainOverview((current) => (current ? { ...current, provider: response.provider } : current));
+      if (body.action === "probe") {
+        if (response.ok) {
+          setNotice("Provider probe succeeded — the model answered end-to-end.");
+        } else {
+          setError(`Provider probe failed: ${response.provider.health.lastError ?? response.provider.message}`);
+        }
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Provider action failed.");
+    } finally {
+      setBusy(null);
     }
   }
 
@@ -862,6 +895,7 @@ export function App() {
             onEnableCodex={() => void handleEnableCodexMemory()}
             onDisableProvider={() => void handleDisableMemoryProvider()}
           />
+          <BrainPanel overview={brainOverview} busy={busy} onProviderAction={(body) => void handleBrainProviderAction(body)} />
 
           <ImportLauncher status={status} onOpen={() => setImportWizardOpen(true)} />
 
@@ -1416,6 +1450,118 @@ function LivePanel({
               Unlink device
             </button>
           )}
+        </>
+      )}
+    </section>
+  );
+}
+
+// The brain's operator panel: coverage truth, run-due alert, and full provider
+// control (opt-in, model choice, probe) — manual-first, everything from the UI.
+function BrainPanel({
+  overview,
+  busy,
+  onProviderAction
+}: {
+  overview: BrainOverview | null;
+  busy: string | null;
+  onProviderAction: (body: {
+    action: "enable" | "disable" | "probe" | "set-model";
+    provider?: Exclude<BrainProviderName, "extractive">;
+    model?: string;
+  }) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const provider = overview?.provider;
+  const runDue = Boolean(overview?.scheduler.runDue);
+  const activeProviderName = provider?.provider ?? "extractive";
+  const modelOptions = provider && provider.provider !== "extractive" ? provider.models[provider.provider] ?? [] : [];
+  return (
+    <section className={`memoryPanel ${open ? "" : "collapsed"}`}>
+      <button className="panelToggle" type="button" aria-expanded={open} onClick={() => setOpen((current) => !current)}>
+        <span className="panelTitle">
+          <Brain size={16} />
+          <span>Brain</span>
+          {runDue && <span className="dueBadge">run due</span>}
+          {provider?.degraded && <AlertTriangle size={14} className="degradedIcon" />}
+        </span>
+        {open ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+      </button>
+      {open && (
+        <>
+          <div className="statusGrid">
+            <Metric label="Coverage" value={`${overview?.coveragePercent ?? 0}%`} />
+            <Metric label="Backlog chats" value={overview?.chatsWithBacklog.toLocaleString() ?? "0"} />
+            <Metric
+              label="Pending msgs"
+              value={((overview?.totalVisibleMessages ?? 0) - (overview?.assimilatedVisibleMessages ?? 0)).toLocaleString()}
+            />
+            <Metric label="Calls today" value={overview?.usageToday.calls.toLocaleString() ?? "0"} />
+          </div>
+          {runDue && (
+            <div className="brainDueAlert">
+              <AlertTriangle size={14} />
+              <span>
+                {overview?.scheduler.dueReason} Automatic runs are {overview?.scheduler.mode} — trigger one manually when your
+                model quota allows. (Run controls arrive with the episode engine.)
+              </span>
+            </div>
+          )}
+          <div className="brainProviderControls">
+            <label>
+              <span>Provider</span>
+              <select
+                value={activeProviderName}
+                disabled={Boolean(busy)}
+                onChange={(event) => {
+                  const value = event.target.value as BrainProviderName;
+                  if (value === "extractive") {
+                    onProviderAction({ action: "disable" });
+                  } else {
+                    onProviderAction({ action: "enable", provider: value });
+                  }
+                }}
+              >
+                <option value="extractive">extractive (no model)</option>
+                <option value="claude-cli">claude (WSL CLI)</option>
+                <option value="codex">codex (GPT OAuth)</option>
+              </select>
+            </label>
+            {provider && provider.provider !== "extractive" && (
+              <label>
+                <span>Model</span>
+                <select
+                  value={provider.model ?? modelOptions[0] ?? ""}
+                  disabled={Boolean(busy)}
+                  onChange={(event) =>
+                    onProviderAction({
+                      action: "set-model",
+                      provider: provider.provider as Exclude<BrainProviderName, "extractive">,
+                      model: event.target.value
+                    })
+                  }
+                >
+                  {modelOptions.map((model) => (
+                    <option key={model} value={model}>
+                      {model}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
+            {provider && provider.provider !== "extractive" && (
+              <button
+                className="miniButton"
+                type="button"
+                disabled={Boolean(busy)}
+                onClick={() => onProviderAction({ action: "probe" })}
+                title="Make one tiny model call to verify the provider end-to-end"
+              >
+                Probe
+              </button>
+            )}
+          </div>
+          <div className={`statusLine ${provider?.degraded ? "degradedLine" : ""}`}>{provider?.message}</div>
         </>
       )}
     </section>

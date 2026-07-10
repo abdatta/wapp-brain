@@ -1,4 +1,11 @@
 import type {
+  BrainChatBacklogItem,
+  BrainLlmUsageSummary,
+  BrainRunSummary,
+  BrainStatusSummary,
+  BrainTaskInput,
+  BrainTaskRecord,
+  BrainTaskSummary,
   CapturedLinkPreview,
   ChatListItem,
   ChatRecord,
@@ -180,6 +187,24 @@ export interface ArchiveRepository {
   markStaleMemoryForMissingMessages(): Promise<number>;
   resolveMemoryCitation(citationLabelOrMessageKey: string): Promise<MemoryCitationRecord | null>;
   listNearbyMemoryMessages(messageId: number, radius: number): Promise<MemoryEvidenceMessage[]>;
+  // --- Brain substrate: watermarks (coverage truth), durable task queue,
+  // run ledger, and model-usage ledger. Watermarks advance only on commit;
+  // backlog is derived live from messages newer than the watermark.
+  getBrainChatBacklog(options: { limit: number; minPending?: number }): Promise<BrainChatBacklogItem[]>;
+  advanceBrainWatermark(chatSourceId: string, throughMs: number): Promise<void>;
+  enqueueBrainTasks(tasks: BrainTaskInput[]): Promise<number>;
+  claimDueBrainTasks(limit: number, nowMs?: number): Promise<BrainTaskRecord[]>;
+  completeBrainTask(id: number): Promise<void>;
+  failBrainTask(id: number, error: string, options?: { retryInMs?: number | null }): Promise<void>;
+  // Restart recovery: claimed-but-unfinished tasks return to pending.
+  resetInFlightBrainTasks(staleClaimMs?: number): Promise<number>;
+  getBrainTaskSummary(): Promise<BrainTaskSummary>;
+  startBrainRun(kind: BrainRunSummary["kind"], timezone?: string | null): Promise<string>;
+  completeBrainRun(runId: string, totals: Record<string, number>): Promise<void>;
+  failBrainRun(runId: string, status: "failed" | "interrupted" | "budget_exceeded", message: string): Promise<void>;
+  recordBrainLlmUsage(entry: { purpose: string; provider: string; inputTokens: number; outputTokens: number }): Promise<void>;
+  getBrainLlmUsage(options: { sinceMs: number }): Promise<BrainLlmUsageSummary>;
+  getBrainStatus(): Promise<BrainStatusSummary>;
   close?(): Promise<void>;
 }
 

@@ -98,6 +98,51 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === "brain-status") {
+    const { getBrainProviderStatus } = await import("./brain/provider");
+    const repository = createArchiveRepository();
+    try {
+      const status = await repository.getBrainStatus();
+      const provider = getBrainProviderStatus();
+      console.log(JSON.stringify({ ...status, provider }, null, 2));
+    } finally {
+      await repository.close?.();
+    }
+    return;
+  }
+
+  if (command === "brain-provider") {
+    const { disableBrainProvider, enableBrainProvider, getBrainProviderStatus, probeBrainProvider, setBrainProviderModel } =
+      await import("./brain/provider");
+    const action = stringArg(args._) ?? "status";
+    if (action === "set-model") {
+      const provider = stringArg(args.provider);
+      const model = stringArg(args.model);
+      if ((provider !== "claude-cli" && provider !== "codex") || !model) {
+        throw new Error("Usage: brain-provider set-model --provider <claude-cli|codex> --model <name>");
+      }
+      const status = setBrainProviderModel(provider, model);
+      console.log(`Model for ${provider} set to ${model}. ${status.message}`);
+    } else if (action === "enable-claude-cli") {
+      console.log(enableBrainProvider("claude-cli").message);
+    } else if (action === "enable-codex") {
+      console.log(enableBrainProvider("codex").message);
+    } else if (action === "disable") {
+      console.log(disableBrainProvider().message);
+    } else if (action === "probe") {
+      console.log("Probing the model provider end-to-end (this makes one tiny model call)…");
+      const probe = await probeBrainProvider();
+      console.log(probe.ok ? `PROBE OK — ${probe.status.message}` : `PROBE FAILED — ${probe.status.message}`);
+      if (!probe.ok) {
+        process.exitCode = 1;
+      }
+    } else {
+      const status = getBrainProviderStatus();
+      console.log(JSON.stringify(status, null, 2));
+    }
+    return;
+  }
+
   if (command === "search-reindex") {
     const repository = createArchiveRepository();
     try {

@@ -3,6 +3,13 @@ import type {
   ArchiveRestorePoint
 } from "./repository";
 import type {
+  BrainChatBacklogItem,
+  BrainLlmUsageSummary,
+  BrainRunSummary,
+  BrainStatusSummary,
+  BrainTaskInput,
+  BrainTaskRecord,
+  BrainTaskSummary,
   CapturedLinkPreview,
   ChatListItem,
   ChatListOptions,
@@ -79,6 +86,11 @@ export class MemoryArchiveRepository implements ArchiveRepository {
   private mediaQueue = new Map<string, MediaDownloadQueueRecord & { id: number }>();
   private mediaAssets = new Map<number, MediaAssetRecord & { id: number }>();
   private linkPreviews = new Map<string, CapturedLinkPreview>();
+  private brainWatermarks = new Map<string, { assimilatedThroughMs: number; lastEpisodeAt: string | null }>();
+  private brainTasks = new Map<string, BrainTaskRecord>();
+  private nextBrainTaskId = 1;
+  private brainRuns = new Map<string, BrainRunSummary>();
+  private brainLedger: Array<{ purpose: string; provider: string; inputTokens: number; outputTokens: number; atMs: number }> = [];
   private editRevisions = new Map<string, MessageEditRevisionRecord[]>();
   private nextMediaQueueId = 1;
   private nextMediaAssetId = 1;
@@ -317,6 +329,10 @@ export class MemoryArchiveRepository implements ArchiveRepository {
 
   async createRestorePoint(_label: string): Promise<ArchiveRestorePoint> {
     const snapshot = {
+      brainWatermarks: cloneMap(this.brainWatermarks),
+      brainTasks: cloneMap(this.brainTasks),
+      brainRuns: cloneMap(this.brainRuns),
+      brainLedger: structuredClone(this.brainLedger),
       importRuns: cloneMap(this.importRuns),
       warnings: structuredClone(this.warnings),
       contacts: cloneMap(this.contacts),
@@ -344,6 +360,10 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     };
     return {
       restore: async () => {
+        this.brainWatermarks = cloneMap(snapshot.brainWatermarks);
+        this.brainTasks = cloneMap(snapshot.brainTasks);
+        this.brainRuns = cloneMap(snapshot.brainRuns);
+        this.brainLedger = structuredClone(snapshot.brainLedger);
         this.importRuns = cloneMap(snapshot.importRuns);
         this.warnings = structuredClone(snapshot.warnings);
         this.contacts = cloneMap(snapshot.contacts);
@@ -1392,6 +1412,186 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       index,
       totalMatches: scored.length,
       results: scored.slice(options.offset, options.offset + options.limit).map((entry) => entry.item)
+    };
+  }
+
+  // --- Brain substrate (mirrors the SQLite adapter's semantics) ---
+
+  async getBrainChatBacklog(options: { limit: number; minPending?: number }): Promise<BrainChatBacklogItem[]> {
+    const minPending = Math.max(1, options.minPending ?? 1);
+    const items: BrainChatBacklogItem[] = [];
+    for (const chat of this.chats.values()) {
+      const watermark = this.brainWatermarks.get(chat.sourceChatId);
+      const throughMs = watermark?.assimilatedThroughMs ?? 0;
+      const pendingMessages = [...this.messages.values()].filter(
+        (message) =>
+          message.chatSourceId === chat.sourceChatId &&
+          (message.timestampMs ?? 0) > throughMs &&
+          isVisibleExchangeMessage(message)
+      );
+      if (pendingMessages.length >= minPending) {
+        items.push({
+          chatSourceId: chat.sourceChatId,
+          chatDisplayName: chat.displayName ?? null,
+          assimilatedThroughMs: throughMs,
+          lastEpisodeAt: watermark?.lastEpisodeAt ?? null,
+          pendingVisibleMessages: pendingMessages.length,
+          newestVisibleMs: pendingMessages.reduce<number | null>((max, message) => Math.max(max ?? 0, message.timestampMs ?? 0), null)
+        });
+      }
+    }
+    return items.sort((a, b) => b.pendingVisibleMessages - a.pendingVisibleMessages).slice(0, options.limit);
+  }
+
+  async advanceBrainWatermark(chatSourceId: string, throughMs: number): Promise<void> {
+    const existing = this.brainWatermarks.get(chatSourceId);
+    this.brainWatermarks.set(chatSourceId, {
+      assimilatedThroughMs: Math.max(existing?.assimilatedThroughMs ?? 0, throughMs),
+      lastEpisodeAt: new Date().toISOString()
+    });
+  }
+
+  async enqueueBrainTasks(tasks: BrainTaskInput[]): Promise<number> {
+    let enqueued = 0;
+    for (const task of tasks) {
+      if (this.brainTasks.has(task.dedupeKey)) {
+        continue;
+      }
+      this.brainTasks.set(task.dedupeKey, {
+        id: this.nextBrainTaskId++,
+        kind: task.kind,
+        chatSourceId: task.chatSourceId ?? null,
+        payload: task.payload ?? null,
+        dedupeKey: task.dedupeKey,
+        status: "pending",
+        priority: task.priority ?? 0,
+        attempts: 0,
+        nextAttemptAtMs: null,
+        lastError: null
+      });
+      enqueued += 1;
+    }
+    return enqueued;
+  }
+
+  async claimDueBrainTasks(limit: number, nowMs = Date.now()): Promise<BrainTaskRecord[]> {
+    const due = [...this.brainTasks.values()]
+      .filter((task) => task.status === "pending" && (task.nextAttemptAtMs == null || task.nextAttemptAtMs <= nowMs))
+      .sort((a, b) => b.priority - a.priority || a.id - b.id)
+      .slice(0, limit);
+    for (const task of due) {
+      task.status = "running";
+    }
+    return structuredClone(due);
+  }
+
+  async completeBrainTask(id: number): Promise<void> {
+    const task = [...this.brainTasks.values()].find((candidate) => candidate.id === id);
+    if (task) {
+      task.status = "done";
+      task.lastError = null;
+    }
+  }
+
+  async failBrainTask(id: number, error: string, options?: { retryInMs?: number | null }): Promise<void> {
+    const task = [...this.brainTasks.values()].find((candidate) => candidate.id === id);
+    if (!task) {
+      return;
+    }
+    task.attempts += 1;
+    task.lastError = error;
+    if (options?.retryInMs != null) {
+      task.status = "pending";
+      task.nextAttemptAtMs = Date.now() + options.retryInMs;
+    } else {
+      task.status = "failed";
+    }
+  }
+
+  async resetInFlightBrainTasks(_staleClaimMs = 30 * 60_000): Promise<number> {
+    let reset = 0;
+    for (const task of this.brainTasks.values()) {
+      if (task.status === "running") {
+        task.status = "pending";
+        reset += 1;
+      }
+    }
+    return reset;
+  }
+
+  async getBrainTaskSummary(): Promise<BrainTaskSummary> {
+    const summary: BrainTaskSummary = { pending: 0, running: 0, failed: 0, done: 0 };
+    for (const task of this.brainTasks.values()) {
+      summary[task.status] += 1;
+    }
+    return summary;
+  }
+
+  async startBrainRun(kind: BrainRunSummary["kind"], timezone?: string | null): Promise<string> {
+    const id = crypto.randomUUID();
+    this.brainRuns.set(id, {
+      id,
+      kind,
+      status: "running",
+      startedAt: new Date().toISOString(),
+      finishedAt: null,
+      timezone: timezone ?? null,
+      totals: null,
+      errorMessage: null
+    });
+    return id;
+  }
+
+  async completeBrainRun(runId: string, totals: Record<string, number>): Promise<void> {
+    const run = this.brainRuns.get(runId);
+    if (run) {
+      run.status = "completed";
+      run.finishedAt = new Date().toISOString();
+      run.totals = totals;
+    }
+  }
+
+  async failBrainRun(runId: string, status: "failed" | "interrupted" | "budget_exceeded", message: string): Promise<void> {
+    const run = this.brainRuns.get(runId);
+    if (run) {
+      run.status = status;
+      run.finishedAt = new Date().toISOString();
+      run.errorMessage = message;
+    }
+  }
+
+  async recordBrainLlmUsage(entry: { purpose: string; provider: string; inputTokens: number; outputTokens: number }): Promise<void> {
+    this.brainLedger.push({ ...entry, atMs: Date.now() });
+  }
+
+  async getBrainLlmUsage(options: { sinceMs: number }): Promise<BrainLlmUsageSummary> {
+    const entries = this.brainLedger.filter((entry) => entry.atMs >= options.sinceMs);
+    return {
+      calls: entries.length,
+      inputTokens: entries.reduce((sum, entry) => sum + entry.inputTokens, 0),
+      outputTokens: entries.reduce((sum, entry) => sum + entry.outputTokens, 0)
+    };
+  }
+
+  async getBrainStatus(): Promise<BrainStatusSummary> {
+    const visible = [...this.messages.values()].filter((message) => isVisibleExchangeMessage(message));
+    const assimilated = visible.filter(
+      (message) => (message.timestampMs ?? 0) <= (this.brainWatermarks.get(message.chatSourceId)?.assimilatedThroughMs ?? 0)
+    );
+    const backlog = await this.getBrainChatBacklog({ limit: 8 });
+    const utcMidnight = new Date();
+    utcMidnight.setUTCHours(0, 0, 0, 0);
+    const runs = [...this.brainRuns.values()].sort((a, b) => b.startedAt.localeCompare(a.startedAt));
+    return {
+      totalVisibleMessages: visible.length,
+      assimilatedVisibleMessages: assimilated.length,
+      coveragePercent: visible.length > 0 ? Math.round((assimilated.length / visible.length) * 1000) / 10 : 100,
+      chatsWithBacklog: backlog.length,
+      backlogSample: backlog,
+      tasks: await this.getBrainTaskSummary(),
+      usageToday: await this.getBrainLlmUsage({ sinceMs: utcMidnight.getTime() }),
+      latestRun: runs[0] ?? null,
+      activeRun: runs.find((run) => run.status === "running") ?? null
     };
   }
 

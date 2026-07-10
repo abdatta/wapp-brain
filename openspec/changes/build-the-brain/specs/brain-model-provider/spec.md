@@ -1,11 +1,22 @@
 ## ADDED Requirements
 
 ### Requirement: Provider Interface
-The brain SHALL access language models exclusively through a single provider interface that accepts a system prompt, user content, an output schema, and an output token bound, and returns validated structured JSON with token usage; consolidation and retrieval code SHALL NOT branch on provider identity.
+The brain SHALL access language models exclusively through a single provider interface that accepts a system prompt, user content, an output schema, an output token bound, and an optional model selection, and returns validated structured JSON with token usage; consolidation and retrieval code SHALL NOT branch on provider identity.
 
 #### Scenario: Provider swapped without pipeline change
 - **WHEN** the configured provider changes between claude-cli, codex, and extractive
 - **THEN** assimilation and deep-query behavior changes only in generation quality, not in control flow
+
+### Requirement: User Model Selection
+Each model-backed provider SHALL expose its selectable models (claude: fable, opus, sonnet, haiku; codex: gpt-5.5, gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna), the user SHALL be able to pick the provider and model from the UI (persisted as the default until changed), and ledger entries SHALL record which provider and model each call used.
+
+#### Scenario: Model picked from the UI
+- **WHEN** the user selects a provider and model in the brain panel
+- **THEN** subsequent generation uses that selection and the choice survives restarts
+
+#### Scenario: Per-run override
+- **WHEN** a run is triggered with an explicit model
+- **THEN** that run uses the override without changing the persisted default
 
 ### Requirement: Claude CLI Adapter
 The system SHALL provide a provider adapter that invokes the local Claude Code CLI as a child process in non-interactive single-turn JSON mode, with tool access disabled, working directory pinned outside the private workspace, the prompt delivered over stdin, and a configurable invocation command supporting environments where the CLI is reachable only through a WSL bridge; the adapter SHALL parse structured output and never block the server event loop.

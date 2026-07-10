@@ -66,8 +66,19 @@ The brain SHALL maintain a typed knowledge graph (person, chat, topic, event, co
 - **WHEN** a consumer holds a node id whose node was merged
 - **THEN** requests for that id resolve to the winning node
 
+### Requirement: Manual-First Run Control
+Automatic consolidation SHALL be paused by default: the brain SHALL compute when a run is due (pending backlog plus a passed consolidation window) and surface a visible "run due" alert in the UI and status APIs, but SHALL NOT spend model budget until the user triggers a run or explicitly enables automatic scheduling. Every triggered run SHALL carry the user's provider and model selection, controllable entirely from the UI.
+
+#### Scenario: Run due but not auto-executed
+- **WHEN** backlog exists and the consolidation window has passed with scheduling paused
+- **THEN** the UI shows a run-due alert with the pending scope, and no model call happens until the user starts the run
+
+#### Scenario: User triggers a run with a chosen model
+- **WHEN** the user starts a brain run from the UI selecting a provider and model
+- **THEN** the run executes with exactly that provider and model, its usage is recorded against them in the ledger, and progress is visible throughout
+
 ### Requirement: Consolidation Lifecycle And Decay
-The brain SHALL run scheduled consolidation — nightly episodic passes, volume-triggered intra-day episodes for busy chats, a significance gate folding low-activity chats into weekly mini-episodes, weekly semantic rollups and maintenance, and monthly compression of old episodes into digests — and SHALL apply salience-based dormancy that hides low-salience nodes from default surfaces without deleting anything; episodes and citations are permanent.
+The brain SHALL compute scheduled consolidation work — nightly episodic passes, volume-triggered intra-day episodes for busy chats, a significance gate folding low-activity chats into weekly mini-episodes, weekly semantic rollups and maintenance, and monthly compression of old episodes into digests — executing it automatically only when automatic scheduling is enabled, and SHALL apply salience-based dormancy that hides low-salience nodes from default surfaces without deleting anything; episodes and citations are permanent.
 
 #### Scenario: Quiet chat folds weekly
 - **WHEN** a chat accumulates fewer than the significance threshold of pending messages
