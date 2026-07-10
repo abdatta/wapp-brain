@@ -9,6 +9,7 @@ import { SqliteArchiveRepository } from "./db/sqliteRepository";
 import { configuredTraceRecorder, getTraceRecorderSummary } from "./diagnostics/traceRecorder";
 import { runDoctor } from "./doctor";
 import { inspectArchive } from "./import/inspect";
+import { listWaContacts } from "./import/waContacts";
 import { runImport } from "./import/importer";
 import { parseWorksheetAnnotations, renderUnknownTypeReport } from "./import/unknownTypeReport";
 import { createSyntheticFixture } from "./import/fixtures";
@@ -95,6 +96,37 @@ async function main(): Promise<void> {
 
   if (command === "import") {
     await runImportCommand(args);
+    return;
+  }
+
+  if (command === "wa-contacts") {
+    const waPath = stringArg(args.wa) ?? stringArg(args._);
+    if (!waPath) {
+      throw new Error("Missing --wa path.");
+    }
+    const summary = await listWaContacts({
+      waPath,
+      key: stringArg(args.key),
+      keyPath: stringArg(args["key-file"]),
+      keepDecrypted: Boolean(args["keep-decrypted"])
+    });
+    console.log(
+      `wa.db contacts: total=${summary.totalContacts} resolved=${summary.resolvedCount} unresolved=${summary.unresolvedCount}`
+    );
+    const showAll = Boolean(args.all);
+    if (showAll) {
+      console.log("\nAll contacts:");
+      for (const contact of summary.contacts) {
+        printContactRow(contact);
+      }
+    } else if (summary.unresolvedCount > 0) {
+      console.log("\nContacts with no resolved name (pass --all to list every contact):");
+      for (const contact of summary.contacts) {
+        if (!contact.resolved) {
+          printContactRow(contact);
+        }
+      }
+    }
     return;
   }
 
@@ -613,6 +645,13 @@ function numberArg(value: string | boolean | undefined): number | undefined {
   return Number.isFinite(number) && number > 0 ? Math.floor(number) : undefined;
 }
 
+function printContactRow(contact: { jid: string; number: string | null; displayName: string | null; resolved: boolean }): void {
+  const label = contact.resolved ? "OK  " : "MISS";
+  const name = contact.displayName ?? "(no name)";
+  const number = contact.number ? ` (${contact.number})` : "";
+  console.log(`  ${label} ${contact.jid}${number} - ${name}`);
+}
+
 function printHelp(): void {
   console.log(`Usage:
   npm run init-db
@@ -622,6 +661,7 @@ function printHelp(): void {
   npm run generate-fixtures -- --dir fixtures/generated/basic
   npm run inspect -- --msgstore <msgstore.db|msgstore.db.crypt15> [--wa <wa.db|wa.db.crypt15>] [--key <64-hex-key> | --key-file <encrypted_backup.key>]
   npm run import -- --msgstore <msgstore.db.crypt15> [--wa <wa.db|wa.db.crypt15>] [--media <WhatsApp/Media>] [--archive <archive.sqlite>] [--key <64-hex-key> | --key-file <encrypted_backup.key>]
+  npm run wa-contacts -- --wa <wa.db|wa.db.crypt15> [--key <64-hex-key> | --key-file <encrypted_backup.key>] [--all]
   tsx src/server/cli.ts live-proof [--phone <countrycode-number>] [--timeout <ms>]
   tsx src/server/cli.ts live-start [--phone <countrycode-number>] [--once]
   tsx src/server/cli.ts live-status
@@ -643,6 +683,7 @@ Notes:
   - Each import writes a unique verbose debug log under .wapp-brain/logs.
   - Set WAPP_TRACE_NAME=<name> to record exact local diagnostic traces under .wapp-brain/traces.
   - inspect reports schema compatibility and counts without message bodies.
+  - wa-contacts decrypts only the contacts sidecar and lists which contacts have a resolved name and which don't.
   - live-* commands are explicit opt-in and store auth/session state only under .wapp-brain/live.
   - memory-* commands write private generated Markdown, sidecars, and provider session state under .wapp-brain/memory by default.
   - Use --keep-decrypted only if you intentionally want decrypted databases left in the local work directory.

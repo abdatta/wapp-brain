@@ -30,7 +30,8 @@ import type {
   SearchResponse,
   SearchTypeFilter,
   StatusSummary,
-  BackupDetectionManifest
+  BackupDetectionManifest,
+  WaContactsSummary
 } from "../shared/types";
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
@@ -96,6 +97,17 @@ export function verifyImportKey(requestBody: {
   key?: string | null;
 }): Promise<{ ok: boolean; verification: ImportVerificationSummary }> {
   return request<{ ok: boolean; verification: ImportVerificationSummary }>("/api/import/verify-key", {
+    method: "POST",
+    body: JSON.stringify(requestBody)
+  });
+}
+
+export function fetchWaContacts(requestBody: {
+  waPath: string;
+  key?: string | null;
+  keyPath?: string | null;
+}): Promise<{ ok: boolean; summary: WaContactsSummary }> {
+  return request<{ ok: boolean; summary: WaContactsSummary }>("/api/wa-contacts", {
     method: "POST",
     body: JSON.stringify(requestBody)
   });

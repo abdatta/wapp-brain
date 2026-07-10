@@ -1928,6 +1928,122 @@ button.fileButton:disabled {
   font-size: 12px;
 }
 
+.toolPage {
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 28px 24px 60px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.toolHeader p {
+  margin-top: 8px;
+  color: #c8d3ce;
+  max-width: 640px;
+}
+
+.toolCard {
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
+  background:
+    linear-gradient(150deg, rgba(42, 69, 66, 0.32), rgba(20, 23, 29, 0.92) 34%),
+    #12161b;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.waContactsFilters {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.waContactsFilters .searchBox {
+  flex: 1;
+  min-width: 220px;
+}
+
+.waContactsStatusFilter {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  min-width: 260px;
+  margin-top: 0;
+}
+
+.waContactsPagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+  color: #9ba7a2;
+  font-size: 12px;
+}
+
+.waContactsPaginationButtons {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.waContactsPaginationButtons .secondaryButton {
+  width: auto;
+  margin-top: 0;
+  padding: 0 14px;
+}
+
+.waContactsTableWrap {
+  max-height: 520px;
+  overflow-y: auto;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  background: rgba(17, 21, 26, 0.78);
+}
+
+.waContactsTable {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.waContactsTable th,
+.waContactsTable td {
+  text-align: left;
+  padding: 8px 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  overflow-wrap: anywhere;
+}
+
+.waContactsTable th {
+  position: sticky;
+  top: 0;
+  background: #141b1a;
+  color: #9ba7a2;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  font-size: 11px;
+}
+
+.waContactsTable td {
+  color: #eff8f4;
+}
+
+.waContactsTable tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.waContactsTable .detectionOk,
+.waContactsTable .detectionMissing {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+}
+
 .keyBox,
 .jobStatus {
   display: flex;

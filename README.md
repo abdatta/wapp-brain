@@ -105,6 +105,16 @@ npm run inspect -- --msgstore "C:\path\msgstore.db.crypt15" --wa "C:\path\wa.db"
 
 Inspect validates/decrypts if needed, opens SQLite, reports schema compatibility and counts, and prints redacted warnings only. It does not print message bodies or raw rows.
 
+View just the contacts sidecar (`wa.db` / `wa.db.crypt15`) without needing `msgstore` at all — lists which contacts have a resolved name and which don't:
+
+```powershell
+npm run wa-contacts -- --wa "C:\path\wa.db.crypt15" --key-file "C:\path\encrypted_backup.key"
+```
+
+Unlike `inspect`, this prints the actual contact rows (JID, number, resolved name) since that's the point of the command; pass `--all` to list every contact instead of only the unresolved ones. The decrypted database is deleted again as soon as the command finishes unless you pass `--keep-decrypted`.
+
+The same thing is also available as a small side tool at `/wa-contacts.html` (linked from the sidebar) — a page separate from the main archive UI, for browsing a wa.db file with a search box and a resolved/unresolved filter to page through many contacts.
+
 Regenerate the private unknown-type mapping worksheet (per-code counts and example locations for any message types the importer does not map yet — your "What is it?" annotations are preserved across regenerations):
 
 ```powershell

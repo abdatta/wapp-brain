@@ -846,6 +846,25 @@ export interface ImportVerificationSummary {
   message: string;
 }
 
+// See server/import/waContacts.ts — a lightweight, read-only viewer for a
+// wa.db/wa.db.crypt15 contacts sidecar, independent of a full msgstore import.
+export interface WaContactRow {
+  jid: string;
+  lid: string | null;
+  number: string | null;
+  displayName: string | null;
+  resolved: boolean;
+}
+
+export interface WaContactsSummary {
+  table: string;
+  decryptedDuringInspect: boolean;
+  totalContacts: number;
+  resolvedCount: number;
+  unresolvedCount: number;
+  contacts: WaContactRow[];
+}
+
 // Native OS file/folder picker (see server/import/nativePicker.ts). The picker
 // returns an absolute path the server reads in place — nothing is uploaded.
 export type PickKind = "backup-root" | "media" | "msgstore" | "wa";

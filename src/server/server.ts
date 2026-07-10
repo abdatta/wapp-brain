@@ -10,6 +10,7 @@ import { mediaBlobStore } from "./media/blobStore";
 import { configuredTraceRecorder, getTraceRecorderSummary } from "./diagnostics/traceRecorder";
 import { BaileysLiveWhatsAppClient } from "./live/baileysClient";
 import { runImport } from "./import/importer";
+import { listWaContacts } from "./import/waContacts";
 import {
   cancelImportJob,
   getCurrentImportJob,
@@ -353,6 +354,26 @@ app.post("/api/import/verify-key", async (req, res) => {
         key: req.body?.key ? String(req.body.key) : null
       })
     });
+  } catch (error) {
+    res.status(400).json({ ok: false, error: publicErrorMessage(error) });
+  }
+});
+
+// Decrypts (if needed) and lists just the wa.db contacts sidecar, independent
+// of a full msgstore import — a quick "what's in this backup" check.
+app.post("/api/wa-contacts", async (req, res) => {
+  try {
+    const waPath = req.body?.waPath ? String(req.body.waPath) : "";
+    if (!waPath) {
+      res.status(400).json({ ok: false, error: "Provide a local wa.db or wa.db.crypt15 path." });
+      return;
+    }
+    const summary = await listWaContacts({
+      waPath,
+      key: req.body?.key ? String(req.body.key) : null,
+      keyPath: req.body?.keyPath ? String(req.body.keyPath) : null
+    });
+    res.json({ ok: true, summary });
   } catch (error) {
     res.status(400).json({ ok: false, error: publicErrorMessage(error) });
   }

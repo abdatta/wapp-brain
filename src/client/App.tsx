@@ -32,6 +32,7 @@ import {
   Trash2,
   Unlink,
   Upload,
+  Users,
   X
 } from "lucide-react";
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
@@ -984,6 +985,16 @@ export function App() {
           />
 
           <ImportLauncher status={status} onOpen={() => setImportWizardOpen(true)} />
+
+          <section className="importPanel collapsed">
+            <a className="panelToggle" href="/wa-contacts.html" target="_blank" rel="noreferrer">
+              <span className="panelTitle">
+                <Users size={16} />
+                <span>View wa.db contacts</span>
+              </span>
+              <ChevronRight size={16} />
+            </a>
+          </section>
 
           <div className="filterPanel globalSearchPanel">
             <div className="searchBox">

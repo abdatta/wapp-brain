@@ -13,6 +13,7 @@
     "trace-status": "tsx src/server/cli.ts trace-status",
     "init-db": "tsx src/server/cli.ts init-db",
     "inspect": "tsx src/server/cli.ts inspect",
+    "wa-contacts": "tsx src/server/cli.ts wa-contacts",
     "import": "tsx src/server/cli.ts import",
     "unknown-report": "tsx src/server/cli.ts unknown-report",
     "search:reindex": "tsx src/server/cli.ts search-reindex",
