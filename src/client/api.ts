@@ -295,6 +295,13 @@ export function getBrainRunProgress(): Promise<BrainRunProgress> {
   return request<BrainRunProgress>("/api/brain/runs/current");
 }
 
+export function setBrainOwner(displayName: string | null): Promise<{ ok: boolean; ownerName: string | null }> {
+  return request<{ ok: boolean; ownerName: string | null }>("/api/brain/owner", {
+    method: "POST",
+    body: JSON.stringify({ displayName })
+  });
+}
+
 export function brainProviderAction(body: {
   action: "enable" | "disable" | "probe" | "set-model" | "status";
   provider?: Exclude<BrainProviderName, "extractive">;

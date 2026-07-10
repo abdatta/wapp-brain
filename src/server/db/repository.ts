@@ -201,6 +201,9 @@ export interface ArchiveRepository {
   // Restart recovery: claimed-but-unfinished tasks return to pending.
   resetInFlightBrainTasks(staleClaimMs?: number): Promise<number>;
   getBrainTaskSummary(): Promise<BrainTaskSummary>;
+  // Archive owner identity: who "me" is in evidence, episodes, and search.
+  getArchiveOwnerName(): Promise<string | null>;
+  setArchiveOwnerName(displayName: string | null): Promise<void>;
   // Startup sweep: a run left 'running' by a dead process becomes an honest
   // 'interrupted' (watermarks make interruption free; the row must not lie).
   reconcileBrainRuns(): Promise<number>;

@@ -32,6 +32,22 @@ function isEvidenceMessage(message: MemoryEvidenceMessage): boolean {
   return message.direction === "incoming" || message.direction === "outgoing" || Boolean(message.text?.trim());
 }
 
+// The archive owner's messages: outgoing direction, or the importer's "me"
+// sender sentinel (which also materialized a contact literally named "Me" —
+// never surface that as a person's name).
+function isSelfMessage(message: MemoryEvidenceMessage): boolean {
+  return message.direction === "outgoing" || message.senderSourceJid === "me";
+}
+
+function senderLabel(message: MemoryEvidenceMessage, ownerLabel: string): string {
+  if (isSelfMessage(message)) {
+    return `${ownerLabel} (me)`;
+  }
+  return message.senderDisplayName && message.senderDisplayName.trim().toLowerCase() !== "me"
+    ? message.senderDisplayName
+    : "Unknown";
+}
+
 // Segment a chat window into packs: silence-gap boundaries, greedily merged
 // up to the evidence cap; oversized silent-free stretches split hard.
 export async function buildEvidencePacks(
@@ -76,13 +92,14 @@ export async function buildEvidencePacks(
       merged.push(segment);
     }
   }
+  const ownerLabel = (await repository.getArchiveOwnerName()) ?? "the archive owner";
   return merged.map((messages) => ({
     chatSourceId: options.chatSourceId,
     chatDisplayName: messages[0]?.chatDisplayName ?? null,
     startAtMs: messages[0]?.timestampMs ?? options.startAtMs,
     endAtMs: messages[messages.length - 1]?.timestampMs ?? options.endAtMs,
     messages,
-    participants: [...new Set(messages.map((message) => message.senderDisplayName ?? "").filter(Boolean))]
+    participants: [...new Set(messages.map((message) => senderLabel(message, ownerLabel)).filter((label) => label !== "Unknown"))]
   }));
 }
 
@@ -103,15 +120,14 @@ interface ModelEpisode {
 
 const CLAIM_KINDS: BrainClaimKind[] = ["fact", "decision", "commitment", "question", "event"];
 
-function packPromptLines(pack: BrainEvidencePack): { lines: string[]; keyByAlias: Map<string, string> } {
+function packPromptLines(pack: BrainEvidencePack, ownerLabel: string): { lines: string[]; keyByAlias: Map<string, string> } {
   const keyByAlias = new Map<string, string>();
   const lines = pack.messages.map((message, index) => {
     const alias = `m${index + 1}`;
     keyByAlias.set(alias, message.sourceMessageKey);
     const time = message.sentAt ? message.sentAt.slice(0, 16).replace("T", " ") : "unknown-time";
-    const sender = message.senderDisplayName ?? (message.direction === "outgoing" ? "Me" : "Unknown");
     const text = message.text?.trim() || `[${message.interpretation?.label ?? message.messageType}]`;
-    return `${alias} | ${time} | ${sender}: ${text}`;
+    return `${alias} | ${time} | ${senderLabel(message, ownerLabel)}: ${text}`;
   });
   return { lines, keyByAlias };
 }
@@ -151,7 +167,10 @@ function validateModelEpisode(
 
 // Mechanical fallback: verbatim-quote claims from the most substantial
 // messages. Honest, citation-complete, and marked regenerable.
-function extractiveEpisode(pack: BrainEvidencePack): {
+function extractiveEpisode(
+  pack: BrainEvidencePack,
+  ownerLabel: string
+): {
   summary: string;
   claims: Array<{ kind: BrainClaimKind; text: string; citations: string[] }>;
 } {
@@ -162,7 +181,7 @@ function extractiveEpisode(pack: BrainEvidencePack): {
   const summary = `${pack.messages.length} messages${pack.participants.length ? ` between ${pack.participants.slice(0, 4).join(", ")}` : ""} from ${first?.sentAt?.slice(0, 10) ?? "?"} to ${last?.sentAt?.slice(0, 10) ?? "?"} (extractive placeholder — regenerate with a model for real synthesis).`;
   const claims = top.map((message) => ({
     kind: "fact" as BrainClaimKind,
-    text: `${message.senderDisplayName ?? "Someone"} wrote: "${(message.text ?? "").slice(0, 200)}"`,
+    text: `${isSelfMessage(message) ? ownerLabel : message.senderDisplayName?.trim() || "Someone"} wrote: "${(message.text ?? "").slice(0, 200)}"`,
     citations: [message.sourceMessageKey]
   }));
   return { summary, claims: claims.length > 0 ? claims : [{ kind: "fact", text: "Window contained no quotable text.", citations: [pack.messages[0].sourceMessageKey] }] };
@@ -219,9 +238,12 @@ export async function generateEpisodeForPack(
   let usage: BrainTokenUsage | null = null;
   let generator: "model" | "extractive" = options.generator;
   let fellBack = false;
+  const ownerName = await repository.getArchiveOwnerName();
+  const ownerLabel = ownerName ?? "the archive owner";
   if (options.generator === "model") {
-    const { lines, keyByAlias } = packPromptLines(pack);
+    const { lines, keyByAlias } = packPromptLines(pack, ownerLabel);
     const basePrompt = `Chat: ${pack.chatDisplayName ?? pack.chatSourceId}
+Archive owner: ${ownerLabel}. Messages marked "(me)" are the owner's own words${ownerName ? `; when other people write "${ownerName}" they mean the owner` : ""}. In summaries and claims refer to the owner as ${ownerName ? `"${ownerName}"` : `"the owner"`} — never as "Me".
 Messages (${pack.messages.length}), each prefixed with its citation alias:
 
 ${lines.join("\n")}
@@ -259,7 +281,7 @@ Rules: 2-8 claims; every claim MUST cite at least one alias from the list; cite 
     }
   }
   if (!summaryAndClaims) {
-    summaryAndClaims = extractiveEpisode(pack);
+    summaryAndClaims = extractiveEpisode(pack, ownerLabel);
   }
   const committed = await repository.commitBrainEpisode({
     chatSourceId: pack.chatSourceId,

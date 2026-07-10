@@ -725,6 +725,9 @@ export interface BrainSchedulerStatus {
 // One-call brain overview: coverage, queue, budget, runs. Provider health is
 // attached by the server layer (it lives outside the repository).
 export interface BrainStatusSummary {
+  // The archive owner's display name (UI-settable): evidence and episodes
+  // label the owner's messages with it instead of the confusing "Me".
+  ownerName: string | null;
   totalVisibleMessages: number;
   assimilatedVisibleMessages: number;
   coveragePercent: number;

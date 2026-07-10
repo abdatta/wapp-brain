@@ -154,6 +154,52 @@ describe("brain episodes", () => {
     }
   });
 
+  it("labels the owner's messages by name instead of the 'Me' sentinel", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-owner-"));
+    const restore = configureBrain({ rootDir: tempDir, provider: "extractive" });
+    const { SqliteArchiveRepository } = await import("../src/server/db/sqliteRepository");
+    const repository = new SqliteArchiveRepository(path.join(tempDir, "archive.sqlite"));
+    try {
+      await repository.setArchiveOwnerName("Abhishek");
+      expect(await repository.getArchiveOwnerName()).toBe("Abhishek");
+      const runId = await repository.startImportRun({ test: true });
+      // The importer's own-number sentinel materializes a contact named "Me".
+      await repository.upsertContacts(runId, [{ sourceJid: "me", displayName: "Me" }]);
+      await repository.upsertChats(runId, [{ sourceChatId: "own@g.us", jid: "own@g.us", displayName: "Own", chatType: "group" }]);
+      await repository.upsertMessages([
+        {
+          sourceMessageId: "O1",
+          sourceMessageKey: "",
+          sourceTable: "test",
+          sourceRowId: "O1",
+          chatSourceId: "own@g.us",
+          senderSourceJid: "me",
+          timestampMs: Date.now() - 3_600_000,
+          fromMe: true,
+          direction: "outgoing",
+          messageType: "text",
+          body: "I will bring the projector cable tomorrow",
+          hasMedia: false,
+          isDeleted: false,
+          isForwarded: false,
+          isStarred: false
+        }
+      ]);
+      const packs = await buildEvidencePacks(repository, { chatSourceId: "own@g.us", startAtMs: 0, endAtMs: Date.now() });
+      expect(packs[0].participants).toContain("Abhishek (me)");
+      expect(packs[0].participants).not.toContain("Me");
+      const episode = await generateEpisodeForPack(repository, packs[0], { generator: "extractive" });
+      expect(episode.episode.claims[0].text).toContain("Abhishek wrote:");
+      // Search indexes the owner's messages under their name, not "Me".
+      const byName = await repository.searchMessages({ query: "abhishek projector", limit: 5, offset: 0 });
+      expect(byName.results.map((hit) => hit.sourceMessageId)).toContain("O1");
+    } finally {
+      await repository.close?.();
+      restore();
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it("splits packs at silence gaps beyond the minimum segment size", async () => {
     const repository = new MemoryArchiveRepository();
     await seed(repository, 30, 15);

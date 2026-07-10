@@ -95,6 +95,7 @@ import {
   retryLiveGap,
   retryStuckMedia,
   searchArchive,
+  setBrainOwner,
   startBrainRun,
   startMemoryRun,
   startImportJob,
@@ -587,6 +588,21 @@ export function App() {
     }
   }
 
+  async function handleSetBrainOwner(displayName: string | null) {
+    setError(null);
+    try {
+      await setBrainOwner(displayName);
+      setNotice(
+        displayName
+          ? `Saved: your messages will be labeled "${displayName} (me)" in new episodes. Run a search reindex to apply it to historical search results.`
+          : "Owner name cleared."
+      );
+      getBrainOverview().then(setBrainOverview).catch(() => undefined);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not save your name.");
+    }
+  }
+
   async function handleStartBrainRun(body: { mode: "model" | "extractive"; model?: string | null }) {
     setError(null);
     try {
@@ -944,6 +960,7 @@ export function App() {
             busy={busy}
             onProviderAction={(body) => void handleBrainProviderAction(body)}
             onRun={(body) => void handleStartBrainRun(body)}
+            onSetOwner={(displayName) => void handleSetBrainOwner(displayName)}
           />
 
           <ImportLauncher status={status} onOpen={() => setImportWizardOpen(true)} />
@@ -1512,7 +1529,8 @@ function BrainPanel({
   run,
   busy,
   onProviderAction,
-  onRun
+  onRun,
+  onSetOwner
 }: {
   overview: BrainOverview | null;
   run: BrainRunProgress | null;
@@ -1523,11 +1541,16 @@ function BrainPanel({
     model?: string;
   }) => void;
   onRun: (body: { mode: "model" | "extractive"; model?: string | null }) => void;
+  onSetOwner: (displayName: string | null) => void;
 }) {
   const [open, setOpen] = useState(false);
+  const [ownerDraft, setOwnerDraft] = useState("");
   const provider = overview?.provider;
   const runDue = Boolean(overview?.scheduler.runDue);
   const running = run?.state === "running";
+  useEffect(() => {
+    setOwnerDraft(overview?.ownerName ?? "");
+  }, [overview?.ownerName]);
   const activeProviderName = provider?.provider ?? "extractive";
   const modelOptions = provider && provider.provider !== "extractive" ? provider.models[provider.provider] ?? [] : [];
   return (
@@ -1573,6 +1596,21 @@ function BrainPanel({
             </div>
           )}
           <div className="brainProviderControls">
+            <label>
+              <span>Your name</span>
+              <input
+                value={ownerDraft}
+                disabled={Boolean(busy)}
+                placeholder="e.g. Abhishek"
+                onChange={(event) => setOwnerDraft(event.target.value)}
+                onBlur={() => {
+                  if (ownerDraft.trim() !== (overview?.ownerName ?? "")) {
+                    onSetOwner(ownerDraft.trim() || null);
+                  }
+                }}
+                title='Labels your own messages in episodes and search ("Abhishek (me)" instead of "Me"), and tells the model who you are'
+              />
+            </label>
             <label>
               <span>Provider</span>
               <select

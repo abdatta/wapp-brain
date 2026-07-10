@@ -606,6 +606,18 @@ app.get("/api/brain/episodes", async (req, res) => {
   }
 });
 
+// Who "me" is: evidence, episodes, and new search indexing label the owner's
+// messages with this name. Historical search rows update on the next reindex.
+app.post("/api/brain/owner", async (req, res) => {
+  try {
+    const displayName = typeof req.body?.displayName === "string" ? req.body.displayName : null;
+    await repository.setArchiveOwnerName(displayName);
+    res.json({ ok: true, ownerName: await repository.getArchiveOwnerName() });
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
 // Provider control from the UI: opt-in/out, model selection, health probe.
 app.post("/api/brain/provider", async (req, res) => {
   try {

@@ -1530,6 +1530,16 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     return summary;
   }
 
+  private ownerDisplayName: string | null = null;
+
+  async getArchiveOwnerName(): Promise<string | null> {
+    return this.ownerDisplayName;
+  }
+
+  async setArchiveOwnerName(displayName: string | null): Promise<void> {
+    this.ownerDisplayName = displayName?.trim() || null;
+  }
+
   async reconcileBrainRuns(): Promise<number> {
     let reconciled = 0;
     for (const run of this.brainRuns.values()) {
@@ -1599,6 +1609,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     utcMidnight.setUTCHours(0, 0, 0, 0);
     const runs = [...this.brainRuns.values()].sort((a, b) => b.startedAt.localeCompare(a.startedAt));
     return {
+      ownerName: this.ownerDisplayName,
       totalVisibleMessages: visible.length,
       assimilatedVisibleMessages: assimilated.length,
       coveragePercent: visible.length > 0 ? Math.round((assimilated.length / visible.length) * 1000) / 10 : 100,

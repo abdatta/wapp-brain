@@ -1171,6 +1171,14 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     return labels;
   }
 
+  // The owner's saved name, read synchronously for use inside transactions.
+  private readOwnerNameSync(): string | null {
+    const row = this.db.prepare(`SELECT value FROM schema_meta WHERE key = 'owner_display_name'`).get() as
+      | { value: string }
+      | undefined;
+    return row?.value?.trim() || null;
+  }
+
   // Recompute derived search state (resolved_text + message_mentions) for a
   // set of messages from their FINAL stored content. Runs inside the caller's
   // transaction; FTS follows via the update trigger. Rows whose derived state
@@ -1185,6 +1193,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       caption: string | null;
       media_name: string | null;
       sender_source_jid: string | null;
+      from_me: number | null;
       resolved_text: string | null;
     }> = [];
     const unique = [...new Set(messageIds)];
@@ -1193,12 +1202,13 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       rows.push(
         ...(this.db
           .prepare(
-            `SELECT id, body, caption, media_name, sender_source_jid, resolved_text
+            `SELECT id, body, caption, media_name, sender_source_jid, from_me, resolved_text
              FROM messages WHERE id IN (${batch.map(() => "?").join(",")})`
           )
           .all(...batch) as typeof rows)
       );
     }
+    const ownerName = this.readOwnerNameSync();
     const texts = rows.flatMap((row) => [row.body, row.caption]);
     const mentionLabels = this.resolveMentionLabels(texts);
     const mentionJids = this.resolveMentionJids(texts);
@@ -1210,9 +1220,14 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     const deleteMentions = this.db.prepare(`DELETE FROM message_mentions WHERE message_id = ?`);
     const insertMention = this.db.prepare(`INSERT OR IGNORE INTO message_mentions (message_id, mentioned_jid) VALUES (?, ?)`);
     for (const row of rows) {
-      const senderLabel = row.sender_source_jid
-        ? senderLabels.get(row.sender_source_jid) ?? displayPhoneFromJid(row.sender_source_jid)
-        : null;
+      // The owner's messages index under the owner's saved name — never under
+      // the importer's "me" sentinel contact (display name "Me").
+      const isSelf = row.sender_source_jid === "me" || Boolean(row.from_me);
+      const senderLabel = isSelf
+        ? ownerName
+        : row.sender_source_jid
+          ? senderLabels.get(row.sender_source_jid) ?? displayPhoneFromJid(row.sender_source_jid)
+          : null;
       const resolved = composeResolvedText(row.body, row.caption, row.media_name, senderLabel, mentionLabels);
       if ((resolved ?? null) !== (row.resolved_text ?? null)) {
         updateResolved.run(resolved, row.id);
@@ -1584,6 +1599,27 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     return summary;
   }
 
+  async getArchiveOwnerName(): Promise<string | null> {
+    const row = this.db.prepare(`SELECT value FROM schema_meta WHERE key = 'owner_display_name'`).get() as
+      | { value: string }
+      | undefined;
+    return row?.value?.trim() || null;
+  }
+
+  async setArchiveOwnerName(displayName: string | null): Promise<void> {
+    const trimmed = displayName?.trim();
+    if (!trimmed) {
+      this.db.prepare(`DELETE FROM schema_meta WHERE key = 'owner_display_name'`).run();
+      return;
+    }
+    this.db
+      .prepare(
+        `INSERT INTO schema_meta (key, value, updated_at) VALUES ('owner_display_name', ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+      )
+      .run(trimmed, currentIso());
+  }
+
   async reconcileBrainRuns(): Promise<number> {
     const result = this.db
       .prepare(
@@ -1662,6 +1698,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     const total = Number(coverage.total ?? 0);
     const assimilated = Number(coverage.assimilated ?? 0);
     return {
+      ownerName: await this.getArchiveOwnerName(),
       totalVisibleMessages: total,
       assimilatedVisibleMessages: assimilated,
       coveragePercent: total > 0 ? Math.round((assimilated / total) * 1000) / 10 : 100,
@@ -2397,15 +2434,19 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     const incomingSenderLabels = this.resolveContactLabels(
       canonical.map((message) => message.senderSourceJid).filter((jid): jid is string => Boolean(jid))
     );
+    const ownerName = this.readOwnerNameSync();
     const rows = canonical
       .map((message) => {
         const chatId = chatIds.get(message.chatSourceId);
         if (!chatId) {
           return null;
         }
-        const senderLabel = message.senderSourceJid
-          ? incomingSenderLabels.get(message.senderSourceJid) ?? displayPhoneFromJid(message.senderSourceJid)
-          : null;
+        const senderLabel =
+          message.senderSourceJid === "me" || message.fromMe
+            ? ownerName
+            : message.senderSourceJid
+              ? incomingSenderLabels.get(message.senderSourceJid) ?? displayPhoneFromJid(message.senderSourceJid)
+              : null;
         return {
           sourceMessageKey: message.sourceMessageKey,
           sourceMessageId: message.sourceMessageId,
