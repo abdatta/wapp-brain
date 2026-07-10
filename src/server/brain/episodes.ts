@@ -221,6 +221,26 @@ function projectEpisodeFile(record: BrainEpisodeRecord): void {
   fs.renameSync(tempPath, filePath);
 }
 
+// Remove the projected files for reset episodes (files are named …-<id8>.md).
+export function deleteProjectedEpisodeFiles(episodeIds: string[]): number {
+  const dir = path.join(config.brain.rootDir, "episodes");
+  if (episodeIds.length === 0 || !fs.existsSync(dir)) {
+    return 0;
+  }
+  const suffixes = new Set(episodeIds.map((id) => `-${id.slice(0, 8)}.md`));
+  let removed = 0;
+  for (const file of fs.readdirSync(dir)) {
+    for (const suffix of suffixes) {
+      if (file.endsWith(suffix)) {
+        fs.rmSync(path.join(dir, file), { force: true });
+        removed += 1;
+        break;
+      }
+    }
+  }
+  return removed;
+}
+
 export interface EpisodeGenerationResult {
   episode: BrainEpisodeRecord;
   usage: BrainTokenUsage | null;

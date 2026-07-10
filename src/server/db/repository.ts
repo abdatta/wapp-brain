@@ -215,6 +215,10 @@ export interface ArchiveRepository {
   getBrainStatus(): Promise<BrainStatusSummary>;
   // Episode commit is atomic: episode + claims + citations + watermark advance
   // in one transaction — coverage moves only when the evidence lands.
+  // Reset derived brain data (episodes + claims + citations + watermarks),
+  // optionally for one chat. Raw messages are untouched; the next run
+  // re-assimilates from scratch. Returns removed episode ids for file cleanup.
+  resetBrainDerivedData(options?: { chatSourceId?: string | null }): Promise<{ episodeIds: string[]; watermarks: number }>;
   commitBrainEpisode(episode: BrainEpisodeInput): Promise<BrainEpisodeRecord>;
   // Rendered markdown references committed claim ids, so it lands post-commit.
   updateBrainEpisodeMarkdown(episodeId: string, markdown: string): Promise<void>;

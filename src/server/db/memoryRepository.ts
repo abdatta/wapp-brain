@@ -1622,6 +1622,24 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     };
   }
 
+  async resetBrainDerivedData(options?: { chatSourceId?: string | null }): Promise<{ episodeIds: string[]; watermarks: number }> {
+    const chat = options?.chatSourceId ?? null;
+    const episodeIds = [...this.brainEpisodes.values()]
+      .filter((episode) => !chat || episode.chatSourceId === chat)
+      .map((episode) => episode.id);
+    for (const id of episodeIds) {
+      this.brainEpisodes.delete(id);
+    }
+    let watermarks = 0;
+    for (const key of [...this.brainWatermarks.keys()]) {
+      if (!chat || key === chat) {
+        this.brainWatermarks.delete(key);
+        watermarks += 1;
+      }
+    }
+    return { episodeIds, watermarks };
+  }
+
   async commitBrainEpisode(episode: BrainEpisodeInput): Promise<BrainEpisodeRecord> {
     const id = crypto.randomUUID();
     const record: BrainEpisodeRecord = {

@@ -1711,6 +1711,35 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     };
   }
 
+  async resetBrainDerivedData(options?: { chatSourceId?: string | null }): Promise<{ episodeIds: string[]; watermarks: number }> {
+    const chat = options?.chatSourceId ? this.canonicalJid(options.chatSourceId) ?? options.chatSourceId : null;
+    const episodeIds = (
+      chat
+        ? (this.db.prepare(`SELECT id FROM brain_episodes WHERE chat_source_id = ?`).all(chat) as Array<{ id: string }>)
+        : (this.db.prepare(`SELECT id FROM brain_episodes`).all() as Array<{ id: string }>)
+    ).map((row) => row.id);
+    let watermarks = 0;
+    const transaction = this.db.transaction(() => {
+      for (let index = 0; index < episodeIds.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+        const batch = episodeIds.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+        const placeholders = batch.map(() => "?").join(",");
+        this.db
+          .prepare(`DELETE FROM brain_citations WHERE claim_id IN (SELECT id FROM brain_claims WHERE episode_id IN (${placeholders}))`)
+          .run(...batch);
+        this.db.prepare(`DELETE FROM brain_claims WHERE episode_id IN (${placeholders})`).run(...batch);
+        this.db.prepare(`DELETE FROM brain_episodes WHERE id IN (${placeholders})`).run(...batch);
+      }
+      watermarks = Number(
+        (chat
+          ? this.db.prepare(`DELETE FROM brain_chat_watermarks WHERE chat_source_id = ?`).run(chat)
+          : this.db.prepare(`DELETE FROM brain_chat_watermarks`).run()
+        ).changes
+      );
+    });
+    transaction();
+    return { episodeIds, watermarks };
+  }
+
   async commitBrainEpisode(episode: BrainEpisodeInput): Promise<BrainEpisodeRecord> {
     this.assertWritableIdentityVersion();
     const id = crypto.randomUUID();

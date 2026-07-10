@@ -295,6 +295,13 @@ export function getBrainRunProgress(): Promise<BrainRunProgress> {
   return request<BrainRunProgress>("/api/brain/runs/current");
 }
 
+export function resetBrainData(): Promise<{ ok: boolean; episodesRemoved: number; watermarksReset: number; filesRemoved: number }> {
+  return request<{ ok: boolean; episodesRemoved: number; watermarksReset: number; filesRemoved: number }>("/api/brain/reset", {
+    method: "POST",
+    body: "{}"
+  });
+}
+
 export function setBrainOwner(displayName: string | null): Promise<{ ok: boolean; ownerName: string | null }> {
   return request<{ ok: boolean; ownerName: string | null }>("/api/brain/owner", {
     method: "POST",

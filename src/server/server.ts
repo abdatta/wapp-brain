@@ -606,6 +606,29 @@ app.get("/api/brain/episodes", async (req, res) => {
   }
 });
 
+// Reset derived brain data (episodes/claims/citations/watermarks + projected
+// files) — raw messages untouched; the next run re-assimilates from scratch.
+app.post("/api/brain/reset", async (req, res) => {
+  try {
+    const { getBrainRunProgress } = await import("./brain/runJob");
+    if (getBrainRunProgress().state === "running") {
+      res.status(409).json({ error: "A brain run is in progress; wait for it to finish before resetting." });
+      return;
+    }
+    const chatSourceId = typeof req.body?.chatSourceId === "string" ? req.body.chatSourceId : null;
+    const result = await repository.resetBrainDerivedData({ chatSourceId });
+    const { deleteProjectedEpisodeFiles } = await import("./brain/episodes");
+    const filesRemoved = deleteProjectedEpisodeFiles(result.episodeIds);
+    console.log(
+      `[brain] reset${chatSourceId ? ` (one chat)` : ""}: ${result.episodeIds.length} episode(s), ${result.watermarks} watermark(s), ${filesRemoved} file(s) removed`
+    );
+    broadcastArchiveChanged({ source: "manual", chatSourceIds: chatSourceId ? [chatSourceId] : [], messageCount: 0, contactCount: 0 });
+    res.json({ ok: true, episodesRemoved: result.episodeIds.length, watermarksReset: result.watermarks, filesRemoved });
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
 // Who "me" is: evidence, episodes, and new search indexing label the owner's
 // messages with this name. Historical search rows update on the next reindex.
 app.post("/api/brain/owner", async (req, res) => {
