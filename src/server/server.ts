@@ -28,6 +28,7 @@ import { LiveMaintainer } from "./live/maintainer";
 import { queryMemory, resolveMemoryCitation, runMemoryConsolidation, validateMemoryStore } from "./memory/consolidation";
 import { disableRemoteMemoryProvider, enableCodexProvider, getMemoryProviderStatus } from "./memory/provider";
 import { isLocalDatabaseError, publicErrorMessage } from "./privacy";
+import { GoogleContactsService } from "./googleContacts";
 import { getSearchReindexProgress, startSearchReindex } from "./search/reindexJob";
 import { withGuidedSetup } from "./onboarding";
 import type { ArchiveChangeEvent, LivePairingSummary, PickKind } from "../shared/types";
@@ -40,6 +41,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "64kb" }));
 
 const repository = createArchiveRepository();
+const googleContacts = new GoogleContactsService(config.googleContacts);
 let activeMaintainer: LiveMaintainer | null = null;
 let activeClient: BaileysLiveWhatsAppClient | null = null;
 let livePairing: LivePairingSummary = idlePairing();
@@ -65,6 +67,38 @@ app.get("/api/status", async (_req, res) => {
       pickerAvailable: isPickerAvailable()
     });
   }
+});
+
+app.get("/api/google-contacts/status", async (_req, res) => {
+  try { res.json(await googleContacts.status()); }
+  catch (error) { res.status(400).json({ error: publicErrorMessage(error) }); }
+});
+
+app.get("/api/google-contacts/oauth/start", (_req, res) => {
+  try { res.redirect(googleContacts.createAuthorizationUrl()); }
+  catch (error) { res.redirect(`/?googleContacts=error&message=${encodeURIComponent(publicErrorMessage(error))}`); }
+});
+
+app.get("/api/google-contacts/oauth/callback", async (req, res) => {
+  try {
+    await googleContacts.handleCallback(typeof req.query.code === "string" ? req.query.code : "", typeof req.query.state === "string" ? req.query.state : "");
+    res.redirect("/?googleContacts=connected");
+  } catch (error) {
+    res.redirect(`/?googleContacts=error&message=${encodeURIComponent(publicErrorMessage(error))}`);
+  }
+});
+
+app.post("/api/google-contacts/sync", async (_req, res) => {
+  try {
+    const result = await googleContacts.sync(repository);
+    if (result.improvedNames > 0) broadcastArchiveChanged({ source: "manual", chatSourceIds: [], messageCount: 0, contactCount: result.improvedNames });
+    res.json({ ok: true, result, status: await googleContacts.status() });
+  } catch (error) { res.status(400).json({ ok: false, error: publicErrorMessage(error) }); }
+});
+
+app.delete("/api/google-contacts", async (_req, res) => {
+  try { res.json({ ok: true, ...(await googleContacts.disconnect()), status: await googleContacts.status() }); }
+  catch (error) { res.status(400).json({ ok: false, error: publicErrorMessage(error) }); }
 });
 
 app.get("/api/live/status", async (_req, res) => {
@@ -592,6 +626,14 @@ app.post("/api/brain/runs", async (req, res) => {
       },
       () => {
         broadcastArchiveChanged({ source: "manual", chatSourceIds: [], messageCount: 0, contactCount: 0 });
+      },
+      async () => {
+        const contactStatus = await googleContacts.status();
+        if (!contactStatus.connected) return;
+        const sync = await googleContacts.sync(repository);
+        if (sync.improvedNames > 0) {
+          broadcastArchiveChanged({ source: "manual", chatSourceIds: [], messageCount: 0, contactCount: sync.improvedNames });
+        }
       }
     );
     if (!result.started) {

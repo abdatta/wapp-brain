@@ -49,7 +49,9 @@ const envSchema = z.object({
   WAPP_MEMORY_DEFAULT_CUTOFF_HOUR: z.coerce.number().int().min(0).max(23).default(0),
   WAPP_MEMORY_MAX_EVIDENCE_MESSAGES: z.coerce.number().int().positive().default(400),
   WAPP_MEMORY_MAX_QUERY_MESSAGES: z.coerce.number().int().positive().default(40),
-  WAPP_TRACE_NAME: z.string().optional()
+  WAPP_TRACE_NAME: z.string().optional(),
+  GOOGLE_CONTACTS_CLIENT_ID: z.string().optional(),
+  GOOGLE_CONTACTS_CLIENT_SECRET: z.string().optional()
 });
 
 const parsed = envSchema.parse(process.env);
@@ -113,6 +115,12 @@ export const config = {
   diagnostics: {
     traceName: parsed.WAPP_TRACE_NAME?.trim() || null,
     traceRootDir: path.join(workDir, "traces")
+  },
+  googleContacts: {
+    clientId: parsed.GOOGLE_CONTACTS_CLIENT_ID?.trim() || null,
+    clientSecret: parsed.GOOGLE_CONTACTS_CLIENT_SECRET?.trim() || null,
+    callbackUrl: `http://${parsed.APP_HOST}:${parsed.APP_PORT}/api/google-contacts/oauth/callback`,
+    credentialsPath: path.join(workDir, "google-contacts-auth.json")
   },
   workDir
 };

@@ -242,6 +242,29 @@ export interface ContactRecord {
   rawMetadata?: Record<string, unknown> | null;
 }
 
+export interface GoogleContactCandidate {
+  phoneNumber: string;
+  displayName: string;
+}
+
+export interface GoogleContactsSyncResult {
+  fetchedPeople: number;
+  usableNumbers: number;
+  matchedIdentities: number;
+  improvedNames: number;
+  ambiguousNumbers: number;
+  skippedNumbers: number;
+  syncedAt: string;
+}
+
+export interface GoogleContactsStatus {
+  configured: boolean;
+  connected: boolean;
+  accountLabel: string | null;
+  callbackUrl: string;
+  lastSync: GoogleContactsSyncResult | null;
+}
+
 export interface ChatRecord {
   sourceChatId: string;
   jid: string;

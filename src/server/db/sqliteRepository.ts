@@ -17,6 +17,7 @@ import type {
   ChatRecord,
   ChatSyncStateRecord,
   ContactRecord,
+  GoogleContactCandidate,
   ImportRunSummary,
   ImportTotals,
   ImportWarning,
@@ -401,6 +402,7 @@ const schemaStatements = [
     source_jid TEXT NOT NULL UNIQUE,
     phone_number TEXT NULL,
     display_name TEXT NULL,
+    display_name_source TEXT NULL,
     push_name TEXT NULL,
     raw_metadata_json TEXT NULL,
     first_seen_import_id TEXT NULL,
@@ -2260,11 +2262,12 @@ export class SqliteArchiveRepository implements ArchiveRepository {
 
     const upsert = this.db.prepare(
       `INSERT INTO contacts
-       (source_jid, phone_number, display_name, push_name, raw_metadata_json, first_seen_import_id, last_seen_import_id, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       (source_jid, phone_number, display_name, display_name_source, push_name, raw_metadata_json, first_seen_import_id, last_seen_import_id, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(source_jid) DO UPDATE SET
          phone_number = COALESCE(excluded.phone_number, contacts.phone_number),
          display_name = COALESCE(NULLIF(excluded.display_name, ''), contacts.display_name),
+         display_name_source = CASE WHEN NULLIF(excluded.display_name, '') IS NOT NULL THEN excluded.display_name_source ELSE contacts.display_name_source END,
          push_name = COALESCE(NULLIF(excluded.push_name, ''), contacts.push_name),
          raw_metadata_json = COALESCE(excluded.raw_metadata_json, contacts.raw_metadata_json),
          last_seen_import_id = excluded.last_seen_import_id,
@@ -2276,6 +2279,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
           contact.sourceJid,
           contact.phoneNumber ?? null,
           contact.displayName ?? null,
+          contact.displayName?.trim() ? (contact.rawMetadata?.source === "lid_display_name" ? "display_cache" : "whatsapp_saved") : null,
           contact.pushName ?? null,
           stringifyJson(contact.rawMetadata ?? null),
           runId,
@@ -2288,6 +2292,38 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     this.propagateContactNamesToDmChats([...unique.values()]);
 
     return this.getContactIds([...unique.keys()]);
+  }
+
+  async enrichContactsFromGoogle(contacts: GoogleContactCandidate[]): Promise<{ matchedIdentities: number; improvedNames: number }> {
+    this.assertWritableIdentityVersion();
+    const find = this.db.prepare(
+      `SELECT id, source_jid, display_name, display_name_source FROM contacts
+       WHERE phone_number = ? OR source_jid = ?`
+    );
+    const updateContact = this.db.prepare(
+      `UPDATE contacts SET display_name = ?, display_name_source = 'google_contacts', updated_at = ? WHERE id = ?`
+    );
+    const updateChat = this.db.prepare(
+      `UPDATE chats SET display_name = ?, updated_at = ?
+       WHERE source_chat_id = ? AND chat_type IN ('dm','unknown')`
+    );
+    let matchedIdentities = 0;
+    let improvedNames = 0;
+    this.db.transaction(() => {
+      for (const contact of contacts) {
+        const jid = `${contact.phoneNumber}@s.whatsapp.net`;
+        const rows = find.all(contact.phoneNumber, jid) as Array<{ id: number; source_jid: string; display_name: string | null; display_name_source: string | null }>;
+        matchedIdentities += rows.length;
+        for (const row of rows) {
+          const weak = !row.display_name?.trim() || row.display_name_source === "google_contacts" || row.display_name_source === "display_cache" || isIdentityDerivedName(row.display_name, row.source_jid);
+          if (!weak) continue;
+          updateContact.run(contact.displayName, currentIso(), row.id);
+          updateChat.run(contact.displayName, currentIso(), row.source_jid);
+          improvedNames += 1;
+        }
+      }
+    })();
+    return { matchedIdentities, improvedNames };
   }
 
   async upsertChats(runId: string, chats: ChatRecord[]): Promise<Map<string, number>> {
@@ -4457,7 +4493,8 @@ function migrateLiveMessageUpdateTypes(db: Database.Database): void {
 function migrateAdditiveColumns(db: Database.Database): void {
   const additions: Array<{ table: string; column: string; ddl: string }> = [
     { table: "chats", column: "platform_recency_ms", ddl: "ALTER TABLE chats ADD COLUMN platform_recency_ms INTEGER NULL" },
-    { table: "messages", column: "resolved_text", ddl: "ALTER TABLE messages ADD COLUMN resolved_text TEXT NULL" }
+    { table: "messages", column: "resolved_text", ddl: "ALTER TABLE messages ADD COLUMN resolved_text TEXT NULL" },
+    { table: "contacts", column: "display_name_source", ddl: "ALTER TABLE contacts ADD COLUMN display_name_source TEXT NULL" }
   ];
   for (const addition of additions) {
     const columns = db.prepare(`SELECT name FROM pragma_table_info(?)`).all(addition.table) as Array<{ name: string }>;

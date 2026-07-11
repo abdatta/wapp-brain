@@ -13,6 +13,8 @@ import type {
   ChatRecord,
   ChatSyncStateRecord,
   ContactRecord,
+  GoogleContactCandidate,
+  GoogleContactsSyncResult,
   ImportTotals,
   ImportWarning,
   LiveChatCheckpointRecord,
@@ -59,6 +61,7 @@ export interface ArchiveRepository {
   failImportRun(runId: string, code: string, message: string, totals?: ImportTotals, warningCount?: number): Promise<void>;
   addWarnings(runId: string, warnings: ImportWarning[]): Promise<void>;
   upsertContacts(runId: string, contacts: ContactRecord[]): Promise<Map<string, number>>;
+  enrichContactsFromGoogle(contacts: GoogleContactCandidate[]): Promise<Pick<GoogleContactsSyncResult, "matchedIdentities" | "improvedNames">>;
   upsertChats(runId: string, chats: ChatRecord[]): Promise<Map<string, number>>;
   upsertParticipants(participants: ParticipantRecord[]): Promise<number>;
   upsertMessages(messages: MessageRecord[]): Promise<number>;

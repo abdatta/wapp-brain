@@ -474,6 +474,24 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     return new Map([...this.contacts].map(([jid, contact]) => [jid, contact.id]));
   }
 
+  async enrichContactsFromGoogle(contacts: Array<{ phoneNumber: string; displayName: string }>): Promise<{ matchedIdentities: number; improvedNames: number }> {
+    let matchedIdentities = 0;
+    let improvedNames = 0;
+    for (const candidate of contacts) {
+      const jid = `${candidate.phoneNumber}@s.whatsapp.net`;
+      const contact = this.contacts.get(jid);
+      if (!contact) continue;
+      matchedIdentities += 1;
+      if (!contact.displayName || isIdentityDerivedName(contact.displayName, jid)) {
+        contact.displayName = candidate.displayName;
+        const chat = this.chats.get(jid);
+        if (chat && (chat.chatType === "dm" || chat.chatType === "unknown")) chat.displayName = candidate.displayName;
+        improvedNames += 1;
+      }
+    }
+    return { matchedIdentities, improvedNames };
+  }
+
   async upsertChats(_runId: string, chats: ChatRecord[]): Promise<Map<string, number>> {
     for (const rawChat of chats) {
       const sourceChatId = this.canonicalJid(rawChat.sourceChatId);

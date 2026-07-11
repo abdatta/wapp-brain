@@ -45,7 +45,8 @@ export interface BrainRunRequest {
 export function startBrainRun(
   repository: ArchiveRepository,
   request: BrainRunRequest,
-  onDone?: (result: { ok: boolean }) => void
+  onDone?: (result: { ok: boolean }) => void,
+  beforeAssimilation?: () => Promise<void>
 ): { started: boolean; progress: BrainRunProgress; refusal?: string } {
   if (progress.state === "running") {
     return { started: false, progress: getBrainRunProgress(), refusal: "A brain run is already in progress." };
@@ -77,7 +78,7 @@ export function startBrainRun(
   progress.startedAt = new Date().toISOString();
   progress.finishedAt = null;
   progress.error = null;
-  void executeRun(repository, request)
+  void executeRun(repository, request, beforeAssimilation)
     .then((outcome) => {
       progress.state = outcome;
       progress.finishedAt = new Date().toISOString();
@@ -96,7 +97,14 @@ export function startBrainRun(
   return { started: true, progress: getBrainRunProgress() };
 }
 
-async function executeRun(repository: ArchiveRepository, request: BrainRunRequest): Promise<"completed" | "budget_exceeded"> {
+async function executeRun(
+  repository: ArchiveRepository,
+  request: BrainRunRequest,
+  beforeAssimilation?: () => Promise<void>
+): Promise<"completed" | "budget_exceeded"> {
+  // Contact enrichment is a correctness boundary: connected Google contacts
+  // must be current before a run exists or any evidence backlog is read.
+  await beforeAssimilation?.();
   const runId = await repository.startBrainRun("manual");
   progress.runId = runId;
   const maxModelCalls = Math.max(1, request.maxModelCalls ?? config.brain.maxCallsPerHour);

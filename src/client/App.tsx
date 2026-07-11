@@ -61,7 +61,8 @@ import type {
   SearchReindexProgress,
   SearchResultItem,
   SearchTypeFilter,
-  StatusSummary
+  StatusSummary,
+  GoogleContactsStatus
 } from "../shared/types";
 import { SEARCH_HIGHLIGHT_END, SEARCH_HIGHLIGHT_START } from "../shared/types";
 import {
@@ -104,7 +105,10 @@ import {
   startSearchReindex,
   stopLiveSession,
   unlinkLiveSession,
-  verifyImportKey
+  verifyImportKey,
+  getGoogleContactsStatus,
+  syncGoogleContacts,
+  disconnectGoogleContacts
 } from "./api";
 
 const CHAT_LIMIT = 60;
@@ -113,6 +117,7 @@ const MESSAGE_LIMIT = 150;
 export function App() {
   const [status, setStatus] = useState<StatusSummary | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
+  const [googleStatus, setGoogleStatus] = useState<GoogleContactsStatus | null>(null);
   const [liveGaps, setLiveGaps] = useState<LiveGapWindowRecord[]>([]);
   const [chats, setChats] = useState<ChatListItem[]>([]);
   const [chatOffset, setChatOffset] = useState(0);
@@ -164,8 +169,35 @@ export function App() {
 
   useEffect(() => {
     void refreshStatus();
+    void refreshGoogleContacts();
     void reattachActiveImport();
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("googleContacts") === "connected") setNotice("Google Contacts connected. Sync when ready.");
+    if (params.get("googleContacts") === "error") setError(params.get("message") || "Google Contacts authorization failed.");
+    if (params.has("googleContacts")) window.history.replaceState({}, "", window.location.pathname);
   }, []);
+
+  async function refreshGoogleContacts() {
+    try { setGoogleStatus(await getGoogleContactsStatus()); } catch (err) { setError(err instanceof Error ? err.message : "Could not read Google Contacts status."); }
+  }
+
+  async function handleSyncGoogleContacts() {
+    setBusy("google-contacts"); setError(null);
+    try {
+      const response = await syncGoogleContacts(); setGoogleStatus(response.status);
+      setNotice(`Google Contacts synced: ${response.result.improvedNames.toLocaleString()} names improved.`);
+      await refreshStatus(); await loadChats(true);
+    } catch (err) { setError(err instanceof Error ? err.message : "Google Contacts sync failed."); }
+    finally { setBusy(null); }
+  }
+
+  async function handleDisconnectGoogleContacts() {
+    if (!window.confirm("Disconnect Google Contacts? Imported names will remain in your local archive.")) return;
+    setBusy("google-contacts"); setError(null);
+    try { const response = await disconnectGoogleContacts(); setGoogleStatus(response.status); setNotice(response.revoked ? "Google Contacts disconnected and access revoked." : "Google Contacts disconnected locally."); }
+    catch (err) { setError(err instanceof Error ? err.message : "Could not disconnect Google Contacts."); }
+    finally { setBusy(null); }
+  }
 
   useEffect(() => {
     void loadChats(true);
@@ -960,6 +992,12 @@ export function App() {
             onResume={() => void handleResumeLive()}
             onUnlink={() => void handleUnlinkLive()}
           />
+          <GoogleContactsPanel
+            status={googleStatus}
+            busy={busy === "google-contacts"}
+            onSync={() => void handleSyncGoogleContacts()}
+            onDisconnect={() => void handleDisconnectGoogleContacts()}
+          />
           <MemoryPanel
             status={status}
             busy={busy}
@@ -1379,6 +1417,34 @@ function renderSearchSnippet(snippet: string): ReactNode {
     rest = afterStart.slice(end + SEARCH_HIGHLIGHT_END.length);
   }
   return nodes;
+}
+
+function GoogleContactsPanel({ status, busy, onSync, onDisconnect }: {
+  status: GoogleContactsStatus | null;
+  busy: boolean;
+  onSync: () => void;
+  onDisconnect: () => void;
+}) {
+  const last = status?.lastSync;
+  return (
+    <section className="importPanel">
+      <div className="panelTitle"><Users size={16} /><span>Google Contacts</span></div>
+      {!status ? <p className="muted">Loading local connection status…</p> : !status.configured ? (
+        <><p className="muted">Add a Google OAuth web client to enable read-only contact enrichment.</p><small>Callback: {status.callbackUrl}</small></>
+      ) : !status.connected ? (
+        <><p className="muted">Connect Google to resolve phone-number contacts. Contacts stay in this local archive.</p><a className="primaryButton" href="/api/google-contacts/oauth/start">Connect Google</a></>
+      ) : (
+        <>
+          <p className="muted">Connected{status.accountLabel ? ` as ${status.accountLabel}` : " with read-only contact access"}.</p>
+          {last && <p className="muted">Last sync: {last.fetchedPeople.toLocaleString()} people, {last.matchedIdentities.toLocaleString()} matched, {last.improvedNames.toLocaleString()} improved, {last.ambiguousNumbers.toLocaleString()} ambiguous, {last.skippedNumbers.toLocaleString()} skipped.</p>}
+          <div className="buttonRow">
+            <button className="primaryButton" disabled={busy} onClick={onSync}>{busy ? <Loader2 className="spin" size={16} /> : <RefreshCcw size={16} />} Sync contacts</button>
+            <button className="secondaryButton" disabled={busy} onClick={onDisconnect}><Unlink size={16} /> Disconnect</button>
+          </div>
+        </>
+      )}
+    </section>
+  );
 }
 
 function LivePanel({

@@ -31,7 +31,9 @@ import type {
   SearchTypeFilter,
   StatusSummary,
   BackupDetectionManifest,
-  WaContactsSummary
+  WaContactsSummary,
+  GoogleContactsStatus,
+  GoogleContactsSyncResult
 } from "../shared/types";
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
@@ -51,6 +53,18 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
 
 export function getStatus(): Promise<StatusSummary> {
   return request<StatusSummary>("/api/status");
+}
+
+export function getGoogleContactsStatus(): Promise<GoogleContactsStatus> {
+  return request<GoogleContactsStatus>("/api/google-contacts/status");
+}
+
+export function syncGoogleContacts(): Promise<{ ok: boolean; result: GoogleContactsSyncResult; status: GoogleContactsStatus }> {
+  return request("/api/google-contacts/sync", { method: "POST", body: "{}" });
+}
+
+export function disconnectGoogleContacts(): Promise<{ ok: boolean; revoked: boolean; status: GoogleContactsStatus }> {
+  return request("/api/google-contacts", { method: "DELETE", body: "{}" });
 }
 
 export function initDatabase(): Promise<{ ok: boolean; status: StatusSummary }> {
