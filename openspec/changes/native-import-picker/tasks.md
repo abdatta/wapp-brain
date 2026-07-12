@@ -61,6 +61,6 @@
 
 ## 9. Verification and docs
 
-- [ ] 9.1 On Windows, run `npm run dev`, Browse to a real backup folder, confirm the detection summary and busy indicators, enter the key, and confirm an import runs reading in place with nothing uploaded — including the multi-GB `Media/` folder
+- [x] 9.1 On Windows, run `npm run dev`, Browse to a real backup folder, confirm the detection summary and busy indicators, enter the key, and confirm an import runs reading in place with nothing uploaded — including the multi-GB `Media/` folder
 - [x] 9.2 Confirm cancel leaves state unchanged; confirm the server stays responsive while a pick dialog is open; with `pickerAvailable=false` confirm the typed folder path and advanced override keep the web viewer working
 - [x] 9.3 Update user-facing copy/docs (README, `docs/`, wizard text) to describe the single-folder Browse + text-key flow, the removal of uploads and the key file, and that auxiliary files are detected and reserved

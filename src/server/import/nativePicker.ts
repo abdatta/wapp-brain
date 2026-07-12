@@ -120,8 +120,28 @@ export function setPickRunnerForTests(runner: PickRunner | null): () => void {
   };
 }
 
+// Cross-process test seam: WAPP_PICK_FAKE_MS makes picks resolve to a fixed
+// fake path after a delay (abort → cancelled) so a spawned test server can
+// exercise the pick route without opening a real dialog.
+function fakeRunnerFromEnv(): PickRunner | null {
+  const delayMs = Number(process.env.WAPP_PICK_FAKE_MS ?? "");
+  if (!Number.isFinite(delayMs) || delayMs <= 0) return null;
+  return (env, signal) =>
+    new Promise((resolve) => {
+      const timer = setTimeout(() => resolve({ path: `fake-pick:${env.WAPP_PICK_MODE}` }), delayMs);
+      signal?.addEventListener(
+        "abort",
+        () => {
+          clearTimeout(timer);
+          resolve({ cancelled: true });
+        },
+        { once: true }
+      );
+    });
+}
+
 function activeRunner(): PickRunner {
-  return runnerOverride ?? runWindowsPicker;
+  return runnerOverride ?? fakeRunnerFromEnv() ?? runWindowsPicker;
 }
 
 function runWindowsPicker(env: Record<string, string>, signal?: AbortSignal): Promise<PickResult> {
@@ -188,5 +208,5 @@ export async function pickImportPath(kind: PickKind, options: PickOptions = {}):
 export function isPickerAvailable(): boolean {
   // macOS (`osascript` choose file/folder) and Linux (`zenity --file-selection
   // [--directory]`) seams go here later; today only Windows is implemented.
-  return runnerOverride != null || process.platform === "win32";
+  return runnerOverride != null || fakeRunnerFromEnv() != null || process.platform === "win32";
 }

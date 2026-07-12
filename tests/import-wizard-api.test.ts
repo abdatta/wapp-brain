@@ -43,7 +43,8 @@ describe("import wizard local API", () => {
           APP_PORT: String(port),
           APP_HOST: "127.0.0.1",
           ARCHIVE_DB_PATH: archivePath,
-          WAPP_WORK_DIR: workDir
+          WAPP_WORK_DIR: workDir,
+          WAPP_PICK_FAKE_MS: "400"
         },
         stdio: "ignore"
       });
@@ -80,6 +81,18 @@ describe("import wizard local API", () => {
           body: JSON.stringify({ kind: "nonsense" })
         });
         expect(badPick.ok).toBe(false);
+
+        // Regression: a pending pick must survive the request's own "close"
+        // event (which fires as soon as the consumed body ends on modern Node);
+        // only a real client disconnect may abort the dialog. The fake runner
+        // (WAPP_PICK_FAKE_MS) resolves after a delay unless aborted.
+        const picked = await fetchJson<{ ok: boolean; path?: string; cancelled?: boolean }>(`${base}/api/import/pick`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ kind: "backup-root" })
+        });
+        expect(picked.cancelled).toBeUndefined();
+        expect(picked.path).toBe("fake-pick:folder");
 
         // Text key only: wrong key fails, correct key verifies against the detected msgstore.
         const failedVerify = await fetch(`${base}/api/import/verify-key`, {

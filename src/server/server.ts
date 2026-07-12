@@ -344,7 +344,12 @@ app.post("/api/import/pick", async (req, res) => {
   try {
     const kind = pickKind(req.body?.kind);
     const controller = new AbortController();
-    req.on("close", () => controller.abort());
+    // Abort only on a real client disconnect. The request's own "close" fires as
+    // soon as its (already-consumed) body ends, which would kill the dialog
+    // instantly — the response only closes early when the client goes away.
+    res.on("close", () => {
+      if (!res.writableEnded) controller.abort();
+    });
     const result = await pickImportPath(kind, {
       startIn: req.body?.startIn ? String(req.body.startIn) : null,
       signal: controller.signal
