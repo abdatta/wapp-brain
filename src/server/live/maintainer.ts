@@ -32,6 +32,10 @@ const MEDIA_FRESH_WINDOW_MS = 48 * 3_600_000;
 
 export interface LiveMaintainerCallbacks {
   onArchiveChanged?: (event: LiveMessageEvent) => void | Promise<void>;
+  // Media queue state changed (claimed for download, stored, or terminal) for
+  // these chats — lets open threads flip queued → downloading → rendered media
+  // without a reload.
+  onMediaChanged?: (chatSourceIds: string[]) => void | Promise<void>;
 }
 
 export class LiveMaintainer {
@@ -232,6 +236,8 @@ export class LiveMaintainer {
       if (tasks.length === 0) {
         return;
       }
+      const affectedChats = [...new Set(tasks.map((task) => task.chatSourceId))];
+      await this.callbacks.onMediaChanged?.(affectedChats);
       let stored = 0;
       let failedTransient = 0;
       let expired = 0;
@@ -300,6 +306,8 @@ export class LiveMaintainer {
       };
       await Promise.all(Array.from({ length: Math.min(MEDIA_DOWNLOAD_CONCURRENCY, queue.length) }, () => worker()));
       if (stored || failedTransient || expired) {
+        await this.callbacks.onMediaChanged?.(affectedChats);
+        console.log(`[live] media pass: ${stored} stored, ${failedTransient} failed transient, ${expired} expired of ${tasks.length} claimed`);
         await configuredTraceRecorder?.record("live.media_download_pass", {
           runId: this.runId,
           claimed: tasks.length,

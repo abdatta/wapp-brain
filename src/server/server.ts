@@ -1015,6 +1015,9 @@ async function startLiveMaintainer(phoneNumber: string | null): Promise<void> {
         messageCount: event.messages?.length ?? 0,
         contactCount: event.contacts?.length ?? 0
       });
+    },
+    onMediaChanged: (chatSourceIds) => {
+      broadcastArchiveChanged({ source: "live", chatSourceIds, messageCount: 0, contactCount: 0 });
     }
   });
   void activeMaintainer.start().catch(async (error: unknown) => {
