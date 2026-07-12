@@ -31,6 +31,6 @@
 
 ## 6. Verification and docs
 
-- [ ] 6.1 Re-import the real backup; confirm previously-missing recoverable media now reads queued (`pending`), the import summary shows the archived/queued/unrecoverable breakdown, and keyless media reads the honest missing label
-- [ ] 6.2 With live sync connected, confirm queued items transition to `stored` (fresh links) or `expired_unrecoverable` (expired), and message import stands regardless
+- [x] 6.1 PASSED 2026-07-12: real backup + media folder re-imported (6.5 min, merge); summary read "15,714 of 22,916 media messages archived from the folder, 5,471 queued to recover from WhatsApp, 1,731 with no recoverable copy"; queued media reads `pending` ("Media download is queued."), keyless media reads the honest "never saved on your phone" label; enqueue deduped against existing queue rows (first-capture-wins) and message import stood throughout
+- [x] 6.2 PASSED 2026-07-12: with live sync connected, queued items transitioned live — stored 79→86+ (fresh links recovered, incl. same-day photos), expired_unrecoverable 80→91 (old links going terminal honestly) — while imported messages stood untouched; the drain surfaced two field defects, both fixed and committed (silent pass completion 600c1a3, unbounded socket awaits 27d7a23)
 - [x] 6.3 Update `docs/IMPORTING_AND_DATA_MODEL.md` (and media docs) to describe CDN recovery of file-less media and that recovery runs when live sync is connected
