@@ -39,3 +39,7 @@ It subsumes four backlog todos that were always one system: `archive-full-text-a
 - **UI**: global search panel; brain status/overview panel replacing the memory panel.
 - **Docs/tests**: ARCHITECTURE, SECURITY_AND_PRIVACY, TESTING, LIMITATIONS, ROADMAP, `.env.example`; vitest suites with synthetic fixtures, schema additivity, idempotency, privacy canaries; four backlog todos absorbed/retired.
 - **External dependency**: `claude` CLI presence for LLM generation (graceful extractive degradation when absent); optional `@modelcontextprotocol/sdk` for the MCP server.
+
+## Scope Revision (2026-07-11)
+
+Following the 2026-07-11 architecture review (multi-agent, 26 adversarially-verified findings), this change is **narrowed to the operational spine**: search foundation + brain substrate (delivered), run-job objects, scheduler/dueness, startup catch-up audit, and edit/delete/interpretation staleness. The extraction contract, identity/person model, evaluation, semantic tier, retrieval pipeline, MCP surface, backfill, and teardown are re-planned as fifteen sequenced changes with the review's design amendments baked in — see `openspec/changes/ROADMAP.md` for the full dependency chart and supersession map. The design decisions D1–D13 in `design.md` remain the architectural baseline; the new changes amend specific decisions (D5, D6, D7, D8, D12) as recorded in their proposals.

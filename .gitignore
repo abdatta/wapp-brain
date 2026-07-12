@@ -33,6 +33,7 @@ exports/
 fixtures/generated/
 
 # Local app working directories
+outputs/
 .wapp-brain/
 .wapp-brain/memory/
 .second-brain/

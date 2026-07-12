@@ -1,0 +1,29 @@
+# Historical Backfill
+
+> Proposal-level seed (2026-07-11). Expand with `/opsx:propose` when scheduled. See `openspec/changes/ROADMAP.md` for ordering and dependencies. **Recommended model: Opus.**
+
+## Why
+
+Assimilating the pre-brain archive (~325k messages ≈ 3–4k chat-window packs) is the single largest token spend in the project's life, which is why it is gated behind three prerequisites: the extraction contract must be final (`episode-contract-v2` — re-extraction is the only expensive do-over), late name resolution must be repair-safe (`identity-late-resolution` — backfilling unresolved chats is then safe because repair is deterministic), and the model choice must be evidence-based (`brain-eval-harness` — Terra vs Sonnet vs Haiku-turbo decided by measured recall/precision on this archive, not external benchmarks). Once those hold, backfill runs as a months-long background drain or attended turbo sessions, with coverage metadata keeping every answer honest meanwhile.
+
+## What Changes
+
+- **Queue-backed backfill**: uncovered (chat, window) work enqueued through `brain_tasks` (the durable queue finally gains its producer for historical work), resumable by construction, dedupe-keyed, rate-limited under the daily ledger.
+- **Ordering per resolved D12**: chat-level priority newest-first (recent history assimilates first); within-chat always oldest-first from the watermark — the scalar watermark stays honest, no interval bookkeeping.
+- **`brain backfill --turbo`**: attended accelerated mode — user-set call rate, live progress, resumable, stoppable; respects provider health and budget stops (named `BUDGET_EXCEEDED`, never silent).
+- **Backfill dashboard**: coverage percentage, drain rate, ETA at current pace, per-model spend so far, extractive-fallback rate as an ongoing quality canary (feeding the eval harness's per-model tables).
+- **Weekly mini-episode folding**: the significance gate finally consumes `WAPP_BRAIN_SIGNIFICANCE_MIN` — low-activity chats fold into weekly mini-episodes instead of burning per-day calls (essential at 3.7k chats).
+- **Checkpoint**: start turbo backfill, kill the server mid-run, restart — it resumes with no duplicated episodes; the dashboard shows coverage climbing and honest per-model quality; a budget stop is a named state with remaining work pending.
+
+## Capabilities
+
+### Modified Capabilities
+
+- `brain-assimilation`: Offline Catch-Up requirement implemented for historical scope — queue-produced backfill tasks, resolved ordering semantics, turbo mode, significance-gate folding, spend/quality dashboard.
+
+## Impact
+
+- **Code**: backfill producer + drain in `src/server/brain/` (scheduler-adjacent), CLI `brain backfill [--turbo]`, dashboard section in the Brain panel.
+- **Schema**: none new (consumes `brain_tasks`, watermarks, ledger).
+- **Tests**: resume-after-kill, dedupe idempotency, ordering (newest chat first, oldest window first within chat), significance folding, budget-stop honesty.
+- **Depends on**: `episode-contract-v2`, `identity-late-resolution`, `brain-eval-harness` (all three are hard gates before the spend); `build-the-brain`'s narrowed operational spine (run jobs/scheduler) for the drain loop.
