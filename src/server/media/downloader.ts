@@ -22,6 +22,30 @@ export interface MediaDownloadDependencies {
   requestReupload?: ((message: Record<string, unknown>) => Promise<Record<string, unknown>>) | null;
 }
 
+// Socket-facing awaits must be bounded: a CDN fetch can stall mid-stream, and
+// a re-upload request waits on the ORIGINAL SENDER's phone, which may never
+// answer. An unbounded await here wedges the media pass permanently (workers
+// never return, mediaPassRunning never clears) — observed in the field
+// 2026-07-12 with 8 workers stuck on updateMediaMessage for 10+ minutes.
+const FETCH_TIMEOUT_MS = 120_000;
+const REUPLOAD_TIMEOUT_MS = 45_000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${Math.round(ms / 1000)}s.`)), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
+}
+
 export async function downloadQueuedMedia(
   task: MediaDownloadQueueRecord,
   options: { allowReupload: boolean },
@@ -35,7 +59,7 @@ export async function downloadQueuedMedia(
     url: descriptor.url ?? undefined
   };
   try {
-    const bytes = await fetchContent(downloadable, descriptor.mediaType);
+    const bytes = await withTimeout(fetchContent(downloadable, descriptor.mediaType), FETCH_TIMEOUT_MS, "Media download");
     if (bytes.length === 0) {
       return { status: "transient", usedReupload: false, error: "Media download returned no bytes." };
     }
@@ -56,14 +80,14 @@ export async function downloadQueuedMedia(
     return { status: "expired", usedReupload: false, error: "Media link expired and no retry key was captured." };
   }
   try {
-    const updated = await dependencies.requestReupload(retryMessage);
+    const updated = await withTimeout(dependencies.requestReupload(retryMessage), REUPLOAD_TIMEOUT_MS, "Media re-upload request");
     const refreshed = mediaContentOf(updated ?? retryMessage);
     const refreshedDownloadable = {
       mediaKey: Buffer.from(descriptor.mediaKey, "base64"),
       directPath: nonEmpty(refreshed?.directPath) ?? descriptor.directPath ?? undefined,
       url: nonEmpty(refreshed?.url) ?? undefined
     };
-    const bytes = await fetchContent(refreshedDownloadable, descriptor.mediaType);
+    const bytes = await withTimeout(fetchContent(refreshedDownloadable, descriptor.mediaType), FETCH_TIMEOUT_MS, "Re-uploaded media download");
     if (bytes.length === 0) {
       return { status: "expired", usedReupload: true, error: "Re-uploaded media download returned no bytes." };
     }

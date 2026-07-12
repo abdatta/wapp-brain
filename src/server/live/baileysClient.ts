@@ -299,16 +299,24 @@ export class BaileysLiveWhatsAppClient implements LiveWhatsAppClient {
       // Baileys forwards this verbatim into the wire field oldestMsgTimestampMs
       // — it expects MILLISECONDS; dividing by 1000 sends a 1970-era anchor and
       // the phone returns nothing.
-      await this.socket.fetchMessageHistory(
-        request.count,
-        {
-          remoteJid: request.chatSourceId,
-          id: request.anchor.id,
-          fromMe: request.anchor.fromMe ?? undefined,
-          participant: request.anchor.participant ?? undefined
-        },
-        Math.floor(request.oldestMsgTimestampMs)
-      );
+      // Bounded await: this asks the PHONE for history and the phone may never
+      // answer; an unbounded hang here wedges the whole recovery tick (and with
+      // it audits, secrets, and media passes) until the server restarts.
+      await Promise.race([
+        this.socket.fetchMessageHistory(
+          request.count,
+          {
+            remoteJid: request.chatSourceId,
+            id: request.anchor.id,
+            fromMe: request.anchor.fromMe ?? undefined,
+            participant: request.anchor.participant ?? undefined
+          },
+          Math.floor(request.oldestMsgTimestampMs)
+        ),
+        new Promise<never>((_resolve, reject) => {
+          setTimeout(() => reject(new Error("On-demand history request timed out after 30s.")), 30_000).unref?.();
+        })
+      ]);
       return { status: "partial", events: [], messageCount: 0 };
     } catch (error) {
       return { status: "failed", events: [], messageCount: 0, errorMessage: safeError(error) };
