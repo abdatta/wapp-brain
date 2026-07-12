@@ -5,6 +5,7 @@ import { config } from "./config";
 import { publicErrorMessage } from "./privacy";
 import { isSqliteArchiveInitialized } from "./db/sqliteRepository";
 import { getLiveDependencyStatus } from "./live/dependency";
+import { getBrainProviderStatus } from "./brain/provider";
 import { getMemoryProviderStatus } from "./memory/provider";
 
 export interface DoctorCheck {
@@ -41,7 +42,35 @@ export async function runDoctor(): Promise<DoctorCheck[]> {
   checks.push(checkImportStaging());
   checks.push(checkLiveDependency());
   checks.push(await checkMemoryStore());
+  checks.push(checkBrain());
   return checks;
+}
+
+// Brain assimilation health: scheduling mode, provider opt-in, and degradation.
+// A degraded provider is a warn (episodes still commit, extractive); auto
+// scheduling with no model provider is a warn (episodes are placeholders).
+function checkBrain(): DoctorCheck {
+  const provider = getBrainProviderStatus();
+  const mode = config.brain.scheduler === "auto" ? "auto (unattended runs)" : "paused (manual-first)";
+  if (provider.degraded) {
+    return {
+      name: "Brain assimilation",
+      status: "warn",
+      message: `Scheduler ${mode}; provider ${provider.provider} is DEGRADED — runs fall back to extractive until a probe succeeds.`
+    };
+  }
+  if (config.brain.scheduler === "auto" && (!provider.modelBacked || !provider.enabled || provider.sessionMissing)) {
+    return {
+      name: "Brain assimilation",
+      status: "warn",
+      message: `Scheduler is auto but no model provider is ready; unattended runs will commit extractive placeholders (caps: ${config.brain.maxCallsPerHour}/hr, ${config.brain.maxCallsPerDay}/day).`
+    };
+  }
+  return {
+    name: "Brain assimilation",
+    status: "pass",
+    message: `Scheduler ${mode}; ${provider.message} Budget caps: ${config.brain.maxCallsPerHour}/hr, ${config.brain.maxCallsPerDay}/day.`
+  };
 }
 
 function checkHostBinding(): DoctorCheck {

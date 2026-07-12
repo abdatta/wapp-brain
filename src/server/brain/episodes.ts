@@ -241,6 +241,25 @@ export function deleteProjectedEpisodeFiles(episodeIds: string[]): number {
   return removed;
 }
 
+// Full-reset cleanup: the episodes dir is a pure one-way projection of the DB,
+// so after a full reset it must be empty. This removes EVERY projected file,
+// including orphans whose DB episode was already gone — which the id-matched
+// deletion above cannot reach.
+export function clearAllProjectedEpisodeFiles(): number {
+  const dir = path.join(config.brain.rootDir, "episodes");
+  if (!fs.existsSync(dir)) {
+    return 0;
+  }
+  let removed = 0;
+  for (const file of fs.readdirSync(dir)) {
+    if (file.endsWith(".md")) {
+      fs.rmSync(path.join(dir, file), { force: true });
+      removed += 1;
+    }
+  }
+  return removed;
+}
+
 export interface EpisodeGenerationResult {
   episode: BrainEpisodeRecord;
   usage: BrainTokenUsage | null;

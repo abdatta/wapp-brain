@@ -211,8 +211,14 @@ export interface ArchiveRepository {
   // 'interrupted' (watermarks make interruption free; the row must not lie).
   reconcileBrainRuns(): Promise<number>;
   startBrainRun(kind: BrainRunSummary["kind"], timezone?: string | null): Promise<string>;
+  getBrainRun(runId: string): Promise<BrainRunSummary | null>;
   completeBrainRun(runId: string, totals: Record<string, number>): Promise<void>;
   failBrainRun(runId: string, status: "failed" | "interrupted" | "budget_exceeded", message: string): Promise<void>;
+  // Cross-process 'brain' job lock (mirrors the memory lock): the auto pass and
+  // a CLI run must not spend the budget concurrently. TTL-expiring, re-entrant
+  // for the same run id.
+  tryAcquireBrainLock(runId: string, ttlMs: number): Promise<boolean>;
+  releaseBrainLock(runId: string): Promise<void>;
   recordBrainLlmUsage(entry: { purpose: string; provider: string; inputTokens: number; outputTokens: number }): Promise<void>;
   getBrainLlmUsage(options: { sinceMs: number }): Promise<BrainLlmUsageSummary>;
   getBrainStatus(): Promise<BrainStatusSummary>;
@@ -226,6 +232,11 @@ export interface ArchiveRepository {
   // Rendered markdown references committed claim ids, so it lands post-commit.
   updateBrainEpisodeMarkdown(episodeId: string, markdown: string): Promise<void>;
   listBrainEpisodes(options: { chatSourceId?: string | null; limit: number }): Promise<BrainEpisodeRecord[]>;
+  // Staleness propagation: edits/deletes/interpretation upgrades on a cited
+  // message mark the dependent 'current' episodes 'stale' and enqueue a
+  // dedupe-keyed regeneration task per episode (one transaction). Returns the
+  // number of episodes newly marked stale.
+  markStaleEpisodesForMessages(sourceMessageKeys: string[]): Promise<number>;
   close?(): Promise<void>;
 }
 

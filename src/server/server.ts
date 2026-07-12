@@ -588,27 +588,14 @@ app.get("/api/search/status", async (_req, res) => {
 app.get("/api/brain/status", async (_req, res) => {
   try {
     const { getBrainProviderStatus } = await import("./brain/provider");
+    const { schedulerStatusFromSummary } = await import("./brain/scheduler");
     const status = await repository.getBrainStatus();
-    // A run is due when backlog exists and no run has completed since the
-    // most recent nightly cutoff boundary. Paused mode alerts; auto executes.
-    const boundary = new Date();
-    boundary.setHours(config.brain.cutoffHour, 0, 0, 0);
-    if (boundary.getTime() > Date.now()) {
-      boundary.setDate(boundary.getDate() - 1);
-    }
-    const lastFinished = status.latestRun?.finishedAt ? Date.parse(status.latestRun.finishedAt) : null;
-    const pending = status.totalVisibleMessages - status.assimilatedVisibleMessages;
-    const runDue = status.chatsWithBacklog > 0 && (lastFinished == null || lastFinished < boundary.getTime());
     res.json({
       ...status,
       provider: getBrainProviderStatus(),
-      scheduler: {
-        mode: config.brain.scheduler,
-        runDue,
-        dueReason: runDue
-          ? `${pending.toLocaleString()} messages across ${status.chatsWithBacklog.toLocaleString()} chats are waiting to be assimilated and no run has completed since the ${String(config.brain.cutoffHour).padStart(2, "0")}:00 cutoff.`
-          : null
-      }
+      // Dueness derived from the status we already computed — no extra scan, so
+      // this stays a fast, UI-pollable endpoint.
+      scheduler: schedulerStatusFromSummary(status)
     });
   } catch (error) {
     res.status(400).json({ error: publicErrorMessage(error) });
@@ -660,6 +647,35 @@ app.get("/api/brain/runs/current", async (_req, res) => {
   }
 });
 
+// A specific run object (manual or scheduled) by id — the durable record with
+// its final status and totals, for polling a run after the in-memory progress
+// has rolled over to the next one.
+app.get("/api/brain/runs/:id", async (req, res) => {
+  try {
+    const run = await repository.getBrainRun(req.params.id);
+    if (!run) {
+      res.status(404).json({ error: "No brain run with that id." });
+      return;
+    }
+    res.json(run);
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+// Cancel the in-progress manual run: sets a cooperative stop flag the run loop
+// checks between chats, ending it as 'interrupted' (watermarks make the partial
+// coverage honest; nothing needs undoing).
+app.post("/api/brain/runs/cancel", async (_req, res) => {
+  try {
+    const { requestBrainRunCancel, getBrainRunProgress } = await import("./brain/runJob");
+    const cancelled = requestBrainRunCancel();
+    res.json({ ok: true, cancelling: cancelled, progress: getBrainRunProgress() });
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
 app.get("/api/brain/episodes", async (req, res) => {
   try {
     res.json(
@@ -684,8 +700,10 @@ app.post("/api/brain/reset", async (req, res) => {
     }
     const chatSourceId = typeof req.body?.chatSourceId === "string" ? req.body.chatSourceId : null;
     const result = await repository.resetBrainDerivedData({ chatSourceId });
-    const { deleteProjectedEpisodeFiles } = await import("./brain/episodes");
-    const filesRemoved = deleteProjectedEpisodeFiles(result.episodeIds);
+    const { clearAllProjectedEpisodeFiles, deleteProjectedEpisodeFiles } = await import("./brain/episodes");
+    // A full reset empties the whole projection dir (orphan-proof); a scoped
+    // reset only removes the affected chat's episode files.
+    const filesRemoved = chatSourceId ? deleteProjectedEpisodeFiles(result.episodeIds) : clearAllProjectedEpisodeFiles();
     console.log(
       `[brain] reset${chatSourceId ? ` (one chat)` : ""}: ${result.episodeIds.length} episode(s), ${result.watermarks} watermark(s), ${filesRemoved} file(s) removed`
     );
@@ -849,6 +867,23 @@ try {
   const orphanedBrainRuns = await repository.reconcileBrainRuns();
   if (orphanedBrainRuns > 0) {
     console.log(`[brain] marked ${orphanedBrainRuns} orphaned run(s) interrupted (watermarks make interruption safe).`);
+  }
+  // Startup catch-up audit: assimilation correctness must not depend on
+  // schedules firing. Only auto mode enqueues (and drains) uncovered windows —
+  // in manual mode dueness is derived live from watermarks, so nothing needs a
+  // durable queue that would otherwise linger as stale pending work.
+  if (config.brain.scheduler === "auto") {
+    const { auditCatchup } = await import("./brain/scheduler");
+    // After a restart every claimed-but-unfinished task is orphaned; reclaim
+    // them all so a killed run resumes immediately, not after the stale window.
+    const reclaimed = await repository.resetInFlightBrainTasks(0);
+    if (reclaimed > 0) {
+      console.log(`[brain] returned ${reclaimed} in-flight task(s) to pending after restart.`);
+    }
+    const catchup = await auditCatchup(repository);
+    if (catchup.enqueued > 0) {
+      console.log(`[brain] catch-up audit enqueued ${catchup.enqueued} episode task(s) across ${catchup.chats} chat(s) with a coverage gap.`);
+    }
   }
   const legacyClosed = await closeLegacyWallClockGaps(repository);
   if (legacyClosed) {
@@ -1018,6 +1053,14 @@ async function startLiveMaintainer(phoneNumber: string | null): Promise<void> {
     },
     onMediaChanged: (chatSourceIds) => {
       broadcastArchiveChanged({ source: "live", chatSourceIds, messageCount: 0, contactCount: 0 });
+    },
+    // Last recovery-tick pass: no-ops unless WAPP_BRAIN_SCHEDULER=auto. A
+    // committed episode nudges open panels to refetch brain status live.
+    runBrainPass: async () => {
+      const { runBrainMaintenancePass } = await import("./brain/scheduler");
+      await runBrainMaintenancePass(repository, {
+        onEpisodesCommitted: () => broadcastArchiveChanged({ source: "live", chatSourceIds: [], messageCount: 0, contactCount: 0 })
+      });
     }
   });
   void activeMaintainer.start().catch(async (error: unknown) => {

@@ -181,6 +181,111 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Drive a brain run from the terminal (best run with the server stopped —
+  // SQLite is single-writer). --provider/--model set the persisted selection
+  // before running; --extractive forces the no-model path; --max-chats caps it.
+  if (command === "brain-run") {
+    const { enableBrainProvider, getBrainProviderStatus, setBrainProviderModel } = await import("./brain/provider");
+    const provider = stringArg(args.provider);
+    const model = stringArg(args.model);
+    if (provider === "claude-cli" || provider === "codex") {
+      enableBrainProvider(provider);
+      if (model) {
+        setBrainProviderModel(provider, model);
+      }
+    }
+    const status = getBrainProviderStatus();
+    const mode = Boolean(args.extractive) || !status.modelBacked || !status.enabled ? "extractive" : "model";
+    const repository = createArchiveRepository();
+    try {
+      const { startBrainRun, getBrainRunProgress } = await import("./brain/runJob");
+      const started = startBrainRun(repository, { mode, model: model ?? null, maxChats: numberArg(args["max-chats"]) ?? 10 });
+      if (!started.started) {
+        console.error(started.refusal ?? "Could not start the brain run.");
+        process.exitCode = 1;
+        return;
+      }
+      console.log(`Brain run started (${mode}${mode === "model" && model ? `/${model}` : ""})…`);
+      while (getBrainRunProgress().state === "running") {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+      const final = getBrainRunProgress();
+      console.log(
+        `Run ${final.state}: ${final.episodesCommitted} episode(s), ${final.claimsCommitted} claim(s) across ${final.processedChats} chat(s), ${final.modelCalls} model call(s).${final.error ? ` ${final.error}` : ""}`
+      );
+      if (final.state === "failed") {
+        process.exitCode = 1;
+      }
+    } finally {
+      await repository.close?.();
+    }
+    return;
+  }
+
+  // Wipe derived brain data for a clean slate (episodes + claims + citations +
+  // watermarks + projected .md files + the task queue) — raw messages untouched;
+  // the next run re-assimilates from scratch. --chat <sourceId> scopes it to one
+  // chat. Run with the server STOPPED (SQLite is single-writer).
+  if (command === "brain-reset") {
+    const chatSourceId = stringArg(args.chat) ?? null;
+    const repository = createArchiveRepository();
+    try {
+      const result = await repository.resetBrainDerivedData({ chatSourceId });
+      const { clearAllProjectedEpisodeFiles, deleteProjectedEpisodeFiles } = await import("./brain/episodes");
+      const filesRemoved = chatSourceId ? deleteProjectedEpisodeFiles(result.episodeIds) : clearAllProjectedEpisodeFiles();
+      console.log(
+        `Brain reset${chatSourceId ? ` (chat ${chatSourceId})` : ""}: removed ${result.episodeIds.length} episode(s), ${result.watermarks} watermark(s), ${filesRemoved} projected file(s), and cleared pending tasks. Raw messages are untouched.`
+      );
+    } finally {
+      await repository.close?.();
+    }
+    return;
+  }
+
+  // Force one brain scheduler pass on demand — catch-up enqueue → drain → cited
+  // episodes → run object — without waiting for the nightly cutoff or an auto
+  // tick (and without needing live sync connected). Handy for a quick test or an
+  // ops "assimilate now". --reset wipes existing episodes first (clean slate);
+  // --calls caps model spend for the pass; --extractive runs free with
+  // placeholder episodes (your real provider config is untouched). Run with the
+  // server STOPPED — SQLite is single-writer.
+  if (command === "brain-pass") {
+    const calls = numberArg(args.calls);
+    if (calls) {
+      config.brain.maxCallsPerHour = calls;
+    }
+    if (args.extractive) {
+      config.brain.providerConfigPath = path.join(config.brain.rootDir, `_brain-pass-extractive-${Date.now()}.json`);
+    }
+    const repository = createArchiveRepository();
+    try {
+      if (args.reset) {
+        const wiped = await repository.resetBrainDerivedData({ chatSourceId: null });
+        const { clearAllProjectedEpisodeFiles } = await import("./brain/episodes");
+        const filesRemoved = clearAllProjectedEpisodeFiles();
+        console.log(`Reset first: removed ${wiped.episodeIds.length} episode(s), ${wiped.watermarks} watermark(s), ${filesRemoved} file(s).`);
+      }
+      const { computeDueWork, runBrainMaintenancePass } = await import("./brain/scheduler");
+      const before = await repository.getBrainStatus();
+      const due = await computeDueWork(repository);
+      console.log(`Coverage ${before.coveragePercent}% — ${due.dueChats.length} chat(s) due${due.runDue ? `: ${due.dueReason}` : " (nothing due)"}`);
+      console.log(`Forcing one brain pass (${args.extractive ? "extractive" : "model"}${calls ? `, ≤${calls} model calls` : ""})…`);
+      const result = await runBrainMaintenancePass(repository, { force: true });
+      console.log(JSON.stringify(result, null, 2));
+      const after = await repository.getBrainStatus();
+      console.log(`Coverage now ${after.coveragePercent}% — latest run ${after.latestRun?.status ?? "none"}, ${after.usageToday.calls} model call(s) today.`);
+      const [episode] = await repository.listBrainEpisodes({ limit: 1 });
+      if (episode) {
+        console.log(`Newest episode (${episode.generator}${episode.model ? `/${episode.model}` : ""}) — ${episode.chatDisplayName ?? episode.chatSourceId}: ${episode.summary}`);
+        console.log(`Episodes are in ${path.join(config.brain.rootDir, "episodes")} (open the .md in Obsidian).`);
+      }
+      console.log("Undo anytime via the Brain panel Reset or POST /api/brain/reset.");
+    } finally {
+      await repository.close?.();
+    }
+    return;
+  }
+
   if (command === "search-reindex") {
     const repository = createArchiveRepository();
     try {

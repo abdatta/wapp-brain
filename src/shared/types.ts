@@ -827,7 +827,7 @@ export interface BrainEpisodeRecord {
 
 // In-memory progress of a manual/scheduled brain run (job + polling model).
 export interface BrainRunProgress {
-  state: "idle" | "running" | "completed" | "failed" | "budget_exceeded";
+  state: "idle" | "running" | "completed" | "failed" | "budget_exceeded" | "interrupted";
   runId: string | null;
   mode: BrainEpisodeGenerator;
   provider: string | null;

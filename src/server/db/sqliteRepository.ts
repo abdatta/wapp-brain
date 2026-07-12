@@ -1581,7 +1581,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     const result = this.db
       .prepare(
         `UPDATE brain_tasks SET status = 'pending', claimed_at_ms = NULL, updated_at = ?
-         WHERE status = 'running' AND (claimed_at_ms IS NULL OR claimed_at_ms < ?)`
+         WHERE status = 'running' AND (claimed_at_ms IS NULL OR claimed_at_ms <= ?)`
       )
       .run(currentIso(), Date.now() - staleClaimMs);
     return result.changes;
@@ -1641,10 +1641,44 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     return id;
   }
 
+  async getBrainRun(runId: string): Promise<BrainRunSummary | null> {
+    const row = this.db.prepare(`SELECT * FROM brain_runs WHERE id = ?`).get(runId) as SqliteBrainRunRow | undefined;
+    return row ? rowToBrainRun(row) : null;
+  }
+
   async completeBrainRun(runId: string, totals: Record<string, number>): Promise<void> {
     this.db
       .prepare(`UPDATE brain_runs SET status = 'completed', finished_at = ?, totals_json = ? WHERE id = ?`)
       .run(currentIso(), stringifyJson(totals), runId);
+  }
+
+  // 'brain' job lock over the shared memory_job_locks table (name-keyed): the
+  // TTL sweep clears a crashed holder; same-run re-acquire refreshes the lease.
+  async tryAcquireBrainLock(runId: string, ttlMs: number): Promise<boolean> {
+    const now = Date.now();
+    const expiresAt = now + ttlMs;
+    const transaction = this.db.transaction(() => {
+      this.db.prepare(`DELETE FROM memory_job_locks WHERE name = 'brain' AND expires_at_ms < ?`).run(now);
+      const existing = this.db.prepare(`SELECT run_id FROM memory_job_locks WHERE name = 'brain'`).get() as
+        | { run_id: string }
+        | undefined;
+      if (existing && existing.run_id !== runId) {
+        return false;
+      }
+      this.db
+        .prepare(
+          `INSERT INTO memory_job_locks (name, run_id, acquired_at, expires_at_ms)
+           VALUES ('brain', ?, ?, ?)
+           ON CONFLICT(name) DO UPDATE SET run_id = excluded.run_id, acquired_at = excluded.acquired_at, expires_at_ms = excluded.expires_at_ms`
+        )
+        .run(runId, currentIso(), expiresAt);
+      return true;
+    });
+    return transaction();
+  }
+
+  async releaseBrainLock(runId: string): Promise<void> {
+    this.db.prepare(`DELETE FROM memory_job_locks WHERE name = 'brain' AND run_id = ?`).run(runId);
   }
 
   async failBrainRun(runId: string, status: "failed" | "interrupted" | "budget_exceeded", message: string): Promise<void> {
@@ -1737,6 +1771,14 @@ export class SqliteArchiveRepository implements ArchiveRepository {
           : this.db.prepare(`DELETE FROM brain_chat_watermarks`).run()
         ).changes
       );
+      // Clear the work queue too, so no stale episode/regen task (a regen task
+      // still points at a now-deleted episode id) survives the reset and
+      // resurrects derived data on the next drain.
+      if (chat) {
+        this.db.prepare(`DELETE FROM brain_tasks WHERE chat_source_id = ?`).run(chat);
+      } else {
+        this.db.prepare(`DELETE FROM brain_tasks`).run();
+      }
     });
     transaction();
     return { episodeIds, watermarks };
@@ -1841,6 +1883,61 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         }))
       }))
     }));
+  }
+
+  async markStaleEpisodesForMessages(sourceMessageKeys: string[]): Promise<number> {
+    const keys = [...new Set(sourceMessageKeys.filter((key) => typeof key === "string" && key.length > 0))];
+    if (keys.length === 0) {
+      return 0;
+    }
+    // Reverse-map the changed keys to the 'current' episodes that cite them
+    // (index idx_brain_citations_key backs the lookup), de-duplicated by id.
+    const episodes = new Map<string, { chatSourceId: string; startAtMs: number; endAtMs: number }>();
+    for (let index = 0; index < keys.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = keys.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      const placeholders = batch.map(() => "?").join(",");
+      const rows = this.db
+        .prepare(
+          `SELECT DISTINCT e.id, e.chat_source_id, e.start_at_ms, e.end_at_ms
+           FROM brain_citations c
+           JOIN brain_claims cl ON cl.id = c.claim_id
+           JOIN brain_episodes e ON e.id = cl.episode_id
+           WHERE e.status = 'current' AND c.source_message_key IN (${placeholders})`
+        )
+        .all(...batch) as Array<{ id: string; chat_source_id: string; start_at_ms: number; end_at_ms: number }>;
+      for (const row of rows) {
+        episodes.set(row.id, {
+          chatSourceId: String(row.chat_source_id),
+          startAtMs: Number(row.start_at_ms),
+          endAtMs: Number(row.end_at_ms)
+        });
+      }
+    }
+    if (episodes.size === 0) {
+      return 0;
+    }
+    const markStale = this.db.prepare(`UPDATE brain_episodes SET status = 'stale' WHERE id = ? AND status = 'current'`);
+    // Regeneration reuses the 'episode' kind (no schema change): the payload's
+    // regen flag tells the executor to rebuild this exact window verbatim
+    // rather than the watermark-forward window.
+    const enqueue = this.db.prepare(
+      `INSERT OR IGNORE INTO brain_tasks (kind, chat_source_id, payload_json, dedupe_key, priority)
+       VALUES ('episode', ?, ?, ?, ?)`
+    );
+    let marked = 0;
+    const transaction = this.db.transaction(() => {
+      for (const [episodeId, window] of episodes) {
+        marked += markStale.run(episodeId).changes;
+        enqueue.run(
+          window.chatSourceId,
+          stringifyJson({ chatSourceId: window.chatSourceId, sinceMs: window.startAtMs, throughMs: window.endAtMs, regen: true, episodeId }),
+          `regen:${episodeId}`,
+          1_000
+        );
+      }
+    });
+    transaction();
+    return marked;
   }
 
   async collapseSupersededMessages(
@@ -3112,6 +3209,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
        LIMIT 1`
     );
     const editedKeys: string[] = [];
+    const deletedKeys: string[] = [];
     const transaction = this.db.transaction(() => {
       for (const update of updates) {
         let targetKey: string | null = update.sourceMessageKey;
@@ -3124,6 +3222,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         if (targetKey) {
           if (update.updateType === "delete") {
             markDeleted.run(stringifyJson({ liveUpdate: "delete" }), targetKey);
+            deletedKeys.push(targetKey);
           }
           if (update.updateType === "edit" && typeof update.metadata?.body === "string") {
             const current = readCurrentContent.get(targetKey) as { body: string | null; caption: string | null } | undefined;
@@ -3174,6 +3273,10 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       }
     });
     transaction();
+    // Staleness propagation (outside the transaction above — the episode
+    // stale-mark + regen enqueue runs its own): a live edit or delete of a
+    // cited message invalidates the episodes that quote it.
+    await this.markStaleEpisodesForMessages([...editedKeys, ...deletedKeys]);
     return { applied, pending };
   }
 
@@ -3389,6 +3492,9 @@ export class SqliteArchiveRepository implements ArchiveRepository {
   }
 
   async completeMediaDownload(queueId: number, asset: MediaAssetRecord): Promise<number> {
+    const queued = this.db.prepare(`SELECT message_key FROM media_download_queue WHERE id = ?`).get(queueId) as
+      | { message_key: string }
+      | undefined;
     let assetId = 0;
     const transaction = this.db.transaction(() => {
       assetId = this.upsertMediaAssetRow(asset);
@@ -3403,6 +3509,11 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         .run(currentIso(), queueId);
     });
     transaction();
+    // Media landing upgrades the message's interpretation (e.g. "Photo (not
+    // downloaded)" → "Photo"); episodes that cite it go stale for regeneration.
+    if (queued?.message_key) {
+      await this.markStaleEpisodesForMessages([queued.message_key]);
+    }
     return assetId;
   }
 

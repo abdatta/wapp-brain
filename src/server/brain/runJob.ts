@@ -28,8 +28,23 @@ const progress: BrainRunProgress = {
   error: null
 };
 
+// Cooperative cancellation: the run loop checks this between chats. A cancel
+// leaves committed episodes and advanced watermarks in place (coverage stays
+// honest); only the remaining backlog is skipped.
+let cancelRequested = false;
+
 export function getBrainRunProgress(): BrainRunProgress {
   return { ...progress };
+}
+
+// Request cancellation of the in-progress run. Returns false when nothing is
+// running to cancel.
+export function requestBrainRunCancel(): boolean {
+  if (progress.state !== "running") {
+    return false;
+  }
+  cancelRequested = true;
+  return true;
 }
 
 export interface BrainRunRequest {
@@ -65,6 +80,7 @@ export function startBrainRun(
     }
   }
   progress.state = "running";
+  cancelRequested = false;
   progress.runId = null;
   progress.mode = request.mode;
   progress.provider = request.mode === "model" ? provider.provider : "extractive";
@@ -101,7 +117,7 @@ async function executeRun(
   repository: ArchiveRepository,
   request: BrainRunRequest,
   beforeAssimilation?: () => Promise<void>
-): Promise<"completed" | "budget_exceeded"> {
+): Promise<"completed" | "budget_exceeded" | "interrupted"> {
   // Contact enrichment is a correctness boundary: connected Google contacts
   // must be current before a run exists or any evidence backlog is read.
   await beforeAssimilation?.();
@@ -117,7 +133,12 @@ async function executeRun(
       : await repository.getBrainChatBacklog({ limit: request.maxChats ?? 10 });
     progress.totalChats = backlog.length;
     let budgetExhausted = false;
+    let cancelled = false;
     for (const item of backlog) {
+      if (cancelRequested) {
+        cancelled = true;
+        break;
+      }
       progress.currentChat = item.chatDisplayName ?? item.chatSourceId;
       const packs = await buildEvidencePacks(repository, {
         chatSourceId: item.chatSourceId,
@@ -162,6 +183,10 @@ async function executeRun(
       chats: progress.processedChats,
       modelCalls: progress.modelCalls
     };
+    if (cancelled) {
+      await repository.failBrainRun(runId, "interrupted", "Run cancelled; committed episodes and coverage are kept, remaining backlog stays pending.");
+      return "interrupted";
+    }
     if (budgetExhausted) {
       await repository.failBrainRun(runId, "budget_exceeded", "Model-call budget for this run was reached; remaining backlog stays pending.");
       return "budget_exceeded";

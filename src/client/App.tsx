@@ -655,10 +655,10 @@ export function App() {
     }
   }
 
-  async function handleStartBrainRun(body: { mode: "model" | "extractive"; model?: string | null }) {
+  async function handleStartBrainRun(body: { mode: "model" | "extractive"; model?: string | null; maxChats?: number }) {
     setError(null);
     try {
-      const response = await startBrainRun({ ...body, maxChats: 10 });
+      const response = await startBrainRun({ ...body, maxChats: body.maxChats ?? 10 });
       setBrainRun(response.progress);
       setNotice("Brain run started — progress shows below and in the Brain panel.");
     } catch (err) {
@@ -1638,12 +1638,15 @@ function BrainPanel({
     provider?: Exclude<BrainProviderName, "extractive">;
     model?: string;
   }) => void;
-  onRun: (body: { mode: "model" | "extractive"; model?: string | null }) => void;
+  onRun: (body: { mode: "model" | "extractive"; model?: string | null; maxChats?: number }) => void;
   onSetOwner: (displayName: string | null) => void;
   onReset: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const [ownerDraft, setOwnerDraft] = useState("");
+  // How many backlog chats one Run drains — small for a quick test, larger to
+  // catch up. Model runs still stop at the daily/hourly budget regardless.
+  const [chatsToRun, setChatsToRun] = useState(3);
   const provider = overview?.provider;
   const runDue = Boolean(overview?.scheduler.runDue);
   const running = run?.state === "running";
@@ -1762,6 +1765,17 @@ function BrainPanel({
                 Probe
               </button>
             )}
+            <label title="How many backlog chats this run assimilates (newest first). Keep it small for a quick test.">
+              <span>Chats</span>
+              <input
+                type="number"
+                min={1}
+                max={5000}
+                value={chatsToRun}
+                disabled={Boolean(busy) || running}
+                onChange={(event) => setChatsToRun(Math.max(1, Math.min(5000, Number(event.target.value) || 1)))}
+              />
+            </label>
             <button
               className="primaryButton"
               type="button"
@@ -1769,14 +1783,14 @@ function BrainPanel({
               onClick={() =>
                 onRun(
                   provider && provider.provider !== "extractive"
-                    ? { mode: "model", model: provider.model }
-                    : { mode: "extractive" }
+                    ? { mode: "model", model: provider.model, maxChats: chatsToRun }
+                    : { mode: "extractive", maxChats: chatsToRun }
                 )
               }
               title={
                 provider && provider.provider !== "extractive"
-                  ? `Assimilate the top backlog chats with ${provider.provider}/${provider.model}`
-                  : "Assimilate with extractive placeholders (no model calls; regenerable later)"
+                  ? `Assimilate the top ${chatsToRun} backlog chat(s) with ${provider.provider}/${provider.model} (stops at your daily/hourly budget)`
+                  : `Assimilate the top ${chatsToRun} backlog chat(s) with extractive placeholders (no model calls; regenerable later)`
               }
             >
               {running ? <Loader2 className="spin" size={16} /> : <Play size={16} />}

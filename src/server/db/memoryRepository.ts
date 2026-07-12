@@ -94,6 +94,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
   private brainRuns = new Map<string, BrainRunSummary>();
   private brainLedger: Array<{ purpose: string; provider: string; inputTokens: number; outputTokens: number; atMs: number }> = [];
   private brainEpisodes = new Map<string, BrainEpisodeRecord>();
+  private brainLockRunId: string | null = null;
   private editRevisions = new Map<string, MessageEditRevisionRecord[]>();
   private nextMediaQueueId = 1;
   private nextMediaAssetId = 1;
@@ -763,12 +764,14 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     });
     let applied = 0;
     let pending = 0;
+    const changedKeys: string[] = [];
     for (const update of updates) {
       const message = this.messages.get(update.sourceMessageKey) ?? this.findUpdateTarget(update);
       if (message) {
         if (update.updateType === "delete") {
           // Tombstone only: held content stays (backup-store semantics).
           message.isDeleted = true;
+          changedKeys.push(message.sourceMessageKey);
         }
         if (update.updateType === "edit" && typeof update.metadata?.body === "string") {
           if (message.body != null && message.body !== update.metadata.body) {
@@ -784,6 +787,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
           }
           message.body = update.metadata.body;
           message.rawMetadata = { ...(message.rawMetadata ?? {}), edited: 1 };
+          changedKeys.push(message.sourceMessageKey);
         }
         if (update.updateType === "poll_vote" || update.updateType === "event_response") {
           const merged = mergeInteractionMetadata(message.rawMetadata ?? {}, update);
@@ -798,6 +802,8 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       const existing = this.liveUpdates.get(update.eventKey);
       this.liveUpdates.set(update.eventKey, { ...update, applied: Boolean(message) || Boolean(existing?.applied) });
     }
+    // Staleness propagation: edits/deletes of cited messages invalidate episodes.
+    await this.markStaleEpisodesForMessages(changedKeys);
     return { applied, pending };
   }
 
@@ -926,6 +932,8 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       entry.status = "stored";
       entry.thumbnail = null;
       entry.lastError = null;
+      // Media landing upgrades interpretation; episodes citing it go stale.
+      await this.markStaleEpisodesForMessages([entry.messageKey]);
     }
     return assetId;
   }
@@ -1595,12 +1603,31 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     }
   }
 
+  async getBrainRun(runId: string): Promise<BrainRunSummary | null> {
+    const run = this.brainRuns.get(runId);
+    return run ? structuredClone(run) : null;
+  }
+
   async failBrainRun(runId: string, status: "failed" | "interrupted" | "budget_exceeded", message: string): Promise<void> {
     const run = this.brainRuns.get(runId);
     if (run) {
       run.status = status;
       run.finishedAt = new Date().toISOString();
       run.errorMessage = message;
+    }
+  }
+
+  async tryAcquireBrainLock(runId: string): Promise<boolean> {
+    if (this.brainLockRunId && this.brainLockRunId !== runId) {
+      return false;
+    }
+    this.brainLockRunId = runId;
+    return true;
+  }
+
+  async releaseBrainLock(runId: string): Promise<void> {
+    if (this.brainLockRunId === runId) {
+      this.brainLockRunId = null;
     }
   }
 
@@ -1653,6 +1680,12 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       if (!chat || key === chat) {
         this.brainWatermarks.delete(key);
         watermarks += 1;
+      }
+    }
+    // Clear the work queue too so no stale task resurrects derived data.
+    for (const [dedupeKey, task] of [...this.brainTasks.entries()]) {
+      if (!chat || task.chatSourceId === chat) {
+        this.brainTasks.delete(dedupeKey);
       }
     }
     return { episodeIds, watermarks };
@@ -1709,6 +1742,35 @@ export class MemoryArchiveRepository implements ArchiveRepository {
         .sort((a, b) => b.endAtMs - a.endAtMs)
         .slice(0, options.limit)
     );
+  }
+
+  async markStaleEpisodesForMessages(sourceMessageKeys: string[]): Promise<number> {
+    const keys = new Set(sourceMessageKeys.filter((key) => typeof key === "string" && key.length > 0));
+    if (keys.size === 0) {
+      return 0;
+    }
+    const tasks: BrainTaskInput[] = [];
+    let marked = 0;
+    for (const episode of this.brainEpisodes.values()) {
+      if (episode.status !== "current") {
+        continue;
+      }
+      const cited = episode.claims.some((claim) => claim.citations.some((citation) => keys.has(citation.sourceMessageKey)));
+      if (!cited) {
+        continue;
+      }
+      episode.status = "stale";
+      marked += 1;
+      tasks.push({
+        kind: "episode",
+        chatSourceId: episode.chatSourceId,
+        payload: { chatSourceId: episode.chatSourceId, sinceMs: episode.startAtMs, throughMs: episode.endAtMs, regen: true, episodeId: episode.id },
+        dedupeKey: `regen:${episode.id}`,
+        priority: 1_000
+      });
+    }
+    await this.enqueueBrainTasks(tasks);
+    return marked;
   }
 
   async getMemoryStatus(provider: MemoryProviderStatus): Promise<MemoryStatusSummary> {

@@ -36,6 +36,10 @@ export interface LiveMaintainerCallbacks {
   // these chats — lets open threads flip queued → downloading → rendered media
   // without a reload.
   onMediaChanged?: (chatSourceIds: string[]) => void | Promise<void>;
+  // The last recovery-tick pass: brain assimilation. Self-guards (no-op unless
+  // scheduling is auto) and holds its own `brain` job lock; wired to the brain
+  // scheduler in server.ts so live/ stays decoupled from brain/.
+  runBrainPass?: () => Promise<void>;
 }
 
 export class LiveMaintainer {
@@ -198,6 +202,16 @@ export class LiveMaintainer {
       await this.runSecretsPass();
       // Media runs last on the tick so gap recovery and secrets never wait.
       await this.runMediaDownloadPass();
+      // Brain assimilation runs after media — the lowest-priority pass, so it
+      // can never starve gap/identity/secrets/media. Its own errors stay inside
+      // the brain (never inflate live-sync warnings).
+      if (this.callbacks.runBrainPass) {
+        try {
+          await this.callbacks.runBrainPass();
+        } catch (error) {
+          console.error(`[brain] auto pass failed: ${error instanceof Error ? error.message.slice(0, 200) : "unknown error"}`);
+        }
+      }
     } catch (error) {
       this.totals = { ...this.totals, warnings: this.totals.warnings + 1 };
       await configuredTraceRecorder?.record("live.recovery_tick_failed", {
