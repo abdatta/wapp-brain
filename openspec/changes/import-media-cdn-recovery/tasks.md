@@ -24,7 +24,7 @@
 
 ## 5. Tests
 
-- [ ] 5.1 Parser: from a modern `message_media` fixture with descriptor columns, a descriptor is attached for a file-less row with `media_key`, not attached when `file_path` is present, and not attached when `media_key` is absent
+- [x] 5.1 Parser: from a modern `message_media` fixture with descriptor columns, a descriptor is attached for a file-less row with `media_key`, not attached when `file_path` is present, and not attached when `media_key` is absent
 - [x] 5.2 Backfill: no-local-match + descriptor enqueues (deduped) via `enqueueMediaDownloads`; no-descriptor stays unrecoverable; summary reports archived/queued/unrecoverable; import never aborts on enqueue failure
 - [x] 5.3 Availability parity: an enqueued file-less message reads `pending`, a keyless file-less message reads import-missing — asserted against both the sqlite and memory repositories
 - [x] 5.4 Interpretation: the import-missing reason is the honest "never saved on your phone" text, and the old folder wording is not produced

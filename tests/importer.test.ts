@@ -642,6 +642,147 @@ describe("msgstore LID identity resolution", () => {
   });
 });
 
+describe("msgstore media CDN descriptor parsing", () => {
+  it("attaches a download descriptor only to file-less media rows that carry a media key", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-media-descriptor-"));
+    try {
+      const msgstorePath = path.join(tempDir, "msgstore-media.db");
+      const mediaKey = randomBytes(32);
+      createMediaDescriptorMsgstoreDb(msgstorePath, mediaKey);
+      const db = new Database(msgstorePath, { readonly: true });
+      try {
+        const parsed = parseWhatsAppSource(db);
+        const refs = [...parsed.iterateMediaRefs()];
+        expect(refs.map((ref) => ref.sourceMessageId).sort()).toEqual(["IMG-KEYLESS", "IMG-LOCAL", "IMG-RECOVER"]);
+
+        // File-less + media_key → full recovery descriptor for the queue.
+        const recoverable = refs.find((ref) => ref.sourceMessageId === "IMG-RECOVER");
+        expect(recoverable?.filePath).toBeNull();
+        const descriptor = recoverable?.downloadDescriptor;
+        expect(descriptor).toBeTruthy();
+        expect(descriptor?.mediaType).toBe("image");
+        expect(descriptor?.mediaKey).toBe(mediaKey.toString("base64"));
+        expect(descriptor?.directPath).toBe("/v/t62.7118-24/recover");
+        expect(descriptor?.fileEncSha256).toBe("enc-hash-b64");
+        expect(descriptor?.fileLength).toBe(23456);
+        expect(descriptor?.retryKey).toEqual({
+          remoteJid: "15550000001@s.whatsapp.net",
+          id: "IMG-RECOVER",
+          fromMe: false,
+          participant: "15550000001@s.whatsapp.net"
+        });
+
+        // A recorded local file wins — never queue what the folder can supply.
+        const local = refs.find((ref) => ref.sourceMessageId === "IMG-LOCAL");
+        expect(local?.filePath).toBe("Media/WhatsApp Images/IMG-LOCAL.jpg");
+        expect(local?.downloadDescriptor).toBeNull();
+
+        // No media_key → genuinely unrecoverable, no descriptor.
+        const keyless = refs.find((ref) => ref.sourceMessageId === "IMG-KEYLESS");
+        expect(keyless?.filePath).toBeNull();
+        expect(keyless?.downloadDescriptor).toBeNull();
+      } finally {
+        db.close();
+      }
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// Modern msgstore schema with a message_media table carrying the CDN descriptor
+// columns: one recoverable file-less row (media_key, no file_path), one row with
+// a local file, and one keyless file-less row.
+function createMediaDescriptorMsgstoreDb(filePath: string, mediaKey: Buffer): void {
+  const db = new Database(filePath);
+  try {
+    db.exec(`
+      CREATE TABLE jid (
+        _id INTEGER PRIMARY KEY,
+        raw_string TEXT,
+        user TEXT,
+        server TEXT
+      );
+
+      CREATE TABLE chat (
+        _id INTEGER PRIMARY KEY,
+        jid_row_id INTEGER NOT NULL,
+        subject TEXT,
+        display_name TEXT,
+        sort_timestamp INTEGER
+      );
+
+      CREATE TABLE message (
+        _id INTEGER PRIMARY KEY,
+        chat_row_id INTEGER NOT NULL,
+        sender_jid_row_id INTEGER,
+        from_me INTEGER NOT NULL,
+        key_id TEXT NOT NULL,
+        timestamp INTEGER,
+        message_type INTEGER,
+        status INTEGER,
+        starred INTEGER,
+        forwarded INTEGER
+      );
+
+      CREATE TABLE message_media (
+        message_row_id INTEGER PRIMARY KEY,
+        file_path TEXT,
+        file_size INTEGER,
+        mime_type TEXT,
+        media_name TEXT,
+        file_hash TEXT,
+        width INTEGER,
+        height INTEGER,
+        media_duration INTEGER,
+        media_key BLOB,
+        enc_file_hash TEXT,
+        direct_path TEXT,
+        message_url TEXT,
+        media_key_timestamp INTEGER,
+        file_length INTEGER
+      );
+    `);
+    db.prepare("INSERT INTO jid (_id, raw_string, user, server) VALUES (?, ?, ?, ?)").run(
+      1,
+      "15550000001@s.whatsapp.net",
+      "15550000001",
+      "s.whatsapp.net"
+    );
+    db.prepare("INSERT INTO chat (_id, jid_row_id, subject, display_name, sort_timestamp) VALUES (?, ?, ?, ?, ?)").run(
+      10,
+      1,
+      null,
+      null,
+      1711000002000
+    );
+    const insertMessage = db.prepare(`
+      INSERT INTO message (_id, chat_row_id, sender_jid_row_id, from_me, key_id, timestamp, message_type, status, starred, forwarded)
+      VALUES (?, ?, ?, ?, ?, ?, 1, 0, 0, 0)
+    `);
+    const insertMedia = db.prepare(`
+      INSERT INTO message_media (
+        message_row_id, file_path, file_size, mime_type, media_name, file_hash, width, height, media_duration,
+        media_key, enc_file_hash, direct_path, message_url, media_key_timestamp, file_length
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    // Recoverable: no local file, but the full CDN descriptor survives.
+    insertMessage.run(100, 10, 1, 0, "IMG-RECOVER", 1711000001000);
+    insertMedia.run(100, null, null, "image/jpeg", "recover.jpg", "plain-hash-b64", 640, 480, null, mediaKey, "enc-hash-b64", "/v/t62.7118-24/recover", "https://mmg.whatsapp.net/recover", 1711000000, 23456);
+
+    // Local file present: descriptor columns exist but must not be attached.
+    insertMessage.run(101, 10, 1, 0, "IMG-LOCAL", 1711000002000);
+    insertMedia.run(101, "Media/WhatsApp Images/IMG-LOCAL.jpg", 34567, "image/jpeg", "local.jpg", "local-hash-b64", 640, 480, null, mediaKey, "enc-hash-b64", "/v/t62.7118-24/local", null, 1711000000, 34567);
+
+    // Keyless: nothing to decrypt with — honestly unrecoverable.
+    insertMessage.run(102, 10, 1, 0, "IMG-KEYLESS", 1711000003000);
+    insertMedia.run(102, null, null, "image/jpeg", "gone.jpg", null, null, null, null, null, null, null, null, null, null);
+  } finally {
+    db.close();
+  }
+}
+
 // Modern msgstore schema plus the LID identity tables (jid_map, lid_display_name).
 // jid row 2 is a LID mapped to the phone row 1; jid row 3 is a LID the phone can
 // name but not map — the two coverage classes measured on the real archive.
