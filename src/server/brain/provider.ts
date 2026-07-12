@@ -295,7 +295,14 @@ async function generateWithHealthTracking(
 
 // --- claude-cli adapter ---
 
-export function claudeCliInvocation(model?: string): { command: string; args: string[] } {
+// wsl.exe's stdin relay drops with a connection error (Wsl/Service/0x8007274c,
+// UTF-16 text on stdout) when a multi-kilobyte prompt is written and the pipe
+// closed before the relay socket is up — tiny probe prompts squeak through,
+// real episode prompts never arrive. bash therefore announces readiness on
+// stderr and runChildProcess holds the prompt until the marker is seen.
+const WSL_STDIN_READY_MARKER = "__WAPP_BRAIN_STDIN_READY__";
+
+export function claudeCliInvocation(model?: string): { command: string; args: string[]; stdinReadyMarker?: string } {
   const cliArgs = ["-p", "--output-format", "json", "--max-turns", "1"];
   if (model) {
     // Sanitized upstream: plain token characters only, safe inside the WSL
@@ -309,10 +316,17 @@ export function claudeCliInvocation(model?: string): { command: string; args: st
     const [command, ...leading] = native.split(/\s+/);
     return { command, args: [...leading, ...cliArgs] };
   }
-  // WSL bridge: sandbox cwd inside WSL, login shell for PATH, prompt on stdin.
+  // WSL bridge: sandbox cwd inside WSL, login shell for PATH, prompt on stdin
+  // only after the readiness marker (see WSL_STDIN_READY_MARKER above).
   return {
     command: "wsl.exe",
-    args: ["-e", "bash", "-lc", `mkdir -p ~/.wapp-brain-sandbox && cd ~/.wapp-brain-sandbox && claude ${cliArgs.join(" ")}`]
+    args: [
+      "-e",
+      "bash",
+      "-lc",
+      `echo ${WSL_STDIN_READY_MARKER} >&2; mkdir -p ~/.wapp-brain-sandbox && cd ~/.wapp-brain-sandbox && claude ${cliArgs.join(" ")}`
+    ],
+    stdinReadyMarker: WSL_STDIN_READY_MARKER
   };
 }
 
@@ -326,9 +340,9 @@ interface ClaudeCliEnvelope {
 }
 
 async function generateWithClaudeCli(request: BrainGenerationRequest, model: string): Promise<BrainGenerationResult> {
-  const { command, args } = claudeCliInvocation(model);
+  const { command, args, stdinReadyMarker } = claudeCliInvocation(model);
   const prompt = `${request.system}\n\n---\n\n${request.user}\n\nRespond with ONLY the JSON object described above — no prose, no markdown fences. Keep the response under ${request.maxOutputTokens} tokens.`;
-  const output = await runChildProcess(command, args, prompt, request.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const output = await runChildProcess(command, args, prompt, request.timeoutMs ?? DEFAULT_TIMEOUT_MS, stdinReadyMarker);
   // The CLI exits non-zero for platform errors but still writes an envelope
   // whose `result` carries the human-readable reason (quota, auth, rate
   // limit). Parse the envelope FIRST so the real reason reaches health
@@ -444,13 +458,23 @@ function runChildProcess(
   command: string,
   args: string[],
   stdin: string,
-  timeoutMs: number
+  timeoutMs: number,
+  stdinReadyMarker?: string
 ): Promise<{ stdout: string; code: number; stderrHint: string }> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
     let stdout = "";
     let stderr = "";
     let settled = false;
+    let stdinSent = false;
+    const sendStdin = () => {
+      if (stdinSent) {
+        return;
+      }
+      stdinSent = true;
+      child.stdin.write(stdin);
+      child.stdin.end();
+    };
     const timer = setTimeout(() => {
       if (!settled) {
         settled = true;
@@ -466,6 +490,9 @@ function runChildProcess(
     child.stderr.on("data", (chunk: Buffer) => {
       if (stderr.length < 4096) {
         stderr += chunk.toString("utf8");
+      }
+      if (stdinReadyMarker && stderr.includes(stdinReadyMarker)) {
+        sendStdin();
       }
     });
     child.on("error", (error) => {
@@ -484,10 +511,17 @@ function runChildProcess(
       // stderr may carry PATH/auth hints but never prompt content; keep it
       // short. Callers decide how to interpret non-zero exits because the CLI
       // often writes a diagnostic envelope to stdout alongside them.
-      resolve({ stdout, code: code ?? -1, stderrHint: stderr.split("\n")[0]?.slice(0, 160) ?? "" });
+      const hint =
+        stderr
+          .split("\n")
+          .map((line) => line.trim())
+          .filter((line) => line.length > 0 && line !== stdinReadyMarker)[0]
+          ?.slice(0, 160) ?? "";
+      resolve({ stdout, code: code ?? -1, stderrHint: hint });
     });
-    child.stdin.write(stdin);
-    child.stdin.end();
+    if (!stdinReadyMarker) {
+      sendStdin();
+    }
   });
 }
 
