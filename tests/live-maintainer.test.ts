@@ -12,7 +12,7 @@ import { assertLiveBaselineExists, getLiveBaselineSummary } from "../src/server/
 import { getLiveDependencyStatus, isSafeBaileysVersion } from "../src/server/live/dependency";
 import { LiveMaintainer } from "../src/server/live/maintainer";
 import { messageIdFromKey, messageKey } from "../src/server/identity/keys";
-import { normalizeBaileysMessage, normalizeBaileysMessagesWithJidResolver } from "../src/server/live/normalize";
+import { capturedMediaFromBaileysMessage, normalizeBaileysMessage, normalizeBaileysMessagesWithJidResolver } from "../src/server/live/normalize";
 import { recoverDueGaps } from "../src/server/live/recovery";
 import type {
   LiveConnectionUpdate,
@@ -632,6 +632,36 @@ describe("live WhatsApp maintainer", () => {
     expect(docWithCaption?.messageType).toBe("document");
     expect(docWithCaption?.caption).toBe("the contract");
     expect(docWithCaption?.mediaName).toBe("contract.pdf");
+  });
+
+  it("types GIF-picker videos as gif, matching the backup importer's vocabulary", () => {
+    const gif = normalizeBaileysMessage(
+      {
+        key: { remoteJid: "wrap@s.whatsapp.net", id: "GIF1", fromMe: false },
+        messageTimestamp: 1712000003,
+        message: { videoMessage: { mimetype: "video/mp4", gifPlayback: true } }
+      },
+      "wa-web:messages.upsert"
+    );
+    const plainVideo = normalizeBaileysMessage(
+      {
+        key: { remoteJid: "wrap@s.whatsapp.net", id: "VID1", fromMe: false },
+        messageTimestamp: 1712000004,
+        message: { videoMessage: { mimetype: "video/mp4" } }
+      },
+      "wa-web:messages.upsert"
+    );
+
+    expect(gif?.messageType).toBe("gif");
+    expect(gif?.hasMedia).toBe(true);
+    expect(plainVideo?.messageType).toBe("video");
+    // The download descriptor keeps mediaType "video" either way — Baileys
+    // derives the decrypt key from it, and gifs are videos on the wire.
+    const captured = capturedMediaFromBaileysMessage({
+      key: { remoteJid: "wrap@s.whatsapp.net", id: "GIF1", fromMe: false },
+      message: { videoMessage: { mimetype: "video/mp4", gifPlayback: true, mediaKey: new Uint8Array([1, 2, 3]), directPath: "/v/t62/gif" } }
+    });
+    expect(captured?.descriptor.mediaType).toBe("video");
   });
 
   it("applies revokes written from the sender's perspective to the archived original", async () => {

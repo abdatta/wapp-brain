@@ -1019,7 +1019,12 @@ function detectMessageType(content: Record<string, unknown> | null): string {
   if (!content) return "unknown";
   if (content.conversation || content.extendedTextMessage) return "text";
   if (content.imageMessage) return "image";
-  if (content.videoMessage) return "video";
+  // GIF-picker sends are videoMessages with gifPlayback set; the backup
+  // importer types those "gif" (msgstore code 13), so live must match. The
+  // media DESCRIPTOR keeps mediaType "video" — Baileys key derivation needs it.
+  if (content.videoMessage) {
+    return (content.videoMessage as { gifPlayback?: boolean }).gifPlayback === true ? "gif" : "video";
+  }
   if (content.audioMessage) return "audio";
   if (content.documentMessage) return "document";
   if (content.stickerMessage) return "sticker";
