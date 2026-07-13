@@ -52,7 +52,7 @@ export function ContactsPage() {
   }
 
   return (
-    <div className="contactsPage toolPage">
+    <div className="contactsPage">
       <div className="toolHeader">
         <span className="eyebrow">Contacts</span>
         <p>Resolve phone-number contacts to names. Everything stays in your local archive.</p>

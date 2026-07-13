@@ -346,7 +346,7 @@ function LivePanel({
   onUnlink: () => void;
 }) {
   const live = status?.live;
-  const [livePanelOpen, setLivePanelOpen] = useState(false);
+  const [livePanelOpen, setLivePanelOpen] = useState(true);
   const setup = status?.setup;
   const state = setup?.state ?? "empty_archive";
   const baselineReady = Boolean(live?.baseline.ready);
@@ -515,7 +515,7 @@ function BrainPanel({
   onSetOwner: (displayName: string | null) => void;
   onReset: () => void;
 }) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(true);
   const [ownerDraft, setOwnerDraft] = useState("");
   // How many backlog chats one Run drains — small for a quick test, larger to
   // catch up. Model runs still stop at the daily/hourly budget regardless.
@@ -1690,7 +1690,7 @@ function StatusPanel({
   onCleanup: () => void;
 }) {
   const latest = status?.latestImport;
-  const [statusPanelOpen, setStatusPanelOpen] = useState(false);
+  const [statusPanelOpen, setStatusPanelOpen] = useState(true);
   return (
     <section className={`statusPanel ${statusPanelOpen ? "" : "collapsed"}`}>
       <button className="panelToggle" type="button" aria-expanded={statusPanelOpen} onClick={() => setStatusPanelOpen((current) => !current)}>
