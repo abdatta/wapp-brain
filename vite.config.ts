@@ -1,7 +1,8 @@
 import react from "@vitejs/plugin-react";
-import path from "node:path";
 import { defineConfig } from "vite";
 
+// Single-page app: one `index.html` entry mounts the router. The former
+// `wa-contacts.html` entry folded into the `/contacts` route.
 export default defineConfig({
   plugins: [react()],
   server: {
@@ -16,13 +17,5 @@ export default defineConfig({
     host: "127.0.0.1",
     port: 5900,
     strictPort: true
-  },
-  build: {
-    rollupOptions: {
-      input: {
-        main: path.resolve(__dirname, "index.html"),
-        waContacts: path.resolve(__dirname, "wa-contacts.html")
-      }
-    }
   }
 });
