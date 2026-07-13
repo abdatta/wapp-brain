@@ -1,0 +1,23 @@
+# Normalize line endings across platforms (WSL + Windows).
+# All text files are stored as LF in the repo and checked out as LF everywhere,
+# so the working tree matches the blobs regardless of each machine's core.autocrlf.
+* text=auto eol=lf
+
+# Known binary types: never apply line-ending conversion.
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.gif    binary
+*.ico    binary
+*.webp   binary
+*.pdf    binary
+*.zip    binary
+*.gz     binary
+*.tar    binary
+*.db     binary
+*.sqlite binary
+*.crypt15 binary
+*.woff   binary
+*.woff2  binary
+*.ttf    binary
+*.eot    binary
