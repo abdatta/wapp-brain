@@ -8,33 +8,33 @@
 
 ## Change Inventory
 
-| # | Change | Model | Status | Hard dependencies | Checkpoint (gate) |
-|---|--------|-------|--------|-------------------|-------------------|
-| 0 | `build-the-brain` (narrowed) | Opus | **archived 2026-07-12** | — (ops-spine remainder paired naturally with #3) | gates 2.7 / 3.8 passed live (scheduler, catch-up, crash-resume, staleness); archived to `archive/2026-07-12-build-the-brain` |
-| 1 | `brain-correctness-debts` | Opus | **archived 2026-07-12** | — | compound-cursor watermark, merge rekey, run honesty, startup probe, real usage — shipped; gates 11.1/11.3 test-covered, 11.2 verified live; archived to `archive/2026-07-12-brain-correctness-debts` |
-| 2 | `evidence-pack-fidelity` | Opus | **archived 2026-07-13** | — (#1 recommended first) | reactions/replies/forwards/number-labels visible in a real episode; week-bounded quiet-chat packs |
-| 3 | `episode-contract-v2` | **Fable** | seeded | #1, #2 | wipe + assimilate 2–3 chats: entities, absolute dates, hedges in claims; salvageable weak-model JSON |
-| 4 | `identity-late-resolution` | Opus | seeded | #3, #20 | save a contact → old episodes + search repair with zero model calls |
-| 5 | `two-level-person-model` | **Fable** | seeded | #3 | same-name stays separate; Google same-contact auto-connects; disconnect re-derives, zero episode changes |
-| 6 | `people-management-ui` | Sonnet | seeded | #4, #5, #19 | ranked hygiene queue; dismissed pair stays dismissed |
-| 7 | `brain-eval-harness` | Opus | seeded | #3 | recall table + per-model precision/fallback tables on the real archive |
-| 8 | `retrieval-hardening` | Opus | seeded | — (#7 soft, to measure delta; rename hook shared with #4) | typo'd query returns labelled relaxed results; "nhi" finds "nahi"; renamed contact searchable |
-| 9 | `knowledge-graph-foundation` | Opus | seeded | #3, #5 | nodes/edges from claim entities; open commitment survives salience recompute |
-| 10 | `commitment-lifecycle` | **Fable** | seeded | #2, #3, #9 | promise → reaction-acknowledged → cited closure; overdue flagged |
-| 11 | `semantic-rollups` | **Fable** | seeded | #9, #10 (adjacent) | coherent cited entity pages; undeclared claim-drop refused; mechanical rollback |
-| 12 | `brain-retrieval-pipeline` | **Fable** | seeded | #8, #9, #11, #19 (query-panel UI) | zero-keyword paraphrase recovered in deep mode; coverage verdict + gap sentences; one-call week summary |
-| 13 | `mcp-agent-surface` | Opus | seeded | #5, #12 | Haiku-class client answers cited in ≤2 calls via `brain_ask`; attributed agent spend |
-| 14 | `historical-backfill` | Opus | seeded | #0 (spine), #3, #4, #7 | kill-resume clean; coverage climbing; named budget stops |
-| 15 | `memory-teardown-and-docs` | Sonnet | seeded | #12, #13 | no `memory_*` remnants; docs match reality; full suite green |
-| 16 | `native-import-picker` | Sonnet | **archived 2026-07-11** | — (independent of the brain chain) | gate 9.1 passed; archived to `archive/2026-07-11-native-import-picker` |
-| 17 | `import-media-cdn-recovery` | Sonnet | **archived 2026-07-12** | — (independent) | gates 6.1/6.2 passed on the real archive; archived to `archive/2026-07-12-import-media-cdn-recovery` |
-| 18 | `complete-media-archival` | Sonnet | **archived 2026-07-12** | — (independent; richer media improves evidence interpretation labels, no blocker either way) | gates 11.1/11.3–11.5 passed live with a real sender; archived to `archive/2026-07-12-complete-media-archival` |
-| 19 | `client-route-architecture` | Opus | **archived 2026-07-13** | — (pure client refactor; soft: before #7's grading strip, #13's grants UI, #14's dashboard) | every surface at its own URL, reload-safe; search deep links navigate routes; App.tsx reduced to a shell |
-| 20 | `demask-contact-labels` | Opus | proposed | — (independent of the brain chain; builds on the archived `identity-and-naming-integrity` capability) | masked-name counts on `contacts`/`chats` → ~0; former `+91∙∙∙∙∙∙∙∙86` senders read as full `+E.164` numbers in search + thread view; a re-assimilated chat's claims carry full numbers/names, no `∙` masks |
+|  | # | Change | Model | Status | Hard dependencies | Checkpoint (gate) |
+|---|---|--------|-------|--------|-------------------|-------------------|
+| ✅ | 0 | `build-the-brain` (narrowed) | Opus | **archived 2026-07-12** | — (ops-spine remainder paired naturally with #3) | gates 2.7 / 3.8 passed live (scheduler, catch-up, crash-resume, staleness); archived to `archive/2026-07-12-build-the-brain` |
+| ✅ | 1 | `brain-correctness-debts` | Opus | **archived 2026-07-12** | — | compound-cursor watermark, merge rekey, run honesty, startup probe, real usage — shipped; gates 11.1/11.3 test-covered, 11.2 verified live; archived to `archive/2026-07-12-brain-correctness-debts` |
+| ✅ | 2 | `evidence-pack-fidelity` | Opus | **archived 2026-07-13** | — (#1 recommended first) | reactions/replies/forwards/number-labels visible in a real episode; week-bounded quiet-chat packs |
+|  | 3 | `episode-contract-v2` | **Fable** | seeded | #1, #2 | wipe + assimilate 2–3 chats: entities, absolute dates, hedges in claims; salvageable weak-model JSON |
+|  | 4 | `identity-late-resolution` | Opus | seeded | #3, #20 | save a contact → old episodes + search repair with zero model calls |
+|  | 5 | `two-level-person-model` | **Fable** | seeded | #3 | same-name stays separate; Google same-contact auto-connects; disconnect re-derives, zero episode changes |
+|  | 6 | `people-management-ui` | Sonnet | seeded | #4, #5, #19 | ranked hygiene queue; dismissed pair stays dismissed |
+|  | 7 | `brain-eval-harness` | Opus | seeded | #3 | recall table + per-model precision/fallback tables on the real archive |
+|  | 8 | `retrieval-hardening` | Opus | seeded | — (#7 soft, to measure delta; rename hook shared with #4) | typo'd query returns labelled relaxed results; "nhi" finds "nahi"; renamed contact searchable |
+|  | 9 | `knowledge-graph-foundation` | Opus | seeded | #3, #5 | nodes/edges from claim entities; open commitment survives salience recompute |
+|  | 10 | `commitment-lifecycle` | **Fable** | seeded | #2, #3, #9 | promise → reaction-acknowledged → cited closure; overdue flagged |
+|  | 11 | `semantic-rollups` | **Fable** | seeded | #9, #10 (adjacent) | coherent cited entity pages; undeclared claim-drop refused; mechanical rollback |
+|  | 12 | `brain-retrieval-pipeline` | **Fable** | seeded | #8, #9, #11, #19 (query-panel UI) | zero-keyword paraphrase recovered in deep mode; coverage verdict + gap sentences; one-call week summary |
+|  | 13 | `mcp-agent-surface` | Opus | seeded | #5, #12 | Haiku-class client answers cited in ≤2 calls via `brain_ask`; attributed agent spend |
+|  | 14 | `historical-backfill` | Opus | seeded | #0 (spine), #3, #4, #7 | kill-resume clean; coverage climbing; named budget stops |
+|  | 15 | `memory-teardown-and-docs` | Sonnet | seeded | #12, #13 | no `memory_*` remnants; docs match reality; full suite green |
+| ✅ | 16 | `native-import-picker` | Sonnet | **archived 2026-07-11** | — (independent of the brain chain) | gate 9.1 passed; archived to `archive/2026-07-11-native-import-picker` |
+| ✅ | 17 | `import-media-cdn-recovery` | Sonnet | **archived 2026-07-12** | — (independent) | gates 6.1/6.2 passed on the real archive; archived to `archive/2026-07-12-import-media-cdn-recovery` |
+| ✅ | 18 | `complete-media-archival` | Sonnet | **archived 2026-07-12** | — (independent; richer media improves evidence interpretation labels, no blocker either way) | gates 11.1/11.3–11.5 passed live with a real sender; archived to `archive/2026-07-12-complete-media-archival` |
+| ✅ | 19 | `client-route-architecture` | Opus | **archived 2026-07-13** | — (pure client refactor; soft: before #7's grading strip, #13's grants UI, #14's dashboard) | every surface at its own URL, reload-safe; search deep links navigate routes; App.tsx reduced to a shell |
+| 📝 | 20 | `demask-contact-labels` | Opus | proposed | — (independent of the brain chain; builds on the archived `identity-and-naming-integrity` capability) | masked-name counts on `contacts`/`chats` → ~0; former `+91∙∙∙∙∙∙∙∙86` senders read as full `+E.164` numbers in search + thread view; a re-assimilated chat's claims carry full numbers/names, no `∙` masks |
 
 **Model column** — the Claude model recommended to drive each change's `/opsx:propose` + implementation session. **Fable** where irreversible design judgment concentrates: #3 (the extraction contract is the system's embedding function — every episode ever written inherits it), #5 (person/identity semantics must be right forever), #10/#11 (lifecycle + anti-rot rollup machinery, the highest-rot vector, designed as a pair), #12 (ranking/fusion/coverage-verdict design — the product surface). **Opus** for everything demanding but well-specified by its proposal (core-transaction surgery, pack building, graph mechanics, refactors). **Sonnet** only where the path is fully paved: CRUD UI over decided tables (#6), deletion + docs (#15), and the three verify-and-archive closeouts (#16–18).
 
-**Status column** — a human-readable projection of each change's lifecycle. The **source of truth is the openspec files/folders** (a change's presence, its artifacts, and whether it lives under `archive/`); this cell is *derived* from them, never hand-stamped: `seeded` (proposal seed only) → `proposed` (`tasks.md` present) → `active` (a task checked) → `**archived YYYY-MM-DD**` (folder under `archive/`). Every lifecycle skill keeps it in sync by running the shared reconciler `npm run roadmap:sync` (`openspec/tools/sync-roadmap-status.mjs`): `/opsx:propose|apply|archive` reconcile right after they change folder state, and `/next-change` reconciles on read as a safety net. It self-corrects manual drift and works identically from Claude or Codex. Run it anytime the table looks stale.
+**Status icon (leading column) & Status column** — a human-readable projection of each change's lifecycle, shown twice: a glyph in the unlabeled leading column that reads like a to-do list filling in left to right, and the same state as a word in the Status column. The four states progress from `seeded` (blank cell — proposal seed only) → `📝 proposed` (`tasks.md` present) → `🔄 active` (a task checked) → `✅ **archived YYYY-MM-DD**` (folder under `archive/`). The **source of truth is the openspec files/folders** (a change's presence, its artifacts, and whether it lives under `archive/`); both cells are *derived* from them, never hand-stamped. Every lifecycle skill keeps them in sync by running the shared reconciler `npm run roadmap:sync` (`openspec/tools/sync-roadmap-status.mjs`), which writes the icon and the word from one derivation so they can't drift: `/opsx:propose|apply|archive` reconcile right after they change folder state, and `/next-change` reconciles on read as a safety net. It self-corrects manual drift and works identically from Claude or Codex. Run it anytime the table looks stale. (Re-theme the glyphs by editing the `ICONS` map in the reconciler and this legend.)
 
 **Definition of done for this roadmap**: every folder under `openspec/changes/` is archived. Each change is `/opsx:archive`d after its checkpoint passes; #16–18 need only their verification gates (plus one test for #17) and can close in Wave A. This file itself is absorbed into the docs pass and retired at #15.
 

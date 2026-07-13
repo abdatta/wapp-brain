@@ -139,7 +139,7 @@ What would you like to do?
 
 **Reconcile the roadmap board (if the project has one)**
 
-Once implementation has begun (a task is checked), keep the roadmap board in sync with the source of truth: if this project exposes the roadmap reconciler (`npm run roadmap:sync`), run it so the ROADMAP.md Status cell derives from folder state (→ `active`). It reads `changes/`/`archive/` (the source of truth) and never hand-stamps, so it self-corrects any drift. Skip silently if the project has no roadmap or reconciler.
+Once implementation has begun (a task is checked), keep the roadmap board in sync with the source of truth: if this project exposes the roadmap reconciler (`npm run roadmap:sync`), run it so the ROADMAP.md status-icon + Status cells derive from folder state (→ leading icon 🔄, Status word `active`). It reads `changes/`/`archive/` (the source of truth) and never hand-stamps, so it self-corrects any drift. Skip silently if the project has no roadmap or reconciler.
 
 **Guardrails**
 - Keep going through tasks until done or blocked

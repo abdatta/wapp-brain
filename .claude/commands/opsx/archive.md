@@ -152,7 +152,7 @@ Target archive directory already exists.
 
 **Reconcile the roadmap board (if the project has one)**
 
-After the archive move succeeds, keep the roadmap board in sync with the source of truth: if this project exposes the roadmap reconciler (`npm run roadmap:sync`), run it so the ROADMAP.md Status cell derives from the archived folder (→ `**archived YYYY-MM-DD**`), and mention in the summary whether it was reconciled. It reads `changes/`/`archive/` (the source of truth) and never hand-stamps, so it self-corrects any drift. Skip silently if the project has no roadmap or reconciler.
+After the archive move succeeds, keep the roadmap board in sync with the source of truth: if this project exposes the roadmap reconciler (`npm run roadmap:sync`), run it so the ROADMAP.md status-icon + Status cells derive from the archived folder (→ leading icon ✅, Status word `**archived YYYY-MM-DD**`), and mention in the summary whether it was reconciled. It reads `changes/`/`archive/` (the source of truth) and never hand-stamps, so it self-corrects any drift. Skip silently if the project has no roadmap or reconciler.
 
 **Guardrails**
 - Always prompt for change selection if not provided

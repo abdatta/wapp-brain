@@ -9,7 +9,7 @@ Answer three questions from the live state of the repo: **what change to do next
 
 ## Workflow
 
-1. **Reconcile, then load the roadmap.** First run `npm run roadmap:sync` (equivalently `node openspec/tools/sync-roadmap-status.mjs`) — a deterministic reconciler that derives each change's Status from folder state (`changes/` + `archive/`) and rewrites only the Status cells, so the board is accurate before you read it. It works identically from any agent (Claude, Codex, or a plain shell) and is idempotent. Then read `openspec/changes/ROADMAP.md` in full: the Change Inventory table (numbers, Model column, hard dependencies, checkpoints), Execution Waves, the Clean Slate & Breaking-Change Sanction, and Standing Principles.
+1. **Reconcile, then load the roadmap.** First run `npm run roadmap:sync` (equivalently `node openspec/tools/sync-roadmap-status.mjs`) — a deterministic reconciler that derives each change's Status from folder state (`changes/` + `archive/`) and rewrites only the leading status-icon cell and the Status word cell (seeded blank, then `📝`/`🔄`/`✅`), so the board is accurate before you read it. It works identically from any agent (Claude, Codex, or a plain shell) and is idempotent. Then read `openspec/changes/ROADMAP.md` in full: the Change Inventory table (numbers, Model column, hard dependencies, checkpoints), Execution Waves, the Clean Slate & Breaking-Change Sanction, and Standing Principles.
 
 2. **Read each candidate's folder for progress detail.** Step 1's reconciler already refreshed the Status cells from folder state (that's the deterministic part — don't re-adjudicate or hand-edit the table), so the coarse state is trustworthy. Read the folders for the detail the table can't carry — task counts, which `- [x]`/`- [ ]` remain, and whether only gate items are left:
    - Archived → folder moved under `openspec/changes/archive/` → **done**.
@@ -35,7 +35,7 @@ Answer three questions from the live state of the repo: **what change to do next
 7. **Report — use EXACTLY this output template.** Formatting rules: every bullet is ONE line (hard limit ~100 chars); no multi-line paragraphs anywhere; bold key at line start; pre-flight items are `- [ ]` checkboxes so the user can tick them off; omit a section entirely if it's empty (except Do next and Pre-flight, which always appear).
 
    ```markdown
-   ## Roadmap — Wave <X> · <N> archived / <N> in progress / <N> seeded
+   ## Roadmap — Wave <X> · ✅ <N> archived / 🔄 <N> in progress / <N> seeded
 
    ## ▶ Do next: `<change-name>` (#<n>)
 
@@ -67,4 +67,4 @@ Answer three questions from the live state of the repo: **what change to do next
 - Never skip re-reading ROADMAP.md and the candidate's proposal — recommendations must reflect the files as they are now.
 - Never recommend starting archive-scale assimilation (backfill, large model runs) unless `episode-contract-v2`, `identity-late-resolution`, and `brain-eval-harness` are all done — this is the roadmap's contract-before-spend gate.
 - If the user asks a narrower question ("what model for X?", "is Y blocked?"), answer just that from the same derivation; don't dump the full briefing.
-- When a change finishes, remind the user to `/opsx:archive` it — the Status cell reconciles automatically from folder state (this skill runs `npm run roadmap:sync` first), so no manual status stamping is needed. The definition of done is every folder under `openspec/changes/` archived.
+- When a change finishes, remind the user to `/opsx:archive` it — the status-icon + Status cells reconcile automatically from folder state (this skill runs `npm run roadmap:sync` first), so no manual status stamping is needed. The definition of done is every folder under `openspec/changes/` archived.
