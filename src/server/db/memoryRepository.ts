@@ -66,7 +66,7 @@ import { messageIdFromKey, messageKey } from "../identity/keys";
 import { applyMentionLabels, appliedMentionLabels, extractMentionDigits, mentionJidCandidates } from "../identity/mentions";
 import { mergeInteractionMetadata } from "./interactions";
 import { interpretMessage } from "../interpretation/messageInterpretation";
-import { normalizeJid } from "../import/jid";
+import { isMaskedNumberLabel, normalizeJid } from "../import/jid";
 import { getMemoryProviderStatus } from "../memory/provider";
 
 export class MemoryArchiveRepository implements ArchiveRepository {
@@ -508,11 +508,15 @@ export class MemoryArchiveRepository implements ArchiveRepository {
         continue;
       }
       const queued = unique.get(sourceJid);
+      // A masked-number placeholder is never a name (mirror the SQLite guard):
+      // coerce it to null so no writer can store it and shadow the number.
+      const mergedDisplayName = queued?.displayName?.trim() || rawContact.displayName || null;
+      const mergedPushName = queued?.pushName?.trim() || rawContact.pushName || null;
       unique.set(sourceJid, {
         ...rawContact,
         sourceJid,
-        displayName: queued?.displayName?.trim() || rawContact.displayName || null,
-        pushName: queued?.pushName?.trim() || rawContact.pushName || null,
+        displayName: mergedDisplayName && !isMaskedNumberLabel(mergedDisplayName) ? mergedDisplayName : null,
+        pushName: mergedPushName && !isMaskedNumberLabel(mergedPushName) ? mergedPushName : null,
         phoneNumber: queued?.phoneNumber || rawContact.phoneNumber || null
       });
     }
@@ -544,7 +548,9 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       const contact = this.contacts.get(jid);
       if (!contact) continue;
       matchedIdentities += 1;
-      if (!contact.displayName || isIdentityDerivedName(contact.displayName, jid)) {
+      // Mirror the SQLite adapter: a masked-number placeholder counts as
+      // no-name, so a learned real name replaces it instead of being shadowed.
+      if (!contact.displayName || isMaskedNumberLabel(contact.displayName) || isIdentityDerivedName(contact.displayName, jid)) {
         contact.displayName = candidate.displayName;
         const chat = this.chats.get(jid);
         if (chat && (chat.chatType === "dm" || chat.chatType === "unknown")) chat.displayName = candidate.displayName;
@@ -560,7 +566,10 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       if (!sourceChatId) {
         continue;
       }
-      const displayName = rawChat.displayName && !isIdentityDerivedName(rawChat.displayName, sourceChatId) ? rawChat.displayName : null;
+      const displayName =
+        rawChat.displayName && !isIdentityDerivedName(rawChat.displayName, sourceChatId) && !isMaskedNumberLabel(rawChat.displayName)
+          ? rawChat.displayName
+          : null;
       const chat = { ...rawChat, sourceChatId, jid: sourceChatId, displayName };
       const existing = this.chats.get(chat.sourceChatId);
       this.chats.set(chat.sourceChatId, {

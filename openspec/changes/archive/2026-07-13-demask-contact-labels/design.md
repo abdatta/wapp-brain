@@ -66,6 +66,14 @@ Nulling a masked LID contact with no number lets it resolve to the spec's explic
 
 - **Trade-off:** those 913 lose the "country + last two digits" hint. Accepted — a masked hint is not a usable identifier, reads worse than an honest unresolved state, and can't be repaired by find-replace. Identity health makes them visible rather than hiding them behind a placeholder.
 
+### D6 — A stored mask is "weak" for name enrichment (self-heal)
+
+Name enrichment (`enrichContactsFromGoogle`) only overwrites a display name it considers *weak*: empty, a prior Google/display-cache fill, or an identity-derived restatement of the number. A masked-number placeholder was none of those, so it was treated as a **strong** saved name and enrichment skipped the contact — a phone-form number that was already in the user's Google Contacts kept rendering `+91∙∙∙∙∙∙∙∙86`. Real case (2026-07-13): the DM `+12136968563` sat nameless despite being saved in Google as "Me US (Mint)", because a Google sync had run while the mask was still stored and read it as a name. Adding `isMaskedNumberLabel(display_name)` to the weak set makes the mask rank as no-name here too, so a learned real name replaces it. The in-memory adapter's equivalent gets the same guard for parity.
+
+- **Why this belongs in demask:** it is the last read site that still treated a mask as a saved name. D2 stopped *writing* masks; D4 *cleared* stored masks; D6 stops a stored mask from *shadowing* a real name during improvement. Same predicate, same thesis.
+- **Why no new re-enrichment scheduler:** the sync already auto-runs on every brain run ([server.ts](../../../src/server/server.ts)), so with D6 the archive self-heals on the next run with no manual step. Proactively re-enriching *every* nameless contact (e.g. caching Google names locally to apply without a re-fetch) is broader identity repair and stays with `identity-late-resolution` (#4); demask deliberately scopes to the precedence fix.
+- **Boundary:** a genuine saved name (`whatsapp_saved`, non-masked, non-identity-derived) stays strong and is never overwritten by enrichment — unit-tested.
+
 ## Risks / Trade-offs
 
 - **False positive: a real name that looks masked** → D1 requires the whole string (minus `+`/spaces) to be digits + mask chars, so any letter disqualifies it; unit-tested against names, real numbers, and names containing digits.

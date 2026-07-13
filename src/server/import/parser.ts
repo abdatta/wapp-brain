@@ -9,7 +9,7 @@ import type {
   MessageSecretRecord,
   ParticipantRecord
 } from "../../shared/types";
-import { inferChatType, normalizeJid, phoneFromJid } from "./jid";
+import { inferChatType, isMaskedNumberLabel, normalizeJid, phoneFromJid } from "./jid";
 import { boolish, directionFromFromMe, isMediaMessageType, messageTypeFromCode, normalizeTimestampMs } from "./messageTypes";
 import {
   columnsFor,
@@ -369,12 +369,15 @@ function readWaContacts(
         identityLinks.push({ lid, pn: jid, source: "wa.db" });
       }
     }
-    const displayName = firstString(row, ["display_name", "wa_name", "notify_name", "given_name", "sort_name"]) ?? null;
+    // A masked-number placeholder (e.g. "+91∙∙∙∙∙∙∙∙86") is WhatsApp's stand-in
+    // for an unsaved contact — never a real name; drop it so it can never enter
+    // the archive as one and shadow the full number we already hold.
+    const displayName = dropMaskedName(firstString(row, ["display_name", "wa_name", "notify_name", "given_name", "sort_name"]));
     const existing = contactMap.get(jid);
     contactMap.set(jid, {
       sourceJid: jid,
       displayName: displayName || existing?.displayName || null,
-      pushName: firstString(row, ["wa_name", "notify_name"]) ?? existing?.pushName ?? null,
+      pushName: dropMaskedName(firstString(row, ["wa_name", "notify_name"])) ?? existing?.pushName ?? null,
       phoneNumber: firstString(row, ["number", "phone_number"]) ?? phoneFromJid(jid),
       rawMetadata: {
         source: "wa_contacts",
@@ -531,7 +534,7 @@ function readModernChats(
     if (!jid) {
       continue;
     }
-    const displayName = firstString(row, ["subject", "display_name"]) ?? contactMap.get(jid)?.displayName ?? null;
+    const displayName = dropMaskedName(firstString(row, ["subject", "display_name"])) ?? contactMap.get(jid)?.displayName ?? null;
     chats.set(jid, {
       sourceChatId: jid,
       jid,
@@ -569,7 +572,7 @@ function readLegacyChats(
     if (!jid) {
       continue;
     }
-    const displayName = firstString(row, ["subject", "display_name"]) ?? contactMap.get(jid)?.displayName ?? null;
+    const displayName = dropMaskedName(firstString(row, ["subject", "display_name"])) ?? contactMap.get(jid)?.displayName ?? null;
     chats.set(jid, {
       sourceChatId: jid,
       jid,
@@ -1361,6 +1364,13 @@ function stringOrNull(value: unknown): string | null {
   }
   const text = String(value);
   return text.length ? text : null;
+}
+
+// A backup-sourced display name, unless it is a masked-number placeholder — in
+// which case it is treated as absent (null), the same as if WhatsApp held no
+// name for the identity.
+function dropMaskedName(value: string | null): string | null {
+  return value && !isMaskedNumberLabel(value) ? value : null;
 }
 
 function addRowWarning(

@@ -72,7 +72,7 @@ import { messageIdFromKey, messageKey } from "../identity/keys";
 import { applyMentionLabels, appliedMentionLabels, extractMentionDigits, mentionJidCandidates } from "../identity/mentions";
 import { mergeInteractionMetadata } from "./interactions";
 import { interpretMessage } from "../interpretation/messageInterpretation";
-import { normalizeJid } from "../import/jid";
+import { displayPhoneFromJid, isMaskedNumberLabel, normalizeJid } from "../import/jid";
 import { getMemoryProviderStatus } from "../memory/provider";
 import { PublicError } from "../privacy";
 import type { ArchiveRepository, ArchiveRestorePoint } from "./repository";
@@ -161,11 +161,29 @@ const MEDIA_STATE_JOINS = `LEFT JOIN media_assets ma
            ON ma.id = (SELECT id FROM media_assets pick WHERE pick.message_key = m.source_message_key ORDER BY pick.id ASC LIMIT 1)
          LEFT JOIN media_download_queue q ON q.message_key = m.source_message_key`;
 
+// The one contact display-label expression, shared by every identity-resolution
+// query so they can never diverge: saved name → push name → the full +E.164
+// number formatted from the stored phone record. Masked-number placeholders are
+// nulled at ingest and by the demask backfill, so this never emits a mask. When
+// only a phone-form JID (no stored number) is known it yields NULL; callers add
+// `?? displayPhoneFromJid(jid)`, which renders +E.164 from the JID, and LID-only
+// identities fall through to the explicit unresolved state. `alias` prefixes the
+// columns (e.g. "c." for a joined contacts row; "" for a bare contacts query).
+function contactLabelSql(alias = ""): string {
+  const phone = `${alias}phone_number`;
+  return `COALESCE(
+                NULLIF(TRIM(COALESCE(${alias}display_name, '')), ''),
+                NULLIF(TRIM(COALESCE(${alias}push_name, '')), ''),
+                CASE WHEN NULLIF(TRIM(COALESCE(${phone}, '')), '') IS NOT NULL
+                     THEN '+' || REPLACE(REPLACE(REPLACE(TRIM(${phone}), '+', ''), ' ', ''), '-', '')
+                     ELSE NULL END)`;
+}
+
 // The full thread-view row projection, shared by offset paging and
 // anchor-centered context windows.
 function messageListSelectSql(whereClause: string, orderClause: string, limitClause: string): string {
   return `SELECT m.id, m.source_message_id,
-                COALESCE(NULLIF(TRIM(COALESCE(c.display_name, '')), ''), NULLIF(TRIM(COALESCE(c.push_name, '')), ''), c.phone_number) AS sender_display_name,
+                ${contactLabelSql("c.")} AS sender_display_name,
                 m.sender_source_jid, m.timestamp_ms, m.sent_at, m.direction, m.message_type, m.body, m.caption,
                 m.has_media, m.media_mime_type, m.media_name, m.is_deleted, m.is_forwarded, m.is_starred,
                 m.source_table,
@@ -967,6 +985,78 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     configureDatabase(this.db);
     ensureSchema(this.db);
     this.initializeIdentityState();
+    this.backfillMaskedContactLabels();
+  }
+
+  // One-time, idempotent cleanup of masked-number placeholders (e.g.
+  // "+91∙∙∙∙∙∙∙∙86") already stored as display names, so existing archives
+  // benefit without a re-import. Only display_name is touched — phone_number,
+  // JIDs, and messages are untouched, so the full number stays derivable and no
+  // archive data is lost. Runs on every startup but is a no-op once clean (the
+  // bounded scan over named rows finds nothing to clear).
+  private backfillMaskedContactLabels(): void {
+    if (this.legacyArchive) {
+      return; // writes are refused on a legacy archive; nothing to migrate yet
+    }
+    const maskedContacts = (
+      this.db
+        .prepare(`SELECT id, source_jid, display_name FROM contacts WHERE display_name IS NOT NULL AND TRIM(display_name) <> ''`)
+        .all() as Array<{ id: number; source_jid: string; display_name: string }>
+    ).filter((row) => isMaskedNumberLabel(row.display_name));
+    const maskedChats = (
+      this.db
+        .prepare(`SELECT id, display_name FROM chats WHERE display_name IS NOT NULL AND TRIM(display_name) <> ''`)
+        .all() as Array<{ id: number; display_name: string }>
+    ).filter((row) => isMaskedNumberLabel(row.display_name));
+    if (maskedContacts.length === 0 && maskedChats.length === 0) {
+      return;
+    }
+    const clearContact = this.db.prepare(`UPDATE contacts SET display_name = NULL, updated_at = ? WHERE id = ?`);
+    const clearChat = this.db.prepare(`UPDATE chats SET display_name = NULL, updated_at = ? WHERE id = ?`);
+    const now = currentIso();
+    // A cleared sender label is embedded in messages.resolved_text (the search
+    // index), so those messages must be recomputed or search keeps matching and
+    // showing the mask. Bound the recompute to the affected senders, and only
+    // when the index is already live — a not-yet-built index recomputes
+    // everything on its pending full rebuild.
+    const ftsReady = this.getFtsState() === "ready";
+    const affectedMessageIds =
+      ftsReady && maskedContacts.length > 0
+        ? this.messageIdsForSenders(maskedContacts.map((row) => row.source_jid))
+        : [];
+    const transaction = this.db.transaction(() => {
+      for (const row of maskedContacts) {
+        clearContact.run(now, row.id);
+      }
+      for (const row of maskedChats) {
+        clearChat.run(now, row.id);
+      }
+      for (let index = 0; index < affectedMessageIds.length; index += SEARCH_REINDEX_CHUNK) {
+        this.syncMessageDerivedState(affectedMessageIds.slice(index, index + SEARCH_REINDEX_CHUNK));
+      }
+    });
+    transaction();
+    console.log(
+      `[demask] cleared masked display names: ${maskedContacts.length} contact(s), ${maskedChats.length} chat(s)` +
+        (affectedMessageIds.length > 0 ? `; recomputed search text for ${affectedMessageIds.length} message(s)` : "")
+    );
+  }
+
+  // Message ids sent by any of the given sender JIDs, batched under SQLite's
+  // bound-variable limit.
+  private messageIdsForSenders(jids: string[]): number[] {
+    const unique = [...new Set(jids)].filter(Boolean);
+    const ids: number[] = [];
+    for (let index = 0; index < unique.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = unique.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      const rows = this.db
+        .prepare(`SELECT id FROM messages WHERE sender_source_jid IN (${batch.map(() => "?").join(",")})`)
+        .all(...batch) as Array<{ id: number }>;
+      for (const row of rows) {
+        ids.push(Number(row.id));
+      }
+    }
+    return ids;
   }
 
   private initializeIdentityState(): void {
@@ -1108,7 +1198,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       const rows = this.db
         .prepare(
           `SELECT source_jid,
-                  COALESCE(NULLIF(TRIM(COALESCE(display_name, '')), ''), NULLIF(TRIM(COALESCE(push_name, '')), ''), phone_number) AS label
+                  ${contactLabelSql()} AS label
            FROM contacts
            WHERE source_jid IN (${batch.map(() => "?").join(",")})`
         )
@@ -1168,7 +1258,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       const rows = this.db
         .prepare(
           `SELECT source_jid,
-                  COALESCE(NULLIF(TRIM(COALESCE(display_name, '')), ''), NULLIF(TRIM(COALESCE(push_name, '')), ''), phone_number) AS label
+                  ${contactLabelSql()} AS label
            FROM contacts
            WHERE source_jid IN (${batch.map(() => "?").join(",")})`
         )
@@ -1355,7 +1445,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         `SELECT m.id, m.source_message_key, m.source_message_id, m.chat_id, m.sender_source_jid,
                 m.timestamp_ms, m.sent_at, m.direction, m.message_type, m.is_deleted, m.has_media, m.body,
                 ch.source_chat_id AS chat_source_id, ch.display_name AS chat_display_name, ch.chat_type,
-                COALESCE(NULLIF(TRIM(COALESCE(c.display_name, '')), ''), NULLIF(TRIM(COALESCE(c.push_name, '')), ''), c.phone_number) AS sender_display_name,
+                ${contactLabelSql("c.")} AS sender_display_name,
                 bm25(messages_fts, 3.0, 2.0, 1.0) AS rank,
                 snippet(messages_fts, 0, ?, ?, '…', 14) AS snip_resolved,
                 snippet(messages_fts, 1, ?, ?, '…', 14) AS snip_body,
@@ -2448,11 +2538,16 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       // Two records can canonicalize onto one identity within a batch (LID stub
       // + real contact); merge field-wise so a stub cannot clobber a name.
       const existing = unique.get(sourceJid);
+      // A masked-number placeholder is never a name: coerce it to null here so
+      // no writer — import, live sync, or Google enrichment — can store it and
+      // shadow the full number resolution would otherwise yield.
+      const mergedDisplayName = existing?.displayName?.trim() || contact.displayName || null;
+      const mergedPushName = existing?.pushName?.trim() || contact.pushName || null;
       unique.set(sourceJid, {
         ...contact,
         sourceJid,
-        displayName: existing?.displayName?.trim() || contact.displayName || null,
-        pushName: existing?.pushName?.trim() || contact.pushName || null,
+        displayName: mergedDisplayName && !isMaskedNumberLabel(mergedDisplayName) ? mergedDisplayName : null,
+        pushName: mergedPushName && !isMaskedNumberLabel(mergedPushName) ? mergedPushName : null,
         phoneNumber: existing?.phoneNumber || contact.phoneNumber || null
       });
     }
@@ -2515,7 +2610,19 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         const rows = find.all(contact.phoneNumber, jid) as Array<{ id: number; source_jid: string; display_name: string | null; display_name_source: string | null }>;
         matchedIdentities += rows.length;
         for (const row of rows) {
-          const weak = !row.display_name?.trim() || row.display_name_source === "google_contacts" || row.display_name_source === "display_cache" || isIdentityDerivedName(row.display_name, row.source_jid);
+          // A real saved name is preserved; Google only fills or improves a
+          // *weak* label: empty, a prior Google/display-cache fill, an
+          // identity-derived restatement of the number, or a masked-number
+          // placeholder. The mask must count as no-name here or a stored
+          // "+91∙∙∙∙∙∙∙∙86" would shadow a learned real name and block the
+          // self-heal — the exact gap that left phone-form contacts nameless
+          // after their mask was cleared but before any name reached them.
+          const weak =
+            !row.display_name?.trim() ||
+            row.display_name_source === "google_contacts" ||
+            row.display_name_source === "display_cache" ||
+            isMaskedNumberLabel(row.display_name) ||
+            isIdentityDerivedName(row.display_name, row.source_jid);
           if (!weak) continue;
           updateContact.run(contact.displayName, currentIso(), row.id);
           updateChat.run(contact.displayName, currentIso(), row.source_jid);
@@ -2536,7 +2643,10 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       }
       // Platform chat metadata sometimes carries the bare number/LID digits as
       // the "name"; identity-derived names must never become display labels.
-      const displayName = chat.displayName && !isIdentityDerivedName(chat.displayName, sourceChatId) ? chat.displayName : null;
+      const displayName =
+        chat.displayName && !isIdentityDerivedName(chat.displayName, sourceChatId) && !isMaskedNumberLabel(chat.displayName)
+          ? chat.displayName
+          : null;
       unique.set(sourceChatId, { ...chat, sourceChatId, jid: sourceChatId, displayName });
     }
     if (unique.size === 0) {
@@ -4315,7 +4425,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         `SELECT m.id, m.source_message_key, m.source_message_id, chats.source_chat_id, m.chat_id,
                 NULLIF(TRIM(COALESCE(chats.display_name, '')), '') AS chat_display_name, chats.jid AS chat_jid,
                 m.sender_source_jid,
-                COALESCE(NULLIF(TRIM(COALESCE(c.display_name, '')), ''), NULLIF(TRIM(COALESCE(c.push_name, '')), ''), c.phone_number) AS sender_display_name,
+                ${contactLabelSql("c.")} AS sender_display_name,
                 m.timestamp_ms, m.sent_at, m.direction, m.message_type, m.is_deleted, m.is_forwarded, m.quoted_source_message_id, m.has_media, m.source_table,
                 COALESCE(NULLIF(m.body, ''), NULLIF(m.caption, '')) AS text,
                 ${MEDIA_STATE_SELECT}
@@ -4357,7 +4467,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
           `SELECT lmu.source_message_key AS target_key,
                   json_extract(lmu.metadata_json, '$.emoji') AS emoji,
                   json_extract(lmu.metadata_json, '$.reactorJid') AS reactor_jid,
-                  COALESCE(NULLIF(TRIM(COALESCE(c.display_name, '')), ''), NULLIF(TRIM(COALESCE(c.push_name, '')), ''), c.phone_number) AS reactor_display_name
+                  ${contactLabelSql("c.")} AS reactor_display_name
            FROM live_message_updates lmu
            LEFT JOIN contacts c ON c.source_jid = json_extract(lmu.metadata_json, '$.reactorJid')
            WHERE lmu.update_type = 'reaction'
@@ -4404,7 +4514,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       const rows = this.db
         .prepare(
           `SELECT m.source_message_id AS quoted_id, m.direction, m.sender_source_jid,
-                  COALESCE(NULLIF(TRIM(COALESCE(c.display_name, '')), ''), NULLIF(TRIM(COALESCE(c.push_name, '')), ''), c.phone_number) AS sender_display_name,
+                  ${contactLabelSql("c.")} AS sender_display_name,
                   COALESCE(NULLIF(m.body, ''), NULLIF(m.caption, '')) AS text
            FROM messages m
            JOIN chats ON chats.id = m.chat_id
@@ -4625,7 +4735,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         `SELECT m.id, m.source_message_key, m.source_message_id, chats.source_chat_id, m.chat_id,
                 NULLIF(TRIM(COALESCE(chats.display_name, '')), '') AS chat_display_name, chats.jid AS chat_jid,
                 m.sender_source_jid,
-                COALESCE(NULLIF(TRIM(COALESCE(c.display_name, '')), ''), NULLIF(TRIM(COALESCE(c.push_name, '')), ''), c.phone_number) AS sender_display_name,
+                ${contactLabelSql("c.")} AS sender_display_name,
                 m.timestamp_ms, m.sent_at, m.direction, m.message_type, m.is_deleted, m.has_media, m.source_table,
                 COALESCE(NULLIF(m.body, ''), NULLIF(m.caption, '')) AS text,
                 ${MEDIA_STATE_SELECT}
@@ -5153,20 +5263,6 @@ function emptyStatus(initialized: boolean, error?: string): StatusSummary {
     latestImport: null,
     latestWarnings: []
   };
-}
-
-// Phone digits from a phone-addressed JID only; LID/group/broadcast ids are
-// numeric but are NOT phone numbers.
-function displayPhoneFromJid(jid: string | null | undefined): string | null {
-  if (!jid) {
-    return null;
-  }
-  const [user, server] = jid.split("@");
-  if (server !== "s.whatsapp.net" && server !== "c.us") {
-    return null;
-  }
-  const digits = user?.split(":")[0]?.replace(/\D/g, "");
-  return digits ? `+${digits}` : null;
 }
 
 // Search tuning: candidate pool reranked in JS (BM25 × recency decay) and the
