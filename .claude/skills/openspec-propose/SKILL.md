@@ -103,6 +103,10 @@ After completing all artifacts, summarize:
   - Do NOT copy `<context>`, `<rules>`, `<project_context>` blocks into the artifact
   - These guide what you write, but should never appear in the output
 
+**Reconcile the roadmap board (if the project has one)**
+
+After all artifacts are created, keep the human-readable roadmap board in sync with the source of truth: if this project exposes the roadmap reconciler (`npm run roadmap:sync`, i.e. `node openspec/tools/sync-roadmap-status.mjs`), run it so this change's ROADMAP.md Status cell derives from its now-expanded folder (→ `proposed`). It reads `changes/`/`archive/` (the source of truth) and never hand-stamps, so it self-corrects any drift. Skip silently if the project has no roadmap or reconciler.
+
 **Guardrails**
 - Create ALL artifacts needed for implementation (as defined by schema's `apply.requires`)
 - Always read dependency artifacts before creating a new one

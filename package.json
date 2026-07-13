@@ -31,6 +31,7 @@
     "memory:query": "tsx src/server/cli.ts memory-query",
     "memory:validate": "tsx src/server/cli.ts memory-validate",
     "generate-fixtures": "tsx src/server/cli.ts generate-fixtures",
+    "roadmap:sync": "node openspec/tools/sync-roadmap-status.mjs",
     "test": "vitest run",
     "build": "tsc -p tsconfig.json && vite build",
     "preview": "vite preview --host 127.0.0.1"
