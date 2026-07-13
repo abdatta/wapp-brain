@@ -88,11 +88,19 @@ export class MemoryArchiveRepository implements ArchiveRepository {
   private mediaQueue = new Map<string, MediaDownloadQueueRecord & { id: number }>();
   private mediaAssets = new Map<number, MediaAssetRecord & { id: number }>();
   private linkPreviews = new Map<string, CapturedLinkPreview>();
-  private brainWatermarks = new Map<string, { assimilatedThroughMs: number; lastEpisodeAt: string | null }>();
+  private brainWatermarks = new Map<string, { assimilatedThroughMs: number; assimilatedThroughId: number; lastEpisodeAt: string | null }>();
   private brainTasks = new Map<string, BrainTaskRecord>();
   private nextBrainTaskId = 1;
   private brainRuns = new Map<string, BrainRunSummary>();
-  private brainLedger: Array<{ purpose: string; provider: string; inputTokens: number; outputTokens: number; atMs: number }> = [];
+  private brainLedger: Array<{
+    purpose: string;
+    provider: string;
+    inputTokens: number;
+    outputTokens: number;
+    estimated: boolean;
+    atMs: number;
+    day: string;
+  }> = [];
   private brainEpisodes = new Map<string, BrainEpisodeRecord>();
   private brainLockRunId: string | null = null;
   private editRevisions = new Map<string, MessageEditRevisionRecord[]>();
@@ -274,6 +282,9 @@ export class MemoryArchiveRepository implements ArchiveRepository {
         this.messages.delete(key);
         if (conflict) {
           result.messagesCollapsed += 1;
+          // Brain citations anchor on the rowid; follow the survivor before the
+          // collapsed row's id disappears.
+          this.repointBrainCitations(message.id, conflict.id);
           if ((rekeyed.body ? 1 : 0) + (rekeyed.caption ? 1 : 0) > (conflict.body ? 1 : 0) + (conflict.caption ? 1 : 0)) {
             this.messages.set(rekeyed.sourceMessageKey, { ...rekeyed, id: conflict.id });
           }
@@ -327,8 +338,58 @@ export class MemoryArchiveRepository implements ArchiveRepository {
         gap.chatSourceId = pn;
       }
     }
+
+    // brain-correctness-debts D2: reconcile derived brain state deterministically
+    // (mirror of the SQLite merge) — episodes, citations, watermark cursor, and
+    // pending tasks all follow the surviving identity.
+    for (const episode of this.brainEpisodes.values()) {
+      if (episode.chatSourceId === lid) {
+        episode.chatSourceId = pn;
+      }
+      for (const claim of episode.claims) {
+        for (const citation of claim.citations) {
+          if (citation.sourceChatId === lid) {
+            citation.sourceChatId = pn;
+            const msg = citation.messageId != null ? [...this.messages.values()].find((m) => m.id === citation.messageId) : null;
+            if (msg) {
+              citation.sourceMessageKey = msg.sourceMessageKey;
+            }
+          }
+        }
+      }
+    }
+    const lidWatermark = this.brainWatermarks.get(lid);
+    if (lidWatermark) {
+      const pnWatermark = this.brainWatermarks.get(pn);
+      const keepLid =
+        !pnWatermark ||
+        lidWatermark.assimilatedThroughMs > pnWatermark.assimilatedThroughMs ||
+        (lidWatermark.assimilatedThroughMs === pnWatermark.assimilatedThroughMs &&
+          lidWatermark.assimilatedThroughId > pnWatermark.assimilatedThroughId);
+      this.brainWatermarks.set(pn, keepLid ? { ...lidWatermark } : { ...pnWatermark! });
+      this.brainWatermarks.delete(lid);
+    }
+    for (const [dedupeKey, task] of [...this.brainTasks]) {
+      if (task.chatSourceId === lid) {
+        this.brainTasks.delete(dedupeKey);
+      }
+    }
+
     await this.refreshChatStats([pn]);
     return result;
+  }
+
+  // Repoint brain citations from a collapsed message rowid onto the survivor.
+  private repointBrainCitations(fromId: number, toId: number): void {
+    for (const episode of this.brainEpisodes.values()) {
+      for (const claim of episode.claims) {
+        for (const citation of claim.citations) {
+          if (citation.messageId === fromId) {
+            citation.messageId = toId;
+          }
+        }
+      }
+    }
   }
 
   async createRestorePoint(_label: string): Promise<ArchiveRestorePoint> {
@@ -1446,23 +1507,46 @@ export class MemoryArchiveRepository implements ArchiveRepository {
 
   // --- Brain substrate (mirrors the SQLite adapter's semantics) ---
 
+  // Mirror of the SQLite compound-cursor predicate: a message is covered only
+  // when a watermark exists and it sorts at or before (timestamp, rowid).
+  private isMessagePending(message: MessageRecord & { id: number }, chatSourceId: string): boolean {
+    const cursor = this.brainWatermarks.get(chatSourceId);
+    if (!cursor) {
+      return true;
+    }
+    const ts = message.timestampMs ?? 0;
+    return ts > cursor.assimilatedThroughMs || (ts === cursor.assimilatedThroughMs && message.id > cursor.assimilatedThroughId);
+  }
+
+  // Every message seen at or below `throughMs` in this chat — the rowid half of
+  // the cursor. A later same-timestamp message gets a higher id and stays pending.
+  private boundaryRowidForChat(chatSourceId: string, throughMs: number): number {
+    let maxId = 0;
+    for (const message of this.messages.values()) {
+      if (message.chatSourceId === chatSourceId && (message.timestampMs ?? 0) <= throughMs && message.id > maxId) {
+        maxId = message.id;
+      }
+    }
+    return maxId;
+  }
+
   async getBrainChatBacklog(options: { limit: number; minPending?: number }): Promise<BrainChatBacklogItem[]> {
     const minPending = Math.max(1, options.minPending ?? 1);
     const items: BrainChatBacklogItem[] = [];
     for (const chat of this.chats.values()) {
       const watermark = this.brainWatermarks.get(chat.sourceChatId);
-      const throughMs = watermark?.assimilatedThroughMs ?? 0;
       const pendingMessages = [...this.messages.values()].filter(
         (message) =>
           message.chatSourceId === chat.sourceChatId &&
-          (message.timestampMs ?? 0) > throughMs &&
-          isVisibleExchangeMessage(message)
+          isVisibleExchangeMessage(message) &&
+          this.isMessagePending(message, chat.sourceChatId)
       );
       if (pendingMessages.length >= minPending) {
         items.push({
           chatSourceId: chat.sourceChatId,
           chatDisplayName: chat.displayName ?? null,
-          assimilatedThroughMs: throughMs,
+          assimilatedThroughMs: watermark?.assimilatedThroughMs ?? 0,
+          assimilatedThroughId: watermark?.assimilatedThroughId ?? 0,
           lastEpisodeAt: watermark?.lastEpisodeAt ?? null,
           pendingVisibleMessages: pendingMessages.length,
           newestVisibleMs: pendingMessages.reduce<number | null>((max, message) => Math.max(max ?? 0, message.timestampMs ?? 0), null)
@@ -1474,10 +1558,15 @@ export class MemoryArchiveRepository implements ArchiveRepository {
 
   async advanceBrainWatermark(chatSourceId: string, throughMs: number): Promise<void> {
     const existing = this.brainWatermarks.get(chatSourceId);
-    this.brainWatermarks.set(chatSourceId, {
-      assimilatedThroughMs: Math.max(existing?.assimilatedThroughMs ?? 0, throughMs),
-      lastEpisodeAt: new Date().toISOString()
-    });
+    const throughId = this.boundaryRowidForChat(chatSourceId, throughMs);
+    // Keep the greater (timestamp, rowid) cursor lexicographically.
+    const next =
+      !existing ||
+      throughMs > existing.assimilatedThroughMs ||
+      (throughMs === existing.assimilatedThroughMs && throughId > existing.assimilatedThroughId)
+        ? { assimilatedThroughMs: throughMs, assimilatedThroughId: throughId }
+        : { assimilatedThroughMs: existing.assimilatedThroughMs, assimilatedThroughId: existing.assimilatedThroughId };
+    this.brainWatermarks.set(chatSourceId, { ...next, lastEpisodeAt: new Date().toISOString() });
   }
 
   async enqueueBrainTasks(tasks: BrainTaskInput[]): Promise<number> {
@@ -1608,12 +1697,20 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     return run ? structuredClone(run) : null;
   }
 
-  async failBrainRun(runId: string, status: "failed" | "interrupted" | "budget_exceeded", message: string): Promise<void> {
+  async failBrainRun(
+    runId: string,
+    status: "failed" | "interrupted" | "budget_exceeded",
+    message: string,
+    totals?: Record<string, number>
+  ): Promise<void> {
     const run = this.brainRuns.get(runId);
     if (run) {
       run.status = status;
       run.finishedAt = new Date().toISOString();
       run.errorMessage = message;
+      if (totals) {
+        run.totals = totals;
+      }
     }
   }
 
@@ -1631,12 +1728,21 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     }
   }
 
-  async recordBrainLlmUsage(entry: { purpose: string; provider: string; inputTokens: number; outputTokens: number }): Promise<void> {
-    this.brainLedger.push({ ...entry, atMs: Date.now() });
+  async recordBrainLlmUsage(entry: {
+    purpose: string;
+    provider: string;
+    inputTokens: number;
+    outputTokens: number;
+    estimated?: boolean;
+  }): Promise<void> {
+    const now = Date.now();
+    this.brainLedger.push({ ...entry, estimated: entry.estimated ?? false, atMs: now, day: new Date(now).toISOString().slice(0, 10) });
   }
 
-  async getBrainLlmUsage(options: { sinceMs: number }): Promise<BrainLlmUsageSummary> {
-    const entries = this.brainLedger.filter((entry) => entry.atMs >= options.sinceMs);
+  async getBrainLlmUsage(options: { sinceMs?: number; day?: string }): Promise<BrainLlmUsageSummary> {
+    const entries = this.brainLedger.filter((entry) =>
+      options.day != null ? entry.day === options.day : entry.atMs >= (options.sinceMs ?? 0)
+    );
     return {
       calls: entries.length,
       inputTokens: entries.reduce((sum, entry) => sum + entry.inputTokens, 0),
@@ -1646,12 +1752,9 @@ export class MemoryArchiveRepository implements ArchiveRepository {
 
   async getBrainStatus(): Promise<BrainStatusSummary> {
     const visible = [...this.messages.values()].filter((message) => isVisibleExchangeMessage(message));
-    const assimilated = visible.filter(
-      (message) => (message.timestampMs ?? 0) <= (this.brainWatermarks.get(message.chatSourceId)?.assimilatedThroughMs ?? 0)
-    );
+    // Assimilated is total − pending from the one shared predicate.
+    const assimilated = visible.filter((message) => !this.isMessagePending(message, message.chatSourceId));
     const backlog = await this.getBrainChatBacklog({ limit: 8 });
-    const utcMidnight = new Date();
-    utcMidnight.setUTCHours(0, 0, 0, 0);
     const runs = [...this.brainRuns.values()].sort((a, b) => b.startedAt.localeCompare(a.startedAt));
     return {
       ownerName: this.ownerDisplayName,
@@ -1661,7 +1764,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       chatsWithBacklog: backlog.length,
       backlogSample: backlog,
       tasks: await this.getBrainTaskSummary(),
-      usageToday: await this.getBrainLlmUsage({ sinceMs: utcMidnight.getTime() }),
+      usageToday: await this.getBrainLlmUsage({ day: new Date().toISOString().slice(0, 10) }),
       latestRun: runs[0] ?? null,
       activeRun: runs.find((run) => run.status === "running") ?? null
     };
@@ -1706,6 +1809,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       generator: episode.generator,
       model: episode.model,
       status: "current",
+      fallbackReason: episode.fallbackReason ?? null,
       createdAt: new Date().toISOString(),
       claims: episode.claims.map((claim) => ({
         id: crypto.randomUUID(),
@@ -1735,9 +1839,10 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     }
   }
 
-  async listBrainEpisodes(options: { chatSourceId?: string | null; limit: number }): Promise<BrainEpisodeRecord[]> {
+  async listBrainEpisodes(options: { chatSourceId?: string | null; episodeId?: string; limit: number }): Promise<BrainEpisodeRecord[]> {
     return structuredClone(
       [...this.brainEpisodes.values()]
+        .filter((episode) => !options.episodeId || episode.id === options.episodeId)
         .filter((episode) => !options.chatSourceId || episode.chatSourceId === options.chatSourceId)
         .sort((a, b) => b.endAtMs - a.endAtMs)
         .slice(0, options.limit)

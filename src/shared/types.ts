@@ -689,6 +689,10 @@ export interface BrainChatBacklogItem {
   chatSourceId: string;
   chatDisplayName: string | null;
   assimilatedThroughMs: number;
+  // Rowid half of the compound watermark cursor: pack selection must resume
+  // strictly after (assimilatedThroughMs, assimilatedThroughId) so a new
+  // message sharing the boundary timestamp is not skipped.
+  assimilatedThroughId: number;
   lastEpisodeAt: string | null;
   pendingVisibleMessages: number;
   newestVisibleMs: number | null;
@@ -805,6 +809,9 @@ export interface BrainEpisodeInput {
   generator: BrainEpisodeGenerator;
   model: string | null;
   runId: string | null;
+  // When an intended model generation fell back to extractive, the privacy-safe
+  // reason is stored per episode (not just logged) so run honesty is durable.
+  fallbackReason?: string | null;
   claims: Array<{ kind: BrainClaimKind; text: string; citations: string[] }>;
 }
 
@@ -821,6 +828,7 @@ export interface BrainEpisodeRecord {
   generator: BrainEpisodeGenerator;
   model: string | null;
   status: "current" | "superseded" | "stale" | "compressed";
+  fallbackReason: string | null;
   createdAt: string;
   claims: BrainClaimRecord[];
 }
@@ -836,6 +844,9 @@ export interface BrainRunProgress {
   totalChats: number;
   currentChat: string | null;
   episodesCommitted: number;
+  // Of episodesCommitted, how many fell back to extractive placeholders — the
+  // honest "N/M extractive" breakdown surfaced in the completion notice.
+  extractiveEpisodes: number;
   claimsCommitted: number;
   modelCalls: number;
   startedAt: string | null;

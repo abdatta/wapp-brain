@@ -56,10 +56,10 @@ function nightlyBoundaryMs(nowMs: number): number {
   return boundary.getTime();
 }
 
-function utcMidnightMs(nowMs: number): number {
-  const day = new Date(nowMs);
-  day.setUTCHours(0, 0, 0, 0);
-  return day.getTime();
+// UTC date (YYYY-MM-DD) matching the ledger's `day` column, so daily budget
+// checks hit the (day, purpose) index instead of scanning by timestamp.
+function utcDayString(nowMs: number): string {
+  return new Date(nowMs).toISOString().slice(0, 10);
 }
 
 // Significance gate: chats with fewer than the significance minimum of pending
@@ -166,9 +166,14 @@ interface DrainOptions {
 
 export interface DrainResult {
   episodes: number;
+  // Of episodes, how many fell back to extractive placeholders.
+  extractive: number;
   claims: number;
   modelCalls: number;
   tasksDone: number;
+  // Tasks that actually produced at least one episode (the honest chat count);
+  // already-covered/empty windows increment tasksDone only.
+  chatsProduced: number;
   dailyExceeded: boolean;
   rateLimited: boolean;
 }
@@ -181,31 +186,39 @@ async function executeEpisodeTask(
   repository: ArchiveRepository,
   task: { chatSourceId: string | null; payload: Record<string, unknown> | null },
   options: DrainOptions
-): Promise<{ episodes: number; claims: number; modelCalls: number }> {
+): Promise<{ episodes: number; extractive: number; claims: number; modelCalls: number }> {
   const payload = task.payload ?? {};
   const chatSourceId = String(payload.chatSourceId ?? task.chatSourceId ?? "");
   if (!chatSourceId) {
-    return { episodes: 0, claims: 0, modelCalls: 0 };
+    return { episodes: 0, extractive: 0, claims: 0, modelCalls: 0 };
   }
   const regen = payload.regen === true;
   let startAtMs = Number(payload.sinceMs ?? 0);
   let endAtMs = Number(payload.throughMs ?? Date.now());
+  // A regen task rebuilds its exact stored window (afterId 0 = whole window);
+  // a forward task resumes strictly after the compound cursor.
+  let afterId = 0;
   if (!regen) {
     const item = (await repository.getBrainChatBacklog({ limit: 5000 })).find((candidate) => candidate.chatSourceId === chatSourceId);
     if (!item) {
       // Watermark already covers this window (e.g. a manual run got here first).
-      return { episodes: 0, claims: 0, modelCalls: 0 };
+      return { episodes: 0, extractive: 0, claims: 0, modelCalls: 0 };
     }
-    startAtMs = Math.max(startAtMs, item.assimilatedThroughMs + 1);
+    startAtMs = item.assimilatedThroughMs;
+    afterId = item.assimilatedThroughId;
     endAtMs = Math.max(endAtMs, item.newestVisibleMs ?? endAtMs);
   }
-  const packs = await buildEvidencePacks(repository, { chatSourceId, startAtMs, endAtMs });
+  const packs = await buildEvidencePacks(repository, { chatSourceId, startAtMs, afterId, endAtMs });
   let episodes = 0;
+  let extractive = 0;
   let claims = 0;
   let modelCalls = 0;
   for (const pack of packs) {
     const result = await generateEpisodeForPack(repository, pack, { generator: options.mode, model: options.model, runId: options.runId });
     episodes += 1;
+    if (result.fellBackToExtractive) {
+      extractive += 1;
+    }
     claims += result.episode.claims.length;
     if (result.usage) {
       modelCalls += 1;
@@ -213,13 +226,14 @@ async function executeEpisodeTask(
         purpose: regen ? "episode-regen" : "episode",
         provider: `${options.provider}/${options.model ?? "default"}`,
         inputTokens: result.usage.inputTokens,
-        outputTokens: result.usage.outputTokens
+        outputTokens: result.usage.outputTokens,
+        estimated: result.usage.estimated ?? false
       });
     }
     // Yield between packs so live ingestion and HTTP stay responsive.
     await new Promise((resolve) => setImmediate(resolve));
   }
-  return { episodes, claims, modelCalls };
+  return { episodes, extractive, claims, modelCalls };
 }
 
 // Drain due tasks under the budget. Budget is read from the ledger before each
@@ -228,15 +242,17 @@ async function executeEpisodeTask(
 // attempt cap so one poison task can never starve the queue.
 export async function drainBrainTasks(repository: ArchiveRepository, options: DrainOptions): Promise<DrainResult> {
   let episodes = 0;
+  let extractive = 0;
   let claims = 0;
   let modelCalls = 0;
   let tasksDone = 0;
+  let chatsProduced = 0;
   let dailyExceeded = false;
   let rateLimited = false;
   while (tasksDone < options.maxTasks) {
     if (options.mode === "model") {
       const now = Date.now();
-      const daily = await repository.getBrainLlmUsage({ sinceMs: utcMidnightMs(now) });
+      const daily = await repository.getBrainLlmUsage({ day: utcDayString(now) });
       if (daily.calls + modelCalls >= config.brain.maxCallsPerDay) {
         dailyExceeded = true;
         break;
@@ -260,8 +276,12 @@ export async function drainBrainTasks(repository: ArchiveRepository, options: Dr
     try {
       const result = await executeEpisodeTask(repository, task, options);
       episodes += result.episodes;
+      extractive += result.extractive;
       claims += result.claims;
       modelCalls += result.modelCalls;
+      if (result.episodes > 0) {
+        chatsProduced += 1;
+      }
       await repository.completeBrainTask(task.id);
       tasksDone += 1;
     } catch (error) {
@@ -270,7 +290,7 @@ export async function drainBrainTasks(repository: ArchiveRepository, options: Dr
       await repository.failBrainTask(task.id, publicErrorMessage(error), { retryInMs });
     }
   }
-  return { episodes, claims, modelCalls, tasksDone, dailyExceeded, rateLimited };
+  return { episodes, extractive, claims, modelCalls, tasksDone, chatsProduced, dailyExceeded, rateLimited };
 }
 
 export interface BrainPassResult extends Partial<DrainResult> {
@@ -297,6 +317,9 @@ export async function runBrainMaintenancePass(
   if (!(await repository.tryAcquireBrainLock(lockId, BRAIN_LOCK_TTL_MS))) {
     return { ran: false, reason: "locked" };
   }
+  // Held outside the try so a throw after the run starts can finalize the run
+  // row (rather than leaving it 'running' until a restart heals it).
+  let runId: string | null = null;
   try {
     // The brain lock is held, so any task still 'running' is an orphan from a
     // pass killed mid-drain — return every one to pending immediately.
@@ -315,7 +338,7 @@ export async function runBrainMaintenancePass(
     // row. Skip cleanly instead — the pending work waits for the budget to free.
     if (mode === "model") {
       const now = Date.now();
-      const daily = await repository.getBrainLlmUsage({ sinceMs: utcMidnightMs(now) });
+      const daily = await repository.getBrainLlmUsage({ day: utcDayString(now) });
       if (daily.calls >= config.brain.maxCallsPerDay) {
         return { ran: false, reason: "daily-budget" };
       }
@@ -324,7 +347,7 @@ export async function runBrainMaintenancePass(
         return { ran: false, reason: "hourly-rate-limit" };
       }
     }
-    const runId = await repository.startBrainRun("nightly");
+    runId = await repository.startBrainRun("nightly");
     const result = await drainBrainTasks(repository, {
       maxTasks: MAX_TASKS_PER_PASS,
       mode,
@@ -332,28 +355,40 @@ export async function runBrainMaintenancePass(
       provider: mode === "model" ? provider.provider : "extractive",
       runId
     });
+    const totals: Record<string, number> = {
+      episodes: result.episodes,
+      extractive: result.extractive,
+      claims: result.claims,
+      chats: result.chatsProduced,
+      chatsVisited: result.tasksDone,
+      modelCalls: result.modelCalls,
+      skippedForBudget: result.dailyExceeded ? (await repository.getBrainTaskSummary()).pending : 0
+    };
     if (result.dailyExceeded) {
       await repository.failBrainRun(
         runId,
         "budget_exceeded",
-        `Daily model-call budget (${config.brain.maxCallsPerDay}) reached; ${result.episodes} episode(s) committed, remaining work stays pending.`
+        `Daily model-call budget (${config.brain.maxCallsPerDay}) reached; ${result.episodes} episode(s) committed, remaining work stays pending.`,
+        totals
       );
     } else {
-      await repository.completeBrainRun(runId, {
-        episodes: result.episodes,
-        claims: result.claims,
-        chats: result.tasksDone,
-        modelCalls: result.modelCalls
-      });
+      await repository.completeBrainRun(runId, totals);
     }
     console.log(
-      `[brain] auto pass (${mode}${mode === "model" ? `/${provider.model ?? "default"}` : ""}): ${result.episodes} episode(s), ${result.claims} claim(s), ${result.modelCalls} model call(s), ${result.tasksDone} task(s)` +
+      `[brain] auto pass (${mode}${mode === "model" ? `/${provider.model ?? "default"}` : ""}): ${result.episodes} episode(s, ${result.extractive} extractive), ${result.claims} claim(s), ${result.modelCalls} model call(s), ${result.chatsProduced}/${result.tasksDone} chat(s) produced` +
         (result.dailyExceeded ? " — DAILY BUDGET REACHED, remaining work pending" : result.rateLimited ? " — hourly rate limit, paused until budget frees" : "")
     );
     if (result.episodes > 0) {
       options.onEpisodesCommitted?.();
     }
     return { ran: true, ...result };
+  } catch (error) {
+    // A throw after the run started (e.g. a DB error inside the drain) must not
+    // strand the run 'running' until a restart — mark it failed now.
+    if (runId) {
+      await repository.failBrainRun(runId, "failed", publicErrorMessage(error)).catch(() => undefined);
+    }
+    throw error;
   } finally {
     await repository.releaseBrainLock(lockId);
   }

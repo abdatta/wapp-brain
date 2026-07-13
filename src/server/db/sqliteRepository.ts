@@ -767,6 +767,7 @@ const schemaStatements = [
   `CREATE TABLE IF NOT EXISTS brain_chat_watermarks (
     chat_source_id TEXT PRIMARY KEY,
     assimilated_through_ms INTEGER NOT NULL DEFAULT 0,
+    assimilated_through_id INTEGER NOT NULL DEFAULT 0,
     last_episode_at TEXT NULL,
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   )`,
@@ -819,6 +820,7 @@ const schemaStatements = [
     model TEXT NULL,
     status TEXT NOT NULL DEFAULT 'current' CHECK (status IN ('current','superseded','stale','compressed')),
     run_id TEXT NULL,
+    fallback_reason TEXT NULL,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   )`,
 
@@ -852,6 +854,7 @@ const schemaStatements = [
     provider TEXT NOT NULL,
     input_tokens INTEGER NOT NULL DEFAULT 0,
     output_tokens INTEGER NOT NULL DEFAULT 0,
+    estimated INTEGER NOT NULL DEFAULT 0,
     at_ms INTEGER NOT NULL
   )`,
 
@@ -951,6 +954,12 @@ export class SqliteArchiveRepository implements ArchiveRepository {
   private legacyArchive = false;
   private readonly identityLinks = new Map<string, string>();
   private cachedFtsState: SearchIndexState | null = null;
+  // brain-correctness-debts D7: bound the cost of the coverage scan, which the
+  // client refetches on every archive-updated SSE. A short TTL collapses a
+  // burst of history-sync refreshes into at most one scan per interval;
+  // invalidation on any brain write keeps post-run/post-merge status immediate.
+  private brainStatusCache: { at: number; value: BrainStatusSummary } | null = null;
+  private static readonly BRAIN_STATUS_TTL_MS = 1000;
 
   constructor(private readonly dbPath = config.archive.sqlitePath) {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
@@ -1470,13 +1479,14 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         `SELECT ch.source_chat_id AS chat_source_id,
                 COALESCE(NULLIF(TRIM(COALESCE(ch.display_name, '')), ''), NULL) AS chat_display_name,
                 COALESCE(w.assimilated_through_ms, 0) AS assimilated_through_ms,
+                COALESCE(w.assimilated_through_id, 0) AS assimilated_through_id,
                 w.last_episode_at AS last_episode_at,
                 COUNT(m.id) AS pending,
                 MAX(m.timestamp_ms) AS newest_ms
          FROM chats ch
          LEFT JOIN brain_chat_watermarks w ON w.chat_source_id = ch.source_chat_id
          JOIN messages m ON m.chat_id = ch.id
-         WHERE COALESCE(m.timestamp_ms, 0) > COALESCE(w.assimilated_through_ms, 0)
+         WHERE ${watermarkPendingPredicate("m", "w")}
            AND ${visibleExchangePredicate("m")}
          GROUP BY ch.id
          HAVING COUNT(m.id) >= ?
@@ -1487,6 +1497,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       chat_source_id: string;
       chat_display_name: string | null;
       assimilated_through_ms: number;
+      assimilated_through_id: number;
       last_episode_at: string | null;
       pending: number;
       newest_ms: number | null;
@@ -1495,25 +1506,34 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       chatSourceId: row.chat_source_id,
       chatDisplayName: row.chat_display_name,
       assimilatedThroughMs: Number(row.assimilated_through_ms ?? 0),
+      assimilatedThroughId: Number(row.assimilated_through_id ?? 0),
       lastEpisodeAt: row.last_episode_at,
       pendingVisibleMessages: Number(row.pending),
       newestVisibleMs: row.newest_ms == null ? null : Number(row.newest_ms)
     }));
   }
 
-  // Watermarks never regress: a replayed commit can only move coverage forward.
+  // The rowid half of the cursor: every message seen at or below `throughMs`
+  // in this chat. A later message sharing `throughMs` gets a higher rowid and
+  // stays pending, which is exactly how the tie boundary is disambiguated.
+  private boundaryRowidForChat(chatSourceId: string, throughMs: number): number {
+    const row = this.db
+      .prepare(
+        `SELECT COALESCE(MAX(m.id), 0) AS id
+         FROM messages m JOIN chats ch ON ch.id = m.chat_id
+         WHERE ch.source_chat_id = ? AND COALESCE(m.timestamp_ms, 0) <= ?`
+      )
+      .get(chatSourceId, throughMs) as { id: number } | undefined;
+    return Number(row?.id ?? 0);
+  }
+
+  // Watermarks never regress: a replayed commit can only move the compound
+  // (timestamp, rowid) cursor forward, keeping the greater cursor lexicographically.
   async advanceBrainWatermark(chatSourceId: string, throughMs: number): Promise<void> {
     const canonical = this.canonicalJid(chatSourceId) ?? chatSourceId;
-    this.db
-      .prepare(
-        `INSERT INTO brain_chat_watermarks (chat_source_id, assimilated_through_ms, last_episode_at, updated_at)
-         VALUES (?, ?, ?, ?)
-         ON CONFLICT(chat_source_id) DO UPDATE SET
-           assimilated_through_ms = MAX(brain_chat_watermarks.assimilated_through_ms, excluded.assimilated_through_ms),
-           last_episode_at = excluded.last_episode_at,
-           updated_at = excluded.updated_at`
-      )
-      .run(canonical, throughMs, currentIso(), currentIso());
+    const throughId = this.boundaryRowidForChat(canonical, throughMs);
+    this.db.prepare(WATERMARK_CURSOR_UPSERT).run(canonical, throughMs, throughId, currentIso(), currentIso());
+    this.invalidateBrainStatusCache();
   }
 
   async enqueueBrainTasks(tasks: BrainTaskInput[]): Promise<number> {
@@ -1638,6 +1658,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     this.db
       .prepare(`INSERT INTO brain_runs (id, kind, status, started_at, timezone) VALUES (?, ?, 'running', ?, ?)`)
       .run(id, kind, currentIso(), timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone ?? null);
+    this.invalidateBrainStatusCache();
     return id;
   }
 
@@ -1650,6 +1671,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     this.db
       .prepare(`UPDATE brain_runs SET status = 'completed', finished_at = ?, totals_json = ? WHERE id = ?`)
       .run(currentIso(), stringifyJson(totals), runId);
+    this.invalidateBrainStatusCache();
   }
 
   // 'brain' job lock over the shared memory_job_locks table (name-keyed): the
@@ -1681,34 +1703,68 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     this.db.prepare(`DELETE FROM memory_job_locks WHERE name = 'brain' AND run_id = ?`).run(runId);
   }
 
-  async failBrainRun(runId: string, status: "failed" | "interrupted" | "budget_exceeded", message: string): Promise<void> {
+  // A non-completed terminal run persists the totals it accumulated before
+  // stopping (interrupted/budget-exceeded runs no longer discard their counts).
+  async failBrainRun(
+    runId: string,
+    status: "failed" | "interrupted" | "budget_exceeded",
+    message: string,
+    totals?: Record<string, number>
+  ): Promise<void> {
     this.db
-      .prepare(`UPDATE brain_runs SET status = ?, finished_at = ?, error_message = ? WHERE id = ?`)
-      .run(status, currentIso(), message, runId);
+      .prepare(`UPDATE brain_runs SET status = ?, finished_at = ?, error_message = ?, totals_json = COALESCE(?, totals_json) WHERE id = ?`)
+      .run(status, currentIso(), message, totals ? stringifyJson(totals) : null, runId);
+    this.invalidateBrainStatusCache();
   }
 
-  async recordBrainLlmUsage(entry: { purpose: string; provider: string; inputTokens: number; outputTokens: number }): Promise<void> {
+  async recordBrainLlmUsage(entry: {
+    purpose: string;
+    provider: string;
+    inputTokens: number;
+    outputTokens: number;
+    estimated?: boolean;
+  }): Promise<void> {
     const now = Date.now();
     this.db
-      .prepare(`INSERT INTO brain_llm_ledger (day, purpose, provider, input_tokens, output_tokens, at_ms) VALUES (?, ?, ?, ?, ?, ?)`)
-      .run(new Date(now).toISOString().slice(0, 10), entry.purpose, entry.provider, entry.inputTokens, entry.outputTokens, now);
+      .prepare(`INSERT INTO brain_llm_ledger (day, purpose, provider, input_tokens, output_tokens, estimated, at_ms) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+      .run(
+        new Date(now).toISOString().slice(0, 10),
+        entry.purpose,
+        entry.provider,
+        entry.inputTokens,
+        entry.outputTokens,
+        entry.estimated ? 1 : 0,
+        now
+      );
   }
 
-  async getBrainLlmUsage(options: { sinceMs: number }): Promise<BrainLlmUsageSummary> {
-    const row = this.db
-      .prepare(
-        `SELECT COUNT(*) AS calls, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens
-         FROM brain_llm_ledger WHERE at_ms >= ?`
-      )
-      .get(options.sinceMs) as { calls: number; input_tokens: number; output_tokens: number };
+  // Daily windows pass `day` (UTC date) to hit the (day, purpose) index; the
+  // hourly rate-limit window passes `sinceMs` and scans by timestamp.
+  async getBrainLlmUsage(options: { sinceMs?: number; day?: string }): Promise<BrainLlmUsageSummary> {
+    const columns = `COUNT(*) AS calls, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens`;
+    const row = (
+      options.day != null
+        ? this.db.prepare(`SELECT ${columns} FROM brain_llm_ledger WHERE day = ?`).get(options.day)
+        : this.db.prepare(`SELECT ${columns} FROM brain_llm_ledger WHERE at_ms >= ?`).get(options.sinceMs ?? 0)
+    ) as { calls: number; input_tokens: number; output_tokens: number };
     return { calls: Number(row.calls), inputTokens: Number(row.input_tokens), outputTokens: Number(row.output_tokens) };
   }
 
+  private invalidateBrainStatusCache(): void {
+    this.brainStatusCache = null;
+  }
+
   async getBrainStatus(): Promise<BrainStatusSummary> {
+    const cached = this.brainStatusCache;
+    if (cached && Date.now() - cached.at < SqliteArchiveRepository.BRAIN_STATUS_TTL_MS) {
+      return cached.value;
+    }
+    // Assimilated is DERIVED as total − pending from the one shared predicate,
+    // so coverage can never disagree with the backlog at the tie boundary.
     const coverage = this.db
       .prepare(
         `SELECT COUNT(*) AS total,
-                COALESCE(SUM(CASE WHEN COALESCE(m.timestamp_ms, 0) <= COALESCE(w.assimilated_through_ms, 0) THEN 1 ELSE 0 END), 0) AS assimilated
+                COALESCE(SUM(CASE WHEN ${watermarkPendingPredicate("m", "w")} THEN 0 ELSE 1 END), 0) AS assimilated
          FROM messages m
          JOIN chats ch ON ch.id = m.chat_id
          LEFT JOIN brain_chat_watermarks w ON w.chat_source_id = ch.source_chat_id
@@ -1722,18 +1778,16 @@ export class SqliteArchiveRepository implements ArchiveRepository {
            FROM chats ch
            LEFT JOIN brain_chat_watermarks w ON w.chat_source_id = ch.source_chat_id
            JOIN messages m ON m.chat_id = ch.id
-           WHERE COALESCE(m.timestamp_ms, 0) > COALESCE(w.assimilated_through_ms, 0)
+           WHERE ${watermarkPendingPredicate("m", "w")}
              AND ${visibleExchangePredicate("m")}
            GROUP BY ch.id
          )`
       )
       .get() as { count: number };
-    const utcMidnight = new Date();
-    utcMidnight.setUTCHours(0, 0, 0, 0);
     const runs = this.db.prepare(`SELECT * FROM brain_runs ORDER BY started_at DESC LIMIT 5`).all() as SqliteBrainRunRow[];
     const total = Number(coverage.total ?? 0);
     const assimilated = Number(coverage.assimilated ?? 0);
-    return {
+    const value: BrainStatusSummary = {
       ownerName: await this.getArchiveOwnerName(),
       totalVisibleMessages: total,
       assimilatedVisibleMessages: assimilated,
@@ -1741,10 +1795,12 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       chatsWithBacklog: Number(chatsWithBacklog.count ?? 0),
       backlogSample: await this.getBrainChatBacklog({ limit: 8 }),
       tasks: await this.getBrainTaskSummary(),
-      usageToday: await this.getBrainLlmUsage({ sinceMs: utcMidnight.getTime() }),
+      usageToday: await this.getBrainLlmUsage({ day: utcDayString() }),
       latestRun: runs[0] ? rowToBrainRun(runs[0]) : null,
       activeRun: runs.find((run) => run.status === "running") ? rowToBrainRun(runs.find((run) => run.status === "running")!) : null
     };
+    this.brainStatusCache = { at: Date.now(), value };
+    return value;
   }
 
   async resetBrainDerivedData(options?: { chatSourceId?: string | null }): Promise<{ episodeIds: string[]; watermarks: number }> {
@@ -1781,6 +1837,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       }
     });
     transaction();
+    this.invalidateBrainStatusCache();
     return { episodeIds, watermarks };
   }
 
@@ -1790,8 +1847,8 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     const chatSourceId = this.canonicalJid(episode.chatSourceId) ?? episode.chatSourceId;
     const insertEpisode = this.db.prepare(
       `INSERT INTO brain_episodes
-       (id, chat_source_id, start_at_ms, end_at_ms, message_count, participants_json, summary, markdown, generator, model, run_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       (id, chat_source_id, start_at_ms, end_at_ms, message_count, participants_json, summary, markdown, generator, model, run_id, fallback_reason)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     const insertClaim = this.db.prepare(`INSERT INTO brain_claims (id, episode_id, sequence, kind, text) VALUES (?, ?, ?, ?, ?)`);
     const insertCitation = this.db.prepare(
@@ -1799,14 +1856,11 @@ export class SqliteArchiveRepository implements ArchiveRepository {
        SELECT ?, ?, ?, m.id, m.sender_source_jid, m.timestamp_ms
        FROM (SELECT 1) LEFT JOIN messages m ON m.source_message_key = ?`
     );
-    const advance = this.db.prepare(
-      `INSERT INTO brain_chat_watermarks (chat_source_id, assimilated_through_ms, last_episode_at, updated_at)
-       VALUES (?, ?, ?, ?)
-       ON CONFLICT(chat_source_id) DO UPDATE SET
-         assimilated_through_ms = MAX(brain_chat_watermarks.assimilated_through_ms, excluded.assimilated_through_ms),
-         last_episode_at = excluded.last_episode_at,
-         updated_at = excluded.updated_at`
-    );
+    const advance = this.db.prepare(WATERMARK_CURSOR_UPSERT);
+    // The rowid half of the cursor: every message seen at or below the pack's
+    // end timestamp. A later same-timestamp message gets a higher rowid and
+    // stays pending — the tie boundary fix.
+    const boundaryId = this.boundaryRowidForChat(chatSourceId, episode.endAtMs);
     const transaction = this.db.transaction(() => {
       insertEpisode.run(
         id,
@@ -1819,7 +1873,8 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         episode.markdown,
         episode.generator,
         episode.model,
-        episode.runId
+        episode.runId,
+        episode.fallbackReason ?? null
       );
       episode.claims.forEach((claim, index) => {
         const claimId = crypto.randomUUID();
@@ -1828,20 +1883,33 @@ export class SqliteArchiveRepository implements ArchiveRepository {
           insertCitation.run(claimId, key, chatSourceId, key);
         }
       });
-      advance.run(chatSourceId, episode.endAtMs, currentIso(), currentIso());
+      advance.run(chatSourceId, episode.endAtMs, boundaryId, currentIso(), currentIso());
     });
     transaction();
-    const committed = await this.listBrainEpisodes({ chatSourceId, limit: 50 });
-    return committed.find((candidate) => candidate.id === id)!;
+    this.invalidateBrainStatusCache();
+    // Return the committed record directly (single id-filtered fetch) rather
+    // than re-listing the top 50 episodes for the chat.
+    const committed = await this.listBrainEpisodes({ episodeId: id, limit: 1 });
+    return committed[0]!;
   }
 
   async updateBrainEpisodeMarkdown(episodeId: string, markdown: string): Promise<void> {
     this.db.prepare(`UPDATE brain_episodes SET markdown = ? WHERE id = ?`).run(markdown, episodeId);
   }
 
-  async listBrainEpisodes(options: { chatSourceId?: string | null; limit: number }): Promise<BrainEpisodeRecord[]> {
-    const where = options.chatSourceId ? `WHERE e.chat_source_id = ?` : "";
-    const params: unknown[] = options.chatSourceId ? [options.chatSourceId, options.limit] : [options.limit];
+  async listBrainEpisodes(options: { chatSourceId?: string | null; episodeId?: string; limit: number }): Promise<BrainEpisodeRecord[]> {
+    const clauses: string[] = [];
+    const params: unknown[] = [];
+    if (options.episodeId) {
+      clauses.push("e.id = ?");
+      params.push(options.episodeId);
+    }
+    if (options.chatSourceId) {
+      clauses.push("e.chat_source_id = ?");
+      params.push(options.chatSourceId);
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    params.push(options.limit);
     const rows = this.db
       .prepare(
         `SELECT e.*, COALESCE(NULLIF(TRIM(COALESCE(ch.display_name, '')), ''), NULL) AS chat_display_name
@@ -1869,6 +1937,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       generator: row.generator as BrainEpisodeRecord["generator"],
       model: (row.model as string | null) ?? null,
       status: row.status as BrainEpisodeRecord["status"],
+      fallbackReason: (row.fallback_reason as string | null) ?? null,
       createdAt: String(row.created_at),
       claims: (claimsStmt.all(row.id) as Array<{ id: string; kind: string; text: string }>).map((claim) => ({
         id: claim.id,
@@ -2178,8 +2247,39 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       // Anchor keys embed the old chat form; recovery recomputes them anyway.
       this.db.prepare(`UPDATE live_gap_windows SET chat_source_id = ?, anchor_message_key = NULL WHERE chat_source_id = ?`).run(pn, lid);
       this.db.prepare(`UPDATE live_message_updates SET chat_source_id = ? WHERE chat_source_id = ?`).run(pn, lid);
+
+      // brain-correctness-debts D2: reconcile derived brain state so a merge
+      // strands no watermark, spawns no duplicate re-assimilation, and leaves
+      // no citation pointing at a stale key. Deterministic, no model call. Runs
+      // last, after messages are fully rekeyed, so citation keys resolve to the
+      // post-merge form via the stable rowid anchor.
+      this.db.prepare(`UPDATE brain_episodes SET chat_source_id = ? WHERE chat_source_id = ?`).run(pn, lid);
+      this.db
+        .prepare(
+          `UPDATE brain_citations
+             SET source_message_key = COALESCE((SELECT source_message_key FROM messages WHERE id = brain_citations.message_id), source_message_key),
+                 source_chat_id = ?
+           WHERE source_chat_id = ?`
+        )
+        .run(pn, lid);
+      // Merge the compound watermark cursor onto the survivor (greater cursor
+      // wins), then drop the dead-identity row.
+      const lidWatermark = this.db
+        .prepare(`SELECT assimilated_through_ms, assimilated_through_id, last_episode_at FROM brain_chat_watermarks WHERE chat_source_id = ?`)
+        .get(lid) as { assimilated_through_ms: number; assimilated_through_id: number; last_episode_at: string | null } | undefined;
+      if (lidWatermark) {
+        this.db
+          .prepare(WATERMARK_CURSOR_UPSERT)
+          .run(pn, lidWatermark.assimilated_through_ms, lidWatermark.assimilated_through_id, lidWatermark.last_episode_at ?? currentIso(), currentIso());
+        this.db.prepare(`DELETE FROM brain_chat_watermarks WHERE chat_source_id = ?`).run(lid);
+      }
+      // Pending tasks embed the pre-merge chat and its watermark in their dedupe
+      // key and window; drop them so the drain never re-covers an orphaned
+      // window. The next due/audit pass re-enqueues from the merged cursor.
+      this.db.prepare(`DELETE FROM brain_tasks WHERE chat_source_id = ?`).run(lid);
     });
     transaction();
+    this.invalidateBrainStatusCache();
     await this.refreshChatStats([pn]);
     await this.markStaleMemoryForMissingMessages();
     // The merge may have improved name resolution for this identity: refresh
@@ -2245,6 +2345,9 @@ export class SqliteArchiveRepository implements ArchiveRepository {
          WHERE id = ?`
       )
       .run(dropId, dropId, dropId, dropId, dropId, dropId, dropId, dropId, contentSource, contentSource, dropId, dropId, dropId, contentSource, keepId);
+    // Brain citations anchor on the message rowid; repoint them onto the
+    // survivor before the dropped row (and its rowid) disappears.
+    this.db.prepare(`UPDATE brain_citations SET message_id = ? WHERE message_id = ?`).run(keepId, dropId);
     // Merged tombstones keep their held content: deletion is a state marker,
     // never a content eraser (backup-store semantics).
     this.db.prepare(`DELETE FROM messages WHERE id = ?`).run(dropId);
@@ -4605,7 +4708,12 @@ function migrateAdditiveColumns(db: Database.Database): void {
   const additions: Array<{ table: string; column: string; ddl: string }> = [
     { table: "chats", column: "platform_recency_ms", ddl: "ALTER TABLE chats ADD COLUMN platform_recency_ms INTEGER NULL" },
     { table: "messages", column: "resolved_text", ddl: "ALTER TABLE messages ADD COLUMN resolved_text TEXT NULL" },
-    { table: "contacts", column: "display_name_source", ddl: "ALTER TABLE contacts ADD COLUMN display_name_source TEXT NULL" }
+    { table: "contacts", column: "display_name_source", ddl: "ALTER TABLE contacts ADD COLUMN display_name_source TEXT NULL" },
+    // brain-correctness-debts: compound watermark cursor, per-episode fallback
+    // reason, and the ledger's estimated-usage flag — all additive.
+    { table: "brain_chat_watermarks", column: "assimilated_through_id", ddl: "ALTER TABLE brain_chat_watermarks ADD COLUMN assimilated_through_id INTEGER NOT NULL DEFAULT 0" },
+    { table: "brain_episodes", column: "fallback_reason", ddl: "ALTER TABLE brain_episodes ADD COLUMN fallback_reason TEXT NULL" },
+    { table: "brain_llm_ledger", column: "estimated", ddl: "ALTER TABLE brain_llm_ledger ADD COLUMN estimated INTEGER NOT NULL DEFAULT 0" }
   ];
   for (const addition of additions) {
     const columns = db.prepare(`SELECT name FROM pragma_table_info(?)`).all(addition.table) as Array<{ name: string }>;
@@ -5051,6 +5159,35 @@ function composeResolvedText(
 
 // A "visible exchange" is a message a user would recognize as conversation:
 // used both to hide event-only chats and to compute WhatsApp-style recency.
+// brain-correctness-debts D1: the ONE predicate for "not yet assimilated".
+// The watermark is a compound (timestamp, rowid) cursor; a visible message is
+// covered only when a watermark row exists and it sorts at or before the
+// cursor. Everything else — including a genuinely-new message sharing the
+// watermark's exact timestamp (higher rowid) and every message in a chat with
+// no watermark row — is pending. Backlog, coverage, and pack selection all
+// share this so they can never disagree at the tie boundary.
+function watermarkPendingPredicate(messageAlias: string, watermarkAlias: string): string {
+  const m = messageAlias;
+  const w = watermarkAlias;
+  return `(${w}.assimilated_through_ms IS NULL
+           OR COALESCE(${m}.timestamp_ms, 0) > ${w}.assimilated_through_ms
+           OR (COALESCE(${m}.timestamp_ms, 0) = ${w}.assimilated_through_ms AND ${m}.id > ${w}.assimilated_through_id))`;
+}
+
+// Advance the compound watermark cursor, keeping the greater (timestamp, rowid)
+// lexicographically so coverage never regresses. The id CASE reads the OLD row
+// (SQLite evaluates every SET right-hand side against the pre-update row).
+const WATERMARK_CURSOR_UPSERT = `INSERT INTO brain_chat_watermarks (chat_source_id, assimilated_through_ms, assimilated_through_id, last_episode_at, updated_at)
+   VALUES (?, ?, ?, ?, ?)
+   ON CONFLICT(chat_source_id) DO UPDATE SET
+     assimilated_through_id = CASE
+       WHEN excluded.assimilated_through_ms > brain_chat_watermarks.assimilated_through_ms THEN excluded.assimilated_through_id
+       WHEN excluded.assimilated_through_ms < brain_chat_watermarks.assimilated_through_ms THEN brain_chat_watermarks.assimilated_through_id
+       ELSE MAX(brain_chat_watermarks.assimilated_through_id, excluded.assimilated_through_id) END,
+     assimilated_through_ms = MAX(brain_chat_watermarks.assimilated_through_ms, excluded.assimilated_through_ms),
+     last_episode_at = excluded.last_episode_at,
+     updated_at = excluded.updated_at`;
+
 function visibleExchangePredicate(alias: string): string {
   return `${alias}.message_type NOT IN ('system', 'status', 'reaction', 'encrypted_update')
           AND (
@@ -5061,6 +5198,12 @@ function visibleExchangePredicate(alias: string): string {
             OR ${alias}.is_deleted = 1
             OR ${alias}.message_type = 'call'
           )`;
+}
+
+// UTC date (YYYY-MM-DD) matching how the ledger writes its `day` column, so
+// daily budget/usage queries can hit the (day, purpose) index.
+function utcDayString(ms: number = Date.now()): string {
+  return new Date(ms).toISOString().slice(0, 10);
 }
 
 function currentIso(): string {

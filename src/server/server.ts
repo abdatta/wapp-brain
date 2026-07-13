@@ -907,7 +907,28 @@ try {
 app.listen(config.app.port, config.app.host, () => {
   console.log(`Wapp Brain listening on http://${config.app.host}:${config.app.port}`);
   void autoResumeLiveSync();
+  void probeBrainProviderOnStartup();
 });
+
+// A remote provider's health is only known once it has answered end-to-end.
+// Fire the configured probe (non-blocking) at boot when a model provider is
+// enabled with a session present, so a broken WSL bridge is a visible degraded
+// state before the first run — not a surprise when a run is refused.
+async function probeBrainProviderOnStartup(): Promise<void> {
+  try {
+    const { getBrainProviderStatus, probeBrainProvider } = await import("./brain/provider");
+    const status = getBrainProviderStatus();
+    if (!status.modelBacked || !status.enabled || status.sessionMissing) {
+      return;
+    }
+    const probe = await probeBrainProvider();
+    if (!probe.ok) {
+      console.warn(`Brain provider startup probe failed: ${probe.status.health.lastError ?? probe.status.message}`);
+    }
+  } catch (error) {
+    console.warn(`Brain provider startup probe error: ${publicErrorMessage(error)}`);
+  }
+}
 
 async function autoResumeLiveSync(): Promise<void> {
   if (!config.live.autoResume) {

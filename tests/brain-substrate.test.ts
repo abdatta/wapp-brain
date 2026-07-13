@@ -5,6 +5,8 @@ import { describe, expect, it } from "vitest";
 import { config } from "../src/server/config";
 import { MemoryArchiveRepository } from "../src/server/db/memoryRepository";
 import { SqliteArchiveRepository } from "../src/server/db/sqliteRepository";
+import { buildEvidencePacks, generateEpisodeForPack } from "../src/server/brain/episodes";
+import { drainBrainTasks, runBrainMaintenancePass } from "../src/server/brain/scheduler";
 import {
   claudeCliInvocation,
   disableBrainProvider,
@@ -347,5 +349,198 @@ process.stdin.on("end", () => {
       restore();
       await rm(tempDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("brain correctness debts", () => {
+  it("keeps a message tied to the watermark visible and never re-opens the seen boundary (D1)", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-tie-"));
+    const restore = configureBrain({ rootDir: tempDir, provider: "extractive" });
+    const repository = new SqliteArchiveRepository(path.join(tempDir, "archive.sqlite"));
+    try {
+      const base = Date.now() - 2 * DAY_MS;
+      await seedChat(repository, "tie@g.us", [
+        message("T1", "tie@g.us", { timestampMs: base }),
+        message("T2", "tie@g.us", { timestampMs: base + DAY_MS })
+      ]);
+      // Commit a real episode; the watermark cursor advances to (T2.ts, T2.rowid).
+      const packs = await buildEvidencePacks(repository, { chatSourceId: "tie@g.us", startAtMs: 0, endAtMs: Date.now() });
+      await generateEpisodeForPack(repository, packs[0], { generator: "extractive" });
+      // The seen boundary is not re-opened even if the digest didn't cite it.
+      expect(await repository.getBrainChatBacklog({ limit: 10 })).toHaveLength(0);
+
+      // A NEW message arrives sharing T2's exact timestamp (higher rowid).
+      await repository.upsertMessages([message("T3", "tie@g.us", { timestampMs: base + DAY_MS })]);
+      const backlog = await repository.getBrainChatBacklog({ limit: 10 });
+      expect(backlog).toHaveLength(1);
+      expect(backlog[0].pendingVisibleMessages).toBe(1);
+      // covered ⟺ selected: assimilated + pending == total, no phantom coverage.
+      const status = await repository.getBrainStatus();
+      expect(status.totalVisibleMessages).toBe(3);
+      expect(status.assimilatedVisibleMessages).toBe(2);
+      expect(status.assimilatedVisibleMessages + backlog[0].pendingVisibleMessages).toBe(status.totalVisibleMessages);
+    } finally {
+      await repository.close?.();
+      restore();
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("never reports phantom coverage for a timestamp-0 message without a watermark (D1)", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-zero-"));
+    const repository = new SqliteArchiveRepository(path.join(tempDir, "archive.sqlite"));
+    try {
+      await seedChat(repository, "zero@g.us", [message("Z1", "zero@g.us", { timestampMs: 0 })]);
+      const status = await repository.getBrainStatus();
+      expect(status.totalVisibleMessages).toBe(1);
+      expect(status.assimilatedVisibleMessages).toBe(0);
+      expect(status.coveragePercent).toBe(0);
+    } finally {
+      await repository.close?.();
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rekeys episodes, citations, and the watermark and drops stranded tasks on identity merge (D2)", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-merge-"));
+    const restore = configureBrain({ rootDir: tempDir, provider: "extractive" });
+    const repository = new SqliteArchiveRepository(path.join(tempDir, "archive.sqlite"));
+    const lid = "111@lid";
+    const pn = "222@s.whatsapp.net";
+    try {
+      const base = Date.now() - 2 * DAY_MS;
+      await seedChat(repository, lid, [
+        message("A1", lid, { timestampMs: base }),
+        message("A2", lid, { timestampMs: base + DAY_MS })
+      ]);
+      const packs = await buildEvidencePacks(repository, { chatSourceId: lid, startAtMs: 0, endAtMs: Date.now() });
+      await generateEpisodeForPack(repository, packs[0], { generator: "extractive" });
+      expect(await repository.getBrainChatBacklog({ limit: 10 })).toHaveLength(0);
+      // A stale pending task under the pre-merge identity.
+      await repository.enqueueBrainTasks([{ kind: "episode", chatSourceId: lid, dedupeKey: `episode:${lid}:0` }]);
+
+      const merged = await repository.mergeIdentity(lid, pn);
+      expect(merged.chatsMerged).toBeGreaterThan(0);
+
+      // Episode + citations follow the surviving identity via the rowid anchor.
+      const episodes = await repository.listBrainEpisodes({ limit: 10 });
+      expect(episodes).toHaveLength(1);
+      expect(episodes[0].chatSourceId).toBe(pn);
+      const citation = episodes[0].claims[0].citations[0];
+      expect(citation.sourceChatId).toBe(pn);
+      expect(citation.sourceMessageKey).toContain(pn);
+      expect(citation.messageId).not.toBeNull();
+      // Watermark survived under pn: no phantom backlog, no duplicate re-assimilation.
+      const backlog = await repository.getBrainChatBacklog({ limit: 10 });
+      expect(backlog.find((item) => item.chatSourceId === pn)?.pendingVisibleMessages ?? 0).toBe(0);
+      // Stranded task dropped so the drain never re-covers the orphaned window.
+      expect((await repository.getBrainTaskSummary()).pending).toBe(0);
+    } finally {
+      await repository.close?.();
+      restore();
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("stores the per-episode fallback reason when a model run falls back to extractive (D3)", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-fallback-"));
+    const badStub = path.join(tempDir, "bad.cjs");
+    await writeFile(
+      badStub,
+      `process.stdin.resume(); process.stdin.on("end", () => {
+        process.stdout.write(JSON.stringify({ type: "result", subtype: "success", is_error: false,
+          result: JSON.stringify({ summary: "s", claims: [{ kind: "fact", text: "t", cites: ["m999"] }] }),
+          usage: { input_tokens: 1, output_tokens: 1 } }));
+      });`,
+      "utf8"
+    );
+    const restore = configureBrain({
+      rootDir: tempDir,
+      providerConfigPath: path.join(tempDir, "provider.json"),
+      provider: "claude-cli",
+      claudeCommand: `node ${badStub}`
+    });
+    const repository = new SqliteArchiveRepository(path.join(tempDir, "archive.sqlite"));
+    try {
+      enableBrainProvider("claude-cli");
+      await seedChat(repository, "fb@g.us", [
+        message("F1", "fb@g.us", { timestampMs: Date.now() - 2 * DAY_MS, body: "We decided the launch date is May 4" }),
+        message("F2", "fb@g.us", { timestampMs: Date.now() - DAY_MS, body: "Great, I will book the venue" })
+      ]);
+      const packs = await buildEvidencePacks(repository, { chatSourceId: "fb@g.us", startAtMs: 0, endAtMs: Date.now() });
+      const result = await generateEpisodeForPack(repository, packs[0], { generator: "model", model: "claude-haiku-4-5" });
+      expect(result.fellBackToExtractive).toBe(true);
+      const episodes = await repository.listBrainEpisodes({ chatSourceId: "fb@g.us", limit: 5 });
+      expect(episodes[0].generator).toBe("extractive");
+      expect(episodes[0].fallbackReason).toBeTruthy();
+    } finally {
+      disableBrainProvider();
+      await repository.close?.();
+      restore();
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("counts only chats that produced an episode, not empty windows visited (D3)", async () => {
+    const repository = new MemoryArchiveRepository();
+    // A regen task whose window has no messages: visited, produces nothing.
+    await repository.enqueueBrainTasks([
+      {
+        kind: "episode",
+        chatSourceId: "empty@g.us",
+        payload: { chatSourceId: "empty@g.us", sinceMs: 0, throughMs: Date.now(), regen: true },
+        dedupeKey: "episode:empty@g.us:regen"
+      }
+    ]);
+    const result = await drainBrainTasks(repository, { maxTasks: 5, mode: "extractive", model: null, provider: "extractive", runId: null });
+    expect(result.tasksDone).toBe(1);
+    expect(result.chatsProduced).toBe(0);
+    expect(result.episodes).toBe(0);
+  });
+
+  it("persists accumulated totals on a non-completed terminal run (D3)", async () => {
+    const repository = new MemoryArchiveRepository();
+    const runId = await repository.startBrainRun("manual");
+    await repository.failBrainRun(runId, "budget_exceeded", "budget reached", {
+      episodes: 3,
+      claims: 9,
+      chats: 2,
+      chatsVisited: 4,
+      modelCalls: 3,
+      skippedForBudget: 5
+    });
+    const status = await repository.getBrainStatus();
+    expect(status.latestRun?.status).toBe("budget_exceeded");
+    expect(status.latestRun?.totals?.episodes).toBe(3);
+    expect(status.latestRun?.totals?.skippedForBudget).toBe(5);
+  });
+
+  it("marks the auto-pass run failed when the drain throws, without waiting for a restart (D4)", async () => {
+    class ThrowingRepository extends MemoryArchiveRepository {
+      async claimDueBrainTasks(): Promise<never> {
+        throw new Error("simulated DB error inside the drain");
+      }
+    }
+    const repository = new ThrowingRepository();
+    const restore = configureBrain({ scheduler: "auto" });
+    try {
+      // A pending task makes the pass run rather than short-circuit as nothing-due.
+      await repository.enqueueBrainTasks([{ kind: "episode", chatSourceId: "x@g.us", dedupeKey: "episode:x:1" }]);
+      await expect(runBrainMaintenancePass(repository, { force: true })).rejects.toThrow(/simulated DB error/);
+      const status = await repository.getBrainStatus();
+      expect(status.latestRun?.status).toBe("failed");
+      expect(status.activeRun).toBeNull();
+    } finally {
+      restore();
+    }
+  });
+
+  it("records estimated token usage rather than a silent zero (D6)", async () => {
+    const repository = new MemoryArchiveRepository();
+    await repository.recordBrainLlmUsage({ purpose: "episode", provider: "codex/gpt", inputTokens: 120, outputTokens: 40, estimated: true });
+    const usage = await repository.getBrainLlmUsage({ day: new Date().toISOString().slice(0, 10) });
+    expect(usage.calls).toBe(1);
+    expect(usage.inputTokens).toBe(120);
+    expect(usage.outputTokens).toBe(40);
   });
 });

@@ -11,7 +11,7 @@
 | # | Change | Model | Status | Hard dependencies | Checkpoint (gate) |
 |---|--------|-------|--------|-------------------|-------------------|
 | 0 | `build-the-brain` (narrowed) | Opus | **archived 2026-07-12** | — (ops-spine remainder paired naturally with #3) | gates 2.7 / 3.8 passed live (scheduler, catch-up, crash-resume, staleness); archived to `archive/2026-07-12-build-the-brain` |
-| 1 | `brain-correctness-debts` | Opus | seeded | — | honest run totals; merge leaves no phantom backlog; interrupted run visible |
+| 1 | `brain-correctness-debts` | Opus | **archived 2026-07-12** | — | compound-cursor watermark, merge rekey, run honesty, startup probe, real usage — shipped; gates 11.1/11.3 test-covered, 11.2 verified live; archived to `archive/2026-07-12-brain-correctness-debts` |
 | 2 | `evidence-pack-fidelity` | Opus | seeded | — (#1 recommended first) | reactions/replies/forwards/number-labels visible in a real episode; week-bounded quiet-chat packs |
 | 3 | `episode-contract-v2` | **Fable** | seeded | #1, #2 | wipe + assimilate 2–3 chats: entities, absolute dates, hedges in claims; salvageable weak-model JSON |
 | 4 | `identity-late-resolution` | Opus | seeded | #3 | save a contact → old episodes + search repair with zero model calls |

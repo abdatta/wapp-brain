@@ -21,6 +21,7 @@ const progress: BrainRunProgress = {
   totalChats: 0,
   currentChat: null,
   episodesCommitted: 0,
+  extractiveEpisodes: 0,
   claimsCommitted: 0,
   modelCalls: 0,
   startedAt: null,
@@ -89,6 +90,7 @@ export function startBrainRun(
   progress.totalChats = 0;
   progress.currentChat = null;
   progress.episodesCommitted = 0;
+  progress.extractiveEpisodes = 0;
   progress.claimsCommitted = 0;
   progress.modelCalls = 0;
   progress.startedAt = new Date().toISOString();
@@ -99,7 +101,7 @@ export function startBrainRun(
       progress.state = outcome;
       progress.finishedAt = new Date().toISOString();
       console.log(
-        `[brain] run ${outcome}: ${progress.episodesCommitted} episodes (${progress.claimsCommitted} claims) across ${progress.processedChats} chats, ${progress.modelCalls} model calls`
+        `[brain] run ${outcome}: ${progress.episodesCommitted} episodes (${progress.extractiveEpisodes} extractive, ${progress.claimsCommitted} claims) across ${progress.processedChats} chats, ${progress.modelCalls} model calls`
       );
       onDone?.({ ok: outcome === "completed" });
     })
@@ -134,20 +136,27 @@ async function executeRun(
     progress.totalChats = backlog.length;
     let budgetExhausted = false;
     let cancelled = false;
+    // Chats that actually produced an episode vs. windows merely visited — the
+    // honest chat count, so "12 chats for 3 episodes" can't happen.
+    let chatsProduced = 0;
+    let chatsVisited = 0;
     for (const item of backlog) {
       if (cancelRequested) {
         cancelled = true;
         break;
       }
       progress.currentChat = item.chatDisplayName ?? item.chatSourceId;
+      chatsVisited += 1;
       const packs = await buildEvidencePacks(repository, {
         chatSourceId: item.chatSourceId,
-        startAtMs: item.assimilatedThroughMs + 1,
+        startAtMs: item.assimilatedThroughMs,
+        afterId: item.assimilatedThroughId,
         endAtMs: Date.now()
       });
+      let producedThisChat = false;
       for (const pack of packs) {
         if (progress.mode === "model") {
-          const usedToday = await repository.getBrainLlmUsage({ sinceMs: utcMidnightMs() });
+          const usedToday = await repository.getBrainLlmUsage({ day: utcDayString() });
           if (progress.modelCalls >= maxModelCalls || usedToday.calls >= config.brain.maxCallsPerDay) {
             budgetExhausted = true;
             break;
@@ -159,6 +168,10 @@ async function executeRun(
           runId
         });
         progress.episodesCommitted += 1;
+        producedThisChat = true;
+        if (result.fellBackToExtractive) {
+          progress.extractiveEpisodes += 1;
+        }
         progress.claimsCommitted += result.episode.claims.length;
         if (result.usage) {
           progress.modelCalls += 1;
@@ -166,29 +179,47 @@ async function executeRun(
             purpose: "episode",
             provider: `${progress.provider}/${progress.model ?? "default"}`,
             inputTokens: result.usage.inputTokens,
-            outputTokens: result.usage.outputTokens
+            outputTokens: result.usage.outputTokens,
+            estimated: result.usage.estimated ?? false
           });
         }
         // Yield between packs so ingestion and HTTP stay responsive.
         await new Promise((resolve) => setImmediate(resolve));
       }
       progress.processedChats += 1;
+      if (producedThisChat) {
+        chatsProduced += 1;
+      }
       if (budgetExhausted) {
         break;
       }
     }
     const totals = {
       episodes: progress.episodesCommitted,
+      extractive: progress.extractiveEpisodes,
       claims: progress.claimsCommitted,
-      chats: progress.processedChats,
-      modelCalls: progress.modelCalls
+      chats: chatsProduced,
+      chatsVisited,
+      modelCalls: progress.modelCalls,
+      // Chats still holding pending backlog that this run never attempted.
+      skippedForBudget: budgetExhausted ? Math.max(0, backlog.length - chatsVisited) : 0
     };
     if (cancelled) {
-      await repository.failBrainRun(runId, "interrupted", "Run cancelled; committed episodes and coverage are kept, remaining backlog stays pending.");
+      await repository.failBrainRun(
+        runId,
+        "interrupted",
+        "Run cancelled; committed episodes and coverage are kept, remaining backlog stays pending.",
+        totals
+      );
       return "interrupted";
     }
     if (budgetExhausted) {
-      await repository.failBrainRun(runId, "budget_exceeded", "Model-call budget for this run was reached; remaining backlog stays pending.");
+      await repository.failBrainRun(
+        runId,
+        "budget_exceeded",
+        "Model-call budget for this run was reached; remaining backlog stays pending.",
+        totals
+      );
       return "budget_exceeded";
     }
     await repository.completeBrainRun(runId, totals);
@@ -199,8 +230,8 @@ async function executeRun(
   }
 }
 
-function utcMidnightMs(): number {
-  const midnight = new Date();
-  midnight.setUTCHours(0, 0, 0, 0);
-  return midnight.getTime();
+// UTC date (YYYY-MM-DD) matching the ledger's `day` column, so the per-run
+// daily budget check hits the (day, purpose) index.
+function utcDayString(): string {
+  return new Date().toISOString().slice(0, 10);
 }

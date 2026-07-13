@@ -309,8 +309,11 @@ export function App() {
               setError(`Brain run failed${next.error ? `: ${next.error}` : "."}`);
             } else if (next.state === "budget_exceeded") {
               setNotice("Brain run stopped at its model-call budget; remaining backlog stays pending.");
+            } else if (next.state === "interrupted") {
+              setNotice(`Brain run interrupted: ${next.episodesCommitted} episodes kept; remaining backlog stays pending.`);
             } else if (next.state === "completed") {
-              setNotice(`Brain run completed: ${next.episodesCommitted} episodes (${next.claimsCommitted} claims).`);
+              const extractiveNote = next.extractiveEpisodes > 0 ? `, ${next.extractiveEpisodes}/${next.episodesCommitted} extractive` : "";
+              setNotice(`Brain run completed: ${next.episodesCommitted} episodes (${next.claimsCommitted} claims${extractiveNote}).`);
             }
           }
         })
@@ -1694,6 +1697,20 @@ function BrainPanel({
                 {run?.model ? `/${run.model}` : ""}): {run?.episodesCommitted ?? 0} episodes from {run?.processedChats ?? 0}/
                 {run?.totalChats ?? 0} chats{run?.currentChat ? ` — now: ${run.currentChat}` : ""}. {run?.modelCalls ?? 0} model
                 calls.
+              </span>
+            </div>
+          )}
+          {!running && overview?.latestRun && (
+            <div className="brainDueAlert">
+              <span>
+                Last run: <strong>{overview.latestRun.status}</strong>
+                {overview.latestRun.totals
+                  ? ` — ${overview.latestRun.totals.episodes ?? 0} episodes${
+                      overview.latestRun.totals.extractive ? ` (${overview.latestRun.totals.extractive} extractive)` : ""
+                    }`
+                  : ""}
+                {` · ${formatDate(overview.latestRun.finishedAt ?? overview.latestRun.startedAt)}`}
+                {overview.latestRun.errorMessage ? ` — ${overview.latestRun.errorMessage}` : ""}
               </span>
             </div>
           )}

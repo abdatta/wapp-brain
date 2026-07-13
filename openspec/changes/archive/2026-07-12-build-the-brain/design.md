@@ -100,6 +100,8 @@ interface BrainModelProvider {
 
 Historical assimilation of 325k messages ≈ 3–4k chat-day packs. Default drain (20 packs/day, idle) takes months; that is stated up front, and it is fine — search (hot tier) works from day one, and coverage metadata keeps answers honest meanwhile. `brain backfill --turbo` runs attended sessions (user-set call rate, progress bar, resumable, priority newest-first so recent history assimilates first). The judges' "querying a partially-built graph" concern is handled by D7's coverage qualification rather than by pretending backfill is fast.
 
+_Amended by `brain-correctness-debts` (2026-07-12):_ "newest-first" turbo backfill is a **chat-level priority only**; within-chat assimilation is always oldest-first from the watermark cursor (what the code already does), which is what keeps the scalar watermark honest.
+
 ## Risks / Trade-offs
 
 - **[`claude -p` is an unversioned, load-bearing seam — doubly so through the WSL2 bridge (wsl.exe availability, WSL boot latency on first call, login-shell PATH resolution)]** → health contract (D9): startup end-to-end probe of the exact invocation, degraded-state visibility, extractive fallback, consecutive-failure alerts; provider adapter isolated in one file; Codex as a second remote option; command fully configurable for a future native install.

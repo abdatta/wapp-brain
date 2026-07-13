@@ -52,9 +52,15 @@ function senderLabel(message: MemoryEvidenceMessage, ownerLabel: string): string
 // up to the evidence cap; oversized silent-free stretches split hard.
 export async function buildEvidencePacks(
   repository: ArchiveRepository,
-  options: { chatSourceId: string; startAtMs: number; endAtMs: number; maxMessages?: number }
+  options: { chatSourceId: string; startAtMs: number; endAtMs: number; afterId?: number; maxMessages?: number }
 ): Promise<BrainEvidencePack[]> {
   const maxMessages = options.maxMessages ?? config.brain.maxEvidenceMessages;
+  // `startAtMs` is the inclusive cursor timestamp; `afterId` is its rowid half.
+  // Selecting resumes strictly after the (timestamp, rowid) cursor so a new
+  // message sharing the boundary timestamp is picked up, while the already-seen
+  // boundary message (id <= afterId) is not re-opened. Coverage below the
+  // boundary timestamp is filtered by the SQL lower bound.
+  const afterId = options.afterId ?? 0;
   const evidence = (
     await repository.listMemoryEvidenceMessages({
       startAtMs: options.startAtMs,
@@ -62,7 +68,9 @@ export async function buildEvidencePacks(
       chatSourceIds: [options.chatSourceId],
       limit: 10_000
     })
-  ).filter(isEvidenceMessage);
+  )
+    .filter(isEvidenceMessage)
+    .filter((message) => (message.timestampMs ?? 0) > options.startAtMs || message.messageId > afterId);
   if (evidence.length === 0) {
     return [];
   }
@@ -277,6 +285,7 @@ export async function generateEpisodeForPack(
   let usage: BrainTokenUsage | null = null;
   let generator: "model" | "extractive" = options.generator;
   let fellBack = false;
+  let fallbackReason: string | null = null;
   const ownerName = await repository.getArchiveOwnerName();
   const ownerLabel = ownerName ?? "the archive owner";
   if (options.generator === "model") {
@@ -316,6 +325,7 @@ Rules: 2-8 claims; every claim MUST cite at least one alias from the list; cite 
     if (!summaryAndClaims) {
       generator = "extractive";
       fellBack = true;
+      fallbackReason = attemptError;
       console.warn(`[brain] episode generation fell back to extractive for a pack of ${pack.messages.length} messages: ${attemptError}`);
     }
   }
@@ -333,6 +343,7 @@ Rules: 2-8 claims; every claim MUST cite at least one alias from the list; cite 
     generator,
     model: generator === "model" ? options.model ?? null : null,
     runId: options.runId ?? null,
+    fallbackReason: fellBack ? fallbackReason : null,
     claims: summaryAndClaims.claims
   });
   const markdown = episodeMarkdown(committed);

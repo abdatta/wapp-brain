@@ -30,6 +30,16 @@ export type { BrainProviderHealth, BrainProviderName, BrainProviderStatus, Brain
 export interface BrainTokenUsage {
   inputTokens: number;
   outputTokens: number;
+  // True when the provider surfaced no usage object and the tokens are a
+  // character-based estimate; the ledger flags such rows rather than trusting
+  // them as measured (and never records a silent zero for a real call).
+  estimated?: boolean;
+}
+
+// chars/4 is the conventional rough token estimate; only used when a provider
+// gives us no real usage object.
+function estimateTokens(text: string): number {
+  return Math.ceil((text?.length ?? 0) / 4);
 }
 
 export interface BrainGenerationRequest {
@@ -397,11 +407,23 @@ async function generateWithCodex(request: BrainGenerationRequest, model: string)
     timeoutMs,
     "BRAIN_CODEX_TIMEOUT",
     `The Codex model did not answer within ${Math.round(timeoutMs / 1000)}s.`
-  )) as { content?: string };
+  )) as { content?: string; usage?: { input_tokens?: number; output_tokens?: number } };
   if (typeof response?.content !== "string") {
     throw new PublicError("BRAIN_CODEX_BAD_RESPONSE", "The Codex client returned no readable content.");
   }
-  return { json: parseModelJson(response.content), usage: { inputTokens: 0, outputTokens: 0 } };
+  // Prefer the real usage object (surfaced on response.completed) when present;
+  // otherwise estimate from characters and flag the row estimated — never zero.
+  const reportedInput = Number(response.usage?.input_tokens);
+  const reportedOutput = Number(response.usage?.output_tokens);
+  const hasUsage = Number.isFinite(reportedInput) && Number.isFinite(reportedOutput) && reportedInput + reportedOutput > 0;
+  const usage: BrainTokenUsage = hasUsage
+    ? { inputTokens: reportedInput, outputTokens: reportedOutput, estimated: false }
+    : {
+        inputTokens: estimateTokens(request.system) + estimateTokens(request.user),
+        outputTokens: estimateTokens(response.content),
+        estimated: true
+      };
+  return { json: parseModelJson(response.content), usage };
 }
 
 // Hangs are the enemy of visible progress: every provider await gets a hard
