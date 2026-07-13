@@ -2655,3 +2655,289 @@ button.fileButton:disabled {
 .degradedLine {
   color: #e6a4a4;
 }
+
+/* ------------------------------------------------------------------ *
+ * Route-based shell: nav rail, route outlet, floating toast host, and
+ * per-surface page containers (added by client-route-architecture).
+ * ------------------------------------------------------------------ */
+
+/* The shell is a fixed-height flex column: the topbar and onboarding bar are
+ * fixed-size, and the route outlet takes the rest with its own scroll. This
+ * gives the outlet a *definite* height so the chats two-pane (height:100%) can
+ * bound itself and scroll its list/thread internally instead of the whole page
+ * scrolling as one column. */
+.appShell {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.topbar,
+.onboardingBar {
+  flex-shrink: 0;
+}
+
+/* Primary navigation in the topbar. */
+.navRail {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 1;
+  justify-content: center;
+  min-width: 0;
+  overflow-x: auto;
+}
+
+.navItem {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  color: #b7c2be;
+  text-decoration: none;
+  font-size: 14px;
+  white-space: nowrap;
+}
+
+.navItem:hover {
+  background: rgba(255, 255, 255, 0.05);
+  color: #eef3f0;
+}
+
+.navItem.active {
+  background: #1d2825;
+  border-color: rgba(121, 225, 180, 0.28);
+  color: #7de0b2;
+}
+
+.navBadge {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: #4a3a12;
+  color: #f0bd5e;
+}
+
+.navHealthDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #8f9b97;
+}
+
+.navHealthDot.healthy {
+  background: #67d39d;
+}
+
+.navHealthDot.disconnected {
+  background: #9aa3a0;
+}
+
+.navHealthDot.needs_user_action {
+  background: #f0bd5e;
+}
+
+/* The swappable page region below the topbar. Chats manages its own two-pane
+ * height; other surfaces scroll within the outlet. */
+.routeOutlet {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.chatsWorkspace {
+  height: 100%;
+}
+
+.chatsWorkspace .messagePane {
+  overflow: hidden;
+}
+
+/* Fill the space between the thread header and the bottom so the message list
+ * is the scroll container (enables open-at-newest and scroll-up-to-load-older). */
+.chatsWorkspace .messageList {
+  flex: 1;
+}
+
+/* Floating toast host so notices never change page layout height. */
+.toastHost {
+  position: fixed;
+  top: 84px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 20;
+  width: min(680px, 92vw);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.toastHost .toastLine {
+  pointer-events: auto;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 10px;
+  min-height: 44px;
+  background: rgba(26, 29, 34, 0.96);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(8px);
+}
+
+/* Compact onboarding bar: a slim, dismissible strip during setup rather than a
+ * full-height card that dominates every surface. */
+.onboardingBar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 24px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  background: linear-gradient(90deg, rgba(41, 60, 57, 0.5), rgba(18, 20, 24, 0.15));
+}
+
+.onboardingBarIcon {
+  color: #7de0b2;
+  flex-shrink: 0;
+}
+
+.onboardingBarText {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+  flex: 1;
+}
+
+.onboardingBarText strong {
+  font-size: 14px;
+  color: #eef3f0;
+  white-space: nowrap;
+}
+
+.onboardingBarText span {
+  font-size: 13px;
+  color: #9ea9a6;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.onboardingBarCta {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 14px;
+  border-radius: 8px;
+  border: 1px solid rgba(121, 225, 180, 0.3);
+  background: #1d2825;
+  color: #7de0b2;
+  font-size: 13px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.onboardingBarCta:hover {
+  background: #24322e;
+}
+
+.onboardingBarDismiss {
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border: none;
+  background: transparent;
+  color: #8e9895;
+  border-radius: 6px;
+}
+
+.onboardingBarDismiss:hover {
+  background: rgba(255, 255, 255, 0.06);
+  color: #dbe6e1;
+}
+
+/* Simple surfaces are centered, padded, card-stacked columns. */
+.searchPage,
+.brainPage,
+.settingsPage,
+.contactsPage {
+  max-width: 820px;
+  margin: 0 auto;
+  padding: 20px 16px 48px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.brainPage > section,
+.settingsPage > section,
+.contactsPage > .importPanel {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  background: rgba(17, 19, 22, 0.6);
+}
+
+/* The global search box on /search is centered content, not a bordered sidebar
+ * panel — drop the panel chrome so no divider runs wider than the field. */
+.searchPage .filterPanel {
+  border-bottom: none;
+  padding: 0;
+}
+
+/* On the dedicated /import route the wizard is a page surface, not a modal:
+ * drop the fixed dark backdrop so it doesn't dim/ghost the shell behind it. */
+.importPage .modalBackdrop {
+  position: static;
+  inset: auto;
+  z-index: auto;
+  background: none;
+  backdrop-filter: none;
+  padding: 24px 16px 48px;
+  place-items: start center;
+}
+
+/* Text mini-buttons (Probe, Reset) in the brain controls lay out inline instead
+ * of being squeezed into a 30px icon square that wraps icon over label. */
+.brainProviderControls .miniButton {
+  width: auto;
+  padding: 0 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.toolHeader .eyebrow {
+  text-transform: none;
+}
+
+.searchIntro,
+.routeLoading,
+.routeNotFound,
+.routeCrash {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  text-align: center;
+  color: #9ea9a6;
+  padding: 64px 24px;
+}
+
+.routeLoading {
+  flex-direction: row;
+}
+
+.routeCrash pre,
+.routeNotFound a {
+  color: #7de0b2;
+}
+
+.routeCrash pre {
+  white-space: pre-wrap;
+  max-width: 640px;
+}

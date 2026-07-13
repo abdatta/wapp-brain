@@ -851,8 +851,13 @@ app.post("/api/media/retry", async (_req, res) => {
 const distDir = path.resolve(__dirname, "../../dist");
 if (fs.existsSync(distDir)) {
   app.use(express.static(distDir));
+  // SPA history fallback: any non-API path serves the app so client routes are
+  // reload-safe. Use the `root` option (not an absolute path) so `send` only
+  // dotfile-checks "index.html" — an absolute path whose directories include a
+  // dot-segment (e.g. a checkout under `.claude/worktrees/…`) would otherwise be
+  // rejected by send's default `dotfiles: "ignore"`.
   app.get(/.*/, (_req, res) => {
-    res.sendFile(path.join(distDir, "index.html"));
+    res.sendFile("index.html", { root: distDir });
   });
 }
 
