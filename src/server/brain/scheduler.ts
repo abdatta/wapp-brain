@@ -15,11 +15,11 @@
 // the hourly cap paces the drain, the daily cap is a hard BUDGET_EXCEEDED stop.
 
 import { randomUUID } from "node:crypto";
-import type { BrainChatBacklogItem, BrainSchedulerStatus, BrainStatusSummary } from "../../shared/types";
+import type { BrainChatBacklogItem, BrainSchedulerStatus, BrainStatusSummary, BrainTaskKind } from "../../shared/types";
 import { config } from "../config";
 import type { ArchiveRepository } from "../db/repository";
 import { publicErrorMessage } from "../privacy";
-import { buildEvidencePacks, generateEpisodeForPack } from "./episodes";
+import { buildEvidencePacks, generateEpisodeForPack, regenerateEpisode } from "./episodes";
 import { getBrainProviderStatus } from "./provider";
 
 // A busy chat must be quiet this long before its intra-day volume episode fires,
@@ -162,6 +162,12 @@ interface DrainOptions {
   model: string | null;
   provider: string;
   runId: string | null;
+  // Restrict the drain to one task kind (a regenerate run must not claim
+  // forward episode tasks). Undefined claims everything due.
+  onlyKind?: BrainTaskKind;
+  // Cooperative hooks for run-job integration: progress ticks and cancellation.
+  onTaskDone?: () => void;
+  shouldStop?: () => boolean;
 }
 
 export interface DrainResult {
@@ -178,13 +184,16 @@ export interface DrainResult {
   rateLimited: boolean;
 }
 
-// Execute one `episode` task: build packs for its window and commit cited
-// episodes. Forward tasks clamp their start to the current watermark so a manual
-// run that already advanced coverage is never re-covered (no duplicate
-// episodes); regeneration tasks (from staleness) rebuild their exact window.
+// Execute one `episode` or `regenerate` task. Forward episode tasks clamp
+// their start to the current watermark so a manual run that already advanced
+// coverage is never re-covered (no duplicate episodes). Regeneration tasks —
+// kind 'regenerate' (stale extraction version / extractive upgrade) and legacy
+// 'episode' tasks with a regen payload (staleness propagation) — rebuild their
+// episode's exact stored window without touching the watermark and supersede
+// the old episode.
 async function executeEpisodeTask(
   repository: ArchiveRepository,
-  task: { chatSourceId: string | null; payload: Record<string, unknown> | null },
+  task: { kind: string; chatSourceId: string | null; payload: Record<string, unknown> | null },
   options: DrainOptions
 ): Promise<{ episodes: number; extractive: number; claims: number; modelCalls: number }> {
   const payload = task.payload ?? {};
@@ -192,29 +201,12 @@ async function executeEpisodeTask(
   if (!chatSourceId) {
     return { episodes: 0, extractive: 0, claims: 0, modelCalls: 0 };
   }
-  const regen = payload.regen === true;
-  let startAtMs = Number(payload.sinceMs ?? 0);
-  let endAtMs = Number(payload.throughMs ?? Date.now());
-  // A regen task rebuilds its exact stored window (afterId 0 = whole window);
-  // a forward task resumes strictly after the compound cursor.
-  let afterId = 0;
-  if (!regen) {
-    const item = (await repository.getBrainChatBacklog({ limit: 5000 })).find((candidate) => candidate.chatSourceId === chatSourceId);
-    if (!item) {
-      // Watermark already covers this window (e.g. a manual run got here first).
-      return { episodes: 0, extractive: 0, claims: 0, modelCalls: 0 };
-    }
-    startAtMs = item.assimilatedThroughMs;
-    afterId = item.assimilatedThroughId;
-    endAtMs = Math.max(endAtMs, item.newestVisibleMs ?? endAtMs);
-  }
-  const packs = await buildEvidencePacks(repository, { chatSourceId, startAtMs, afterId, endAtMs });
+  const regenEpisodeId = task.kind === "regenerate" || payload.regen === true ? String(payload.episodeId ?? "") : "";
   let episodes = 0;
   let extractive = 0;
   let claims = 0;
   let modelCalls = 0;
-  for (const pack of packs) {
-    const result = await generateEpisodeForPack(repository, pack, { generator: options.mode, model: options.model, runId: options.runId });
+  const recordResult = async (result: Awaited<ReturnType<typeof generateEpisodeForPack>>, purpose: string) => {
     episodes += 1;
     if (result.fellBackToExtractive) {
       extractive += 1;
@@ -223,13 +215,46 @@ async function executeEpisodeTask(
     if (result.usage) {
       modelCalls += 1;
       await repository.recordBrainLlmUsage({
-        purpose: regen ? "episode-regen" : "episode",
+        purpose,
         provider: `${options.provider}/${options.model ?? "default"}`,
         inputTokens: result.usage.inputTokens,
         outputTokens: result.usage.outputTokens,
         estimated: result.usage.estimated ?? false
       });
     }
+  };
+  if (regenEpisodeId) {
+    const [oldEpisode] = await repository.listBrainEpisodes({ episodeId: regenEpisodeId, limit: 1 });
+    if (!oldEpisode || oldEpisode.status === "superseded") {
+      // Already regenerated (or reset); the task is complete by construction.
+      return { episodes, extractive, claims, modelCalls };
+    }
+    const outcome = await regenerateEpisode(repository, oldEpisode, {
+      generator: options.mode,
+      model: options.model,
+      runId: options.runId
+    });
+    for (const result of outcome.results) {
+      await recordResult(result, "episode-regen");
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    return { episodes, extractive, claims, modelCalls };
+  }
+  const item = (await repository.getBrainChatBacklog({ limit: 5000 })).find((candidate) => candidate.chatSourceId === chatSourceId);
+  if (!item) {
+    // Watermark already covers this window (e.g. a manual run got here first).
+    return { episodes, extractive, claims, modelCalls };
+  }
+  const endAtMs = Math.max(Number(payload.throughMs ?? Date.now()), item.newestVisibleMs ?? 0);
+  const packs = await buildEvidencePacks(repository, {
+    chatSourceId,
+    startAtMs: item.assimilatedThroughMs,
+    afterId: item.assimilatedThroughId,
+    endAtMs
+  });
+  for (const pack of packs) {
+    const result = await generateEpisodeForPack(repository, pack, { generator: options.mode, model: options.model, runId: options.runId });
+    await recordResult(result, "episode");
     // Yield between packs so live ingestion and HTTP stay responsive.
     await new Promise((resolve) => setImmediate(resolve));
   }
@@ -250,6 +275,9 @@ export async function drainBrainTasks(repository: ArchiveRepository, options: Dr
   let dailyExceeded = false;
   let rateLimited = false;
   while (tasksDone < options.maxTasks) {
+    if (options.shouldStop?.()) {
+      break;
+    }
     if (options.mode === "model") {
       const now = Date.now();
       const daily = await repository.getBrainLlmUsage({ day: utcDayString(now) });
@@ -263,11 +291,11 @@ export async function drainBrainTasks(repository: ArchiveRepository, options: Dr
         break;
       }
     }
-    const [task] = await repository.claimDueBrainTasks(1);
+    const [task] = await repository.claimDueBrainTasks(1, Date.now(), options.onlyKind);
     if (!task) {
       break;
     }
-    if (task.kind !== "episode") {
+    if (task.kind !== "episode" && task.kind !== "regenerate") {
       // The spine only executes episode work; other kinds belong to sibling
       // changes (rollups, graph, projection). Retire them loudly, never loop.
       await repository.failBrainTask(task.id, `Task kind "${task.kind}" is not supported by the brain spine executor.`);
@@ -284,6 +312,7 @@ export async function drainBrainTasks(repository: ArchiveRepository, options: Dr
       }
       await repository.completeBrainTask(task.id);
       tasksDone += 1;
+      options.onTaskDone?.();
     } catch (error) {
       const attempts = task.attempts + 1;
       const retryInMs = attempts < TASK_MAX_ATTEMPTS ? Math.min(TASK_MAX_BACKOFF_MS, TASK_BACKOFF_BASE_MS * 2 ** task.attempts) : null;

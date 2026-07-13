@@ -1,13 +1,20 @@
 import type {
   BrainChatBacklogItem,
+  BrainEpisodeGenerator,
   BrainEpisodeInput,
   BrainEpisodeRecord,
   BrainLlmUsageSummary,
+  BrainMediaGapImpact,
+  BrainMediaGapSummary,
   BrainRunSummary,
   BrainStatusSummary,
   BrainTaskInput,
+  BrainTaskKind,
   BrainTaskRecord,
   BrainTaskSummary,
+  BrainValidationIssueInput,
+  BrainValidationIssueRecord,
+  BrainValidationIssueSummary,
   CapturedLinkPreview,
   ChatListItem,
   ChatRecord,
@@ -202,7 +209,9 @@ export interface ArchiveRepository {
   getBrainChatBacklog(options: { limit: number; minPending?: number }): Promise<BrainChatBacklogItem[]>;
   advanceBrainWatermark(chatSourceId: string, throughMs: number): Promise<void>;
   enqueueBrainTasks(tasks: BrainTaskInput[]): Promise<number>;
-  claimDueBrainTasks(limit: number, nowMs?: number): Promise<BrainTaskRecord[]>;
+  // Optional kind filter: a regenerate run drains only its own task kind while
+  // the auto pass claims everything due.
+  claimDueBrainTasks(limit: number, nowMs?: number, kind?: BrainTaskKind): Promise<BrainTaskRecord[]>;
   completeBrainTask(id: number): Promise<void>;
   failBrainTask(id: number, error: string, options?: { retryInMs?: number | null }): Promise<void>;
   // Restart recovery: claimed-but-unfinished tasks return to pending.
@@ -246,7 +255,39 @@ export interface ArchiveRepository {
   commitBrainEpisode(episode: BrainEpisodeInput): Promise<BrainEpisodeRecord>;
   // Rendered markdown references committed claim ids, so it lands post-commit.
   updateBrainEpisodeMarkdown(episodeId: string, markdown: string): Promise<void>;
-  listBrainEpisodes(options: { chatSourceId?: string | null; episodeId?: string; limit: number }): Promise<BrainEpisodeRecord[]>;
+  listBrainEpisodes(options: {
+    chatSourceId?: string | null;
+    episodeId?: string;
+    // Contract-v2 filters: continuity lookup (latest current model episode) and
+    // regeneration selection use these instead of bespoke queries.
+    status?: BrainEpisodeRecord["status"];
+    generator?: BrainEpisodeGenerator;
+    endAtOrBeforeMs?: number;
+    limit: number;
+  }): Promise<BrainEpisodeRecord[]>;
+  // Regeneration selection: current episodes that are extractive-generated or
+  // carry a stale extraction version, optionally scoped to one chat.
+  listRegenerableBrainEpisodes(options: {
+    currentVersion: number;
+    chatSourceId?: string | null;
+    limit: number;
+  }): Promise<BrainEpisodeRecord[]>;
+  // Cheap count for status surfaces (no record materialization).
+  countRegenerableBrainEpisodes(currentVersion: number): Promise<number>;
+  // D13 media-gap demand signal: the modality/impact aggregate (the demand
+  // stat) and the materiality-aware selector a future media-interpretation
+  // change regenerates first.
+  getBrainMediaGapSummary(): Promise<BrainMediaGapSummary[]>;
+  listBrainEpisodesWithMediaGaps(options: { impact: BrainMediaGapImpact; limit: number }): Promise<BrainEpisodeRecord[]>;
+  // Supersede an episode replaced by regeneration (the status's one writer).
+  markBrainEpisodeSuperseded(episodeId: string): Promise<void>;
+  // Contract-v2 quality signals: flag rows never block a commit.
+  recordBrainValidationIssues(issues: BrainValidationIssueInput[]): Promise<void>;
+  listBrainValidationIssues(options?: { episodeId?: string | null; limit?: number }): Promise<BrainValidationIssueRecord[]>;
+  getBrainValidationIssueSummary(): Promise<BrainValidationIssueSummary>;
+  // Topic vocabulary offer: existing topic titles, this chat's most-used first,
+  // then global by usage, deduped and capped.
+  listBrainTopicVocabulary(chatSourceId: string, limit: number): Promise<string[]>;
   // Staleness propagation: edits/deletes/interpretation upgrades on a cited
   // message mark the dependent 'current' episodes 'stale' and enqueue a
   // dedupe-keyed regeneration task per episode (one transaction). Returns the

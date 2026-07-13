@@ -8,8 +8,9 @@ import type { BrainRunProgress } from "../../shared/types";
 import { config } from "../config";
 import type { ArchiveRepository } from "../db/repository";
 import { publicErrorMessage } from "../privacy";
-import { buildEvidencePacks, generateEpisodeForPack } from "./episodes";
+import { buildEvidencePacks, EXTRACTION_VERSION, generateEpisodeForPack } from "./episodes";
 import { getBrainProviderStatus } from "./provider";
+import { drainBrainTasks } from "./scheduler";
 
 const progress: BrainRunProgress = {
   state: "idle",
@@ -56,6 +57,11 @@ export interface BrainRunRequest {
   chatSourceId?: string | null;
   maxChats?: number;
   maxModelCalls?: number;
+  // Regeneration run (contract v2): instead of draining the forward backlog,
+  // select current episodes that are extractive-generated or carry a stale
+  // extraction version, enqueue durable 'regenerate' tasks, and drain those.
+  // Model mode only — regenerating a model episode extractively would downgrade it.
+  regenerate?: boolean;
 }
 
 export function startBrainRun(
@@ -68,6 +74,13 @@ export function startBrainRun(
     return { started: false, progress: getBrainRunProgress(), refusal: "A brain run is already in progress." };
   }
   const provider = getBrainProviderStatus();
+  if (request.regenerate && request.mode !== "model") {
+    return {
+      started: false,
+      progress: getBrainRunProgress(),
+      refusal: "Regeneration needs a model: replacing a model episode with an extractive placeholder would downgrade it."
+    };
+  }
   if (request.mode === "model") {
     if (!provider.modelBacked || !provider.enabled || provider.sessionMissing) {
       return { started: false, progress: getBrainRunProgress(), refusal: provider.message };
@@ -123,6 +136,9 @@ async function executeRun(
   // Contact enrichment is a correctness boundary: connected Google contacts
   // must be current before a run exists or any evidence backlog is read.
   await beforeAssimilation?.();
+  if (request.regenerate) {
+    return executeRegenerateRun(repository, request);
+  }
   const runId = await repository.startBrainRun("manual");
   progress.runId = runId;
   const maxModelCalls = Math.max(1, request.maxModelCalls ?? config.brain.maxCallsPerHour);
@@ -218,6 +234,84 @@ async function executeRun(
         runId,
         "budget_exceeded",
         "Model-call budget for this run was reached; remaining backlog stays pending.",
+        totals
+      );
+      return "budget_exceeded";
+    }
+    await repository.completeBrainRun(runId, totals);
+    return "completed";
+  } catch (error) {
+    await repository.failBrainRun(runId, "failed", publicErrorMessage(error)).catch(() => undefined);
+    throw error;
+  }
+}
+
+// Regeneration run (contract v2): select stale/extractive current episodes,
+// enqueue durable dedupe-keyed 'regenerate' tasks (resumable — a re-run after
+// an interruption is a no-op for already-superseded episodes), then drain only
+// that kind under the usual budget machinery.
+async function executeRegenerateRun(
+  repository: ArchiveRepository,
+  request: BrainRunRequest
+): Promise<"completed" | "budget_exceeded" | "interrupted"> {
+  const runId = await repository.startBrainRun("regenerate");
+  progress.runId = runId;
+  try {
+    const stale = await repository.listRegenerableBrainEpisodes({
+      currentVersion: EXTRACTION_VERSION,
+      chatSourceId: request.chatSourceId ?? null,
+      limit: 10_000
+    });
+    await repository.enqueueBrainTasks(
+      stale.map((episode) => ({
+        kind: "regenerate" as const,
+        chatSourceId: episode.chatSourceId,
+        payload: { episodeId: episode.id, chatSourceId: episode.chatSourceId },
+        dedupeKey: `regen:${episode.id}:v${EXTRACTION_VERSION}`,
+        priority: 500
+      }))
+    );
+    progress.totalChats = stale.length;
+    console.log(`[brain] regenerate run started (${progress.model ?? "default"}) — ${stale.length} stale/extractive episode(s)`);
+    const result = await drainBrainTasks(repository, {
+      maxTasks: Math.max(1, request.maxChats ?? stale.length),
+      mode: "model",
+      model: progress.model,
+      provider: progress.provider ?? "model",
+      runId,
+      onlyKind: "regenerate",
+      onTaskDone: () => {
+        progress.processedChats += 1;
+      },
+      shouldStop: () => cancelRequested
+    });
+    progress.episodesCommitted = result.episodes;
+    progress.extractiveEpisodes = result.extractive;
+    progress.claimsCommitted = result.claims;
+    progress.modelCalls = result.modelCalls;
+    const totals = {
+      episodes: result.episodes,
+      extractive: result.extractive,
+      claims: result.claims,
+      chats: result.chatsProduced,
+      chatsVisited: result.tasksDone,
+      modelCalls: result.modelCalls,
+      skippedForBudget: result.dailyExceeded || result.rateLimited ? Math.max(0, stale.length - result.tasksDone) : 0
+    };
+    if (cancelRequested) {
+      await repository.failBrainRun(
+        runId,
+        "interrupted",
+        "Regeneration cancelled; superseded episodes and committed replacements are kept, remaining tasks stay pending.",
+        totals
+      );
+      return "interrupted";
+    }
+    if (result.dailyExceeded || result.rateLimited) {
+      await repository.failBrainRun(
+        runId,
+        "budget_exceeded",
+        "Model-call budget was reached mid-regeneration; remaining regenerate tasks stay pending.",
         totals
       );
       return "budget_exceeded";

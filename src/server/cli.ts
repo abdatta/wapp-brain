@@ -238,6 +238,57 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Regenerate stale episodes (contract v2): current episodes that are
+  // extractive-generated or carry a stale extraction_version are re-derived
+  // from their stored windows under the current contract; old rows become
+  // 'superseded'. Watermarks are untouched. --chat scopes to one chat;
+  // --dry-run only counts; --provider/--model as in brain-run. Model mode is
+  // required (an extractive re-run would downgrade model episodes). Run with
+  // the server STOPPED (SQLite is single-writer).
+  if (command === "brain-regenerate") {
+    const { enableBrainProvider, setBrainProviderModel } = await import("./brain/provider");
+    const provider = stringArg(args.provider);
+    const model = stringArg(args.model);
+    if (provider === "claude-cli" || provider === "codex") {
+      enableBrainProvider(provider);
+      if (model) {
+        setBrainProviderModel(provider, model);
+      }
+    }
+    const chatSourceId = stringArg(args.chat) ?? null;
+    const repository = createArchiveRepository();
+    try {
+      const { EXTRACTION_VERSION } = await import("./brain/episodes");
+      const stale = await repository.listRegenerableBrainEpisodes({ currentVersion: EXTRACTION_VERSION, chatSourceId, limit: 10_000 });
+      console.log(
+        `${stale.length} episode(s) need regeneration (extractive or extraction_version < ${EXTRACTION_VERSION})${chatSourceId ? ` in chat ${chatSourceId}` : ""}.`
+      );
+      if (args["dry-run"] || stale.length === 0) {
+        return;
+      }
+      const { startBrainRun, getBrainRunProgress } = await import("./brain/runJob");
+      const started = startBrainRun(repository, { mode: "model", model: model ?? null, chatSourceId, regenerate: true });
+      if (!started.started) {
+        console.error(started.refusal ?? "Could not start the regeneration run.");
+        process.exitCode = 1;
+        return;
+      }
+      while (getBrainRunProgress().state === "running") {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+      const final = getBrainRunProgress();
+      console.log(
+        `Regeneration ${final.state}: ${final.episodesCommitted} replacement episode(s), ${final.claimsCommitted} claim(s), ${final.processedChats}/${final.totalChats} superseded, ${final.modelCalls} model call(s).${final.error ? ` ${final.error}` : ""}`
+      );
+      if (final.state === "failed") {
+        process.exitCode = 1;
+      }
+    } finally {
+      await repository.close?.();
+    }
+    return;
+  }
+
   // Wipe derived brain data for a clean slate (episodes + claims + citations +
   // watermarks + projected .md files + the task queue) — raw messages untouched;
   // the next run re-assimilates from scratch. --chat <sourceId> scopes it to one

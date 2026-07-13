@@ -589,14 +589,60 @@ app.get("/api/brain/status", async (_req, res) => {
   try {
     const { getBrainProviderStatus } = await import("./brain/provider");
     const { schedulerStatusFromSummary } = await import("./brain/scheduler");
+    const { EXTRACTION_VERSION } = await import("./brain/episodes");
     const status = await repository.getBrainStatus();
     res.json({
       ...status,
       provider: getBrainProviderStatus(),
       // Dueness derived from the status we already computed — no extra scan, so
       // this stays a fast, UI-pollable endpoint.
-      scheduler: schedulerStatusFromSummary(status)
+      scheduler: schedulerStatusFromSummary(status),
+      // Contract v2 quality surfaces: all cheap indexed counts.
+      extractionVersion: EXTRACTION_VERSION,
+      regenerableEpisodes: await repository.countRegenerableBrainEpisodes(EXTRACTION_VERSION),
+      validationIssues: await repository.getBrainValidationIssueSummary(),
+      // D13 media-demand stat: where unavailable media hurt inferences.
+      mediaGaps: await repository.getBrainMediaGapSummary()
     });
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+// Regeneration (contract v2): re-derive stale-version/extractive episodes from
+// their stored windows under the current contract, superseding the old rows.
+// dryRun reports the queue size without spending anything.
+app.post("/api/brain/regenerate", async (req, res) => {
+  try {
+    const { EXTRACTION_VERSION } = await import("./brain/episodes");
+    const chatSourceId = typeof req.body?.chatSourceId === "string" ? req.body.chatSourceId : null;
+    if (req.body?.dryRun) {
+      const stale = await repository.listRegenerableBrainEpisodes({
+        currentVersion: EXTRACTION_VERSION,
+        chatSourceId,
+        limit: 10_000
+      });
+      res.json({ ok: true, dryRun: true, episodes: stale.length });
+      return;
+    }
+    const { startBrainRun } = await import("./brain/runJob");
+    const result = startBrainRun(
+      repository,
+      {
+        mode: "model",
+        model: typeof req.body?.model === "string" ? req.body.model : null,
+        chatSourceId,
+        regenerate: true
+      },
+      () => {
+        broadcastArchiveChanged({ source: "manual", chatSourceIds: [], messageCount: 0, contactCount: 0 });
+      }
+    );
+    if (!result.started) {
+      res.status(409).json({ error: result.refusal ?? "The regeneration run could not start.", progress: result.progress });
+      return;
+    }
+    res.json({ ok: true, progress: result.progress });
   } catch (error) {
     res.status(400).json({ error: publicErrorMessage(error) });
   }

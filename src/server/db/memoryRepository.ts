@@ -4,14 +4,21 @@ import type {
 } from "./repository";
 import type {
   BrainChatBacklogItem,
+  BrainEpisodeGenerator,
   BrainEpisodeInput,
   BrainEpisodeRecord,
   BrainLlmUsageSummary,
+  BrainMediaGapImpact,
+  BrainMediaGapSummary,
   BrainRunSummary,
   BrainStatusSummary,
   BrainTaskInput,
+  BrainTaskKind,
   BrainTaskRecord,
   BrainTaskSummary,
+  BrainValidationIssueInput,
+  BrainValidationIssueRecord,
+  BrainValidationIssueSummary,
   CapturedLinkPreview,
   ChatListItem,
   ChatListOptions,
@@ -103,6 +110,10 @@ export class MemoryArchiveRepository implements ArchiveRepository {
   }> = [];
   private brainEpisodes = new Map<string, BrainEpisodeRecord>();
   private brainLockRunId: string | null = null;
+  // Contract v2: validation issues and the case-insensitive topic vocabulary
+  // (lowercased key → first-seen canonical title), mirroring the SQLite tables.
+  private brainIssues: BrainValidationIssueRecord[] = [];
+  private brainTopics = new Map<string, string>();
   private editRevisions = new Map<string, MessageEditRevisionRecord[]>();
   private nextMediaQueueId = 1;
   private nextMediaAssetId = 1;
@@ -1601,9 +1612,10 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     return enqueued;
   }
 
-  async claimDueBrainTasks(limit: number, nowMs = Date.now()): Promise<BrainTaskRecord[]> {
+  async claimDueBrainTasks(limit: number, nowMs = Date.now(), kind?: BrainTaskKind): Promise<BrainTaskRecord[]> {
     const due = [...this.brainTasks.values()]
       .filter((task) => task.status === "pending" && (task.nextAttemptAtMs == null || task.nextAttemptAtMs <= nowMs))
+      .filter((task) => !kind || task.kind === kind)
       .sort((a, b) => b.priority - a.priority || a.id - b.id)
       .slice(0, limit);
     for (const task of due) {
@@ -1800,11 +1812,34 @@ export class MemoryArchiveRepository implements ArchiveRepository {
         this.brainTasks.delete(dedupeKey);
       }
     }
+    if (chat) {
+      this.brainIssues = this.brainIssues.filter((issue) => issue.chatSourceId !== chat && !episodeIds.includes(issue.episodeId ?? ""));
+    } else {
+      // Full reset: issues and the topic vocabulary go too — a clean slate.
+      this.brainIssues = [];
+      this.brainTopics.clear();
+    }
     return { episodeIds, watermarks };
   }
 
   async commitBrainEpisode(episode: BrainEpisodeInput): Promise<BrainEpisodeRecord> {
     const id = crypto.randomUUID();
+    // Case-insensitive topic convergence: reuse the first-seen canonical title.
+    const topics: string[] = [];
+    for (const title of episode.topics ?? []) {
+      const clean = title.trim();
+      if (!clean) {
+        continue;
+      }
+      const key = clean.toLowerCase();
+      if (!this.brainTopics.has(key)) {
+        this.brainTopics.set(key, clean);
+      }
+      const canonical = this.brainTopics.get(key)!;
+      if (!topics.includes(canonical)) {
+        topics.push(canonical);
+      }
+    }
     const record: BrainEpisodeRecord = {
       id,
       chatSourceId: episode.chatSourceId,
@@ -1819,11 +1854,26 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       model: episode.model,
       status: "current",
       fallbackReason: episode.fallbackReason ?? null,
+      extractionVersion: episode.extractionVersion,
+      topics,
+      unresolvedParticipants: episode.unresolvedParticipants ?? [],
+      pushNameParticipants: episode.pushNameParticipants ?? [],
+      uninterpretedMediaCount: episode.uninterpretedMediaCount ?? 0,
+      mediaGaps: structuredClone(episode.mediaGaps ?? []),
       createdAt: new Date().toISOString(),
       claims: episode.claims.map((claim) => ({
         id: crypto.randomUUID(),
         kind: claim.kind,
         text: claim.text,
+        eventAtMs: claim.eventAtMs ?? null,
+        validUntilMs: claim.validUntilMs ?? null,
+        confidence: claim.confidence ?? "stated",
+        entities: (claim.entities ?? []).map((entity) => ({
+          kind: entity.kind,
+          name: entity.name,
+          jid: entity.jid ? this.canonicalJid(entity.jid) ?? entity.jid : null,
+          role: entity.role ?? null
+        })),
         citations: claim.citations.map((key) => {
           const message = [...this.messages.values()].find((candidate) => candidate.sourceMessageKey === key) ?? null;
           return {
@@ -1837,8 +1887,132 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       }))
     };
     this.brainEpisodes.set(id, record);
-    await this.advanceBrainWatermark(episode.chatSourceId, episode.endAtMs);
+    // Regeneration commits leave the watermark alone (the window is covered).
+    if (episode.advanceWatermark !== false) {
+      await this.advanceBrainWatermark(episode.chatSourceId, episode.endAtMs);
+    }
+    // Supersede-with-replacement mirrors the SQLite transaction semantics.
+    if (episode.supersedesEpisodeId) {
+      const superseded = this.brainEpisodes.get(episode.supersedesEpisodeId);
+      if (superseded) {
+        superseded.status = "superseded";
+      }
+    }
     return structuredClone(record);
+  }
+
+  async listRegenerableBrainEpisodes(options: {
+    currentVersion: number;
+    chatSourceId?: string | null;
+    limit: number;
+  }): Promise<BrainEpisodeRecord[]> {
+    return structuredClone(
+      [...this.brainEpisodes.values()]
+        .filter((episode) => episode.status === "current")
+        .filter((episode) => episode.generator === "extractive" || episode.extractionVersion < options.currentVersion)
+        .filter((episode) => !options.chatSourceId || episode.chatSourceId === options.chatSourceId)
+        .sort((a, b) => b.endAtMs - a.endAtMs)
+        .slice(0, options.limit)
+    );
+  }
+
+  async markBrainEpisodeSuperseded(episodeId: string): Promise<void> {
+    const episode = this.brainEpisodes.get(episodeId);
+    if (episode) {
+      episode.status = "superseded";
+    }
+  }
+
+  async countRegenerableBrainEpisodes(currentVersion: number): Promise<number> {
+    return [...this.brainEpisodes.values()].filter(
+      (episode) => episode.status === "current" && (episode.generator === "extractive" || episode.extractionVersion < currentVersion)
+    ).length;
+  }
+
+  async getBrainMediaGapSummary(): Promise<BrainMediaGapSummary[]> {
+    const counts = new Map<string, BrainMediaGapSummary>();
+    for (const episode of this.brainEpisodes.values()) {
+      if (episode.status !== "current") {
+        continue;
+      }
+      for (const gap of episode.mediaGaps) {
+        const key = `${gap.modality}:${gap.impact}`;
+        const entry = counts.get(key) ?? { modality: gap.modality, impact: gap.impact, count: 0 };
+        entry.count += 1;
+        counts.set(key, entry);
+      }
+    }
+    return [...counts.values()].sort((a, b) => b.count - a.count);
+  }
+
+  async listBrainEpisodesWithMediaGaps(options: { impact: BrainMediaGapImpact; limit: number }): Promise<BrainEpisodeRecord[]> {
+    return structuredClone(
+      [...this.brainEpisodes.values()]
+        .filter((episode) => episode.status === "current" && episode.mediaGaps.some((gap) => gap.impact === options.impact))
+        .sort((a, b) => b.endAtMs - a.endAtMs)
+        .slice(0, options.limit)
+    );
+  }
+
+  async recordBrainValidationIssues(issues: BrainValidationIssueInput[]): Promise<void> {
+    for (const issue of issues) {
+      this.brainIssues.push({
+        id: this.brainIssues.length + 1,
+        runId: issue.runId ?? null,
+        chatSourceId: issue.chatSourceId ?? null,
+        episodeId: issue.episodeId ?? null,
+        claimSequence: issue.claimSequence ?? null,
+        code: issue.code,
+        severity: issue.severity,
+        detail: issue.detail ?? null,
+        createdAt: new Date().toISOString()
+      });
+    }
+  }
+
+  async listBrainValidationIssues(options?: { episodeId?: string | null; limit?: number }): Promise<BrainValidationIssueRecord[]> {
+    return structuredClone(
+      [...this.brainIssues]
+        .filter((issue) => !options?.episodeId || issue.episodeId === options.episodeId)
+        .reverse()
+        .slice(0, options?.limit ?? 100)
+    );
+  }
+
+  async getBrainValidationIssueSummary(): Promise<BrainValidationIssueSummary> {
+    const summary: BrainValidationIssueSummary = { error: 0, warning: 0, info: 0 };
+    for (const issue of this.brainIssues) {
+      summary[issue.severity] += 1;
+    }
+    return summary;
+  }
+
+  async listBrainTopicVocabulary(chatSourceId: string, limit: number): Promise<string[]> {
+    const chatCounts = new Map<string, number>();
+    const globalCounts = new Map<string, number>();
+    for (const episode of this.brainEpisodes.values()) {
+      for (const topic of episode.topics) {
+        globalCounts.set(topic, (globalCounts.get(topic) ?? 0) + 1);
+        if (episode.chatSourceId === chatSourceId) {
+          chatCounts.set(topic, (chatCounts.get(topic) ?? 0) + 1);
+        }
+      }
+    }
+    const byUsage = (counts: Map<string, number>) =>
+      [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([title]) => title);
+    const seen = new Set<string>();
+    const titles: string[] = [];
+    for (const title of [...byUsage(chatCounts), ...byUsage(globalCounts), ...this.brainTopics.values()]) {
+      const key = title.toLowerCase();
+      if (!seen.has(key)) {
+        seen.add(key);
+        titles.push(title);
+      }
+      if (titles.length >= limit) {
+        break;
+      }
+    }
+    return titles;
   }
 
   async updateBrainEpisodeMarkdown(episodeId: string, markdown: string): Promise<void> {
@@ -1848,11 +2022,21 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     }
   }
 
-  async listBrainEpisodes(options: { chatSourceId?: string | null; episodeId?: string; limit: number }): Promise<BrainEpisodeRecord[]> {
+  async listBrainEpisodes(options: {
+    chatSourceId?: string | null;
+    episodeId?: string;
+    status?: BrainEpisodeRecord["status"];
+    generator?: BrainEpisodeGenerator;
+    endAtOrBeforeMs?: number;
+    limit: number;
+  }): Promise<BrainEpisodeRecord[]> {
     return structuredClone(
       [...this.brainEpisodes.values()]
         .filter((episode) => !options.episodeId || episode.id === options.episodeId)
         .filter((episode) => !options.chatSourceId || episode.chatSourceId === options.chatSourceId)
+        .filter((episode) => !options.status || episode.status === options.status)
+        .filter((episode) => !options.generator || episode.generator === options.generator)
+        .filter((episode) => options.endAtOrBeforeMs == null || episode.endAtMs <= options.endAtOrBeforeMs)
         .sort((a, b) => b.endAtMs - a.endAtMs)
         .slice(0, options.limit)
     );
@@ -2151,7 +2335,10 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       text: message.body ?? message.caption ?? null,
       isForwarded: Boolean(message.isForwarded),
       quotedSourceMessageId: message.quotedSourceMessageId ?? null,
-      reactions: []
+      reactions: [],
+      // Label provenance (contract v2): the label above resolved from the
+      // self-set push name because no saved display name exists.
+      senderNameIsPushName: Boolean(!sender?.displayName?.trim() && sender?.pushName?.trim())
     };
   }
 
@@ -2178,7 +2365,8 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       target.reactions.push({
         emoji,
         reactorJid,
-        reactorDisplayName: contact?.displayName?.trim() || contact?.pushName?.trim() || contact?.phoneNumber || displayPhoneFromJid(reactorJid)
+        reactorDisplayName: contact?.displayName?.trim() || contact?.pushName?.trim() || contact?.phoneNumber || displayPhoneFromJid(reactorJid),
+        reactorNameIsPushName: Boolean(!contact?.displayName?.trim() && contact?.pushName?.trim())
       });
     }
   }

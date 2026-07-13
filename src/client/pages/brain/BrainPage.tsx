@@ -8,6 +8,7 @@ import {
   resetBrainData,
   resolveMemoryCitation,
   setBrainOwner,
+  startBrainRegenerate,
   startBrainRun,
   startMemoryRun
 } from "../../api";
@@ -59,6 +60,17 @@ export function BrainPage() {
       setNotice("Brain run started — progress shows below and in the nav.");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not start the brain run.");
+    }
+  }
+
+  async function handleStartBrainRegenerate(body: { model?: string | null }) {
+    setError(null);
+    try {
+      const response = await startBrainRegenerate(body);
+      setBrainRun(response.progress);
+      setNotice("Regeneration started — stale/extractive episodes are re-derived under the current contract and superseded.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not start the regeneration run.");
     }
   }
 
@@ -177,6 +189,7 @@ export function BrainPage() {
         busy={busy}
         onProviderAction={(body) => void handleBrainProviderAction(body)}
         onRun={(body) => void handleStartBrainRun(body)}
+        onRegenerate={(body) => void handleStartBrainRegenerate(body)}
         onSetOwner={(displayName) => void handleSetBrainOwner(displayName)}
         onReset={() => void handleResetBrain()}
       />

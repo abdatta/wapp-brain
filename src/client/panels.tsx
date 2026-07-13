@@ -500,6 +500,7 @@ function BrainPanel({
   busy,
   onProviderAction,
   onRun,
+  onRegenerate,
   onSetOwner,
   onReset
 }: {
@@ -512,6 +513,7 @@ function BrainPanel({
     model?: string;
   }) => void;
   onRun: (body: { mode: "model" | "extractive"; model?: string | null; maxChats?: number }) => void;
+  onRegenerate: (body: { model?: string | null }) => void;
   onSetOwner: (displayName: string | null) => void;
   onReset: () => void;
 }) {
@@ -549,6 +551,23 @@ function BrainPanel({
               value={((overview?.totalVisibleMessages ?? 0) - (overview?.assimilatedVisibleMessages ?? 0)).toLocaleString()}
             />
             <Metric label="Calls today" value={overview?.usageToday.calls.toLocaleString() ?? "0"} />
+            {overview?.validationIssues && overview.validationIssues.error + overview.validationIssues.warning > 0 && (
+              <Metric
+                label="Quality flags"
+                value={`${overview.validationIssues.error + overview.validationIssues.warning}`}
+              />
+            )}
+            {(overview?.mediaGaps?.length ?? 0) > 0 && (
+              <div
+                className="metric"
+                title={`Where unavailable media hurt an inference (the demand stat for building media interpretation): ${overview!.mediaGaps!
+                  .map((gap) => `${gap.modality} ${gap.impact}: ${gap.count}`)
+                  .join(", ")}`}
+              >
+                <span>Media gaps</span>
+                <strong>{overview!.mediaGaps!.reduce((sum, gap) => sum + gap.count, 0)}</strong>
+              </div>
+            )}
           </div>
           {runDue && !running && (
             <div className="brainDueAlert">
@@ -683,6 +702,18 @@ function BrainPanel({
               {running ? <Loader2 className="spin" size={16} /> : <Play size={16} />}
               Run
             </button>
+            {(overview?.regenerableEpisodes ?? 0) > 0 && (
+              <button
+                className="miniButton"
+                type="button"
+                disabled={Boolean(busy) || running || !provider || provider.provider === "extractive" || Boolean(provider.sessionMissing)}
+                onClick={() => onRegenerate({ model: provider?.model ?? null })}
+                title={`Re-derive ${overview?.regenerableEpisodes} extractive or stale-version episode(s) from their stored windows under the current extraction contract (v${overview?.extractionVersion ?? "?"}); old episodes become superseded, watermarks untouched. Needs a model provider.`}
+              >
+                <RefreshCcw size={14} />
+                Regenerate {overview?.regenerableEpisodes}
+              </button>
+            )}
             <button
               className="miniButton dangerButton"
               type="button"

@@ -3,14 +3,23 @@ import fs from "node:fs";
 import path from "node:path";
 import type {
   BrainChatBacklogItem,
+  BrainClaimEntityRecord,
+  BrainEpisodeGenerator,
   BrainEpisodeInput,
   BrainEpisodeRecord,
   BrainLlmUsageSummary,
   BrainRunSummary,
   BrainStatusSummary,
   BrainTaskInput,
+  BrainTaskKind,
   BrainTaskRecord,
   BrainTaskSummary,
+  BrainMediaGapImpact,
+  BrainMediaGapRecord,
+  BrainMediaGapSummary,
+  BrainValidationIssueInput,
+  BrainValidationIssueRecord,
+  BrainValidationIssueSummary,
   CapturedLinkPreview,
   ChatListItem,
   ChatListOptions,
@@ -113,10 +122,20 @@ const ARCHIVE_TABLES = [
   "brain_llm_ledger",
   "brain_episodes",
   "brain_claims",
-  "brain_citations"
+  "brain_citations",
+  "brain_claim_entities",
+  "brain_topics",
+  "brain_episode_topics",
+  "brain_validation_issues",
+  "brain_media_gaps"
 ] as const;
 const DELETE_TABLE_ORDER = [
   "identity_links",
+  "brain_media_gaps",
+  "brain_validation_issues",
+  "brain_episode_topics",
+  "brain_topics",
+  "brain_claim_entities",
   "brain_citations",
   "brain_claims",
   "brain_episodes",
@@ -177,6 +196,14 @@ function contactLabelSql(alias = ""): string {
                 CASE WHEN NULLIF(TRIM(COALESCE(${phone}, '')), '') IS NOT NULL
                      THEN '+' || REPLACE(REPLACE(REPLACE(TRIM(${phone}), '+', ''), ' ', ''), '-', '')
                      ELSE NULL END)`;
+}
+
+// Label provenance: true when contactLabelSql's result came from the self-set
+// push name (no saved display name). The brain marks such labels ~name and
+// stamps the JID per episode for later repair (contract v2, D12).
+function labelIsPushNameSql(alias = ""): string {
+  return `(NULLIF(TRIM(COALESCE(${alias}display_name, '')), '') IS NULL
+           AND NULLIF(TRIM(COALESCE(${alias}push_name, '')), '') IS NOT NULL)`;
 }
 
 // The full thread-view row projection, shared by offset paging and
@@ -795,7 +822,7 @@ const schemaStatements = [
   // interruption free — the next tick re-claims stale work.
   `CREATE TABLE IF NOT EXISTS brain_tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind TEXT NOT NULL CHECK (kind IN ('episode','rollup','overview','merge_adjudicate','reindex','project_pages')),
+    kind TEXT NOT NULL CHECK (kind IN ('episode','regenerate','rollup','overview','merge_adjudicate','reindex','project_pages')),
     chat_source_id TEXT NULL,
     payload_json TEXT NULL,
     dedupe_key TEXT NOT NULL UNIQUE,
@@ -811,7 +838,7 @@ const schemaStatements = [
 
   `CREATE TABLE IF NOT EXISTS brain_runs (
     id TEXT PRIMARY KEY,
-    kind TEXT NOT NULL CHECK (kind IN ('nightly','catchup','manual','backfill')),
+    kind TEXT NOT NULL CHECK (kind IN ('nightly','catchup','manual','backfill','regenerate')),
     status TEXT NOT NULL CHECK (status IN ('running','completed','failed','interrupted','budget_exceeded')),
     started_at TEXT NOT NULL,
     finished_at TEXT NULL,
@@ -839,6 +866,10 @@ const schemaStatements = [
     status TEXT NOT NULL DEFAULT 'current' CHECK (status IN ('current','superseded','stale','compressed')),
     run_id TEXT NULL,
     fallback_reason TEXT NULL,
+    extraction_version INTEGER NOT NULL,
+    unresolved_participants_json TEXT NULL,
+    push_name_participants_json TEXT NULL,
+    uninterpreted_media_count INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   )`,
 
@@ -848,7 +879,68 @@ const schemaStatements = [
     sequence INTEGER NOT NULL,
     kind TEXT NOT NULL CHECK (kind IN ('fact','decision','commitment','question','event')),
     text TEXT NOT NULL,
+    event_at_ms INTEGER NULL,
+    valid_until_ms INTEGER NULL,
+    confidence TEXT NOT NULL DEFAULT 'stated' CHECK (confidence IN ('stated','hedged','reported')),
     FOREIGN KEY (episode_id) REFERENCES brain_episodes(id) ON DELETE CASCADE
+  )`,
+
+  // Claim entities: identity-anchored at commit (jid = canonical JID when the
+  // entity name matched a pack participant label; NULL otherwise). The future
+  // knowledge graph keys on jid; name is display metadata.
+  `CREATE TABLE IF NOT EXISTS brain_claim_entities (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    claim_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('person','org','place','project','other')),
+    name TEXT NOT NULL,
+    jid TEXT NULL,
+    role TEXT NULL,
+    FOREIGN KEY (claim_id) REFERENCES brain_claims(id) ON DELETE CASCADE
+  )`,
+
+  // Structured episode topics: never load-bearing in prose. Case-insensitive
+  // uniqueness converges vocabulary ('Visa' reuses 'visa').
+  `CREATE TABLE IF NOT EXISTS brain_topics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS brain_episode_topics (
+    episode_id TEXT NOT NULL,
+    topic_id INTEGER NOT NULL,
+    PRIMARY KEY (episode_id, topic_id),
+    FOREIGN KEY (episode_id) REFERENCES brain_episodes(id) ON DELETE CASCADE,
+    FOREIGN KEY (topic_id) REFERENCES brain_topics(id) ON DELETE CASCADE
+  )`,
+
+  // Media-gap demand signal (contract v2, D13): the model's text-only record
+  // that an unavailable media message's content would have improved the
+  // episode. modality is derived at commit from the cited message's type.
+  `CREATE TABLE IF NOT EXISTS brain_media_gaps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    episode_id TEXT NOT NULL,
+    source_message_key TEXT NOT NULL,
+    modality TEXT NOT NULL CHECK (modality IN ('image','audio','video','document','other')),
+    impact TEXT NOT NULL CHECK (impact IN ('blocks','enriches')),
+    note TEXT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    FOREIGN KEY (episode_id) REFERENCES brain_episodes(id) ON DELETE CASCADE
+  )`,
+
+  // Quality signals and salvage records (contract v2): structural failures that
+  // exhausted the retry ('error'), quality lints like the anchoring check
+  // ('warning'), informational notes ('info'). Flag rows never block commits.
+  `CREATE TABLE IF NOT EXISTS brain_validation_issues (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NULL,
+    chat_source_id TEXT NULL,
+    episode_id TEXT NULL,
+    claim_sequence INTEGER NULL,
+    code TEXT NOT NULL,
+    severity TEXT NOT NULL CHECK (severity IN ('info','warning','error')),
+    detail TEXT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   )`,
 
   // Citation labels ARE message keys — stable, globally unique, resolvable.
@@ -901,9 +993,17 @@ const schemaStatements = [
   `CREATE INDEX IF NOT EXISTS idx_brain_ledger_day ON brain_llm_ledger (day, purpose)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_runs_status ON brain_runs (status, started_at)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_episodes_chat ON brain_episodes (chat_source_id, status, end_at_ms)`,
+  `CREATE INDEX IF NOT EXISTS idx_brain_episodes_status_end ON brain_episodes (status, end_at_ms)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_claims_episode ON brain_claims (episode_id, sequence)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_citations_claim ON brain_citations (claim_id)`,
-  `CREATE INDEX IF NOT EXISTS idx_brain_citations_key ON brain_citations (source_message_key)`
+  `CREATE INDEX IF NOT EXISTS idx_brain_citations_key ON brain_citations (source_message_key)`,
+  `CREATE INDEX IF NOT EXISTS idx_brain_claim_entities_claim ON brain_claim_entities (claim_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_brain_claim_entities_jid ON brain_claim_entities (jid)`,
+  `CREATE INDEX IF NOT EXISTS idx_brain_episode_topics_topic ON brain_episode_topics (topic_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_brain_issues_episode ON brain_validation_issues (episode_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_brain_issues_code ON brain_validation_issues (code, created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_brain_media_gaps_episode ON brain_media_gaps (episode_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_brain_media_gaps_modality ON brain_media_gaps (modality, impact)`
 ];
 
 // Full-text search over messages (brain hot tier): a content-storing FTS5
@@ -1645,18 +1745,20 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     return enqueued;
   }
 
-  async claimDueBrainTasks(limit: number, nowMs = Date.now()): Promise<BrainTaskRecord[]> {
+  async claimDueBrainTasks(limit: number, nowMs = Date.now(), kind?: BrainTaskKind): Promise<BrainTaskRecord[]> {
     const claimed: BrainTaskRecord[] = [];
+    const kindClause = kind ? "AND kind = ?" : "";
+    const params: unknown[] = kind ? [nowMs, kind, limit] : [nowMs, limit];
     const transaction = this.db.transaction(() => {
       const rows = this.db
         .prepare(
           `SELECT id, kind, chat_source_id, payload_json, dedupe_key, status, priority, attempts, next_attempt_at_ms, last_error
            FROM brain_tasks
-           WHERE status = 'pending' AND (next_attempt_at_ms IS NULL OR next_attempt_at_ms <= ?)
+           WHERE status = 'pending' AND (next_attempt_at_ms IS NULL OR next_attempt_at_ms <= ?) ${kindClause}
            ORDER BY priority DESC, id ASC
            LIMIT ?`
         )
-        .all(nowMs, limit) as SqliteBrainTaskRow[];
+        .all(...params) as SqliteBrainTaskRow[];
       const claim = this.db.prepare(`UPDATE brain_tasks SET status = 'running', claimed_at_ms = ?, updated_at = ? WHERE id = ?`);
       for (const row of rows) {
         claim.run(nowMs, currentIso(), row.id);
@@ -1908,8 +2010,20 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         this.db
           .prepare(`DELETE FROM brain_citations WHERE claim_id IN (SELECT id FROM brain_claims WHERE episode_id IN (${placeholders}))`)
           .run(...batch);
+        this.db
+          .prepare(`DELETE FROM brain_claim_entities WHERE claim_id IN (SELECT id FROM brain_claims WHERE episode_id IN (${placeholders}))`)
+          .run(...batch);
+        this.db.prepare(`DELETE FROM brain_episode_topics WHERE episode_id IN (${placeholders})`).run(...batch);
+        this.db.prepare(`DELETE FROM brain_validation_issues WHERE episode_id IN (${placeholders})`).run(...batch);
+        this.db.prepare(`DELETE FROM brain_media_gaps WHERE episode_id IN (${placeholders})`).run(...batch);
         this.db.prepare(`DELETE FROM brain_claims WHERE episode_id IN (${placeholders})`).run(...batch);
         this.db.prepare(`DELETE FROM brain_episodes WHERE id IN (${placeholders})`).run(...batch);
+      }
+      if (!chat) {
+        // Full reset: issue rows without an episode anchor and the topic
+        // vocabulary itself go too — the brain starts from a truly clean slate.
+        this.db.prepare(`DELETE FROM brain_validation_issues`).run();
+        this.db.prepare(`DELETE FROM brain_topics`).run();
       }
       watermarks = Number(
         (chat
@@ -1937,20 +2051,34 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     const chatSourceId = this.canonicalJid(episode.chatSourceId) ?? episode.chatSourceId;
     const insertEpisode = this.db.prepare(
       `INSERT INTO brain_episodes
-       (id, chat_source_id, start_at_ms, end_at_ms, message_count, participants_json, summary, markdown, generator, model, run_id, fallback_reason)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       (id, chat_source_id, start_at_ms, end_at_ms, message_count, participants_json, summary, markdown, generator, model, run_id, fallback_reason,
+        extraction_version, unresolved_participants_json, push_name_participants_json, uninterpreted_media_count)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
-    const insertClaim = this.db.prepare(`INSERT INTO brain_claims (id, episode_id, sequence, kind, text) VALUES (?, ?, ?, ?, ?)`);
+    const insertClaim = this.db.prepare(
+      `INSERT INTO brain_claims (id, episode_id, sequence, kind, text, event_at_ms, valid_until_ms, confidence) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    );
     const insertCitation = this.db.prepare(
       `INSERT INTO brain_citations (claim_id, source_message_key, source_chat_id, message_id, sender_source_jid, timestamp_ms)
        SELECT ?, ?, ?, m.id, m.sender_source_jid, m.timestamp_ms
        FROM (SELECT 1) LEFT JOIN messages m ON m.source_message_key = ?`
     );
+    const insertEntity = this.db.prepare(
+      `INSERT INTO brain_claim_entities (claim_id, kind, name, jid, role) VALUES (?, ?, ?, ?, ?)`
+    );
+    const insertMediaGap = this.db.prepare(
+      `INSERT INTO brain_media_gaps (episode_id, source_message_key, modality, impact, note) VALUES (?, ?, ?, ?, ?)`
+    );
+    // Case-insensitive topic convergence: the NOCASE unique index makes the
+    // upsert reuse 'visa' when the model writes 'Visa'.
+    const upsertTopic = this.db.prepare(`INSERT INTO brain_topics (title) VALUES (?) ON CONFLICT (title) DO NOTHING`);
+    const selectTopic = this.db.prepare(`SELECT id FROM brain_topics WHERE title = ?`);
+    const linkTopic = this.db.prepare(`INSERT OR IGNORE INTO brain_episode_topics (episode_id, topic_id) VALUES (?, ?)`);
     const advance = this.db.prepare(WATERMARK_CURSOR_UPSERT);
     // The rowid half of the cursor: every message seen at or below the pack's
     // end timestamp. A later same-timestamp message gets a higher rowid and
     // stays pending — the tie boundary fix.
-    const boundaryId = this.boundaryRowidForChat(chatSourceId, episode.endAtMs);
+    const boundaryId = episode.advanceWatermark === false ? 0 : this.boundaryRowidForChat(chatSourceId, episode.endAtMs);
     const transaction = this.db.transaction(() => {
       insertEpisode.run(
         id,
@@ -1964,16 +2092,56 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         episode.generator,
         episode.model,
         episode.runId,
-        episode.fallbackReason ?? null
+        episode.fallbackReason ?? null,
+        episode.extractionVersion,
+        stringifyJson(episode.unresolvedParticipants ?? []),
+        stringifyJson(episode.pushNameParticipants ?? []),
+        episode.uninterpretedMediaCount ?? 0
       );
       episode.claims.forEach((claim, index) => {
         const claimId = crypto.randomUUID();
-        insertClaim.run(claimId, id, index + 1, claim.kind, claim.text);
+        insertClaim.run(
+          claimId,
+          id,
+          index + 1,
+          claim.kind,
+          claim.text,
+          claim.eventAtMs ?? null,
+          claim.validUntilMs ?? null,
+          claim.confidence ?? "stated"
+        );
         for (const key of claim.citations) {
           insertCitation.run(claimId, key, chatSourceId, key);
         }
+        for (const entity of claim.entities ?? []) {
+          const jid = entity.jid ? this.canonicalJid(entity.jid) ?? entity.jid : null;
+          insertEntity.run(claimId, entity.kind, entity.name, jid, entity.role ?? null);
+        }
       });
-      advance.run(chatSourceId, episode.endAtMs, boundaryId, currentIso(), currentIso());
+      for (const title of episode.topics ?? []) {
+        const clean = title.trim();
+        if (!clean) {
+          continue;
+        }
+        upsertTopic.run(clean);
+        const topic = selectTopic.get(clean) as { id: number } | undefined;
+        if (topic) {
+          linkTopic.run(id, topic.id);
+        }
+      }
+      for (const gap of episode.mediaGaps ?? []) {
+        insertMediaGap.run(id, gap.sourceMessageKey, gap.modality, gap.impact, gap.note ?? null);
+      }
+      // Regeneration commits leave the watermark alone: the window is already
+      // covered and the cursor must never move backwards or churn.
+      if (episode.advanceWatermark !== false) {
+        advance.run(chatSourceId, episode.endAtMs, boundaryId, currentIso(), currentIso());
+      }
+      // Supersede-with-replacement is atomic: no crash window where both the
+      // old and the new episode read as current.
+      if (episode.supersedesEpisodeId) {
+        this.db.prepare(`UPDATE brain_episodes SET status = 'superseded' WHERE id = ?`).run(episode.supersedesEpisodeId);
+      }
     });
     transaction();
     this.invalidateBrainStatusCache();
@@ -1987,7 +2155,14 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     this.db.prepare(`UPDATE brain_episodes SET markdown = ? WHERE id = ?`).run(markdown, episodeId);
   }
 
-  async listBrainEpisodes(options: { chatSourceId?: string | null; episodeId?: string; limit: number }): Promise<BrainEpisodeRecord[]> {
+  async listBrainEpisodes(options: {
+    chatSourceId?: string | null;
+    episodeId?: string;
+    status?: BrainEpisodeRecord["status"];
+    generator?: BrainEpisodeGenerator;
+    endAtOrBeforeMs?: number;
+    limit: number;
+  }): Promise<BrainEpisodeRecord[]> {
     const clauses: string[] = [];
     const params: unknown[] = [];
     if (options.episodeId) {
@@ -1997,6 +2172,18 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     if (options.chatSourceId) {
       clauses.push("e.chat_source_id = ?");
       params.push(options.chatSourceId);
+    }
+    if (options.status) {
+      clauses.push("e.status = ?");
+      params.push(options.status);
+    }
+    if (options.generator) {
+      clauses.push("e.generator = ?");
+      params.push(options.generator);
+    }
+    if (options.endAtOrBeforeMs != null) {
+      clauses.push("e.end_at_ms <= ?");
+      params.push(options.endAtOrBeforeMs);
     }
     const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
     params.push(options.limit);
@@ -2010,11 +2197,24 @@ export class SqliteArchiveRepository implements ArchiveRepository {
          LIMIT ?`
       )
       .all(...params) as Array<Record<string, unknown>>;
-    const claimsStmt = this.db.prepare(`SELECT id, kind, text FROM brain_claims WHERE episode_id = ? ORDER BY sequence`);
+    return rows.map((row) => this.rowToBrainEpisode(row));
+  }
+
+  private rowToBrainEpisode(row: Record<string, unknown>): BrainEpisodeRecord {
+    const claimsStmt = this.db.prepare(
+      `SELECT id, kind, text, event_at_ms, valid_until_ms, confidence FROM brain_claims WHERE episode_id = ? ORDER BY sequence`
+    );
     const citationsStmt = this.db.prepare(
       `SELECT source_message_key, source_chat_id, message_id, sender_source_jid, timestamp_ms FROM brain_citations WHERE claim_id = ?`
     );
-    return rows.map((row) => ({
+    const entitiesStmt = this.db.prepare(`SELECT kind, name, jid, role FROM brain_claim_entities WHERE claim_id = ? ORDER BY id`);
+    const topicsStmt = this.db.prepare(
+      `SELECT t.title FROM brain_episode_topics et JOIN brain_topics t ON t.id = et.topic_id WHERE et.episode_id = ? ORDER BY t.title`
+    );
+    const mediaGapsStmt = this.db.prepare(
+      `SELECT source_message_key, modality, impact, note FROM brain_media_gaps WHERE episode_id = ? ORDER BY id`
+    );
+    return {
       id: String(row.id),
       chatSourceId: String(row.chat_source_id),
       chatDisplayName: (row.chat_display_name as string | null) ?? null,
@@ -2028,11 +2228,40 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       model: (row.model as string | null) ?? null,
       status: row.status as BrainEpisodeRecord["status"],
       fallbackReason: (row.fallback_reason as string | null) ?? null,
+      extractionVersion: Number(row.extraction_version ?? 0),
+      topics: (topicsStmt.all(row.id) as Array<{ title: string }>).map((topic) => String(topic.title)),
+      unresolvedParticipants: (parseJson(row.unresolved_participants_json as string | null) as string[] | null) ?? [],
+      pushNameParticipants: (parseJson(row.push_name_participants_json as string | null) as string[] | null) ?? [],
+      uninterpretedMediaCount: Number(row.uninterpreted_media_count ?? 0),
+      mediaGaps: (mediaGapsStmt.all(row.id) as Array<Record<string, unknown>>).map((gap) => ({
+        sourceMessageKey: String(gap.source_message_key),
+        modality: gap.modality as BrainMediaGapRecord["modality"],
+        impact: gap.impact as BrainMediaGapRecord["impact"],
+        note: (gap.note as string | null) ?? null
+      })),
       createdAt: String(row.created_at),
-      claims: (claimsStmt.all(row.id) as Array<{ id: string; kind: string; text: string }>).map((claim) => ({
+      claims: (
+        claimsStmt.all(row.id) as Array<{
+          id: string;
+          kind: string;
+          text: string;
+          event_at_ms: number | null;
+          valid_until_ms: number | null;
+          confidence: string;
+        }>
+      ).map((claim) => ({
         id: claim.id,
         kind: claim.kind as BrainEpisodeRecord["claims"][number]["kind"],
         text: claim.text,
+        eventAtMs: claim.event_at_ms == null ? null : Number(claim.event_at_ms),
+        validUntilMs: claim.valid_until_ms == null ? null : Number(claim.valid_until_ms),
+        confidence: claim.confidence as BrainEpisodeRecord["claims"][number]["confidence"],
+        entities: (entitiesStmt.all(claim.id) as Array<Record<string, unknown>>).map((entity) => ({
+          kind: entity.kind as BrainClaimEntityRecord["kind"],
+          name: String(entity.name),
+          jid: (entity.jid as string | null) ?? null,
+          role: (entity.role as string | null) ?? null
+        })),
         citations: (citationsStmt.all(claim.id) as Array<Record<string, unknown>>).map((citation) => ({
           sourceMessageKey: String(citation.source_message_key),
           sourceChatId: String(citation.source_chat_id),
@@ -2041,7 +2270,180 @@ export class SqliteArchiveRepository implements ArchiveRepository {
           timestampMs: citation.timestamp_ms == null ? null : Number(citation.timestamp_ms)
         }))
       }))
+    };
+  }
+
+  async listRegenerableBrainEpisodes(options: {
+    currentVersion: number;
+    chatSourceId?: string | null;
+    limit: number;
+  }): Promise<BrainEpisodeRecord[]> {
+    const params: unknown[] = [options.currentVersion];
+    let where = `WHERE e.status = 'current' AND (e.generator = 'extractive' OR e.extraction_version < ?)`;
+    if (options.chatSourceId) {
+      where += ` AND e.chat_source_id = ?`;
+      params.push(options.chatSourceId);
+    }
+    params.push(options.limit);
+    const rows = this.db
+      .prepare(
+        `SELECT e.*, COALESCE(NULLIF(TRIM(COALESCE(ch.display_name, '')), ''), NULL) AS chat_display_name
+         FROM brain_episodes e
+         LEFT JOIN chats ch ON ch.source_chat_id = e.chat_source_id
+         ${where}
+         ORDER BY e.end_at_ms DESC
+         LIMIT ?`
+      )
+      .all(...params) as Array<Record<string, unknown>>;
+    return rows.map((row) => this.rowToBrainEpisode(row));
+  }
+
+  async markBrainEpisodeSuperseded(episodeId: string): Promise<void> {
+    this.db.prepare(`UPDATE brain_episodes SET status = 'superseded' WHERE id = ?`).run(episodeId);
+    this.invalidateBrainStatusCache();
+  }
+
+  async countRegenerableBrainEpisodes(currentVersion: number): Promise<number> {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM brain_episodes WHERE status = 'current' AND (generator = 'extractive' OR extraction_version < ?)`
+      )
+      .get(currentVersion) as { n: number };
+    return Number(row.n);
+  }
+
+  // The D13 demand stat: gap counts by modality and impact over current episodes.
+  async getBrainMediaGapSummary(): Promise<BrainMediaGapSummary[]> {
+    const rows = this.db
+      .prepare(
+        `SELECT g.modality, g.impact, COUNT(*) AS n
+         FROM brain_media_gaps g
+         JOIN brain_episodes e ON e.id = g.episode_id
+         WHERE e.status = 'current'
+         GROUP BY g.modality, g.impact
+         ORDER BY n DESC`
+      )
+      .all() as Array<{ modality: string; impact: string; n: number }>;
+    return rows.map((row) => ({
+      modality: row.modality as BrainMediaGapSummary["modality"],
+      impact: row.impact as BrainMediaGapSummary["impact"],
+      count: Number(row.n)
     }));
+  }
+
+  // Materiality-aware regeneration selector (D13): current episodes carrying a
+  // gap of the given impact — what a future media-interpretation change
+  // regenerates first, instead of every episode containing a sticker.
+  async listBrainEpisodesWithMediaGaps(options: { impact: BrainMediaGapImpact; limit: number }): Promise<BrainEpisodeRecord[]> {
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT e.*, COALESCE(NULLIF(TRIM(COALESCE(ch.display_name, '')), ''), NULL) AS chat_display_name
+         FROM brain_episodes e
+         JOIN brain_media_gaps g ON g.episode_id = e.id AND g.impact = ?
+         LEFT JOIN chats ch ON ch.source_chat_id = e.chat_source_id
+         WHERE e.status = 'current'
+         ORDER BY e.end_at_ms DESC
+         LIMIT ?`
+      )
+      .all(options.impact, options.limit) as Array<Record<string, unknown>>;
+    return rows.map((row) => this.rowToBrainEpisode(row));
+  }
+
+  async recordBrainValidationIssues(issues: BrainValidationIssueInput[]): Promise<void> {
+    if (issues.length === 0) {
+      return;
+    }
+    const insert = this.db.prepare(
+      `INSERT INTO brain_validation_issues (run_id, chat_source_id, episode_id, claim_sequence, code, severity, detail)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    );
+    const transaction = this.db.transaction(() => {
+      for (const issue of issues) {
+        insert.run(
+          issue.runId ?? null,
+          issue.chatSourceId ?? null,
+          issue.episodeId ?? null,
+          issue.claimSequence ?? null,
+          issue.code,
+          issue.severity,
+          issue.detail ?? null
+        );
+      }
+    });
+    transaction();
+  }
+
+  async listBrainValidationIssues(options?: { episodeId?: string | null; limit?: number }): Promise<BrainValidationIssueRecord[]> {
+    const params: unknown[] = [];
+    let where = "";
+    if (options?.episodeId) {
+      where = "WHERE episode_id = ?";
+      params.push(options.episodeId);
+    }
+    params.push(options?.limit ?? 100);
+    const rows = this.db
+      .prepare(`SELECT * FROM brain_validation_issues ${where} ORDER BY id DESC LIMIT ?`)
+      .all(...params) as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      id: Number(row.id),
+      runId: (row.run_id as string | null) ?? null,
+      chatSourceId: (row.chat_source_id as string | null) ?? null,
+      episodeId: (row.episode_id as string | null) ?? null,
+      claimSequence: row.claim_sequence == null ? null : Number(row.claim_sequence),
+      code: String(row.code),
+      severity: row.severity as BrainValidationIssueRecord["severity"],
+      detail: (row.detail as string | null) ?? null,
+      createdAt: String(row.created_at)
+    }));
+  }
+
+  async getBrainValidationIssueSummary(): Promise<BrainValidationIssueSummary> {
+    const rows = this.db
+      .prepare(`SELECT severity, COUNT(*) AS n FROM brain_validation_issues GROUP BY severity`)
+      .all() as Array<{ severity: string; n: number }>;
+    const summary: BrainValidationIssueSummary = { error: 0, warning: 0, info: 0 };
+    for (const row of rows) {
+      if (row.severity === "error" || row.severity === "warning" || row.severity === "info") {
+        summary[row.severity] = Number(row.n);
+      }
+    }
+    return summary;
+  }
+
+  async listBrainTopicVocabulary(chatSourceId: string, limit: number): Promise<string[]> {
+    // This chat's topics by usage first, then global by usage — deterministic,
+    // $0 "nearest" until the graph provides a better ranking.
+    const chatTopics = this.db
+      .prepare(
+        `SELECT t.title, COUNT(*) AS n
+         FROM brain_episode_topics et
+         JOIN brain_topics t ON t.id = et.topic_id
+         JOIN brain_episodes e ON e.id = et.episode_id
+         WHERE e.chat_source_id = ?
+         GROUP BY t.id ORDER BY n DESC, t.title ASC LIMIT ?`
+      )
+      .all(chatSourceId, limit) as Array<{ title: string }>;
+    const globalTopics = this.db
+      .prepare(
+        `SELECT t.title, COUNT(et.episode_id) AS n
+         FROM brain_topics t
+         LEFT JOIN brain_episode_topics et ON et.topic_id = t.id
+         GROUP BY t.id ORDER BY n DESC, t.title ASC LIMIT ?`
+      )
+      .all(limit) as Array<{ title: string }>;
+    const seen = new Set<string>();
+    const titles: string[] = [];
+    for (const row of [...chatTopics, ...globalTopics]) {
+      const key = row.title.toLowerCase();
+      if (!seen.has(key)) {
+        seen.add(key);
+        titles.push(row.title);
+      }
+      if (titles.length >= limit) {
+        break;
+      }
+    }
+    return titles;
   }
 
   async markStaleEpisodesForMessages(sourceMessageKeys: string[]): Promise<number> {
@@ -4426,6 +4828,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
                 NULLIF(TRIM(COALESCE(chats.display_name, '')), '') AS chat_display_name, chats.jid AS chat_jid,
                 m.sender_source_jid,
                 ${contactLabelSql("c.")} AS sender_display_name,
+                ${labelIsPushNameSql("c.")} AS sender_name_is_push_name,
                 m.timestamp_ms, m.sent_at, m.direction, m.message_type, m.is_deleted, m.is_forwarded, m.quoted_source_message_id, m.has_media, m.source_table,
                 COALESCE(NULLIF(m.body, ''), NULLIF(m.caption, '')) AS text,
                 ${MEDIA_STATE_SELECT}
@@ -4467,7 +4870,8 @@ export class SqliteArchiveRepository implements ArchiveRepository {
           `SELECT lmu.source_message_key AS target_key,
                   json_extract(lmu.metadata_json, '$.emoji') AS emoji,
                   json_extract(lmu.metadata_json, '$.reactorJid') AS reactor_jid,
-                  ${contactLabelSql("c.")} AS reactor_display_name
+                  ${contactLabelSql("c.")} AS reactor_display_name,
+                  ${labelIsPushNameSql("c.")} AS reactor_name_is_push_name
            FROM live_message_updates lmu
            LEFT JOIN contacts c ON c.source_jid = json_extract(lmu.metadata_json, '$.reactorJid')
            WHERE lmu.update_type = 'reaction'
@@ -4477,7 +4881,13 @@ export class SqliteArchiveRepository implements ArchiveRepository {
              AND json_extract(lmu.metadata_json, '$.emoji') <> ''
            ORDER BY lmu.occurred_at_ms ASC`
         )
-        .all(...slice) as Array<{ target_key: string; emoji: string; reactor_jid: string | null; reactor_display_name: string | null }>;
+        .all(...slice) as Array<{
+        target_key: string;
+        emoji: string;
+        reactor_jid: string | null;
+        reactor_display_name: string | null;
+        reactor_name_is_push_name: number;
+      }>;
       for (const row of rows) {
         const target = byKey.get(row.target_key);
         if (!target) {
@@ -4486,7 +4896,8 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         target.reactions.push({
           emoji: row.emoji,
           reactorJid: row.reactor_jid,
-          reactorDisplayName: row.reactor_display_name ?? displayPhoneFromJid(row.reactor_jid)
+          reactorDisplayName: row.reactor_display_name ?? displayPhoneFromJid(row.reactor_jid),
+          reactorNameIsPushName: Boolean(row.reactor_name_is_push_name) && row.reactor_display_name != null
         });
       }
     }
@@ -4884,6 +5295,7 @@ function configureDatabase(db: Database.Database): void {
 function ensureSchema(db: Database.Database): void {
   migrateLiveSessionStatuses(db);
   migrateLiveMessageUpdateTypes(db);
+  rebuildBrainDerivedTablesIfStale(db);
   db.exec(schemaStatements.join(";\n"));
   migrateAdditiveColumns(db);
   ensureSearchSchema(db);
@@ -4891,6 +5303,60 @@ function ensureSchema(db: Database.Database): void {
   // only ever held transient request state (message keys, no content), so this
   // is safe cleanup, not a data migration.
   db.exec(`DROP TABLE IF EXISTS view_once_recovery`);
+}
+
+// Contract-v2 shape guard: the episode schema is wiped-and-rebuilt, never
+// migrated (roadmap standing sanction — all brain data is derived and
+// regenerable). An old-shape brain_episodes (no extraction_version column)
+// means every derived brain table predates the final contract: drop the whole
+// derived set (episodes/claims/citations + v2 tables, plus brain_runs and
+// brain_tasks whose kind CHECKs changed), wipe the watermarks with them so
+// coverage never outlives the episodes that justify it, and clear the
+// projected files (a pure one-way projection of the dropped rows).
+function rebuildBrainDerivedTablesIfStale(db: Database.Database): void {
+  const existing = db
+    .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'brain_episodes'`)
+    .get() as { sql: string } | undefined;
+  if (!existing?.sql || existing.sql.includes("extraction_version")) {
+    return;
+  }
+  const dropped = [
+    "brain_media_gaps",
+    "brain_validation_issues",
+    "brain_episode_topics",
+    "brain_topics",
+    "brain_claim_entities",
+    "brain_citations",
+    "brain_claims",
+    "brain_episodes",
+    "brain_runs",
+    "brain_tasks"
+  ];
+  const episodeCount = Number((db.prepare(`SELECT COUNT(*) AS n FROM brain_episodes`).get() as { n: number }).n);
+  db.transaction(() => {
+    for (const table of dropped) {
+      db.exec(`DROP TABLE IF EXISTS ${table}`);
+    }
+    db.exec(`DELETE FROM brain_chat_watermarks`);
+  })();
+  let filesRemoved = 0;
+  try {
+    const episodesDir = path.join(config.brain.rootDir, "episodes");
+    if (fs.existsSync(episodesDir)) {
+      for (const file of fs.readdirSync(episodesDir)) {
+        if (file.endsWith(".md")) {
+          fs.rmSync(path.join(episodesDir, file), { force: true });
+          filesRemoved += 1;
+        }
+      }
+    }
+  } catch {
+    // Projection cleanup is best-effort; the DB rebuild is what matters.
+  }
+  console.warn(
+    `[brain] contract-v2 schema rebuild: dropped pre-v2 derived tables (${episodeCount} episode(s) discarded — all regenerable), ` +
+      `wiped watermarks and the task queue, removed ${filesRemoved} projected file(s). The next run re-assimilates from scratch.`
+  );
 }
 
 // SQLite cannot alter CHECK constraints in place; rebuild live_message_updates
@@ -5198,7 +5664,10 @@ function rowToMemoryEvidence(row: SqliteMemoryEvidenceRow, index: number): Memor
     // lookup); reactions are attached by listMemoryEvidenceMessages after the map.
     isForwarded: Boolean(row.is_forwarded),
     quotedSourceMessageId: row.quoted_source_message_id ?? null,
-    reactions: []
+    reactions: [],
+    // Provenance only applies when the label actually resolved from the contact
+    // row; a displayPhoneFromJid fallback is a number, not a push name.
+    senderNameIsPushName: Boolean(row.sender_name_is_push_name) && row.sender_display_name != null
   };
 }
 
@@ -5658,6 +6127,7 @@ interface SqliteMemoryEvidenceRow extends SqliteMediaStateColumns {
   chat_jid: string | null;
   sender_source_jid: string | null;
   sender_display_name: string | null;
+  sender_name_is_push_name?: number;
   timestamp_ms: number | null;
   sent_at: string | null;
   direction: string;

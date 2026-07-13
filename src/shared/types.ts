@@ -473,12 +473,18 @@ export interface MemoryEvidenceMessage {
   isForwarded: boolean;
   quotedSourceMessageId: string | null;
   reactions: MemoryEvidenceReaction[];
+  // Label provenance (contract v2): true when senderDisplayName came from the
+  // contact's self-set push name because no saved display name exists. The
+  // pack labeler renders such labels with a leading tilde (~name) and the
+  // episode stamps the JID for later repair.
+  senderNameIsPushName: boolean;
 }
 
 export interface MemoryEvidenceReaction {
   emoji: string;
   reactorJid: string | null;
   reactorDisplayName: string | null;
+  reactorNameIsPushName: boolean;
 }
 
 export interface MemoryEvidencePackRecord {
@@ -662,9 +668,9 @@ export interface MessageContextWindow {
 
 // --- Brain substrate (tiered assimilation) ---
 
-export type BrainTaskKind = "episode" | "rollup" | "overview" | "merge_adjudicate" | "reindex" | "project_pages";
+export type BrainTaskKind = "episode" | "regenerate" | "rollup" | "overview" | "merge_adjudicate" | "reindex" | "project_pages";
 export type BrainTaskStatus = "pending" | "running" | "done" | "failed";
-export type BrainRunKind = "nightly" | "catchup" | "manual" | "backfill";
+export type BrainRunKind = "nightly" | "catchup" | "manual" | "backfill" | "regenerate";
 export type BrainRunStatus = "running" | "completed" | "failed" | "interrupted" | "budget_exceeded";
 
 export interface BrainTaskInput {
@@ -786,16 +792,30 @@ export interface BrainStatusSummary {
   activeRun: BrainRunSummary | null;
 }
 
-// The /api/brain/status response: repository status + provider + scheduler.
+// The /api/brain/status response: repository status + provider + scheduler,
+// plus contract-v2 quality surfaces attached by the server layer.
 export interface BrainOverview extends BrainStatusSummary {
   provider: BrainProviderStatus;
   scheduler: BrainSchedulerStatus;
+  extractionVersion?: number;
+  // Current episodes that are extractive-generated or carry a stale
+  // extraction version — the `brain regenerate` queue size.
+  regenerableEpisodes?: number;
+  validationIssues?: BrainValidationIssueSummary;
+  // The D13 media-demand stat: gap counts split by modality and impact.
+  mediaGaps?: BrainMediaGapSummary[];
 }
 
 // --- Episodic tier ---
 
 export type BrainClaimKind = "fact" | "decision" | "commitment" | "question" | "event";
 export type BrainEpisodeGenerator = "model" | "extractive";
+// Epistemic level of a claim (contract v2): 'stated' — the speaker directly
+// asserts it; 'hedged' — the statement carries uncertainty markers; 'reported'
+// — second-hand, or the claim's referent/subject was inferred by the model
+// rather than explicit in the messages.
+export type BrainClaimConfidence = "stated" | "hedged" | "reported";
+export type BrainEntityKind = "person" | "org" | "place" | "project" | "other";
 
 export interface BrainCitationRecord {
   sourceMessageKey: string;
@@ -805,11 +825,35 @@ export interface BrainCitationRecord {
   timestampMs: number | null;
 }
 
+// A typed entity a claim mentions. `jid` is the canonical identity anchor,
+// resolved at commit by matching the entity name against the pack's
+// participant labels — never model-emitted. NULL for non-participants.
+export interface BrainClaimEntityRecord {
+  kind: BrainEntityKind;
+  name: string;
+  jid: string | null;
+  role: string | null;
+}
+
 export interface BrainClaimRecord {
   id: string;
   kind: BrainClaimKind;
   text: string;
+  eventAtMs: number | null;
+  validUntilMs: number | null;
+  confidence: BrainClaimConfidence;
+  entities: BrainClaimEntityRecord[];
   citations: BrainCitationRecord[];
+}
+
+export interface BrainClaimInput {
+  kind: BrainClaimKind;
+  text: string;
+  citations: string[];
+  eventAtMs?: number | null;
+  validUntilMs?: number | null;
+  confidence?: BrainClaimConfidence;
+  entities?: Array<{ kind: BrainEntityKind; name: string; jid?: string | null; role?: string | null }>;
 }
 
 export interface BrainEpisodeInput {
@@ -826,7 +870,26 @@ export interface BrainEpisodeInput {
   // When an intended model generation fell back to extractive, the privacy-safe
   // reason is stored per episode (not just logged) so run honesty is durable.
   fallbackReason?: string | null;
-  claims: Array<{ kind: BrainClaimKind; text: string; citations: string[] }>;
+  // Contract v2: version stamp from the extraction code's named constant.
+  extractionVersion: number;
+  // Episode-level structured topics (never load-bearing in prose).
+  topics?: string[];
+  // Late-binding stamps, computed mechanically from the evidence pack:
+  // participants labelled by a number token (unresolved identity), participants
+  // labelled by a self-set push name (unverified identity), and media that
+  // contributed neither text nor an interpretation label.
+  unresolvedParticipants?: string[];
+  pushNameParticipants?: string[];
+  uninterpretedMediaCount?: number;
+  // Regeneration commits pass false: the watermark already covers the window.
+  advanceWatermark?: boolean;
+  // Regeneration: mark this episode 'superseded' in the same transaction as
+  // the replacement commit, so no crash window leaves both current.
+  supersedesEpisodeId?: string | null;
+  // Media-gap demand signal (D13), model episodes only; modality already
+  // derived from the cited message by the extraction layer.
+  mediaGaps?: BrainMediaGapRecord[];
+  claims: BrainClaimInput[];
 }
 
 export interface BrainEpisodeRecord {
@@ -843,8 +906,73 @@ export interface BrainEpisodeRecord {
   model: string | null;
   status: "current" | "superseded" | "stale" | "compressed";
   fallbackReason: string | null;
+  extractionVersion: number;
+  topics: string[];
+  unresolvedParticipants: string[];
+  pushNameParticipants: string[];
+  uninterpretedMediaCount: number;
+  mediaGaps: BrainMediaGapRecord[];
   createdAt: string;
   claims: BrainClaimRecord[];
+}
+
+// --- Brain media-gap demand signal (contract v2, D13) ---
+// Media content never reaches the model; the model instead records that an
+// unavailable media message's content would have improved the episode. The
+// aggregate is the demand stat that decides whether (and which modality first)
+// media interpretation is worth building; per-episode rows are the
+// materiality-aware regeneration selector once it exists.
+
+export type BrainMediaGapImpact = "blocks" | "enriches";
+export type BrainMediaGapModality = "image" | "audio" | "video" | "document" | "other";
+
+export interface BrainMediaGapRecord {
+  sourceMessageKey: string;
+  // Derived at commit from the cited message's own type — never model-emitted.
+  modality: BrainMediaGapModality;
+  impact: BrainMediaGapImpact;
+  note: string | null;
+}
+
+export interface BrainMediaGapSummary {
+  modality: BrainMediaGapModality;
+  impact: BrainMediaGapImpact;
+  count: number;
+}
+
+// --- Brain validation issues (contract v2) ---
+// Quality signals and salvage records: structural failures that exhausted the
+// retry (severity 'error'), quality lints like the anchoring check ('warning'),
+// and informational notes ('info'). Flag rows never block a commit.
+
+export type BrainValidationSeverity = "info" | "warning" | "error";
+
+export interface BrainValidationIssueInput {
+  runId?: string | null;
+  chatSourceId?: string | null;
+  episodeId?: string | null;
+  claimSequence?: number | null;
+  code: string;
+  severity: BrainValidationSeverity;
+  detail?: string | null;
+}
+
+export interface BrainValidationIssueRecord {
+  id: number;
+  runId: string | null;
+  chatSourceId: string | null;
+  episodeId: string | null;
+  claimSequence: number | null;
+  code: string;
+  severity: BrainValidationSeverity;
+  detail: string | null;
+  createdAt: string;
+}
+
+export interface BrainValidationIssueSummary {
+  error: number;
+  warning: number;
+  info: number;
 }
 
 // In-memory progress of a manual/scheduled brain run (job + polling model).

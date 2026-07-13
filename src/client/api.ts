@@ -320,6 +320,16 @@ export function getBrainRunProgress(): Promise<BrainRunProgress> {
   return request<BrainRunProgress>("/api/brain/runs/current");
 }
 
+export function startBrainRegenerate(body: {
+  model?: string | null;
+  chatSourceId?: string | null;
+}): Promise<{ ok: boolean; progress: BrainRunProgress }> {
+  return request<{ ok: boolean; progress: BrainRunProgress }>("/api/brain/regenerate", {
+    method: "POST",
+    body: JSON.stringify(body)
+  });
+}
+
 export function resetBrainData(): Promise<{ ok: boolean; episodesRemoved: number; watermarksReset: number; filesRemoved: number }> {
   return request<{ ok: boolean; episodesRemoved: number; watermarksReset: number; filesRemoved: number }>("/api/brain/reset", {
     method: "POST",

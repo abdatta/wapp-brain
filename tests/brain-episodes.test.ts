@@ -281,7 +281,7 @@ describe("brain episodes", () => {
       expect(packs[0].messages.map((m) => m.sourceMessageId)).toEqual(["R1", "R2", "R3", "R4", "R5", "R6"]);
       // The reaction was attached to its target, not turned into a pack message.
       expect(packs[0].messages[0].reactions).toEqual([
-        { emoji: "👍", reactorJid: "1777@s.whatsapp.net", reactorDisplayName: "Rohit" }
+        { emoji: "👍", reactorJid: "1777@s.whatsapp.net", reactorDisplayName: "Rohit", reactorNameIsPushName: false }
       ]);
 
       const result = await generateEpisodeForPack(repository, packs[0], { generator: "model", model: "haiku" });

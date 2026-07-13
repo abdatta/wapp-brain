@@ -13,7 +13,7 @@
 | ✅ | 0 | `build-the-brain` (narrowed) | Opus | **archived 2026-07-12** | — (ops-spine remainder paired naturally with #3) | gates 2.7 / 3.8 passed live (scheduler, catch-up, crash-resume, staleness); archived to `archive/2026-07-12-build-the-brain` |
 | ✅ | 1 | `brain-correctness-debts` | Opus | **archived 2026-07-12** | — | compound-cursor watermark, merge rekey, run honesty, startup probe, real usage — shipped; gates 11.1/11.3 test-covered, 11.2 verified live; archived to `archive/2026-07-12-brain-correctness-debts` |
 | ✅ | 2 | `evidence-pack-fidelity` | Opus | **archived 2026-07-13** | — (#1 recommended first) | reactions/replies/forwards/number-labels visible in a real episode; week-bounded quiet-chat packs |
-|  | 3 | `episode-contract-v2` | **Fable** | seeded | #1, #2 | wipe + assimilate 2–3 chats: entities, absolute dates, hedges in claims; salvageable weak-model JSON |
+| ✅ | 3 | `episode-contract-v2` | **Fable** | **archived 2026-07-13** | #1, #2 | wipe + assimilate 2–3 chats: entities, absolute dates, hedges in claims; salvageable weak-model JSON |
 |  | 4 | `identity-late-resolution` | Opus | seeded | #3, #20 | save a contact → old episodes + search repair with zero model calls |
 |  | 5 | `two-level-person-model` | **Fable** | seeded | #3 | same-name stays separate; Google same-contact auto-connects; disconnect re-derives, zero episode changes |
 |  | 6 | `people-management-ui` | Sonnet | seeded | #4, #5, #19 | ranked hygiene queue; dismissed pair stays dismissed |
@@ -37,6 +37,12 @@
 **Status icon (leading column) & Status column** — a human-readable projection of each change's lifecycle, shown twice: a glyph in the unlabeled leading column that reads like a to-do list filling in left to right, and the same state as a word in the Status column. The four states progress from `seeded` (blank cell — proposal seed only) → `📝 proposed` (`tasks.md` present) → `🔄 active` (a task checked) → `✅ **archived YYYY-MM-DD**` (folder under `archive/`). The **source of truth is the openspec files/folders** (a change's presence, its artifacts, and whether it lives under `archive/`); both cells are *derived* from them, never hand-stamped. Every lifecycle skill keeps them in sync by running the shared reconciler `npm run roadmap:sync` (`openspec/tools/sync-roadmap-status.mjs`), which writes the icon and the word from one derivation so they can't drift: `/opsx:propose|apply|archive` reconcile right after they change folder state, and `/next-change` reconciles on read as a safety net. It self-corrects manual drift and works identically from Claude or Codex. Run it anytime the table looks stale. (Re-theme the glyphs by editing the `ICONS` map in the reconciler and this legend.)
 
 **Definition of done for this roadmap**: every folder under `openspec/changes/` is archived. Each change is `/opsx:archive`d after its checkpoint passes; #16–18 need only their verification gates (plus one test for #17) and can close in Wave A. This file itself is absorbed into the docs pass and retired at #15.
+
+## Deferred & Demand-Gated (not yet seeded)
+
+Identified future work that is deliberately **not** an inventory row yet — nothing is sequenced, budgeted, or gated on it until the data says it's worth doing. Seed each via `/opsx:propose` only when its trigger fires.
+
+- **`media-interpretation`** — send image / audio / document *content* to the model (vision + voice-note transcription) so episodes reason over media, not just its text and kind-labels. Deliberately excluded from `episode-contract-v2` (3): the provider seam is text-only and multimodal is a large, separate spend. Instead, #3's **D13 `brain_media_gaps`** signal measures the demand — the model flags, per episode, when unavailable media **blocked** or **would have enriched** an inference, with `modality` derived at commit. **Trigger to seed**: the `brain_media_gaps` aggregate justifies the spend, and the modality split (audio vs image) sets the build order. Sibling of `brain-eval-harness` (7) in spirit — *measure, then spend*. Deps when seeded: **#3** (the signal, plus the `brain regenerate` path it targets — materiality-first, `impact='blocks'` episodes re-derived under a bumped `EXTRACTION_VERSION`); no new coverage machinery needed.
 
 ## Dependency Graph
 
