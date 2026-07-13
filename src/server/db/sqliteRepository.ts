@@ -4316,7 +4316,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
                 NULLIF(TRIM(COALESCE(chats.display_name, '')), '') AS chat_display_name, chats.jid AS chat_jid,
                 m.sender_source_jid,
                 COALESCE(NULLIF(TRIM(COALESCE(c.display_name, '')), ''), NULLIF(TRIM(COALESCE(c.push_name, '')), ''), c.phone_number) AS sender_display_name,
-                m.timestamp_ms, m.sent_at, m.direction, m.message_type, m.is_deleted, m.has_media, m.source_table,
+                m.timestamp_ms, m.sent_at, m.direction, m.message_type, m.is_deleted, m.is_forwarded, m.quoted_source_message_id, m.has_media, m.source_table,
                 COALESCE(NULLIF(m.body, ''), NULLIF(m.caption, '')) AS text,
                 ${MEDIA_STATE_SELECT}
          FROM messages m
@@ -4328,7 +4328,109 @@ export class SqliteArchiveRepository implements ArchiveRepository {
          LIMIT ?`
       )
       .all(...params) as SqliteMemoryEvidenceRow[];
-    return rows.map((row, index) => rowToMemoryEvidence(row, index));
+    const evidence = rows.map((row, index) => rowToMemoryEvidence(row, index));
+    this.attachReactions(evidence);
+    return evidence;
+  }
+
+  // Reactions live only in live_message_updates (update_type='reaction'), keyed
+  // by target source_message_key with metadata {emoji, reactorJid}. They are
+  // attached to their target evidence message as non-citable annotations; the
+  // reactor is contact-resolved here but the final owner/number label is applied
+  // by the brain so one labelling policy governs senders and reactors alike.
+  private attachReactions(evidence: MemoryEvidenceMessage[]): void {
+    if (evidence.length === 0) {
+      return;
+    }
+    const byKey = new Map<string, MemoryEvidenceMessage>();
+    for (const message of evidence) {
+      message.reactions = [];
+      byKey.set(message.sourceMessageKey, message);
+    }
+    const keys = [...byKey.keys()];
+    const CHUNK = 400;
+    for (let start = 0; start < keys.length; start += CHUNK) {
+      const slice = keys.slice(start, start + CHUNK);
+      const placeholders = slice.map(() => "?").join(", ");
+      const rows = this.db
+        .prepare(
+          `SELECT lmu.source_message_key AS target_key,
+                  json_extract(lmu.metadata_json, '$.emoji') AS emoji,
+                  json_extract(lmu.metadata_json, '$.reactorJid') AS reactor_jid,
+                  COALESCE(NULLIF(TRIM(COALESCE(c.display_name, '')), ''), NULLIF(TRIM(COALESCE(c.push_name, '')), ''), c.phone_number) AS reactor_display_name
+           FROM live_message_updates lmu
+           LEFT JOIN contacts c ON c.source_jid = json_extract(lmu.metadata_json, '$.reactorJid')
+           WHERE lmu.update_type = 'reaction'
+             AND lmu.applied = 1
+             AND lmu.source_message_key IN (${placeholders})
+             AND json_extract(lmu.metadata_json, '$.emoji') IS NOT NULL
+             AND json_extract(lmu.metadata_json, '$.emoji') <> ''
+           ORDER BY lmu.occurred_at_ms ASC`
+        )
+        .all(...slice) as Array<{ target_key: string; emoji: string; reactor_jid: string | null; reactor_display_name: string | null }>;
+      for (const row of rows) {
+        const target = byKey.get(row.target_key);
+        if (!target) {
+          continue;
+        }
+        target.reactions.push({
+          emoji: row.emoji,
+          reactorJid: row.reactor_jid,
+          reactorDisplayName: row.reactor_display_name ?? displayPhoneFromJid(row.reactor_jid)
+        });
+      }
+    }
+  }
+
+  // Resolve quoted-reply referents that are NOT in the current pack. A message's
+  // quoted_source_message_id holds a surrogate source_message_id; it resolves by
+  // matching another message's source_message_id within the same chat. Returns a
+  // ready-to-render {senderLabel, snippet} per resolvable id (owner-aware); ids
+  // that point at an unarchived message are simply absent from the map.
+  async resolveQuotedReferents(
+    chatSourceId: string,
+    quotedSourceMessageIds: string[]
+  ): Promise<Map<string, { senderLabel: string; snippet: string }>> {
+    const result = new Map<string, { senderLabel: string; snippet: string }>();
+    const ids = [...new Set(quotedSourceMessageIds.filter((id) => id && id.trim()))];
+    if (ids.length === 0) {
+      return result;
+    }
+    const ownerName = (await this.getArchiveOwnerName()) ?? "the archive owner";
+    const CHUNK = 400;
+    for (let start = 0; start < ids.length; start += CHUNK) {
+      const slice = ids.slice(start, start + CHUNK);
+      const placeholders = slice.map(() => "?").join(", ");
+      const rows = this.db
+        .prepare(
+          `SELECT m.source_message_id AS quoted_id, m.direction, m.sender_source_jid,
+                  COALESCE(NULLIF(TRIM(COALESCE(c.display_name, '')), ''), NULLIF(TRIM(COALESCE(c.push_name, '')), ''), c.phone_number) AS sender_display_name,
+                  COALESCE(NULLIF(m.body, ''), NULLIF(m.caption, '')) AS text
+           FROM messages m
+           JOIN chats ON chats.id = m.chat_id
+           LEFT JOIN contacts c ON c.source_jid = m.sender_source_jid
+           WHERE chats.source_chat_id = ? AND m.source_message_id IN (${placeholders})`
+        )
+        .all(chatSourceId, ...slice) as Array<{
+        quoted_id: string;
+        direction: string;
+        sender_source_jid: string | null;
+        sender_display_name: string | null;
+        text: string | null;
+      }>;
+      for (const row of rows) {
+        if (result.has(row.quoted_id)) {
+          continue;
+        }
+        const isSelf = row.direction === "outgoing" || row.sender_source_jid === "me";
+        const label = isSelf
+          ? ownerName
+          : row.sender_display_name?.trim() || displayPhoneFromJid(row.sender_source_jid) || "someone";
+        const snippet = (row.text ?? "").trim().slice(0, 80);
+        result.set(row.quoted_id, { senderLabel: label, snippet });
+      }
+    }
+    return result;
   }
 
   async getLatestCommittedMemoryEndAtMs(chatSourceId?: string | null): Promise<number | null> {
@@ -4981,7 +5083,12 @@ function rowToMemoryEvidence(row: SqliteMemoryEvidenceRow, index: number): Memor
       hasHeldContent: Boolean(row.text) || availability === "stored",
       mediaAvailability: availability
     }),
-    text: row.text
+    text: row.text,
+    // Tolerant of callers whose SELECT omits these columns (e.g. nearby-context
+    // lookup); reactions are attached by listMemoryEvidenceMessages after the map.
+    isForwarded: Boolean(row.is_forwarded),
+    quotedSourceMessageId: row.quoted_source_message_id ?? null,
+    reactions: []
   };
 }
 
@@ -5460,6 +5567,8 @@ interface SqliteMemoryEvidenceRow extends SqliteMediaStateColumns {
   direction: string;
   message_type: string;
   is_deleted: number;
+  is_forwarded?: number;
+  quoted_source_message_id?: string | null;
   text: string | null;
 }
 

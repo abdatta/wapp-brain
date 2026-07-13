@@ -38,6 +38,10 @@ const envSchema = z.object({
   WAPP_BRAIN_MAX_CALLS_PER_DAY: z.coerce.number().int().positive().default(200),
   WAPP_BRAIN_MAX_CALLS_PER_HOUR: z.coerce.number().int().positive().default(30),
   WAPP_BRAIN_MAX_EVIDENCE_MESSAGES: z.coerce.number().int().positive().default(150),
+  // Hard cap on an episode's time span, enforced inside buildEvidencePacks so a
+  // quiet chat's sparse backlog produces week-bounded episodes instead of one
+  // spanning months. Independent of the scheduler's significance/volume gates.
+  WAPP_BRAIN_MAX_EPISODE_SPAN_DAYS: z.coerce.number().int().positive().default(7),
   WAPP_BRAIN_PROVIDER_FAILURE_THRESHOLD: z.coerce.number().int().positive().default(3),
   WAPP_MEMORY_DIR: z.string().optional(),
   WAPP_MEMORY_PROVIDER: z.enum(["local", "codex"]).default("local"),
@@ -97,6 +101,8 @@ export const config = {
     maxCallsPerDay: parsed.WAPP_BRAIN_MAX_CALLS_PER_DAY,
     maxCallsPerHour: parsed.WAPP_BRAIN_MAX_CALLS_PER_HOUR,
     maxEvidenceMessages: parsed.WAPP_BRAIN_MAX_EVIDENCE_MESSAGES,
+    maxEpisodeSpanDays: parsed.WAPP_BRAIN_MAX_EPISODE_SPAN_DAYS,
+    maxEpisodeSpanMs: parsed.WAPP_BRAIN_MAX_EPISODE_SPAN_DAYS * 24 * 60 * 60_000,
     providerFailureThreshold: parsed.WAPP_BRAIN_PROVIDER_FAILURE_THRESHOLD
   },
   memory: {

@@ -4,7 +4,7 @@
 
 ## Why
 
-Names resolve over time — Google contact sync, manual saves after a new number messages first — and resolution will keep improving for the life of the archive. The governing principle is *store references, render names*: every derived layer must key on JID and resolve display names at read time, so late resolution is free everywhere except the one place it can't be — LLM-generated prose, where names get baked into text. With `evidence-pack-fidelity`'s number-labelling in place, that baked prose becomes deterministically repairable: a phone number is a distinctive token you can find and substitute. This change builds the repair machinery so that saving a contact tomorrow retroactively improves every episode written today, at zero LLM cost.
+Names resolve over time — Google contact sync, manual saves after a new number messages first — and resolution will keep improving for the life of the archive. The governing principle is *store references, render names*: every derived layer must key on JID and resolve display names at read time, so late resolution is free everywhere except the one place it can't be — LLM-generated prose, where names get baked into text. With `evidence-pack-fidelity`'s number-labelling in place — **and `demask-contact-labels` guaranteeing that number is the full, clean `+E.164` token rather than WhatsApp's masked `+91∙∙∙∙∙∙∙∙86` placeholder** — that baked prose becomes deterministically repairable: a full phone number is a distinctive token you can find and substitute; a masked placeholder is not. This change builds the repair machinery so that saving a contact tomorrow retroactively improves every episode written today, at zero LLM cost.
 
 ## What Changes
 
@@ -28,4 +28,4 @@ Names resolve over time — Google contact sync, manual saves after a new number
 - **Code**: `src/server/db/sqliteRepository.ts` (`upsertContacts` transition hook, substitution pass, episode stamp queries) + mirror, `src/server/brain/episodes.ts` (re-projection), Brain panel debt line, SSE nudge on repair completion.
 - **Schema**: none beyond `episode-contract-v2`'s `unresolved_participants` stamp (this change is its consumer).
 - **Tests**: rename-triggers-repair end-to-end (prose substituted, FTS recomputed, stamp cleared), merge-variant routing, provenance rendering, debt surface counts.
-- **Depends on**: `episode-contract-v2` (stamps in commit shape), `evidence-pack-fidelity` (number labels make substitution reliable), `brain-correctness-debts` (merge rekey).
+- **Depends on**: `episode-contract-v2` (stamps in commit shape), `evidence-pack-fidelity` (number labels make substitution reliable), `demask-contact-labels` (**hard** — substitution is only reliable when the baked token is a full `+E.164` number, not a masked placeholder; without it the repair pass silently no-ops on masked-labelled episodes and the checkpoint fails), `brain-correctness-debts` (merge rekey).

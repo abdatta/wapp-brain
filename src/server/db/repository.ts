@@ -192,6 +192,10 @@ export interface ArchiveRepository {
   markStaleMemoryForMissingMessages(): Promise<number>;
   resolveMemoryCitation(citationLabelOrMessageKey: string): Promise<MemoryCitationRecord | null>;
   listNearbyMemoryMessages(messageId: number, radius: number): Promise<MemoryEvidenceMessage[]>;
+  resolveQuotedReferents(
+    chatSourceId: string,
+    quotedSourceMessageIds: string[]
+  ): Promise<Map<string, { senderLabel: string; snippet: string }>>;
   // --- Brain substrate: watermarks (coverage truth), durable task queue,
   // run ledger, and model-usage ledger. Watermarks advance only on commit;
   // backlog is derived live from messages newer than the watermark.

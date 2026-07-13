@@ -465,6 +465,20 @@ export interface MemoryEvidenceMessage {
   messageType: string;
   interpretation: MessageInterpretationSummary | null;
   text: string | null;
+  // Evidence-pack fidelity: whether the row is a forward, the quoted message's
+  // source id (resolved to a referent at prompt-assembly time), and reactions
+  // targeting this message. Reactions carry the raw reactor identity so the
+  // brain applies one owner/number labelling policy (see episodes.ts); the
+  // final reactor label is not baked here.
+  isForwarded: boolean;
+  quotedSourceMessageId: string | null;
+  reactions: MemoryEvidenceReaction[];
+}
+
+export interface MemoryEvidenceReaction {
+  emoji: string;
+  reactorJid: string | null;
+  reactorDisplayName: string | null;
 }
 
 export interface MemoryEvidencePackRecord {

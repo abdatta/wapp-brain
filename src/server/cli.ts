@@ -183,7 +183,10 @@ async function main(): Promise<void> {
 
   // Drive a brain run from the terminal (best run with the server stopped —
   // SQLite is single-writer). --provider/--model set the persisted selection
-  // before running; --extractive forces the no-model path; --max-chats caps it.
+  // before running; --extractive forces the no-model path; --max-chats caps how
+  // many backlog chats (by pending count) drain; --chat <sourceId> targets ONE
+  // chat regardless of ordering; --max-model-calls caps spend (partial coverage
+  // commits and resumes next run).
   if (command === "brain-run") {
     const { enableBrainProvider, getBrainProviderStatus, setBrainProviderModel } = await import("./brain/provider");
     const provider = stringArg(args.provider);
@@ -196,16 +199,29 @@ async function main(): Promise<void> {
     }
     const status = getBrainProviderStatus();
     const mode = Boolean(args.extractive) || !status.modelBacked || !status.enabled ? "extractive" : "model";
+    // --chat scopes the run to exactly one chat (bypassing the pending-count
+    // ordering); --max-model-calls hard-caps spend, committing partial coverage
+    // and leaving the rest resumable. Together: a bounded, targeted assimilation.
+    const chatSourceId = stringArg(args.chat) ?? null;
+    const maxModelCalls = numberArg(args["max-model-calls"]);
     const repository = createArchiveRepository();
     try {
       const { startBrainRun, getBrainRunProgress } = await import("./brain/runJob");
-      const started = startBrainRun(repository, { mode, model: model ?? null, maxChats: numberArg(args["max-chats"]) ?? 10 });
+      const started = startBrainRun(repository, {
+        mode,
+        model: model ?? null,
+        chatSourceId,
+        maxChats: numberArg(args["max-chats"]) ?? 10,
+        maxModelCalls: maxModelCalls ?? undefined
+      });
       if (!started.started) {
         console.error(started.refusal ?? "Could not start the brain run.");
         process.exitCode = 1;
         return;
       }
-      console.log(`Brain run started (${mode}${mode === "model" && model ? `/${model}` : ""})…`);
+      console.log(
+        `Brain run started (${mode}${mode === "model" && model ? `/${model}` : ""})${chatSourceId ? ` — chat ${chatSourceId}` : ""}${maxModelCalls ? `, ≤${maxModelCalls} model call(s)` : ""}…`
+      );
       while (getBrainRunProgress().state === "running") {
         await new Promise((resolve) => setTimeout(resolve, 500));
       }

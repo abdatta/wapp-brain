@@ -1996,7 +1996,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     limit: number;
   }): Promise<MemoryEvidenceMessage[]> {
     const chatSet = options.chatSourceIds?.length ? new Set(options.chatSourceIds) : null;
-    return [...this.messages.values()]
+    const evidence = [...this.messages.values()]
       .filter((message) => message.timestampMs != null)
       .filter((message) => options.startAtMs == null || (message.timestampMs ?? 0) >= options.startAtMs)
       .filter((message) => options.endAtMs == null || (message.timestampMs ?? 0) <= options.endAtMs)
@@ -2004,6 +2004,8 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       .sort((a, b) => (a.timestampMs ?? 0) - (b.timestampMs ?? 0) || a.id - b.id)
       .slice(0, options.limit)
       .map((message, index) => this.toMemoryEvidence(message, index));
+    this.attachReactions(evidence);
+    return evidence;
   }
 
   async getLatestCommittedMemoryEndAtMs(chatSourceId?: string | null): Promise<number | null> {
@@ -2128,14 +2130,72 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       chatId: chat?.id ?? 0,
       chatDisplayName: chat?.displayName ?? null,
       senderSourceJid: message.senderSourceJid ?? null,
-      senderDisplayName: sender?.displayName ?? message.senderSourceJid ?? null,
+      // Mirror the SQLite evidence query: contact name/push/phone, then a PN
+      // fallback, else null so the brain applies its own number label (a raw JID
+      // must never leak through as a display name).
+      senderDisplayName: sender?.displayName?.trim() || sender?.pushName?.trim() || sender?.phoneNumber || displayPhoneFromJid(message.senderSourceJid),
       timestampMs: message.timestampMs ?? null,
       sentAt: message.timestampMs ? new Date(message.timestampMs).toISOString() : null,
       direction: message.direction,
       messageType: message.messageType,
       interpretation: interpretMessage({ messageType: message.messageType }),
-      text: message.body ?? message.caption ?? null
+      text: message.body ?? message.caption ?? null,
+      isForwarded: Boolean(message.isForwarded),
+      quotedSourceMessageId: message.quotedSourceMessageId ?? null,
+      reactions: []
     };
+  }
+
+  private attachReactions(evidence: MemoryEvidenceMessage[]): void {
+    if (evidence.length === 0) {
+      return;
+    }
+    const byKey = new Map<string, MemoryEvidenceMessage>();
+    for (const message of evidence) {
+      message.reactions = [];
+      byKey.set(message.sourceMessageKey, message);
+    }
+    const reactions = [...this.liveUpdates.values()]
+      .filter((update) => update.updateType === "reaction" && update.applied)
+      .sort((a, b) => (a.occurredAtMs ?? 0) - (b.occurredAtMs ?? 0));
+    for (const update of reactions) {
+      const target = byKey.get(update.sourceMessageKey);
+      const emoji = typeof update.metadata?.emoji === "string" ? update.metadata.emoji : "";
+      if (!target || !emoji) {
+        continue;
+      }
+      const reactorJid = (update.metadata?.reactorJid as string | null | undefined) ?? null;
+      const contact = reactorJid ? this.contacts.get(reactorJid) : null;
+      target.reactions.push({
+        emoji,
+        reactorJid,
+        reactorDisplayName: contact?.displayName?.trim() || contact?.pushName?.trim() || contact?.phoneNumber || displayPhoneFromJid(reactorJid)
+      });
+    }
+  }
+
+  async resolveQuotedReferents(
+    chatSourceId: string,
+    quotedSourceMessageIds: string[]
+  ): Promise<Map<string, { senderLabel: string; snippet: string }>> {
+    const result = new Map<string, { senderLabel: string; snippet: string }>();
+    const ids = new Set(quotedSourceMessageIds.filter((id) => id && id.trim()));
+    if (ids.size === 0) {
+      return result;
+    }
+    const ownerName = (await this.getArchiveOwnerName()) ?? "the archive owner";
+    for (const message of this.messages.values()) {
+      if (message.chatSourceId !== chatSourceId || !ids.has(message.sourceMessageId) || result.has(message.sourceMessageId)) {
+        continue;
+      }
+      const isSelf = message.direction === "outgoing" || message.senderSourceJid === "me";
+      const contact = message.senderSourceJid ? this.contacts.get(message.senderSourceJid) : null;
+      const label = isSelf
+        ? ownerName
+        : contact?.displayName?.trim() || contact?.pushName?.trim() || contact?.phoneNumber || displayPhoneFromJid(message.senderSourceJid) || "someone";
+      result.set(message.sourceMessageId, { senderLabel: label, snippet: (message.body ?? message.caption ?? "").trim().slice(0, 80) });
+    }
+    return result;
   }
 }
 

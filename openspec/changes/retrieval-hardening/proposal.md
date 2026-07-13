@@ -27,4 +27,4 @@ The shipped hot-tier search has recall dead-ends that no later tier can compensa
 - **Schema**: fourth FTS column (index rebuild — measured at ~31s for 325k rows), `brain_term_aliases`, `fts5vocab` companion table.
 - **Code**: `src/server/db/sqliteRepository.ts` (query builder, ladder, pools, boost) + mirror, seed list fixture, search DTO `matchTier` in `src/shared/types.ts`, client badge for relaxed results.
 - **Tests**: ladder tiers, pool union, sent-by vs about ranking, alias OR-in, rename recompute, code-mixed fixture recall.
-- **Depends on**: nothing hard; `brain-eval-harness` first is recommended so the delta is measured, and the rename hook coordinates with `identity-late-resolution`.
+- **Depends on**: nothing hard; `brain-eval-harness` first is recommended so the delta is measured, and the rename-triggered `resolved_text` recompute hook coordinates with `identity-late-resolution` and `demask-contact-labels` (which lands first and needs the same recompute after its bulk display-name backfill — this change generalizes that one-off into the shared hook).

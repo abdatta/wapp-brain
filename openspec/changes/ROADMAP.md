@@ -12,9 +12,9 @@
 |---|--------|-------|--------|-------------------|-------------------|
 | 0 | `build-the-brain` (narrowed) | Opus | **archived 2026-07-12** | — (ops-spine remainder paired naturally with #3) | gates 2.7 / 3.8 passed live (scheduler, catch-up, crash-resume, staleness); archived to `archive/2026-07-12-build-the-brain` |
 | 1 | `brain-correctness-debts` | Opus | **archived 2026-07-12** | — | compound-cursor watermark, merge rekey, run honesty, startup probe, real usage — shipped; gates 11.1/11.3 test-covered, 11.2 verified live; archived to `archive/2026-07-12-brain-correctness-debts` |
-| 2 | `evidence-pack-fidelity` | Opus | seeded | — (#1 recommended first) | reactions/replies/forwards/number-labels visible in a real episode; week-bounded quiet-chat packs |
+| 2 | `evidence-pack-fidelity` | Opus | **archived 2026-07-13** | — (#1 recommended first) | reactions/replies/forwards/number-labels visible in a real episode; week-bounded quiet-chat packs |
 | 3 | `episode-contract-v2` | **Fable** | seeded | #1, #2 | wipe + assimilate 2–3 chats: entities, absolute dates, hedges in claims; salvageable weak-model JSON |
-| 4 | `identity-late-resolution` | Opus | seeded | #3 | save a contact → old episodes + search repair with zero model calls |
+| 4 | `identity-late-resolution` | Opus | seeded | #3, #20 | save a contact → old episodes + search repair with zero model calls |
 | 5 | `two-level-person-model` | **Fable** | seeded | #3 | same-name stays separate; Google same-contact auto-connects; disconnect re-derives, zero episode changes |
 | 6 | `people-management-ui` | Sonnet | seeded | #4, #5, #19 | ranked hygiene queue; dismissed pair stays dismissed |
 | 7 | `brain-eval-harness` | Opus | seeded | #3 | recall table + per-model precision/fallback tables on the real archive |
@@ -30,6 +30,7 @@
 | 17 | `import-media-cdn-recovery` | Sonnet | **archived 2026-07-12** | — (independent) | gates 6.1/6.2 passed on the real archive; archived to `archive/2026-07-12-import-media-cdn-recovery` |
 | 18 | `complete-media-archival` | Sonnet | **archived 2026-07-12** | — (independent; richer media improves evidence interpretation labels, no blocker either way) | gates 11.1/11.3–11.5 passed live with a real sender; archived to `archive/2026-07-12-complete-media-archival` |
 | 19 | `client-route-architecture` | Opus | seeded | — (pure client refactor; soft: before #7's grading strip, #13's grants UI, #14's dashboard) | every surface at its own URL, reload-safe; search deep links navigate routes; App.tsx reduced to a shell |
+| 20 | `demask-contact-labels` | Opus | proposed | — (independent of the brain chain; builds on the archived `identity-and-naming-integrity` capability) | masked-name counts on `contacts`/`chats` → ~0; former `+91∙∙∙∙∙∙∙∙86` senders read as full `+E.164` numbers in search + thread view; a re-assimilated chat's claims carry full numbers/names, no `∙` masks |
 
 **Model column** — the Claude model recommended to drive each change's `/opsx:propose` + implementation session. **Fable** where irreversible design judgment concentrates: #3 (the extraction contract is the system's embedding function — every episode ever written inherits it), #5 (person/identity semantics must be right forever), #10/#11 (lifecycle + anti-rot rollup machinery, the highest-rot vector, designed as a pair), #12 (ranking/fusion/coverage-verdict design — the product surface). **Opus** for everything demanding but well-specified by its proposal (core-transaction surgery, pack building, graph mechanics, refactors). **Sonnet** only where the path is fully paved: CRUD UI over decided tables (#6), deletion + docs (#15), and the three verify-and-archive closeouts (#16–18).
 
@@ -70,13 +71,15 @@ graph TD
     C18[18 complete-media-archival · verify+archive]
     C19[19 client-route-architecture] --> C6
     C19 --> C12
+    C20[20 demask-contact-labels] --> C4
+    C20 -.->|clean labels before the spend| C14
 ```
 
 ## Execution Waves
 
 Changes within a wave can run in any order or in parallel; a wave starts when its members' dependencies are met.
 
-- **Wave A — now, parallel**: `brain-correctness-debts` (1), `evidence-pack-fidelity` (2). `retrieval-hardening` (8) and `client-route-architecture` (19) are dependency-free and can slot in from here on — 19 is pure client work, fully parallel to the server-side chain, and must land before Wave D's `people-management-ui` (its own hard deadline; earlier is better so #7's grading strip and #14's dashboard are born on the `/brain` page rather than added to the monolith). Also in this wave: **close out the three near-done archive-layer changes** — `native-import-picker` (16: run gate 9.1), `import-media-cdn-recovery` (17: write parser test 5.1, run gates 6.1/6.2), `complete-media-archival` (18: run gates 11.1/11.3–11.5) — then `/opsx:archive` each.
+- **Wave A — now, parallel**: `brain-correctness-debts` (1), `evidence-pack-fidelity` (2). `retrieval-hardening` (8), `client-route-architecture` (19), and `demask-contact-labels` (20) are dependency-free and can slot in from here on — 19 is pure client work, fully parallel to the server-side chain, and must land before Wave D's `people-management-ui` (its own hard deadline; earlier is better so #7's grading strip and #14's dashboard are born on the `/brain` page rather than added to the monolith). **`demask-contact-labels` (20) should land before the archive-scale spend**: it strips WhatsApp's masked-number placeholders so episodes are born with clean, substitutable `+E.164` labels — a hard prerequisite for `identity-late-resolution` (4)'s deterministic substitution and therefore upstream of `historical-backfill` (14). Also in this wave: **close out the three near-done archive-layer changes** — `native-import-picker` (16: run gate 9.1), `import-media-cdn-recovery` (17: write parser test 5.1, run gates 6.1/6.2), `complete-media-archival` (18: run gates 11.1/11.3–11.5) — then `/opsx:archive` each.
 - **Wave B — the keystone**: `episode-contract-v2` (3). Everything downstream consumes its contract; nothing token-expensive should run before it lands. The `build-the-brain` ops-spine remainder (run objects 3.5, scheduler 3.3, catch-up audit) pairs naturally with this wave.
 - **Wave C — parallel after the contract**: `identity-late-resolution` (4), `two-level-person-model` (5), `brain-eval-harness` (7).
 - **Wave D — parallel**: `people-management-ui` (6), `knowledge-graph-foundation` (9). **`historical-backfill` (14) may START here** (gates 3/4/7 met) and runs as a months-long background drain or attended turbo sessions while later waves are built — coverage metadata keeps partial assimilation honest by design.
@@ -100,7 +103,7 @@ Changes within a wave can run in any order or in parallel; a wave starts when it
 | 4.6 memory removal | → `memory-teardown-and-docs` |
 | 5.x MCP | → `mcp-agent-surface` (+ `brain_ask`, spend authority, weak-model gate) |
 | 6.x docs/closeout | → `memory-teardown-and-docs` |
-| *(new, no predecessor)* | `brain-eval-harness`, `evidence-pack-fidelity`, `identity-late-resolution`, `people-management-ui`, `retrieval-hardening`, `commitment-lifecycle` |
+| *(new, no predecessor)* | `brain-eval-harness`, `evidence-pack-fidelity`, `identity-late-resolution`, `people-management-ui`, `retrieval-hardening`, `commitment-lifecycle`, `demask-contact-labels` |
 
 ## Clean Slate & Breaking-Change Sanction
 
