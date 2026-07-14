@@ -12,7 +12,7 @@ The review's sharpest lifecycle finding: commitments and questions can open but 
 - **Status transitions with writers**: `open → fulfilled | cancelled | still_open` applied via the weekly rollup contract — the rollup input includes the entity's open commitment/question nodes and the JSON schema requires a validated `resolutions` array (`{node_id, status, cites}`), applied in the same transaction as the page rewrite.
 - **Kind-aware L0 semantics**: "open commitments" at L0 is defined as status-open nodes *regardless of salience*, each carrying an as-of/last-evidence stamp; past-due open items flagged `overdue`; items with no new evidence for N days labelled `stale` distinctly from `open`.
 - **Due-date capture**: commitment nodes carry due dates from claim `event_at` where stated, powering proximity boosts and overdue detection.
-- **Question→answer linkage**: the same machinery covers question nodes — a citing later claim resolves the question, linked for retrieval.
+- **Question→answer linkage**: the same machinery covers question nodes — a citing later claim resolves the question, linked for retrieval. `reply-quote-recovery` (21) sharpens this: a reply *structurally* links an answer to the message it answers, and the recovered quoted text of a commitment ("did you send it?" quoting the promise, then "done ✅") gives closure detection an explicit antecedent instead of relying on the model to re-find it.
 - **Checkpoint**: assimilate a conversation where a promise is made, then acknowledged days later (including by reaction) — the commitment node opens, the rollup closes it with a citation; an unresolved commitment in a quiet chat survives dormancy and shows as overdue past its due date.
 
 ## Capabilities
