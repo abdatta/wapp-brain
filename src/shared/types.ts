@@ -804,6 +804,33 @@ export interface BrainOverview extends BrainStatusSummary {
   validationIssues?: BrainValidationIssueSummary;
   // The D13 media-demand stat: gap counts split by modality and impact.
   mediaGaps?: BrainMediaGapSummary[];
+  // Identity late-resolution debt: episodes whose participants are still
+  // labelled by a number, ranked so the highest-value contact saves surface.
+  resolutionDebt?: BrainResolutionDebtSummary;
+}
+
+// One unresolved identity in the resolution-debt surface: how much brain content
+// saving its contact would repair, so the queue ranks by payoff.
+export interface BrainResolutionDebtIdentity {
+  jid: string;
+  label: string;
+  messageCount: number;
+  episodeCount: number;
+}
+
+// The resolution-debt surface: how much of the brain still refers to people by
+// number, and which saves would repair the most. Computed with no model call.
+export interface BrainResolutionDebtSummary {
+  episodesWithUnresolved: number;
+  distinctIdentities: number;
+  topIdentities: BrainResolutionDebtIdentity[];
+}
+
+// The outcome of a deterministic identity repair pass (zero model calls).
+export interface IdentityRepairResult {
+  episodesRepaired: number;
+  tokensSubstituted: number;
+  messagesRecomputed: number;
 }
 
 // --- Episodic tier ---

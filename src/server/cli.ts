@@ -309,6 +309,49 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Set (or correct) a contact's display name and fire identity late-resolution:
+  // the deterministic, model-free repair substitutes the person's baked number in
+  // old episode summaries/claims and recomputes their search text, so saving a
+  // contact retroactively improves the brain. --jid <sourceJid> --name "<name>".
+  // Run with the server STOPPED (SQLite is single-writer).
+  if (command === "set-contact-name") {
+    const jid = stringArg(args.jid);
+    const name = stringArg(args.name);
+    if (!jid || !name) {
+      console.error('Usage: set-contact-name --jid <sourceJid> --name "<display name>"');
+      process.exitCode = 1;
+      return;
+    }
+    const repository = createArchiveRepository();
+    try {
+      const canonical = await repository.resolveIdentityJid(jid);
+      // Episodes currently referring to this person by number (repaired below).
+      const before = await repository.getBrainResolutionDebt({ limit: 10_000 });
+      const willRepair = before.topIdentities.find((identity) => identity.jid === canonical)?.episodeCount ?? 0;
+      const phone = jid.split("@")[0]?.replace(/\D/g, "") || null;
+      // upsertContacts detects the name transition and routes through the one
+      // repair entry point (prose substitution + FTS recompute) with no model call.
+      await repository.upsertContacts("cli-set-contact-name", [{ sourceJid: jid, displayName: name, phoneNumber: phone }]);
+      const after = await repository.getBrainResolutionDebt({ limit: 5 });
+      console.log(`Set "${name}" for ${canonical}.`);
+      console.log(
+        `Repaired ${willRepair} episode(s) that referred to this person by number — prose substituted, search text recomputed, no model call.`
+      );
+      console.log(
+        `Resolution debt: ${before.episodesWithUnresolved} → ${after.episodesWithUnresolved} episode(s) with any unresolved participant; ` +
+          `${before.distinctIdentities} → ${after.distinctIdentities} distinct identities.`
+      );
+      if (willRepair > 0 && after.episodesWithUnresolved > 0) {
+        console.log(
+          "(Group episodes that also mention other unsaved people stay counted — expected; this person's prose is repaired.)"
+        );
+      }
+    } finally {
+      await repository.close?.();
+    }
+    return;
+  }
+
   // Force one brain scheduler pass on demand — catch-up enqueue → drain → cited
   // episodes → run object — without waiting for the nightly cutoff or an auto
   // tick (and without needing live sync connected). Handy for a quick test or an
@@ -840,6 +883,7 @@ function printHelp(): void {
   tsx src/server/cli.ts live-gaps
   tsx src/server/cli.ts live-retry-gap --id <gap-id>
   tsx src/server/cli.ts live-unlink
+  tsx src/server/cli.ts set-contact-name --jid <sourceJid> --name "<display name>"
   tsx src/server/cli.ts memory-status
   tsx src/server/cli.ts memory-provider [status|enable-codex|login|disable]
   tsx src/server/cli.ts memory-rem [--dry-run] [--force]

@@ -17,6 +17,8 @@ import type {
   BrainMediaGapImpact,
   BrainMediaGapRecord,
   BrainMediaGapSummary,
+  BrainResolutionDebtIdentity,
+  BrainResolutionDebtSummary,
   BrainValidationIssueInput,
   BrainValidationIssueRecord,
   BrainValidationIssueSummary,
@@ -27,6 +29,7 @@ import type {
   ChatSyncStateRecord,
   ContactRecord,
   GoogleContactCandidate,
+  IdentityRepairResult,
   ImportRunSummary,
   ImportTotals,
   ImportWarning,
@@ -2777,23 +2780,382 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     // The merge may have improved name resolution for this identity: refresh
     // derived search text for its messages and the messages that mention it,
     // chunked with yields so a heavy sender never stalls ingestion.
-    const affected = (
-      this.db
+    await this.recomputeFtsForIdentities([pn]);
+    // Deterministic brain-prose repair: old episodes still carry the merged
+    // identity's `lid:` token in their summary/claims. Substitute it with the
+    // now-known number (or a name if the survivor has one). FTS is already
+    // recomputed above, so only the prose+projection half runs here. The stamp
+    // records the LID form, so both JIDs are candidates.
+    await this.repairBrainProseForIdentities(new Set([pn, lid]));
+    this.invalidateBrainStatusCache();
+    return result;
+  }
+
+  // Refresh derived search text (`resolved_text` + mentions) for the given
+  // identities' messages and the messages that mention them — chunked with
+  // event-loop yields so a heavy sender never stalls ingestion. Shared by the
+  // merge path, the name-gained path, and the one-time backfill. Returns the
+  // number of messages recomputed.
+  private async recomputeFtsForIdentities(jids: string[]): Promise<number> {
+    const unique = [...new Set(jids.filter(Boolean))];
+    if (unique.length === 0 || this.getFtsState() !== "ready") {
+      return 0;
+    }
+    const affected = new Set<number>();
+    for (let index = 0; index < unique.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = unique.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      const placeholders = batch.map(() => "?").join(",");
+      const rows = this.db
         .prepare(
-          `SELECT id FROM messages WHERE sender_source_jid = ?
+          `SELECT id FROM messages WHERE sender_source_jid IN (${placeholders})
            UNION
-           SELECT message_id AS id FROM message_mentions WHERE mentioned_jid = ?`
+           SELECT message_id AS id FROM message_mentions WHERE mentioned_jid IN (${placeholders})`
         )
-        .all(pn, pn) as Array<{ id: number }>
-    ).map((row) => Number(row.id));
-    for (let index = 0; index < affected.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
-      const chunk = affected.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+        .all(...batch, ...batch) as Array<{ id: number }>;
+      for (const row of rows) {
+        affected.add(Number(row.id));
+      }
+    }
+    const ids = [...affected];
+    for (let index = 0; index < ids.length; index += SEARCH_REINDEX_CHUNK) {
+      const chunk = ids.slice(index, index + SEARCH_REINDEX_CHUNK);
       this.db.transaction(() => this.syncMessageDerivedState(chunk))();
-      if (index + SQLITE_IN_QUERY_BATCH_SIZE < affected.length) {
+      if (index + SEARCH_REINDEX_CHUNK < ids.length) {
         await new Promise((resolve) => setImmediate(resolve));
       }
     }
+    return ids.length;
+  }
+
+  // === Identity late-resolution repair ===================================
+  // "Store references, render names" is free everywhere except LLM-generated
+  // prose, where an unresolved participant's number is baked into episode
+  // summaries and claim text at commit. These methods are the one entry point
+  // every resolution source routes through to repair that prose (and derived
+  // search text) deterministically, with no model call, once a name is known.
+
+  // Normalize/canonicalize the improved JIDs and include any LIDs that link to
+  // them — so a repair invoked with a phone identity also matches merge-era
+  // episode stamps, which record the pre-merge LID form.
+  private expandIdentityCandidates(jids: string[]): Set<string> {
+    const set = new Set<string>();
+    for (const raw of jids) {
+      const normalized = normalizeJid(raw);
+      if (!normalized) {
+        continue;
+      }
+      set.add(normalized);
+      const canonical = this.canonicalJid(normalized) ?? normalized;
+      set.add(canonical);
+      const lids = this.db.prepare(`SELECT lid FROM identity_links WHERE pn = ?`).all(canonical) as Array<{ lid: string }>;
+      for (const row of lids) {
+        set.add(row.lid);
+      }
+    }
+    return set;
+  }
+
+  // The current best display label for a JID — resolved exactly as the evidence
+  // pack labels senders (saved name → push name → +E.164) and following identity
+  // links so a merged LID resolves through its phone identity. Null when nothing
+  // is known.
+  private resolveCurrentLabelForJid(jid: string): string | null {
+    const canonical = this.canonicalJid(jid) ?? jid;
+    const row = this.db
+      .prepare(`SELECT display_name, push_name, phone_number FROM contacts WHERE source_jid = ?`)
+      .get(canonical) as { display_name: string | null; push_name: string | null; phone_number: string | null } | undefined;
+    const name = row?.display_name?.trim();
+    if (name && !isMaskedNumberLabel(name)) {
+      return name;
+    }
+    const push = row?.push_name?.trim();
+    if (push && !isMaskedNumberLabel(push)) {
+      return push;
+    }
+    const phone = row?.phone_number?.trim();
+    if (phone) {
+      return `+${phone.replace(/[+\s-]/g, "")}`;
+    }
+    return displayPhoneFromJid(canonical);
+  }
+
+  // Of the given JIDs, those that currently resolve to a genuine saved/push name
+  // (not a masked placeholder, and not an identity-derived restatement of the
+  // number). Used to detect a name transition worth repairing after a contact
+  // write, so bulk imports of already-named or number-only contacts don't churn.
+  private genuinelyNamedJids(jids: string[]): Set<string> {
+    const result = new Set<string>();
+    const unique = [...new Set(jids.map((jid) => this.canonicalJid(jid) ?? jid).filter(Boolean))];
+    for (let index = 0; index < unique.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = unique.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      const placeholders = batch.map(() => "?").join(",");
+      const rows = this.db
+        .prepare(`SELECT source_jid, display_name, push_name FROM contacts WHERE source_jid IN (${placeholders})`)
+        .all(...batch) as Array<{ source_jid: string; display_name: string | null; push_name: string | null }>;
+      for (const row of rows) {
+        const name = row.display_name?.trim() || row.push_name?.trim() || "";
+        if (name && !isMaskedNumberLabel(name) && !isIdentityDerivedName(name, row.source_jid)) {
+          result.add(row.source_jid);
+        }
+      }
+    }
     return result;
+  }
+
+  async repairIdentityResolution(jids: string | string[]): Promise<IdentityRepairResult> {
+    const inputs = (Array.isArray(jids) ? jids : [jids]).filter(Boolean);
+    const candidates = this.expandIdentityCandidates(inputs);
+    if (candidates.size === 0) {
+      return { episodesRepaired: 0, tokensSubstituted: 0, messagesRecomputed: 0 };
+    }
+    const messagesRecomputed = await this.recomputeFtsForIdentities([...candidates]);
+    const { episodesRepaired, tokensSubstituted } = await this.repairBrainProseForIdentities(candidates, {
+      enqueueRegeneration: config.brain.regenerateAfterResolution === true
+    });
+    if (episodesRepaired > 0 || messagesRecomputed > 0) {
+      this.invalidateBrainStatusCache();
+    }
+    return { episodesRepaired, tokensSubstituted, messagesRecomputed };
+  }
+
+  // Deterministic brain-prose repair for a set of improved identities: for every
+  // current episode whose unresolved-participants stamp names one of them,
+  // substitute the baked number/LID token in the summary, claims, and participant
+  // list with the resolved label; drop the stamp entry when a genuine name
+  // arrived (keep it when only a number did); re-project the Markdown. No model
+  // call. Bounded by the debt set (episodes with a non-empty stamp), yielding.
+  private async repairBrainProseForIdentities(
+    candidates: Set<string>,
+    options?: { enqueueRegeneration?: boolean }
+  ): Promise<{ episodesRepaired: number; tokensSubstituted: number }> {
+    if (candidates.size === 0) {
+      return { episodesRepaired: 0, tokensSubstituted: 0 };
+    }
+    const { episodeMarkdown, projectEpisodeFile, numberLabelFromJid, substituteParticipantToken, labelIsResolvedName } =
+      await import("../brain/episodes");
+    const debt = this.db
+      .prepare(
+        `SELECT id, unresolved_participants_json FROM brain_episodes
+         WHERE status = 'current'
+           AND unresolved_participants_json IS NOT NULL
+           AND unresolved_participants_json <> '[]'`
+      )
+      .all() as Array<{ id: string; unresolved_participants_json: string }>;
+    let episodesRepaired = 0;
+    let tokensSubstituted = 0;
+    const repairedIds: string[] = [];
+    let processed = 0;
+    for (const entry of debt) {
+      const stamp = (parseJson(entry.unresolved_participants_json) as string[] | null) ?? [];
+      const hits = stamp.filter((jid) => candidates.has(jid));
+      if (hits.length === 0) {
+        continue;
+      }
+      // (oldToken → newLabel) per hit that has actually improved. The token is
+      // regenerated from the JID by the same function that baked it.
+      const subs: Array<{ jid: string; token: string; label: string; isName: boolean }> = [];
+      for (const jid of hits) {
+        const token = numberLabelFromJid(jid);
+        if (!token.startsWith("+") && !token.startsWith("lid:")) {
+          continue; // participant-unknown / hash — nothing findable to substitute
+        }
+        const label = this.resolveCurrentLabelForJid(jid);
+        if (!label || label === token) {
+          continue; // no improvement yet
+        }
+        subs.push({ jid, token, label, isName: labelIsResolvedName(label) });
+      }
+      if (subs.length === 0) {
+        continue;
+      }
+      const applied = this.db.transaction(() => {
+        const epRow = this.db.prepare(`SELECT summary, participants_json FROM brain_episodes WHERE id = ?`).get(entry.id) as
+          | { summary: string; participants_json: string | null }
+          | undefined;
+        if (!epRow) {
+          return 0;
+        }
+        let count = 0;
+        let summary = epRow.summary;
+        let participants = (parseJson(epRow.participants_json) as string[] | null) ?? [];
+        for (const sub of subs) {
+          const before = summary;
+          summary = substituteParticipantToken(summary, sub.token, sub.label);
+          if (summary !== before) {
+            count += 1;
+          }
+          participants = participants.map((participant) => substituteParticipantToken(participant, sub.token, sub.label));
+        }
+        const claims = this.db.prepare(`SELECT id, text FROM brain_claims WHERE episode_id = ?`).all(entry.id) as Array<{
+          id: string;
+          text: string;
+        }>;
+        const updateClaim = this.db.prepare(`UPDATE brain_claims SET text = ? WHERE id = ?`);
+        for (const claim of claims) {
+          let text = claim.text;
+          for (const sub of subs) {
+            const before = text;
+            text = substituteParticipantToken(text, sub.token, sub.label);
+            if (text !== before) {
+              count += 1;
+            }
+          }
+          if (text !== claim.text) {
+            updateClaim.run(text, claim.id);
+          }
+        }
+        // Drop only the JIDs that resolved to a genuine name; a number-only
+        // improvement keeps its stamp so it stays counted and repairable.
+        const resolvedNameJids = new Set(subs.filter((sub) => sub.isName).map((sub) => sub.jid));
+        const newStamp = stamp.filter((jid) => !resolvedNameJids.has(jid));
+        this.db
+          .prepare(`UPDATE brain_episodes SET summary = ?, participants_json = ?, unresolved_participants_json = ? WHERE id = ?`)
+          .run(summary, stringifyJson(participants), stringifyJson(newStamp), entry.id);
+        return count;
+      })();
+      if (applied > 0) {
+        tokensSubstituted += applied;
+        episodesRepaired += 1;
+        repairedIds.push(entry.id);
+      }
+      processed += 1;
+      if (processed % 25 === 0) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    }
+    // Re-project repaired episodes deterministically from fresh DB state.
+    for (const id of repairedIds) {
+      const [record] = await this.listBrainEpisodes({ episodeId: id, limit: 1 });
+      if (!record) {
+        continue;
+      }
+      const markdown = episodeMarkdown(record);
+      this.db.prepare(`UPDATE brain_episodes SET markdown = ? WHERE id = ?`).run(markdown, id);
+      try {
+        projectEpisodeFile({ ...record, markdown });
+      } catch {
+        // Projection to the vault is best-effort; the database is the source of truth.
+      }
+    }
+    if (options?.enqueueRegeneration === true && repairedIds.length > 0) {
+      this.enqueueRegenerationForEpisodes(repairedIds);
+    }
+    return { episodesRepaired, tokensSubstituted };
+  }
+
+  // Optional quality upgrade (repair-first): enqueue low-priority regeneration
+  // for repaired episodes so the model can weave the now-named person into
+  // context. Never marks the episode stale (it is repaired and current) and
+  // never clears the debt — the deterministic pass already did. Off by default.
+  private enqueueRegenerationForEpisodes(episodeIds: string[]): void {
+    const enqueue = this.db.prepare(
+      `INSERT OR IGNORE INTO brain_tasks (kind, chat_source_id, payload_json, dedupe_key, priority)
+       VALUES ('episode', ?, ?, ?, ?)`
+    );
+    const transaction = this.db.transaction(() => {
+      for (const id of episodeIds) {
+        const row = this.db
+          .prepare(`SELECT chat_source_id, start_at_ms, end_at_ms FROM brain_episodes WHERE id = ?`)
+          .get(id) as { chat_source_id: string; start_at_ms: number; end_at_ms: number } | undefined;
+        if (!row) {
+          continue;
+        }
+        enqueue.run(
+          row.chat_source_id,
+          stringifyJson({ chatSourceId: row.chat_source_id, sinceMs: row.start_at_ms, throughMs: row.end_at_ms, regen: true, episodeId: id }),
+          `regen:${id}`,
+          2_000
+        );
+      }
+    });
+    transaction();
+  }
+
+  async backfillIdentityResolution(): Promise<IdentityRepairResult> {
+    const empty: IdentityRepairResult = { episodesRepaired: 0, tokensSubstituted: 0, messagesRecomputed: 0 };
+    if (this.legacyArchive) {
+      return empty;
+    }
+    const debt = this.db
+      .prepare(
+        `SELECT unresolved_participants_json FROM brain_episodes
+         WHERE status = 'current' AND unresolved_participants_json IS NOT NULL AND unresolved_participants_json <> '[]'`
+      )
+      .all() as Array<{ unresolved_participants_json: string }>;
+    const stampedJids = new Set<string>();
+    for (const row of debt) {
+      for (const jid of (parseJson(row.unresolved_participants_json) as string[] | null) ?? []) {
+        stampedJids.add(jid);
+      }
+    }
+    if (stampedJids.size === 0) {
+      return empty;
+    }
+    const { numberLabelFromJid } = await import("../brain/episodes");
+    const improved: string[] = [];
+    for (const jid of stampedJids) {
+      const token = numberLabelFromJid(jid);
+      if (!token.startsWith("+") && !token.startsWith("lid:")) {
+        continue;
+      }
+      const label = this.resolveCurrentLabelForJid(jid);
+      if (label && label !== token) {
+        improved.push(jid);
+      }
+    }
+    if (improved.length === 0) {
+      return empty;
+    }
+    const result = await this.repairIdentityResolution(improved);
+    if (result.episodesRepaired > 0) {
+      console.log(
+        `[identity-repair] backfill repaired ${result.episodesRepaired} episode(s), ` +
+          `${result.tokensSubstituted} token substitution(s)` +
+          (result.messagesRecomputed > 0 ? `; recomputed search text for ${result.messagesRecomputed} message(s)` : "")
+      );
+    }
+    return result;
+  }
+
+  async getBrainResolutionDebt(options?: { limit?: number }): Promise<BrainResolutionDebtSummary> {
+    const limit = options?.limit ?? 8;
+    const debt = this.db
+      .prepare(
+        `SELECT unresolved_participants_json FROM brain_episodes
+         WHERE status = 'current' AND unresolved_participants_json IS NOT NULL AND unresolved_participants_json <> '[]'`
+      )
+      .all() as Array<{ unresolved_participants_json: string }>;
+    const episodeCountByJid = new Map<string, number>();
+    let episodesWithUnresolved = 0;
+    for (const row of debt) {
+      const stamp = (parseJson(row.unresolved_participants_json) as string[] | null) ?? [];
+      if (stamp.length === 0) {
+        continue;
+      }
+      episodesWithUnresolved += 1;
+      for (const jid of new Set(stamp)) {
+        episodeCountByJid.set(jid, (episodeCountByJid.get(jid) ?? 0) + 1);
+      }
+    }
+    const { numberLabelFromJid } = await import("../brain/episodes");
+    const identities: BrainResolutionDebtIdentity[] = [...episodeCountByJid.keys()].map((jid) => {
+      const canonical = this.canonicalJid(jid) ?? jid;
+      const messages = this.db.prepare(`SELECT COUNT(*) AS n FROM messages WHERE sender_source_jid = ?`).get(canonical) as {
+        n: number;
+      };
+      return {
+        jid,
+        label: this.resolveCurrentLabelForJid(jid) ?? numberLabelFromJid(jid),
+        messageCount: Number(messages.n ?? 0),
+        episodeCount: episodeCountByJid.get(jid) ?? 0
+      };
+    });
+    identities.sort((a, b) => b.messageCount - a.messageCount || b.episodeCount - a.episodeCount);
+    return {
+      episodesWithUnresolved,
+      distinctIdentities: episodeCountByJid.size,
+      topIdentities: identities.slice(0, limit)
+    };
   }
 
   // Re-derive message keys after their chat's canonical JID changed.
@@ -2957,6 +3319,12 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       return new Map();
     }
 
+    // Snapshot which identities already resolved to a genuine name, so after the
+    // write we can repair episodes only for those that just transitioned — not
+    // every contact in a bulk import.
+    const batchJids = [...unique.keys()];
+    const namedBefore = this.genuinelyNamedJids(batchJids);
+
     const upsert = this.db.prepare(
       `INSERT INTO contacts
        (source_jid, phone_number, display_name, display_name_source, push_name, raw_metadata_json, first_seen_import_id, last_seen_import_id, updated_at)
@@ -2988,6 +3356,14 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     transaction();
     this.propagateContactNamesToDmChats([...unique.values()]);
 
+    // Identity late-resolution: any identity that just gained a genuine name is
+    // routed through the one repair entry point (search text + brain prose), so
+    // saving a contact retroactively improves old episodes with no model call.
+    const transitioned = [...this.genuinelyNamedJids(batchJids)].filter((jid) => !namedBefore.has(jid));
+    if (transitioned.length > 0) {
+      await this.repairIdentityResolution(transitioned);
+    }
+
     return this.getContactIds([...unique.keys()]);
   }
 
@@ -3006,6 +3382,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     );
     let matchedIdentities = 0;
     let improvedNames = 0;
+    const improvedJids: string[] = [];
     this.db.transaction(() => {
       for (const contact of contacts) {
         const jid = `${contact.phoneNumber}@s.whatsapp.net`;
@@ -3029,9 +3406,15 @@ export class SqliteArchiveRepository implements ArchiveRepository {
           updateContact.run(contact.displayName, currentIso(), row.id);
           updateChat.run(contact.displayName, currentIso(), row.source_jid);
           improvedNames += 1;
+          improvedJids.push(row.source_jid);
         }
       }
     })();
+    // Retroactive enrichment reaches the brain: repair episodes and search text
+    // for every identity Google just named, deterministically and model-free.
+    if (improvedJids.length > 0) {
+      await this.repairIdentityResolution(improvedJids);
+    }
     return { matchedIdentities, improvedNames };
   }
 

@@ -602,7 +602,10 @@ app.get("/api/brain/status", async (_req, res) => {
       regenerableEpisodes: await repository.countRegenerableBrainEpisodes(EXTRACTION_VERSION),
       validationIssues: await repository.getBrainValidationIssueSummary(),
       // D13 media-demand stat: where unavailable media hurt inferences.
-      mediaGaps: await repository.getBrainMediaGapSummary()
+      mediaGaps: await repository.getBrainMediaGapSummary(),
+      // Identity late-resolution debt: episodes still referring to people by
+      // number, ranked so the highest-value contact saves surface first.
+      resolutionDebt: await repository.getBrainResolutionDebt({ limit: 8 })
     });
   } catch (error) {
     res.status(400).json({ error: publicErrorMessage(error) });
@@ -959,7 +962,26 @@ app.listen(config.app.port, config.app.host, () => {
   console.log(`Wapp Brain listening on http://${config.app.host}:${config.app.port}`);
   void autoResumeLiveSync();
   void probeBrainProviderOnStartup();
+  void backfillIdentityResolutionOnStartup();
 });
+
+// Episodes written before the identity-repair machinery existed may still refer
+// to participants by number even though their contacts were saved since. Run the
+// idempotent, bounded, model-free repair once at boot (non-blocking) so history
+// catches up; a clean archive finds nothing and returns immediately.
+async function backfillIdentityResolutionOnStartup(): Promise<void> {
+  try {
+    const result = await repository.backfillIdentityResolution();
+    if (result.episodesRepaired > 0) {
+      console.log(
+        `[identity-repair] startup backfill repaired ${result.episodesRepaired} episode(s) ` +
+          `(${result.tokensSubstituted} substitution(s), ${result.messagesRecomputed} message(s) reindexed)`
+      );
+    }
+  } catch (error) {
+    console.warn(`Identity-resolution backfill error: ${publicErrorMessage(error)}`);
+  }
+}
 
 // A remote provider's health is only known once it has answered end-to-end.
 // Fire the configured probe (non-blocking) at boot when a model provider is

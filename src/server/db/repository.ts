@@ -6,6 +6,7 @@ import type {
   BrainLlmUsageSummary,
   BrainMediaGapImpact,
   BrainMediaGapSummary,
+  BrainResolutionDebtSummary,
   BrainRunSummary,
   BrainStatusSummary,
   BrainTaskInput,
@@ -22,6 +23,7 @@ import type {
   ContactRecord,
   GoogleContactCandidate,
   GoogleContactsSyncResult,
+  IdentityRepairResult,
   ImportTotals,
   ImportWarning,
   LiveChatCheckpointRecord,
@@ -80,6 +82,18 @@ export interface ArchiveRepository {
   getIdentityLidsForJid(jid: string): Promise<string[]>;
   listUnmergedLidIdentities(limit?: number): Promise<Array<{ lid: string; pn: string }>>;
   mergeIdentity(lid: string, pn: string): Promise<{ chatsMerged: number; contactsMerged: number; messagesCollapsed: number }>;
+  // Identity late-resolution: one entry point every resolution source routes
+  // through to deterministically repair derived layers keyed on an improved
+  // identity (search text + brain prose/projection), with no model call. Called
+  // internally by the name-gained and merge write paths; also callable directly
+  // by future name sources.
+  repairIdentityResolution(jids: string | string[]): Promise<IdentityRepairResult>;
+  // One-time idempotent pass that repairs episodes written before the identity
+  // repair machinery existed, for identities that already resolve to a name.
+  backfillIdentityResolution(): Promise<IdentityRepairResult>;
+  // The resolution-debt surface: episodes still referring to people by number,
+  // ranked by message volume. Computed with no model call.
+  getBrainResolutionDebt(options?: { limit?: number }): Promise<BrainResolutionDebtSummary>;
   // Collapse rows stored under a superseded identity (e.g. an edited message's
   // edit key from an earlier importer) onto their canonical row; removed rows
   // route through memory staleness.

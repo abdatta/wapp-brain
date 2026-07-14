@@ -14,7 +14,7 @@
 | ✅ | 1 | `brain-correctness-debts` | Opus | **archived 2026-07-12** | — | compound-cursor watermark, merge rekey, run honesty, startup probe, real usage — shipped; gates 11.1/11.3 test-covered, 11.2 verified live; archived to `archive/2026-07-12-brain-correctness-debts` |
 | ✅ | 2 | `evidence-pack-fidelity` | Opus | **archived 2026-07-13** | — (#1 recommended first) | reactions/replies/forwards/number-labels visible in a real episode; week-bounded quiet-chat packs |
 | ✅ | 3 | `episode-contract-v2` | **Fable** | **archived 2026-07-13** | #1, #2 | wipe + assimilate 2–3 chats: entities, absolute dates, hedges in claims; salvageable weak-model JSON |
-|  | 4 | `identity-late-resolution` | Opus | seeded | #3, #20 | save a contact → old episodes + search repair with zero model calls |
+| ✅ | 4 | `identity-late-resolution` | Opus | **archived 2026-07-14** | #3, #20 | save a contact → old episodes + search repair with zero model calls |
 |  | 5 | `two-level-person-model` | **Fable** | seeded | #3 | same-name stays separate; Google same-contact auto-connects; disconnect re-derives, zero episode changes |
 |  | 6 | `people-management-ui` | Sonnet | seeded | #4, #5, #19 | ranked hygiene queue; dismissed pair stays dismissed |
 |  | 7 | `brain-eval-harness` | Opus | seeded | #3 | recall table + per-model precision/fallback tables on the real archive |

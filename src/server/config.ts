@@ -43,6 +43,14 @@ const envSchema = z.object({
   // spanning months. Independent of the scheduler's significance/volume gates.
   WAPP_BRAIN_MAX_EPISODE_SPAN_DAYS: z.coerce.number().int().positive().default(7),
   WAPP_BRAIN_PROVIDER_FAILURE_THRESHOLD: z.coerce.number().int().positive().default(3),
+  // Identity late-resolution is deterministic and model-free by design. When a
+  // provider is configured, optionally enqueue low-priority regeneration for
+  // repaired episodes so the model can weave the now-named person into context.
+  // Off by default: the deterministic repair alone keeps the brain honest.
+  WAPP_BRAIN_REGENERATE_AFTER_RESOLUTION: z
+    .string()
+    .optional()
+    .transform((value) => value === "1" || value === "true"),
   WAPP_MEMORY_DIR: z.string().optional(),
   WAPP_MEMORY_PROVIDER: z.enum(["local", "codex"]).default("local"),
   WAPP_MEMORY_REMOTE_MODEL_ENABLED: z
@@ -103,7 +111,8 @@ export const config = {
     maxEvidenceMessages: parsed.WAPP_BRAIN_MAX_EVIDENCE_MESSAGES,
     maxEpisodeSpanDays: parsed.WAPP_BRAIN_MAX_EPISODE_SPAN_DAYS,
     maxEpisodeSpanMs: parsed.WAPP_BRAIN_MAX_EPISODE_SPAN_DAYS * 24 * 60 * 60_000,
-    providerFailureThreshold: parsed.WAPP_BRAIN_PROVIDER_FAILURE_THRESHOLD
+    providerFailureThreshold: parsed.WAPP_BRAIN_PROVIDER_FAILURE_THRESHOLD,
+    regenerateAfterResolution: parsed.WAPP_BRAIN_REGENERATE_AFTER_RESOLUTION
   },
   memory: {
     rootDir: memoryRootDir,

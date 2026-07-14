@@ -568,7 +568,32 @@ function BrainPanel({
                 <strong>{overview!.mediaGaps!.reduce((sum, gap) => sum + gap.count, 0)}</strong>
               </div>
             )}
+            {(overview?.resolutionDebt?.episodesWithUnresolved ?? 0) > 0 && (
+              <div
+                className="metric"
+                title={`Episodes still referring to people by number. Saving these contacts repairs old episodes and search with no model call — highest payoff first: ${overview!.resolutionDebt!.topIdentities
+                  .map((identity) => `${identity.label} (${identity.messageCount.toLocaleString()} msgs, ${identity.episodeCount} ep)`)
+                  .join(", ")}`}
+              >
+                <span>Unresolved people</span>
+                <strong>{overview!.resolutionDebt!.distinctIdentities.toLocaleString()}</strong>
+              </div>
+            )}
           </div>
+          {(overview?.resolutionDebt?.episodesWithUnresolved ?? 0) > 0 && (
+            <div className="brainHint">
+              {overview!.resolutionDebt!.episodesWithUnresolved.toLocaleString()} episode
+              {overview!.resolutionDebt!.episodesWithUnresolved === 1 ? "" : "s"} involve unresolved participants (
+              {overview!.resolutionDebt!.distinctIdentities.toLocaleString()} distinct number
+              {overview!.resolutionDebt!.distinctIdentities === 1 ? "" : "s"}). Save the top contact
+              {overview!.resolutionDebt!.topIdentities.length === 1 ? "" : "s"} to repair the most — with no model call:{" "}
+              {overview!.resolutionDebt!.topIdentities
+                .slice(0, 3)
+                .map((identity) => `${identity.label} (${identity.messageCount.toLocaleString()})`)
+                .join(", ")}
+              .
+            </div>
+          )}
           {runDue && !running && (
             <div className="brainDueAlert">
               <AlertTriangle size={14} />

@@ -77,7 +77,11 @@ function shortHash(input: string): string {
 // The FULL number is kept (never truncated) so late identity resolution can
 // find-and-replace the exact token once a name binds. PN → "+digits", LID →
 // "lid:digits", anything else → "participant-<shorthash>".
-function numberLabelFromJid(jid: string | null | undefined): string {
+// The verbatim token an unresolved participant is baked as, both on evidence
+// lines and (therefore) in generated prose. Exported so identity late-resolution
+// can regenerate the exact token from a JID and find-replace it — the token is a
+// pure function of the JID, so nothing needs to have stored it.
+export function numberLabelFromJid(jid: string | null | undefined): string {
   if (!jid || jid === "me") {
     return "participant-unknown";
   }
@@ -87,6 +91,41 @@ function numberLabelFromJid(jid: string | null | undefined): string {
     return digits ? `lid:${digits}` : `participant-${shortHash(jid)}`;
   }
   return digits ? `+${digits}` : `participant-${shortHash(jid)}`;
+}
+
+// Deterministic prose repair (identity late-resolution): replace a baked
+// participant token — a `+E.164` number or a `lid:<digits>` token as produced by
+// numberLabelFromJid — with a resolved label, wherever it appears in an episode's
+// summary, claim text, or participant list. The token may carry the labeler's
+// collision-disambiguation suffix (` (…7186)`, ellipsis U+2026); that suffix is
+// consumed together with the token so no dangling `(…7186)` is left behind. A
+// negative digit lookahead prevents matching a longer number that merely starts
+// with the token. Pure and unit-testable; no model call.
+export function substituteParticipantToken(text: string, token: string, replacement: string): string {
+  if (!text || !token || token === replacement) {
+    return text;
+  }
+  const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(`${escaped}(?!\\d)(?:\\s\\(\\u2026[^)]*\\))?`, "g");
+  return text.replace(pattern, replacement);
+}
+
+// True when a resolved label is a genuine name rather than a fallback number or
+// identifier token. Identity repair uses it to decide whether to clear the
+// unresolved stamp (a real name arrived) or merely upgrade an opaque `lid:` token
+// to a now-known number (still unresolved, so the stamp stays).
+export function labelIsResolvedName(label: string | null | undefined): boolean {
+  const name = label?.trim();
+  if (!name) {
+    return false;
+  }
+  if (/^\+\d+$/.test(name)) {
+    return false; // bare +E.164 number
+  }
+  if (/^lid:\d+$/.test(name)) {
+    return false; // opaque LID token
+  }
+  return !name.startsWith("participant-");
 }
 
 // One naming style for everyone (Gate 2.7): short display forms. The owner is
@@ -821,7 +860,7 @@ function extractiveEpisode(
   };
 }
 
-function episodeMarkdown(record: BrainEpisodeRecord): string {
+export function episodeMarkdown(record: BrainEpisodeRecord): string {
   const lines = [
     "---",
     `episode: ${record.id}`,
@@ -869,7 +908,7 @@ function episodeMarkdown(record: BrainEpisodeRecord): string {
   return lines.join("\n");
 }
 
-function projectEpisodeFile(record: BrainEpisodeRecord): void {
+export function projectEpisodeFile(record: BrainEpisodeRecord): void {
   const dir = path.join(config.brain.rootDir, "episodes");
   fs.mkdirSync(dir, { recursive: true });
   const slug = `${new Date(record.startAtMs).toISOString().slice(0, 10)}-${record.chatSourceId.replace(/[^A-Za-z0-9]/g, "").slice(0, 12)}-${record.id.slice(0, 8)}`;

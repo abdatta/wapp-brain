@@ -10,6 +10,8 @@ import type {
   BrainLlmUsageSummary,
   BrainMediaGapImpact,
   BrainMediaGapSummary,
+  BrainResolutionDebtIdentity,
+  BrainResolutionDebtSummary,
   BrainRunSummary,
   BrainStatusSummary,
   BrainTaskInput,
@@ -25,6 +27,7 @@ import type {
   ChatRecord,
   ChatSyncStateRecord,
   ContactRecord,
+  IdentityRepairResult,
   ImportRunSummary,
   ImportTotals,
   ImportWarning,
@@ -387,6 +390,10 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     }
 
     await this.refreshChatStats([pn]);
+    // Deterministic brain-prose repair: substitute the merged identity's baked
+    // `lid:` token in old episodes with the now-known number or name. The stamp
+    // records the LID form, so both JIDs are candidates.
+    await this.repairBrainProseForIdentities(new Set([pn, lid]));
     return result;
   }
 
@@ -401,6 +408,186 @@ export class MemoryArchiveRepository implements ArchiveRepository {
         }
       }
     }
+  }
+
+  // === Identity late-resolution repair (mirror of the SQLite adapter) ======
+  // The in-memory search resolves labels live (contacts are read at query time),
+  // so there is no derived search text to recompute — repair here is purely the
+  // brain-prose half. Episodes are stored as hydrated records, mutated in place.
+
+  private expandIdentityCandidates(jids: string[]): Set<string> {
+    const set = new Set<string>();
+    for (const raw of jids) {
+      const normalized = normalizeJid(raw);
+      if (!normalized) {
+        continue;
+      }
+      set.add(normalized);
+      const canonical = this.canonicalJid(normalized) ?? normalized;
+      set.add(canonical);
+      for (const [lid, pn] of this.identityLinks) {
+        if (pn === canonical) {
+          set.add(lid);
+        }
+      }
+    }
+    return set;
+  }
+
+  private resolveCurrentLabelForJid(jid: string): string | null {
+    const canonical = this.canonicalJid(jid) ?? jid;
+    const contact = this.contacts.get(canonical);
+    const name = contact?.displayName?.trim();
+    if (name && !isMaskedNumberLabel(name)) {
+      return name;
+    }
+    const push = contact?.pushName?.trim();
+    if (push && !isMaskedNumberLabel(push)) {
+      return push;
+    }
+    const phone = contact?.phoneNumber?.trim();
+    if (phone) {
+      return `+${phone.replace(/[+\s-]/g, "")}`;
+    }
+    return displayPhoneFromJid(canonical);
+  }
+
+  private genuinelyNamedJids(jids: string[]): Set<string> {
+    const result = new Set<string>();
+    for (const jid of jids) {
+      const canonical = this.canonicalJid(jid) ?? jid;
+      const contact = this.contacts.get(canonical);
+      const name = contact?.displayName?.trim() || contact?.pushName?.trim() || "";
+      if (name && !isMaskedNumberLabel(name) && !isIdentityDerivedName(name, canonical)) {
+        result.add(canonical);
+      }
+    }
+    return result;
+  }
+
+  async repairIdentityResolution(jids: string | string[]): Promise<IdentityRepairResult> {
+    const inputs = (Array.isArray(jids) ? jids : [jids]).filter(Boolean);
+    const candidates = this.expandIdentityCandidates(inputs);
+    const { episodesRepaired, tokensSubstituted } = await this.repairBrainProseForIdentities(candidates);
+    return { episodesRepaired, tokensSubstituted, messagesRecomputed: 0 };
+  }
+
+  private async repairBrainProseForIdentities(candidates: Set<string>): Promise<{ episodesRepaired: number; tokensSubstituted: number }> {
+    if (candidates.size === 0) {
+      return { episodesRepaired: 0, tokensSubstituted: 0 };
+    }
+    const { episodeMarkdown, numberLabelFromJid, substituteParticipantToken, labelIsResolvedName } = await import("../brain/episodes");
+    let episodesRepaired = 0;
+    let tokensSubstituted = 0;
+    for (const episode of this.brainEpisodes.values()) {
+      if (episode.status !== "current" || episode.unresolvedParticipants.length === 0) {
+        continue;
+      }
+      const hits = episode.unresolvedParticipants.filter((jid) => candidates.has(jid));
+      if (hits.length === 0) {
+        continue;
+      }
+      const subs: Array<{ jid: string; token: string; label: string; isName: boolean }> = [];
+      for (const jid of hits) {
+        const token = numberLabelFromJid(jid);
+        if (!token.startsWith("+") && !token.startsWith("lid:")) {
+          continue;
+        }
+        const label = this.resolveCurrentLabelForJid(jid);
+        if (!label || label === token) {
+          continue;
+        }
+        subs.push({ jid, token, label, isName: labelIsResolvedName(label) });
+      }
+      if (subs.length === 0) {
+        continue;
+      }
+      let count = 0;
+      for (const sub of subs) {
+        const before = episode.summary;
+        episode.summary = substituteParticipantToken(episode.summary, sub.token, sub.label);
+        if (episode.summary !== before) {
+          count += 1;
+        }
+        episode.participants = episode.participants.map((participant) => substituteParticipantToken(participant, sub.token, sub.label));
+        for (const claim of episode.claims) {
+          const claimBefore = claim.text;
+          claim.text = substituteParticipantToken(claim.text, sub.token, sub.label);
+          if (claim.text !== claimBefore) {
+            count += 1;
+          }
+        }
+      }
+      const resolvedNameJids = new Set(subs.filter((sub) => sub.isName).map((sub) => sub.jid));
+      episode.unresolvedParticipants = episode.unresolvedParticipants.filter((jid) => !resolvedNameJids.has(jid));
+      if (count > 0) {
+        episode.markdown = episodeMarkdown(episode);
+        episodesRepaired += 1;
+        tokensSubstituted += count;
+      }
+    }
+    return { episodesRepaired, tokensSubstituted };
+  }
+
+  async backfillIdentityResolution(): Promise<IdentityRepairResult> {
+    const stamped = new Set<string>();
+    for (const episode of this.brainEpisodes.values()) {
+      if (episode.status === "current") {
+        for (const jid of episode.unresolvedParticipants) {
+          stamped.add(jid);
+        }
+      }
+    }
+    const empty: IdentityRepairResult = { episodesRepaired: 0, tokensSubstituted: 0, messagesRecomputed: 0 };
+    if (stamped.size === 0) {
+      return empty;
+    }
+    const { numberLabelFromJid } = await import("../brain/episodes");
+    const improved = [...stamped].filter((jid) => {
+      const token = numberLabelFromJid(jid);
+      if (!token.startsWith("+") && !token.startsWith("lid:")) {
+        return false;
+      }
+      const label = this.resolveCurrentLabelForJid(jid);
+      return !!label && label !== token;
+    });
+    if (improved.length === 0) {
+      return empty;
+    }
+    return this.repairIdentityResolution(improved);
+  }
+
+  async getBrainResolutionDebt(options?: { limit?: number }): Promise<BrainResolutionDebtSummary> {
+    const limit = options?.limit ?? 8;
+    const episodeCountByJid = new Map<string, number>();
+    let episodesWithUnresolved = 0;
+    for (const episode of this.brainEpisodes.values()) {
+      if (episode.status !== "current" || episode.unresolvedParticipants.length === 0) {
+        continue;
+      }
+      episodesWithUnresolved += 1;
+      for (const jid of new Set(episode.unresolvedParticipants)) {
+        episodeCountByJid.set(jid, (episodeCountByJid.get(jid) ?? 0) + 1);
+      }
+    }
+    const { numberLabelFromJid } = await import("../brain/episodes");
+    const identities: BrainResolutionDebtIdentity[] = [...episodeCountByJid.keys()].map((jid) => {
+      const canonical = this.canonicalJid(jid) ?? jid;
+      let messageCount = 0;
+      for (const message of this.messages.values()) {
+        if (message.senderSourceJid === canonical) {
+          messageCount += 1;
+        }
+      }
+      return {
+        jid,
+        label: this.resolveCurrentLabelForJid(jid) ?? numberLabelFromJid(jid),
+        messageCount,
+        episodeCount: episodeCountByJid.get(jid) ?? 0
+      };
+    });
+    identities.sort((a, b) => b.messageCount - a.messageCount || b.episodeCount - a.episodeCount);
+    return { episodesWithUnresolved, distinctIdentities: episodeCountByJid.size, topIdentities: identities.slice(0, limit) };
   }
 
   async createRestorePoint(_label: string): Promise<ArchiveRestorePoint> {
@@ -531,6 +718,8 @@ export class MemoryArchiveRepository implements ArchiveRepository {
         phoneNumber: queued?.phoneNumber || rawContact.phoneNumber || null
       });
     }
+    const batchJids = [...unique.keys()];
+    const namedBefore = this.genuinelyNamedJids(batchJids);
     for (const contact of unique.values()) {
       const existing = this.contacts.get(contact.sourceJid);
       this.contacts.set(contact.sourceJid, {
@@ -548,12 +737,19 @@ export class MemoryArchiveRepository implements ArchiveRepository {
         chat.displayName = pushName;
       }
     }
+    // Identity late-resolution: repair episodes for identities that just gained a
+    // genuine name (mirror of the SQLite path).
+    const transitioned = [...this.genuinelyNamedJids(batchJids)].filter((jid) => !namedBefore.has(jid));
+    if (transitioned.length > 0) {
+      await this.repairIdentityResolution(transitioned);
+    }
     return new Map([...this.contacts].map(([jid, contact]) => [jid, contact.id]));
   }
 
   async enrichContactsFromGoogle(contacts: Array<{ phoneNumber: string; displayName: string }>): Promise<{ matchedIdentities: number; improvedNames: number }> {
     let matchedIdentities = 0;
     let improvedNames = 0;
+    const improvedJids: string[] = [];
     for (const candidate of contacts) {
       const jid = `${candidate.phoneNumber}@s.whatsapp.net`;
       const contact = this.contacts.get(jid);
@@ -566,7 +762,11 @@ export class MemoryArchiveRepository implements ArchiveRepository {
         const chat = this.chats.get(jid);
         if (chat && (chat.chatType === "dm" || chat.chatType === "unknown")) chat.displayName = candidate.displayName;
         improvedNames += 1;
+        improvedJids.push(jid);
       }
+    }
+    if (improvedJids.length > 0) {
+      await this.repairIdentityResolution(improvedJids);
     }
     return { matchedIdentities, improvedNames };
   }
