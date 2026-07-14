@@ -7,7 +7,8 @@ import type {
   MediaDownloadDescriptor,
   MessageRecord,
   MessageSecretRecord,
-  ParticipantRecord
+  ParticipantRecord,
+  QuotedMessageSnapshot
 } from "../../shared/types";
 import { inferChatType, isMaskedNumberLabel, normalizeJid, phoneFromJid } from "./jid";
 import { boolish, directionFromFromMe, isMediaMessageType, messageTypeFromCode, normalizeTimestampMs } from "./messageTypes";
@@ -171,7 +172,7 @@ export function parseWhatsAppSource(
 
   const adapter = chooseMessageAdapter(msgInspection);
   // Empty maps for legacy schemas — every sidecar table is guarded.
-  const sidecars = loadInterpretationSidecars(msgstoreDb, msgInspection, jidMap);
+  const sidecars = loadInterpretationSidecars(msgstoreDb, msgInspection, jidMap, chatRowJidMap, warnings);
   const messageCountEstimate = adapter ? countMessageRows(msgstoreDb, adapter) : null;
   if (!adapter) {
     warnings.push({
@@ -747,6 +748,10 @@ interface InterpretationSidecars {
   // mime, name, and content hash used both to keep modern mime/name on the
   // message row and to match files in the user-provided media folder.
   media: Map<number, MediaSidecarInfo>;
+  quotedSnapshots: Map<number, QuotedMessageSnapshot>;
+  // Current Android schemas put the reply's own message row id on
+  // message_quoted, rather than putting a quoted-row pointer on message.
+  quotedSnapshotsByReplyRowId: Map<number, QuotedMessageSnapshot>;
 }
 
 interface MediaSidecarInfo {
@@ -772,7 +777,9 @@ interface MediaSidecarInfo {
 function loadInterpretationSidecars(
   db: Database.Database,
   inspection: SQLiteInspection,
-  jidMap: Map<number, string>
+  jidMap: Map<number, string>,
+  chatRowJidMap: Map<number, string>,
+  warnings: ImportWarning[]
 ): InterpretationSidecars {
   const sidecars: InterpretationSidecars = {
     polls: new Map(),
@@ -785,7 +792,9 @@ function loadInterpretationSidecars(
     calls: new Map(),
     edits: new Map(),
     editRekeys: [],
-    media: new Map()
+    media: new Map(),
+    quotedSnapshots: new Map(),
+    quotedSnapshotsByReplyRowId: new Map()
   };
   const rowsOf = (table: string, columns: string[]): SqlRow[] => {
     if (!hasColumns(inspection, table, columns)) {
@@ -881,6 +890,15 @@ function loadInterpretationSidecars(
   // where present and marks its rows as view-once.
   loadMediaSidecarTable(db, inspection, "message_media", false, sidecars.media);
   loadMediaSidecarTable(db, inspection, "message_view_once_media", true, sidecars.media);
+  loadQuotedSnapshotSidecars(
+    db,
+    inspection,
+    jidMap,
+    chatRowJidMap,
+    warnings,
+    sidecars.quotedSnapshots,
+    sidecars.quotedSnapshotsByReplyRowId
+  );
   return sidecars;
 }
 
@@ -932,6 +950,176 @@ function loadMediaSidecarTable(
   } catch {
     // Optional enrichment only; a missing/odd table shape must not fail import.
   }
+}
+
+// Modern Android stores a quoted-message copy beside the reply. Schemas vary,
+// so every table/column is inspected and mapped by explicit known names only.
+// Unknown fields are never copied into metadata or logs.
+function loadQuotedSnapshotSidecars(
+  db: Database.Database,
+  inspection: SQLiteInspection,
+  jidMap: Map<number, string>,
+  chatRowJidMap: Map<number, string>,
+  warnings: ImportWarning[],
+  target: Map<number, QuotedMessageSnapshot>,
+  byReplyRowId: Map<number, QuotedMessageSnapshot>
+): void {
+  if (!hasTable(inspection, "message_quoted")) {
+    return;
+  }
+  const columns = columnsFor(inspection, "message_quoted");
+  const idColumn = pickColumn(columns, ["_id", "message_row_id", "quoted_message_row_id", "message_quoted_row_id"]);
+  if (!idColumn) {
+    addRowWarning(warnings, {
+      code: "QUOTED_SNAPSHOT_ID_MISSING",
+      sourceTable: "message_quoted",
+      message: "Quoted snapshots were skipped because no supported row identifier was available."
+    });
+    return;
+  }
+  try {
+    const rows = db.prepare(`SELECT * FROM message_quoted`).iterate() as Iterable<SqlRow>;
+    for (const row of rows) {
+      const id = Number(row[idColumn]);
+      if (!Number.isFinite(id)) continue;
+      const rawTypeCode = row.message_type ?? row.media_wa_type ?? null;
+      const mediaType = rawTypeCode == null ? "unknown" : messageTypeFromCode(rawTypeCode);
+      const senderRowId = Number(row.sender_jid_row_id ?? row.sender_id ?? row.participant_jid_row_id);
+      const chatRowId = Number(row.chat_row_id ?? row.chat_id ?? row.remote_chat_row_id);
+      const keyId = stringOrNull(row.key_id ?? row.quoted_key_id ?? row.stanza_id);
+      const snapshot: QuotedMessageSnapshot = {
+        quotedSourceMessageId: keyId ?? surrogateMessageId("quoted", String(id), null),
+        quotedSourceChatId: Number.isFinite(chatRowId) ? chatRowJidMap.get(chatRowId) ?? null : null,
+        quotedSenderSourceJid: boolish(row.from_me ?? row.key_from_me) ? "me" : jidMap.get(senderRowId) ?? null,
+        quotedFromMe: row.from_me == null && row.key_from_me == null ? null : boolish(row.from_me ?? row.key_from_me),
+        timestampMs: normalizeTimestampMs(row.timestamp ?? row.sender_timestamp),
+        messageType: mediaType,
+        rawTypeCode: rawTypeCode == null ? null : String(rawTypeCode),
+        body: stringOrNull(row.text_data ?? row.data ?? row.message_text),
+        caption: stringOrNull(row.caption ?? row.media_caption),
+        mediaMimeType: stringOrNull(row.media_mime_type ?? row.mime_type),
+        mediaName: stringOrNull(row.media_name ?? row.file_name),
+        thumbnail: null,
+        location: null,
+        vcard: null,
+        mentionedJids: []
+      };
+      target.set(id, snapshot);
+      if (idColumn === "message_row_id") {
+        byReplyRowId.set(id, snapshot);
+      }
+    }
+  } catch {
+    addRowWarning(warnings, {
+      code: "QUOTED_SNAPSHOT_READ_FAILED",
+      sourceTable: "message_quoted",
+      message: "Quoted snapshot rows could not be read; replies will keep their existing pointers."
+    });
+    return;
+  }
+
+  loadQuotedMediaCompanion(db, inspection, target, warnings);
+  loadQuotedLocationCompanion(db, inspection, target, warnings);
+  loadQuotedVcardCompanion(db, inspection, target, warnings);
+  loadQuotedMentionsCompanion(db, inspection, jidMap, target, warnings);
+}
+
+function quotedCompanionKey(row: SqlRow): number | null {
+  for (const key of ["quoted_message_row_id", "message_quoted_row_id", "quoted_row_id", "message_row_id"]) {
+    const value = Number(row[key]);
+    if (Number.isFinite(value)) return value;
+  }
+  return null;
+}
+
+function loadQuotedCompanionRows(
+  db: Database.Database,
+  inspection: SQLiteInspection,
+  table: string,
+  target: Map<number, QuotedMessageSnapshot>,
+  warnings: ImportWarning[],
+  apply: (snapshot: QuotedMessageSnapshot, row: SqlRow) => void
+): void {
+  if (!hasTable(inspection, table)) return;
+  try {
+    for (const row of db.prepare(`SELECT * FROM ${quoteIdentifier(table)}`).iterate() as Iterable<SqlRow>) {
+      const key = quotedCompanionKey(row);
+      const snapshot = key == null ? null : target.get(key) ?? null;
+      if (!snapshot) continue;
+      try {
+        apply(snapshot, row);
+      } catch {
+        addRowWarning(warnings, {
+          code: "QUOTED_SNAPSHOT_COMPANION_MALFORMED",
+          sourceTable: table,
+          sourceRowId: row._id == null ? null : String(row._id),
+          message: "A malformed quoted-message companion was skipped while preserving its reply."
+        });
+      }
+    }
+  } catch {
+    addRowWarning(warnings, {
+      code: "QUOTED_SNAPSHOT_COMPANION_READ_FAILED",
+      sourceTable: table,
+      message: "An optional quoted-message companion table could not be read; replies remain available."
+    });
+  }
+}
+
+function loadQuotedMediaCompanion(db: Database.Database, inspection: SQLiteInspection, target: Map<number, QuotedMessageSnapshot>, warnings: ImportWarning[]): void {
+  loadQuotedCompanionRows(db, inspection, "message_quoted_media", target, warnings, (snapshot, row) => {
+    snapshot.caption = stringOrNull(row.caption ?? row.media_caption) ?? snapshot.caption;
+    snapshot.mediaMimeType = stringOrNull(row.mime_type ?? row.media_mime_type) ?? snapshot.mediaMimeType ?? null;
+    snapshot.mediaName = stringOrNull(row.media_name ?? row.file_name) ?? snapshot.mediaName ?? null;
+    const thumbnail = row.thumbnail ?? row.thumbnail_data;
+    if (thumbnail != null && !(thumbnail instanceof Buffer) && !(thumbnail instanceof Uint8Array)) {
+      throw new Error("Quoted thumbnail must be bytes");
+    }
+    snapshot.thumbnail = thumbnail instanceof Buffer && thumbnail.length > 0 ? thumbnail : snapshot.thumbnail ?? null;
+  });
+}
+
+function loadQuotedLocationCompanion(db: Database.Database, inspection: SQLiteInspection, target: Map<number, QuotedMessageSnapshot>, warnings: ImportWarning[]): void {
+  loadQuotedCompanionRows(db, inspection, "message_quoted_location", target, warnings, (snapshot, row) => {
+    const latitude = nullableFiniteNumber(row.latitude ?? row.lat);
+    const longitude = nullableFiniteNumber(row.longitude ?? row.lng);
+    if (((row.latitude ?? row.lat) != null && latitude == null) || ((row.longitude ?? row.lng) != null && longitude == null)) {
+      throw new Error("Quoted location coordinates must be numeric");
+    }
+    snapshot.location = {
+      latitude,
+      longitude,
+      name: stringOrNull(row.name ?? row.place_name),
+      address: stringOrNull(row.address)
+    };
+  });
+}
+
+function loadQuotedVcardCompanion(db: Database.Database, inspection: SQLiteInspection, target: Map<number, QuotedMessageSnapshot>, warnings: ImportWarning[]): void {
+  loadQuotedCompanionRows(db, inspection, "message_quoted_vcard", target, warnings, (snapshot, row) => {
+    snapshot.vcard = { name: stringOrNull(row.name ?? row.display_name), vcard: stringOrNull(row.vcard ?? row.vcard_data) };
+  });
+}
+
+function loadQuotedMentionsCompanion(
+  db: Database.Database,
+  inspection: SQLiteInspection,
+  jidMap: Map<number, string>,
+  target: Map<number, QuotedMessageSnapshot>,
+  warnings: ImportWarning[]
+): void {
+  loadQuotedCompanionRows(db, inspection, "message_quoted_mentions", target, warnings, (snapshot, row) => {
+    const jid = normalizeJid(row.mentioned_jid ?? row.jid) ?? jidMap.get(Number(row.mentioned_jid_row_id ?? row.jid_row_id)) ?? null;
+    if (jid && !(snapshot.mentionedJids ?? []).includes(jid)) {
+      snapshot.mentionedJids = [...(snapshot.mentionedJids ?? []), jid];
+    }
+  });
+}
+
+function nullableFiniteNumber(value: unknown): number | null {
+  if (value == null || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
 }
 
 // message_media stores media_key as a BLOB; the other hash/path columns are
@@ -1275,6 +1463,11 @@ function* iterateModernMessages(
       sidecars.editRekeys.push({ chatSourceId: chatJid, staleMessageId: keyId, canonicalMessageId: edit.originalKeyId });
     }
     const sourceMessageId = identityKeyId ?? surrogateMessageId("modern", sourceRowId, sourceFingerprint);
+    const quotedSnapshot =
+      sidecars.quotedSnapshots.get(Number(row.quoted_message_row_id)) ?? sidecars.quotedSnapshotsByReplyRowId.get(rowIdNumber);
+    if (quotedSnapshot?.quotedSenderSourceJid && quotedSnapshot.quotedSenderSourceJid !== "me") {
+      ensureContact(quotedSnapshot.quotedSenderSourceJid, contactMap);
+    }
     yield {
       sourceMessageId,
       sourceMessageKey: messageKey(chatJid, sourceMessageId),
@@ -1293,7 +1486,10 @@ function* iterateModernMessages(
       hasMedia: isMediaMessageType(messageType) || sidecars.media.has(rowIdNumber),
       mediaMimeType: sidecars.media.get(rowIdNumber)?.mimeType ?? null,
       mediaName: sidecars.media.get(rowIdNumber)?.mediaName ?? null,
-      quotedSourceMessageId: row.quoted_message_row_id == null ? null : surrogateMessageId("modern", String(row.quoted_message_row_id), sourceFingerprint),
+      quotedSourceMessageId:
+        quotedSnapshot?.quotedSourceMessageId ??
+        (row.quoted_message_row_id == null ? null : surrogateMessageId("modern", String(row.quoted_message_row_id), sourceFingerprint)),
+      quotedSnapshot: quotedSnapshot ? structuredClone(quotedSnapshot) : null,
       // Deletion is a fact (revocation records), never inferred from an
       // unrecognized type — unknowns render as honest legacy placeholders.
       isDeleted: messageType === "admin_revoked" || messageType === "revoked",

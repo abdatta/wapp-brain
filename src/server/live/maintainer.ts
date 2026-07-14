@@ -2,6 +2,7 @@ import type { ArchiveRepository } from "../db/repository";
 import { config } from "../config";
 import { configuredTraceRecorder } from "../diagnostics/traceRecorder";
 import { messageKey } from "../identity/keys";
+import { normalizeJid } from "../import/jid";
 import { mediaBlobStore } from "../media/blobStore";
 import { assertLiveDependencySafe } from "./dependency";
 import { auditChatGaps, auditMessageEventCheckpoint, GAP_TOLERANCE_MS } from "./auditor";
@@ -529,7 +530,14 @@ export class LiveMaintainer {
     await this.updateCheckpoints(event);
     this.totals = addEventToTotals(this.totals, event);
     await configuredTraceRecorder?.record("live.ingest_event.complete", { runId: this.runId, eventKey: event.eventKey, totals: this.totals });
-    await configuredTraceRecorder?.snapshotArchive(`after-live-event-${event.eventKey.replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 80)}`, config.archive.sqlitePath);
+    // Exact traces retain every raw and normalized event. Copying the entire
+    // archive after contact/LID-only events, however, serializes a large file
+    // copy for each event and can delay the very message ingestion being
+    // diagnosed. A message-bearing event still gets its complete local archive
+    // snapshot after all of its related writes have committed.
+    if (liveEventNeedsArchiveSnapshot(event)) {
+      await configuredTraceRecorder?.snapshotArchive(`after-live-event-${event.eventKey.replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 80)}`, config.archive.sqlitePath);
+    }
     await this.callbacks.onArchiveChanged?.(event);
   }
 
@@ -545,6 +553,8 @@ export class LiveMaintainer {
     for (const message of event.messages ?? []) {
       collect(message.chatSourceId);
       collect(message.senderSourceJid);
+      collect(message.quotedSnapshot?.quotedSourceChatId);
+      collect(message.quotedSnapshot?.quotedSenderSourceJid);
     }
     for (const chat of event.chats ?? []) collect(chat.sourceChatId);
     for (const participant of event.participants ?? []) {
@@ -558,6 +568,16 @@ export class LiveMaintainer {
     for (const jid of uniqueJids) {
       canonical.set(jid, await this.repository.resolveIdentityJid(jid));
     }
+    // Baileys reports the linked account in device form, while quoted
+    // participants may be phone or canonical-LID forms. Resolve both once and
+    // retain the source JID; `quotedFromMe` is the durable owner signal, not a
+    // guessed contact name.
+    const linkedOwnerJid = this.linkedDeviceJid ? await this.repository.resolveIdentityJid(this.linkedDeviceJid) : null;
+    const ownerIdentities = new Set(
+      [this.linkedDeviceJid, linkedOwnerJid]
+        .map((jid) => normalizeJid(jid))
+        .filter((jid): jid is string => Boolean(jid))
+    );
     const resolve = (jid: string | null | undefined): string | null =>
       jid == null ? null : jid === "me" ? "me" : canonical.get(jid) ?? jid;
     const messages = event.messages?.map((message) => {
@@ -566,6 +586,23 @@ export class LiveMaintainer {
         ...message,
         chatSourceId,
         senderSourceJid: resolve(message.senderSourceJid) ?? message.senderSourceJid,
+        quotedSnapshot: message.quotedSnapshot
+          ? (() => {
+              const quotedSenderSourceJid =
+                resolve(message.quotedSnapshot.quotedSenderSourceJid) ?? message.quotedSnapshot.quotedSenderSourceJid;
+              const quotedFromMe =
+                message.quotedSnapshot.quotedFromMe ??
+                (quotedSenderSourceJid === "me" || ownerIdentities.has(normalizeJid(quotedSenderSourceJid) ?? "") ? true : null);
+              return {
+                ...message.quotedSnapshot,
+                quotedSourceChatId:
+                  resolve(message.quotedSnapshot.quotedSourceChatId) ?? message.quotedSnapshot.quotedSourceChatId,
+                quotedSenderSourceJid,
+                quotedFromMe,
+                mentionedJids: (message.quotedSnapshot.mentionedJids ?? []).map((jid) => resolve(jid) ?? jid)
+              };
+            })()
+          : null,
         sourceMessageKey: messageKey(chatSourceId, message.sourceMessageId)
       };
     });
@@ -662,6 +699,19 @@ export class LiveMaintainer {
       await this.repository.failLiveSyncRun(this.runId, "LIVE_MAINTAINER_FAILED", message, this.totals, this.totals.warnings);
     }
   }
+}
+
+export function liveEventNeedsArchiveSnapshot(
+  event: Pick<LiveMessageEvent, "messages" | "updates" | "secrets" | "retainedPayloads" | "mediaDescriptors" | "linkPreviews">
+): boolean {
+  return Boolean(
+    event.messages?.length ||
+      event.updates?.length ||
+      event.secrets?.length ||
+      event.retainedPayloads?.length ||
+      event.mediaDescriptors?.length ||
+      event.linkPreviews?.length
+  );
 }
 
 export function liveOptionsFromConfig(): LiveMaintainerOptions {

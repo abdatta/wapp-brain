@@ -222,6 +222,7 @@ function createModernMsgstoreDb(filePath: string): void {
         key_id TEXT NOT NULL,
         timestamp INTEGER,
         message_type INTEGER,
+        quoted_message_row_id INTEGER,
         status INTEGER,
         starred INTEGER,
         forwarded INTEGER
@@ -231,6 +232,21 @@ function createModernMsgstoreDb(filePath: string): void {
         message_row_id INTEGER PRIMARY KEY,
         text_data TEXT
       );
+
+      CREATE TABLE message_quoted (
+        _id INTEGER PRIMARY KEY,
+        sender_jid_row_id INTEGER,
+        chat_row_id INTEGER,
+        from_me INTEGER,
+        key_id TEXT,
+        timestamp INTEGER,
+        message_type INTEGER,
+        text_data TEXT
+      );
+      CREATE TABLE message_quoted_media (quoted_message_row_id INTEGER, mime_type TEXT, media_name TEXT, caption TEXT, thumbnail BLOB);
+      CREATE TABLE message_quoted_location (quoted_message_row_id INTEGER, latitude REAL, longitude REAL, name TEXT, address TEXT);
+      CREATE TABLE message_quoted_vcard (quoted_message_row_id INTEGER, name TEXT, vcard TEXT);
+      CREATE TABLE message_quoted_mentions (quoted_message_row_id INTEGER, jid_row_id INTEGER);
     `);
     const insertJid = db.prepare("INSERT INTO jid (_id, raw_string, user, server) VALUES (?, ?, ?, ?)");
     insertJid.run(1, "15550000001@s.whatsapp.net", "15550000001", "s.whatsapp.net");
@@ -243,20 +259,29 @@ function createModernMsgstoreDb(filePath: string): void {
     insertChat.run(20, 2, "Modern Group", null, 1711000005000);
 
     const insertMessage = db.prepare(`
-      INSERT INTO message (_id, chat_row_id, sender_jid_row_id, from_me, key_id, timestamp, message_type, status, starred, forwarded)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO message (_id, chat_row_id, sender_jid_row_id, from_me, key_id, timestamp, message_type, quoted_message_row_id, status, starred, forwarded)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     const insertText = db.prepare("INSERT INTO message_text (message_row_id, text_data) VALUES (?, ?)");
-    insertMessage.run(100, 10, null, 0, "modern-direct-1", 1711000001000, 0, 0, 0, 0);
+    insertMessage.run(100, 10, null, 0, "modern-direct-1", 1711000001000, 0, null, 0, 0, 0);
     insertText.run(100, "Modern hello");
-    insertMessage.run(101, 10, null, 1, "modern-direct-2", 1711000002000, 0, 0, 0, 0);
+    insertMessage.run(101, 10, null, 1, "modern-direct-2", 1711000002000, 0, null, 0, 0, 0);
     insertText.run(101, "Modern reply from me");
-    insertMessage.run(102, 20, 3, 0, "modern-group-1", 1711000003000, 0, 0, 0, 0);
+    insertMessage.run(102, 20, 3, 0, "modern-group-1", 1711000003000, 0, null, 0, 0, 0);
     insertText.run(102, "Modern group message");
-    insertMessage.run(103, 20, 4, 0, "modern-group-2", 1711000004000, 9, 0, 0, 0);
+    insertMessage.run(103, 20, 4, 0, "modern-group-2", 1711000004000, 9, null, 0, 0, 0);
     insertText.run(103, "Modern document caption");
-    insertMessage.run(104, 20, null, 1, "modern-group-3", 1711000005000, 0, 0, 1, 1);
+    insertMessage.run(104, 20, null, 1, "modern-group-3", 1711000005000, 0, 900, 0, 1, 1);
     insertText.run(104, "Modern outgoing group reply");
+    db.prepare("INSERT INTO message_quoted (_id, sender_jid_row_id, chat_row_id, from_me, key_id, timestamp, message_type, text_data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(900, 3, 20, 0, "modern-group-1", 1711000003000, 0, "Long quoted context: " + "complete ".repeat(40));
+    db.prepare("INSERT INTO message_quoted_media (quoted_message_row_id, mime_type, media_name, caption, thumbnail) VALUES (?, ?, ?, ?, ?)")
+      .run(900, "image/jpeg", "quoted.jpg", "quoted caption", Buffer.from([1, 2, 3]));
+    db.prepare("INSERT INTO message_quoted_location (quoted_message_row_id, latitude, longitude, name, address) VALUES (?, ?, ?, ?, ?)")
+      .run(900, 1.5, 2.5, "Cafe", "Main St");
+    db.prepare("INSERT INTO message_quoted_vcard (quoted_message_row_id, name, vcard) VALUES (?, ?, ?)")
+      .run(900, "Casey", "BEGIN:VCARD");
+    db.prepare("INSERT INTO message_quoted_mentions (quoted_message_row_id, jid_row_id) VALUES (?, ?)").run(900, 4);
   } finally {
     db.close();
   }

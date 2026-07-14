@@ -241,6 +241,7 @@ export function ThreadView({ chat }: { chat: ChatListItem }) {
                   isGroup={chat.chatType === "group"}
                   onOpenMedia={(assetId, mimeType) => setLightbox({ assetId, mimeType })}
                   highlighted={jumpContext?.anchorId === entry.message.id}
+                  onJumpToMessage={(messageId) => navigate(buildChatDeepLink(chat.id, messageId))}
                 />
               )
             )}

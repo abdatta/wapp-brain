@@ -60,6 +60,8 @@ import type {
   MessageListItem,
   MessageRecord,
   MessageSecretRecord,
+  QuotedMessageSnapshot,
+  QuotedMessageSnapshotSummary,
   ParticipantRecord,
   RecoveryAnchorRecord,
   RetainedPayloadRecord,
@@ -142,6 +144,95 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     return this.identityLinks.get(normalized) ?? normalized;
   }
 
+  private mergeQuotedSnapshot(existing: QuotedMessageSnapshot | null | undefined, incoming: QuotedMessageSnapshot | null | undefined): QuotedMessageSnapshot | null {
+    if (!existing) return incoming ? structuredClone(incoming) : null;
+    if (!incoming) return structuredClone(existing);
+    return {
+      ...existing,
+      quotedSourceMessageId: incoming.quotedSourceMessageId ?? existing.quotedSourceMessageId,
+      quotedSourceChatId: incoming.quotedSourceChatId ?? existing.quotedSourceChatId,
+      quotedSenderSourceJid: incoming.quotedSenderSourceJid ?? existing.quotedSenderSourceJid,
+      quotedFromMe: incoming.quotedFromMe ?? existing.quotedFromMe,
+      timestampMs: incoming.timestampMs ?? existing.timestampMs,
+      messageType: existing.messageType.startsWith("unknown") && !incoming.messageType.startsWith("unknown") ? incoming.messageType : existing.messageType,
+      rawTypeCode: incoming.rawTypeCode ?? existing.rawTypeCode ?? null,
+      body: incoming.body?.trim() ? incoming.body : existing.body,
+      caption: incoming.caption?.trim() ? incoming.caption : existing.caption,
+      mediaMimeType: incoming.mediaMimeType ?? existing.mediaMimeType ?? null,
+      mediaName: incoming.mediaName ?? existing.mediaName ?? null,
+      thumbnail: incoming.thumbnail ?? existing.thumbnail ?? null,
+      location: incoming.location ?? existing.location ?? null,
+      vcard: incoming.vcard ?? existing.vcard ?? null,
+      mentionedJids: incoming.mentionedJids?.length ? incoming.mentionedJids : existing.mentionedJids ?? []
+    };
+  }
+
+  private quoteSummary(message: MessageRecord & { id: number }): QuotedMessageSnapshotSummary | null {
+    const snapshot = message.quotedSnapshot;
+    // Pointer-only imports and live messages retain the legacy same-chat
+    // lookup. It is deliberately bounded to the reply's chat: a matching ID
+    // in another chat is never evidence that it is the quoted original.
+    if (!snapshot) {
+      const original = message.quotedSourceMessageId
+        ? [...this.messages.values()].find(
+            (candidate) => candidate.chatSourceId === message.chatSourceId && candidate.sourceMessageId === message.quotedSourceMessageId
+          )
+        : null;
+      if (!original) return null;
+      const sender = original.senderSourceJid ? this.contacts.get(original.senderSourceJid) : null;
+      return {
+        captured: false,
+        quotedSourceMessageId: original.sourceMessageId,
+        quotedSourceChatId: null,
+        quotedSenderSourceJid: original.senderSourceJid ?? null,
+        quotedSenderDisplayName:
+          sender?.displayName?.trim() || sender?.pushName?.trim() || sender?.phoneNumber || displayPhoneFromJid(original.senderSourceJid),
+        quotedSenderNameIsPushName: Boolean(!sender?.displayName?.trim() && sender?.pushName?.trim()),
+        quotedFromMe:
+          original.fromMe === true || original.senderSourceJid === "me"
+            ? true
+            : original.fromMe === false
+              ? false
+              : null,
+        timestampMs: original.timestampMs ?? null,
+        messageType: original.messageType,
+        body: original.body ?? null,
+        caption: original.caption ?? null,
+        mediaMimeType: original.mediaMimeType ?? null,
+        mediaName: original.mediaName ?? null,
+        location: null,
+        vcard: null,
+        mentionedJids: [],
+        hasThumbnail: false,
+        originalMessageId: original.id
+      };
+    }
+    const sender = snapshot.quotedSenderSourceJid ? this.contacts.get(snapshot.quotedSenderSourceJid) : null;
+    const original = snapshot.quotedSourceMessageId && (!snapshot.quotedSourceChatId || snapshot.quotedSourceChatId === message.chatSourceId)
+      ? [...this.messages.values()].find((candidate) => candidate.chatSourceId === message.chatSourceId && candidate.sourceMessageId === snapshot.quotedSourceMessageId)
+      : null;
+    return {
+      captured: true,
+      quotedSourceMessageId: snapshot.quotedSourceMessageId,
+      quotedSourceChatId: snapshot.quotedSourceChatId,
+      quotedSenderSourceJid: snapshot.quotedSenderSourceJid,
+      quotedSenderDisplayName: sender?.displayName?.trim() || sender?.pushName?.trim() || sender?.phoneNumber || displayPhoneFromJid(snapshot.quotedSenderSourceJid),
+      quotedSenderNameIsPushName: Boolean(!sender?.displayName?.trim() && sender?.pushName?.trim()),
+      quotedFromMe: snapshot.quotedFromMe,
+      timestampMs: snapshot.timestampMs,
+      messageType: snapshot.messageType,
+      body: snapshot.body,
+      caption: snapshot.caption,
+      mediaMimeType: snapshot.mediaMimeType ?? null,
+      mediaName: snapshot.mediaName ?? null,
+      location: snapshot.location ?? null,
+      vcard: snapshot.vcard ?? null,
+      mentionedJids: snapshot.mentionedJids ?? [],
+      hasThumbnail: Boolean(snapshot.thumbnail?.length),
+      originalMessageId: original?.id ?? null
+    };
+  }
+
   async resolveIdentityJid(jid: string): Promise<string> {
     return this.canonicalJid(jid) ?? jid;
   }
@@ -211,17 +302,26 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     pairs: Array<{ chatSourceId: string; staleMessageId: string; canonicalMessageId: string }>
   ): Promise<number> {
     let collapsed = 0;
+    const quoteAffectedKeys: string[] = [];
     for (const pair of pairs) {
       const chatSourceId = this.canonicalJid(pair.chatSourceId) ?? pair.chatSourceId;
       const staleKey = messageKey(chatSourceId, pair.staleMessageId);
       const canonicalKey = messageKey(chatSourceId, pair.canonicalMessageId);
       if (this.messages.has(staleKey) && this.messages.has(canonicalKey)) {
+        const stale = this.messages.get(staleKey)!;
+        const canonical = this.messages.get(canonicalKey)!;
+        const mergedSnapshot = this.mergeQuotedSnapshot(canonical.quotedSnapshot, stale.quotedSnapshot);
+        if (JSON.stringify(canonical.quotedSnapshot ?? null) !== JSON.stringify(mergedSnapshot)) {
+          quoteAffectedKeys.push(staleKey, canonicalKey);
+        }
+        canonical.quotedSnapshot = mergedSnapshot;
         this.messages.delete(staleKey);
         collapsed += 1;
       }
     }
     if (collapsed > 0) {
       await this.markStaleMemoryForMissingMessages();
+      await this.markStaleEpisodesForQuotedReplies(quoteAffectedKeys);
     }
     return collapsed;
   }
@@ -806,6 +906,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
   }
 
   async upsertMessages(messages: MessageRecord[]): Promise<number> {
+    const enrichedQuoteKeys: string[] = [];
     for (const rawMessage of messages) {
       const chatSourceId = this.canonicalJid(rawMessage.chatSourceId);
       if (!chatSourceId || !rawMessage.sourceMessageId) {
@@ -813,7 +914,16 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       }
       const senderSourceJid =
         rawMessage.senderSourceJid === "me" ? "me" : this.canonicalJid(rawMessage.senderSourceJid) ?? rawMessage.senderSourceJid ?? null;
-      const message = { ...rawMessage, chatSourceId, senderSourceJid, sourceMessageKey: messageKey(chatSourceId, rawMessage.sourceMessageId) };
+      const rawSnapshot = rawMessage.quotedSnapshot;
+      const quotedSnapshot = rawSnapshot
+        ? {
+            ...rawSnapshot,
+            quotedSourceChatId: this.canonicalJid(rawSnapshot.quotedSourceChatId) ?? rawSnapshot.quotedSourceChatId,
+            quotedSenderSourceJid: this.canonicalJid(rawSnapshot.quotedSenderSourceJid) ?? rawSnapshot.quotedSenderSourceJid,
+            mentionedJids: (rawSnapshot.mentionedJids ?? []).map((jid) => this.canonicalJid(jid) ?? jid)
+          }
+        : null;
+      const message = { ...rawMessage, quotedSnapshot, chatSourceId, senderSourceJid, sourceMessageKey: messageKey(chatSourceId, rawMessage.sourceMessageId) };
       const existing = this.messages.get(message.sourceMessageKey);
       // A textless unknown-typed row flagged deleted is the retired inference
       // heuristic, not evidence; a re-import bearing a fresh not-deleted
@@ -834,6 +944,10 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       const keepExistingType =
         (incomingTypeIsWeak && existingTypeIsStrong) ||
         (message.messageType.startsWith("unknown") && existing?.messageType === "system");
+      const mergedSnapshot = this.mergeQuotedSnapshot(existing?.quotedSnapshot, message.quotedSnapshot);
+      if (JSON.stringify(existing?.quotedSnapshot ?? null) !== JSON.stringify(mergedSnapshot)) {
+        enrichedQuoteKeys.push(message.sourceMessageKey);
+      }
       this.messages.set(message.sourceMessageKey, {
         ...existing,
         ...message,
@@ -841,9 +955,11 @@ export class MemoryArchiveRepository implements ArchiveRepository {
         body: deletionLocked ? existing?.body ?? null : message.body ?? existing?.body ?? null,
         caption: deletionLocked ? existing?.caption ?? null : message.caption ?? existing?.caption ?? null,
         isDeleted: deletionLocked || message.isDeleted,
+        quotedSnapshot: mergedSnapshot,
         id: existing?.id ?? this.nextMessageId++
       });
     }
+    await this.markStaleEpisodesForQuotedReplies(enrichedQuoteKeys);
     return messages.length;
   }
 
@@ -1333,6 +1449,11 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     return this.linkPreviews.get(message.sourceMessageKey)?.thumbnail ?? null;
   }
 
+  async getQuotedSnapshotThumbnail(messageId: number): Promise<Uint8Array | null> {
+    const message = [...this.messages.values()].find((candidate) => candidate.id === messageId);
+    return message?.quotedSnapshot?.thumbnail ?? null;
+  }
+
   async listMessageEditRevisions(messageId: number): Promise<MessageEditRevisionRecord[]> {
     const message = [...this.messages.values()].find((candidate) => candidate.id === messageId);
     if (!message) {
@@ -1574,6 +1695,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
                 hasThumbnail: Boolean(preview.thumbnail?.length)
               }
             : null,
+          quotedSnapshot: this.quoteSummary(message),
           isEdited: Boolean(message.rawMetadata?.edited) || revisions.length > 0,
           editRevisionCount: revisions.length,
           isDeleted: message.isDeleted,
@@ -2059,6 +2181,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       unresolvedParticipants: episode.unresolvedParticipants ?? [],
       pushNameParticipants: episode.pushNameParticipants ?? [],
       uninterpretedMediaCount: episode.uninterpretedMediaCount ?? 0,
+      quotedReplyAnchors: structuredClone(episode.quotedReplyAnchors ?? []),
       mediaGaps: structuredClone(episode.mediaGaps ?? []),
       createdAt: new Date().toISOString(),
       claims: episode.claims.map((claim) => ({
@@ -2255,6 +2378,29 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       }
       const cited = episode.claims.some((claim) => claim.citations.some((citation) => keys.has(citation.sourceMessageKey)));
       if (!cited) {
+        continue;
+      }
+      episode.status = "stale";
+      marked += 1;
+      tasks.push({
+        kind: "episode",
+        chatSourceId: episode.chatSourceId,
+        payload: { chatSourceId: episode.chatSourceId, sinceMs: episode.startAtMs, throughMs: episode.endAtMs, regen: true, episodeId: episode.id },
+        dedupeKey: `regen:${episode.id}`,
+        priority: 1_000
+      });
+    }
+    await this.enqueueBrainTasks(tasks);
+    return marked;
+  }
+
+  private async markStaleEpisodesForQuotedReplies(sourceMessageKeys: string[]): Promise<number> {
+    const keys = new Set(sourceMessageKeys.filter(Boolean));
+    if (keys.size === 0) return 0;
+    const tasks: BrainTaskInput[] = [];
+    let marked = 0;
+    for (const episode of this.brainEpisodes.values()) {
+      if (episode.status !== "current" || !episode.quotedReplyAnchors.some((anchor) => keys.has(anchor.replySourceMessageKey))) {
         continue;
       }
       episode.status = "stale";
@@ -2535,6 +2681,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       text: message.body ?? message.caption ?? null,
       isForwarded: Boolean(message.isForwarded),
       quotedSourceMessageId: message.quotedSourceMessageId ?? null,
+      quotedSnapshot: this.quoteSummary(message),
       reactions: [],
       // Label provenance (contract v2): the label above resolved from the
       // self-set push name because no saved display name exists.

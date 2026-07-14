@@ -1306,7 +1306,7 @@ function ImportWizard({
             )}
             <WizardActions
               busy={busy}
-              primaryLabel="Verify key"
+              primaryLabel="Continue to key"
               primaryIcon={<ArrowRight size={16} />}
               primaryDisabled={!hasSelectedBackup || Boolean(busy)}
               onPrimary={() => setStep("key")}

@@ -52,6 +52,10 @@ Where available, the importer stores:
 - deleted/forwarded/starred flags
 - raw/source metadata useful for future parser improvements
 
+### Reply Quote Snapshots
+
+Modern Android imports defensively capture WhatsApp's reply-owned `message_quoted` snapshot and known media, location, vCard, and mention companions when present. The full captured quote stays local in a one-to-one archive record owned by the reply; absent or malformed optional tables keep the existing pointer-only reply behavior. Later backup or live observations can fill missing snapshot fields without erasing the earlier local capture.
+
 ## Schema Strategy
 
 WhatsApp Android schemas are unofficial and change over time. The parser should:

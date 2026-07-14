@@ -247,6 +247,10 @@ export function linkPreviewThumbnailUrl(messageId: number): string {
   return `/api/messages/${messageId}/link-preview-thumbnail`;
 }
 
+export function quotedSnapshotThumbnailUrl(messageId: number): string {
+  return `/api/messages/${messageId}/quoted-thumbnail`;
+}
+
 export function listMessageRevisions(messageId: number): Promise<MessageEditRevisionRecord[]> {
   return request<MessageEditRevisionRecord[]>(`/api/messages/${messageId}/revisions`);
 }

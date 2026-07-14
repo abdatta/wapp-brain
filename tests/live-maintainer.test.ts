@@ -10,7 +10,7 @@ import { SqliteArchiveRepository } from "../src/server/db/sqliteRepository";
 import { auditChatGaps } from "../src/server/live/auditor";
 import { assertLiveBaselineExists, getLiveBaselineSummary } from "../src/server/live/baseline";
 import { getLiveDependencyStatus, isSafeBaileysVersion } from "../src/server/live/dependency";
-import { LiveMaintainer } from "../src/server/live/maintainer";
+import { LiveMaintainer, liveEventNeedsArchiveSnapshot } from "../src/server/live/maintainer";
 import { messageIdFromKey, messageKey } from "../src/server/identity/keys";
 import { capturedMediaFromBaileysMessage, normalizeBaileysMessage, normalizeBaileysMessagesWithJidResolver } from "../src/server/live/normalize";
 import { recoverDueGaps } from "../src/server/live/recovery";
@@ -24,6 +24,20 @@ import type {
 } from "../src/server/live/types";
 
 describe("live WhatsApp maintainer", () => {
+  it("only snapshots exact diagnostic traces for message-bearing live events", () => {
+    expect(liveEventNeedsArchiveSnapshot({ contacts: [{ sourceJid: "contact@s.whatsapp.net" }] } as LiveMessageEvent)).toBe(false);
+    expect(liveEventNeedsArchiveSnapshot({ identityLinks: [{ lid: "contact@lid", pn: "contact@s.whatsapp.net" }] } as LiveMessageEvent)).toBe(false);
+    expect(liveEventNeedsArchiveSnapshot({ messages: [makeMessage("chat@s.whatsapp.net", "snapshot-message", 1)] })).toBe(true);
+    expect(liveEventNeedsArchiveSnapshot({ updates: [{
+      eventKey: "update",
+      updateType: "edit",
+      sourceMessageKey: "wa|chat@s.whatsapp.net|snapshot-message",
+      chatSourceId: "chat@s.whatsapp.net",
+      occurredAtMs: 1,
+      metadata: { synthetic: true }
+    }] })).toBe(true);
+  });
+
   it("pins Baileys above the project safety floor", () => {
     const status = getLiveDependencyStatus();
 

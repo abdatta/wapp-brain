@@ -163,6 +163,9 @@ export interface ArchiveRepository {
   resetInFlightMediaDownloads(): Promise<number>;
   recordLinkPreviews(previews: CapturedLinkPreview[]): Promise<number>;
   getLinkPreviewThumbnail(messageId: number): Promise<Uint8Array | null>;
+  // Captured inside a reply-owned WhatsApp quote envelope; this is local-only
+  // and never causes a media download.
+  getQuotedSnapshotThumbnail(messageId: number): Promise<Uint8Array | null>;
   // Edit history: snapshot rides applyLiveMessageUpdates; this reads it back.
   listMessageEditRevisions(messageId: number): Promise<MessageEditRevisionRecord[]>;
   getLiveStatus(): Promise<LiveMaintainerStatusSummary>;

@@ -2,7 +2,8 @@ import React from "react";
 
 // Per-route error boundary: a render error on one surface shows a readable
 // explanation for that surface while the shell (nav, status) stays usable,
-// instead of unmounting the whole app. Reset it by keying on the route path.
+// instead of unmounting the whole app. The import wizard keeps one key across
+// its setup sub-routes so selecting a folder is not lost before key entry.
 export class RouteErrorBoundary extends React.Component<{ children: React.ReactNode }, { error: Error | null }> {
   constructor(props: { children: React.ReactNode }) {
     super(props);

@@ -40,6 +40,8 @@ tsx src/server/cli.ts memory-provider login
 ## Current Test Coverage
 
 The test suite covers:
+
+- reply-owned quote snapshot parsing, monotonic backup/live enrichment, local thumbnail delivery, cross-chat non-navigation, and generalized live `contextInfo` capture
 - cleanup safety
 - import staging cleanup
 - guided onboarding state derivation

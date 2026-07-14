@@ -67,6 +67,9 @@ import type {
   MessageListItem,
   MessageRecord,
   MessageSecretRecord,
+  QuotedMessageSnapshot,
+  QuotedMessageSnapshotSummary,
+  QuotedReplyAnchor,
   ParticipantRecord,
   RecoveryAnchorRecord,
   RetainedPayloadRecord,
@@ -103,6 +106,7 @@ const ARCHIVE_TABLES = [
   "chats",
   "chat_participants",
   "messages",
+  "message_quoted_snapshots",
   "message_mentions",
   "import_warnings",
   "live_sessions",
@@ -161,6 +165,7 @@ const DELETE_TABLE_ORDER = [
   "live_sync_runs",
   "live_sessions",
   "message_mentions",
+  "message_quoted_snapshots",
   "messages",
   "chat_participants",
   "chats",
@@ -182,6 +187,42 @@ const MEDIA_STATE_SELECT = `ma.id AS media_asset_id, ma.mime_type AS media_mime,
 const MEDIA_STATE_JOINS = `LEFT JOIN media_assets ma
            ON ma.id = (SELECT id FROM media_assets pick WHERE pick.message_key = m.source_message_key ORDER BY pick.id ASC LIMIT 1)
          LEFT JOIN media_download_queue q ON q.message_key = m.source_message_key`;
+const QUOTED_SNAPSHOT_SELECT = `m.quoted_source_message_id AS reply_quoted_source_message_id,
+                qs.quoted_source_message_id, qs.quoted_source_chat_id, qs.quoted_sender_source_jid,
+                qs.quoted_from_me, qs.timestamp_ms AS quoted_timestamp_ms, qs.message_type AS quoted_message_type,
+                qs.body AS quoted_body, qs.caption AS quoted_caption, qs.media_mime_type AS quoted_media_mime_type,
+                qs.media_name AS quoted_media_name, qs.location_json AS quoted_location_json, qs.vcard_json AS quoted_vcard_json,
+                qs.mentioned_jids_json AS quoted_mentioned_jids_json, (qs.thumbnail IS NOT NULL) AS quoted_has_thumbnail,
+                ${contactLabelSql("qc.")} AS quoted_sender_display_name,
+                ${labelIsPushNameSql("qc.")} AS quoted_sender_name_is_push_name,
+                (SELECT original.id FROM messages original
+                   WHERE original.chat_id = m.chat_id AND original.source_message_id = qs.quoted_source_message_id
+                     AND (qs.quoted_source_chat_id IS NULL OR qs.quoted_source_chat_id = (
+                       SELECT source_chat_id FROM chats reply_chat WHERE reply_chat.id = m.chat_id
+                     ))
+                   LIMIT 1) AS quoted_original_message_id,
+                (SELECT original.id FROM messages original
+                   WHERE original.chat_id = m.chat_id AND original.source_message_id = m.quoted_source_message_id
+                   LIMIT 1) AS legacy_quoted_original_message_id,
+                (SELECT COALESCE(NULLIF(original.body, ''), NULLIF(original.caption, '')) FROM messages original
+                   WHERE original.chat_id = m.chat_id AND original.source_message_id = m.quoted_source_message_id
+                   LIMIT 1) AS legacy_quoted_text,
+                (SELECT original.sender_source_jid FROM messages original
+                   WHERE original.chat_id = m.chat_id AND original.source_message_id = m.quoted_source_message_id
+                   LIMIT 1) AS legacy_quoted_sender_source_jid,
+                (SELECT ${contactLabelSql("legacy_contact.")} FROM messages original
+                   LEFT JOIN contacts legacy_contact ON legacy_contact.source_jid = original.sender_source_jid
+                   WHERE original.chat_id = m.chat_id AND original.source_message_id = m.quoted_source_message_id
+                   LIMIT 1) AS legacy_quoted_sender_display_name,
+                (SELECT ${labelIsPushNameSql("legacy_contact.")} FROM messages original
+                   LEFT JOIN contacts legacy_contact ON legacy_contact.source_jid = original.sender_source_jid
+                   WHERE original.chat_id = m.chat_id AND original.source_message_id = m.quoted_source_message_id
+                   LIMIT 1) AS legacy_quoted_sender_name_is_push_name,
+                (SELECT original.from_me FROM messages original
+                   WHERE original.chat_id = m.chat_id AND original.source_message_id = m.quoted_source_message_id
+                   LIMIT 1) AS legacy_quoted_from_me`;
+const QUOTED_SNAPSHOT_JOINS = `LEFT JOIN message_quoted_snapshots qs ON qs.reply_message_key = m.source_message_key
+         LEFT JOIN contacts qc ON qc.source_jid = qs.quoted_sender_source_jid`;
 
 // The one contact display-label expression, shared by every identity-resolution
 // query so they can never diverge: saved name → push name → the full +E.164
@@ -222,10 +263,12 @@ function messageListSelectSql(whereClause: string, orderClause: string, limitCla
                 ${MEDIA_STATE_SELECT},
                 lp.title AS preview_title, lp.description AS preview_description, lp.canonical_url AS preview_url,
                 (lp.thumbnail IS NOT NULL) AS preview_has_thumbnail
+                ,${QUOTED_SNAPSHOT_SELECT}
          FROM messages m
          LEFT JOIN contacts c ON c.source_jid = m.sender_source_jid
          ${MEDIA_STATE_JOINS}
          LEFT JOIN message_link_previews lp ON lp.message_key = m.source_message_key
+         ${QUOTED_SNAPSHOT_JOINS}
          ${whereClause}
          ${orderClause}
          ${limitClause}`;
@@ -299,6 +342,79 @@ function deriveMediaSummary(row: SqliteMediaStateColumns, messageType: string): 
     durationMs: null,
     hasThumbnail: false,
     isViewOnce: Boolean(row.media_queue_view_once) || isViewOnceType
+  };
+}
+
+type QuotedSnapshotRow = {
+  reply_quoted_source_message_id?: string | null;
+  quoted_source_message_id?: string | null;
+  quoted_source_chat_id?: string | null;
+  quoted_sender_source_jid?: string | null;
+  quoted_sender_display_name?: string | null;
+  quoted_sender_name_is_push_name?: number | null;
+  quoted_from_me?: number | null;
+  quoted_timestamp_ms?: number | null;
+  quoted_message_type?: string | null;
+  quoted_body?: string | null;
+  quoted_caption?: string | null;
+  quoted_media_mime_type?: string | null;
+  quoted_media_name?: string | null;
+  quoted_location_json?: string | null;
+  quoted_vcard_json?: string | null;
+  quoted_mentioned_jids_json?: string | null;
+  quoted_has_thumbnail?: number | null;
+  quoted_original_message_id?: number | null;
+  legacy_quoted_original_message_id?: number | null;
+  legacy_quoted_text?: string | null;
+  legacy_quoted_sender_source_jid?: string | null;
+  legacy_quoted_sender_display_name?: string | null;
+  legacy_quoted_sender_name_is_push_name?: number | null;
+  legacy_quoted_from_me?: number | null;
+};
+
+function quoteSummaryFromRow(row: QuotedSnapshotRow): QuotedMessageSnapshotSummary | null {
+  if (!row.quoted_message_type) {
+    if (row.legacy_quoted_original_message_id == null) return null;
+    return {
+      captured: false,
+      quotedSourceMessageId: row.reply_quoted_source_message_id ?? null,
+      quotedSourceChatId: null,
+      quotedSenderSourceJid: row.legacy_quoted_sender_source_jid ?? null,
+      quotedSenderDisplayName: row.legacy_quoted_sender_display_name ?? displayPhoneFromJid(row.legacy_quoted_sender_source_jid),
+      quotedSenderNameIsPushName: Boolean(row.legacy_quoted_sender_name_is_push_name) && row.legacy_quoted_sender_display_name != null,
+      quotedFromMe: row.legacy_quoted_from_me == null ? null : Boolean(row.legacy_quoted_from_me),
+      timestampMs: null,
+      messageType: "text",
+      body: row.legacy_quoted_text ?? null,
+      caption: null,
+      mediaMimeType: null,
+      mediaName: null,
+      location: null,
+      vcard: null,
+      mentionedJids: [],
+      hasThumbnail: false,
+      originalMessageId: nullableNumber(row.legacy_quoted_original_message_id)
+    };
+  }
+  return {
+    captured: true,
+    quotedSourceMessageId: row.quoted_source_message_id ?? null,
+    quotedSourceChatId: row.quoted_source_chat_id ?? null,
+    quotedSenderSourceJid: row.quoted_sender_source_jid ?? null,
+    quotedSenderDisplayName: row.quoted_sender_display_name ?? displayPhoneFromJid(row.quoted_sender_source_jid),
+    quotedSenderNameIsPushName: Boolean(row.quoted_sender_name_is_push_name) && row.quoted_sender_display_name != null,
+    quotedFromMe: row.quoted_from_me == null ? null : Boolean(row.quoted_from_me),
+    timestampMs: nullableNumber(row.quoted_timestamp_ms),
+    messageType: row.quoted_message_type,
+    body: row.quoted_body ?? null,
+    caption: row.quoted_caption ?? null,
+    mediaMimeType: row.quoted_media_mime_type ?? null,
+    mediaName: row.quoted_media_name ?? null,
+    location: (parseJson(row.quoted_location_json ?? null) as QuotedMessageSnapshotSummary["location"]) ?? null,
+    vcard: (parseJson(row.quoted_vcard_json ?? null) as QuotedMessageSnapshotSummary["vcard"]) ?? null,
+    mentionedJids: (parseJson(row.quoted_mentioned_jids_json ?? null) as string[] | null) ?? [],
+    hasThumbnail: Boolean(row.quoted_has_thumbnail),
+    originalMessageId: nullableNumber(row.quoted_original_message_id)
   };
 }
 
@@ -532,6 +648,31 @@ const schemaStatements = [
     PRIMARY KEY (message_id, mentioned_jid),
     FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
   ) WITHOUT ROWID`,
+
+  // Reply-owned WhatsApp quote snapshots. This is intentionally separate from
+  // messages: it is embedded context, never independently visible/searchable
+  // or citable, and can carry a small embedded thumbnail.
+  `CREATE TABLE IF NOT EXISTS message_quoted_snapshots (
+    reply_message_key TEXT PRIMARY KEY,
+    quoted_source_message_id TEXT NULL,
+    quoted_source_chat_id TEXT NULL,
+    quoted_sender_source_jid TEXT NULL,
+    quoted_from_me INTEGER NULL,
+    timestamp_ms INTEGER NULL,
+    message_type TEXT NOT NULL DEFAULT 'unknown',
+    raw_type_code TEXT NULL,
+    body TEXT NULL,
+    caption TEXT NULL,
+    media_mime_type TEXT NULL,
+    media_name TEXT NULL,
+    thumbnail BLOB NULL,
+    location_json TEXT NULL,
+    vcard_json TEXT NULL,
+    mentioned_jids_json TEXT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    FOREIGN KEY (reply_message_key) REFERENCES messages(source_message_key) ON UPDATE CASCADE ON DELETE CASCADE
+  )`,
 
   liveSessionsTableDdl("live_sessions"),
 
@@ -873,6 +1014,7 @@ const schemaStatements = [
     unresolved_participants_json TEXT NULL,
     push_name_participants_json TEXT NULL,
     uninterpreted_media_count INTEGER NOT NULL DEFAULT 0,
+    quoted_reply_anchors_json TEXT NULL,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   )`,
 
@@ -992,11 +1134,13 @@ const schemaStatements = [
   `CREATE INDEX IF NOT EXISTS idx_memory_citations_message ON memory_citations (source_message_key, message_id)`,
   `CREATE INDEX IF NOT EXISTS idx_memory_issues_run ON memory_validation_issues (run_id, severity, code)`,
   `CREATE INDEX IF NOT EXISTS idx_message_mentions_jid ON message_mentions (mentioned_jid, message_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_quoted_snapshots_referent ON message_quoted_snapshots (quoted_source_chat_id, quoted_source_message_id)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_tasks_due ON brain_tasks (status, next_attempt_at_ms, priority, id)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_ledger_day ON brain_llm_ledger (day, purpose)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_runs_status ON brain_runs (status, started_at)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_episodes_chat ON brain_episodes (chat_source_id, status, end_at_ms)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_episodes_status_end ON brain_episodes (status, end_at_ms)`,
+  `CREATE INDEX IF NOT EXISTS idx_brain_episodes_quote_stale ON brain_episodes (status, extraction_version)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_claims_episode ON brain_claims (episode_id, sequence)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_citations_claim ON brain_citations (claim_id)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_citations_key ON brain_citations (source_message_key)`,
@@ -2055,8 +2199,8 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     const insertEpisode = this.db.prepare(
       `INSERT INTO brain_episodes
        (id, chat_source_id, start_at_ms, end_at_ms, message_count, participants_json, summary, markdown, generator, model, run_id, fallback_reason,
-        extraction_version, unresolved_participants_json, push_name_participants_json, uninterpreted_media_count)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        extraction_version, unresolved_participants_json, push_name_participants_json, uninterpreted_media_count, quoted_reply_anchors_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     const insertClaim = this.db.prepare(
       `INSERT INTO brain_claims (id, episode_id, sequence, kind, text, event_at_ms, valid_until_ms, confidence) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
@@ -2099,7 +2243,8 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         episode.extractionVersion,
         stringifyJson(episode.unresolvedParticipants ?? []),
         stringifyJson(episode.pushNameParticipants ?? []),
-        episode.uninterpretedMediaCount ?? 0
+        episode.uninterpretedMediaCount ?? 0,
+        stringifyJson(episode.quotedReplyAnchors ?? [])
       );
       episode.claims.forEach((claim, index) => {
         const claimId = crypto.randomUUID();
@@ -2236,6 +2381,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       unresolvedParticipants: (parseJson(row.unresolved_participants_json as string | null) as string[] | null) ?? [],
       pushNameParticipants: (parseJson(row.push_name_participants_json as string | null) as string[] | null) ?? [],
       uninterpretedMediaCount: Number(row.uninterpreted_media_count ?? 0),
+      quotedReplyAnchors: (parseJson(row.quoted_reply_anchors_json as string | null) as QuotedReplyAnchor[] | null) ?? [],
       mediaGaps: (mediaGapsStmt.all(row.id) as Array<Record<string, unknown>>).map((gap) => ({
         sourceMessageKey: String(gap.source_message_key),
         modality: gap.modality as BrainMediaGapRecord["modality"],
@@ -2504,6 +2650,52 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     return marked;
   }
 
+  // A reply need not be cited for its quote to have shaped the evidence, so
+  // quote enrichment uses the mechanically persisted reply-anchor stamp rather
+  // than the citation reverse map above.
+  private async markStaleEpisodesForQuotedReplies(replySourceMessageKeys: string[]): Promise<number> {
+    const keys = [...new Set(replySourceMessageKeys.filter(Boolean))];
+    if (keys.length === 0) {
+      return 0;
+    }
+    const episodes = new Map<string, { chatSourceId: string; startAtMs: number; endAtMs: number }>();
+    for (const key of keys) {
+      const rows = this.db
+        .prepare(
+          `SELECT id, chat_source_id, start_at_ms, end_at_ms FROM brain_episodes
+           WHERE status = 'current' AND EXISTS (
+             SELECT 1 FROM json_each(COALESCE(quoted_reply_anchors_json, '[]')) anchor
+             WHERE json_extract(anchor.value, '$.replySourceMessageKey') = ?
+           )`
+        )
+        .all(key) as Array<{ id: string; chat_source_id: string; start_at_ms: number; end_at_ms: number }>;
+      for (const row of rows) {
+        episodes.set(row.id, { chatSourceId: row.chat_source_id, startAtMs: row.start_at_ms, endAtMs: row.end_at_ms });
+      }
+    }
+    if (episodes.size === 0) {
+      return 0;
+    }
+    const stale = this.db.prepare(`UPDATE brain_episodes SET status = 'stale' WHERE id = ? AND status = 'current'`);
+    const enqueue = this.db.prepare(
+      `INSERT OR IGNORE INTO brain_tasks (kind, chat_source_id, payload_json, dedupe_key, priority)
+       VALUES ('episode', ?, ?, ?, ?)`
+    );
+    let marked = 0;
+    this.db.transaction(() => {
+      for (const [episodeId, window] of episodes) {
+        marked += stale.run(episodeId).changes;
+        enqueue.run(
+          window.chatSourceId,
+          stringifyJson({ chatSourceId: window.chatSourceId, sinceMs: window.startAtMs, throughMs: window.endAtMs, regen: true, episodeId }),
+          `regen:${episodeId}`,
+          1_000
+        );
+      }
+    })();
+    return marked;
+  }
+
   async collapseSupersededMessages(
     pairs: Array<{ chatSourceId: string; staleMessageId: string; canonicalMessageId: string }>
   ): Promise<number> {
@@ -2512,24 +2704,35 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       return 0;
     }
     // The stale row is a previous import of the same message under its edit
-    // key; the canonical row (just upserted) already carries the final text,
-    // and live-derived state always targeted the canonical identity.
-    const remove = this.db.prepare(
-      `DELETE FROM messages
-       WHERE source_message_key = ?
-         AND EXISTS (SELECT 1 FROM messages canonical WHERE canonical.source_message_key = ?)`
+    // key. Collapse through the central pair merger so reply-owned snapshots
+    // (and their full monotonic fields) move to the canonical key before the
+    // stale row's foreign-key cascade removes it.
+    const findPair = this.db.prepare(
+      `SELECT stale.id AS stale_id, canonical.id AS canonical_id
+       FROM messages stale JOIN messages canonical
+         ON canonical.source_message_key = ?
+       WHERE stale.source_message_key = ?`
     );
     let collapsed = 0;
+    const quoteAffectedKeys: string[] = [];
     const transaction = this.db.transaction(() => {
       for (const pair of pairs) {
         const chatSourceId = this.canonicalJid(pair.chatSourceId) ?? pair.chatSourceId;
-        const result = remove.run(messageKey(chatSourceId, pair.staleMessageId), messageKey(chatSourceId, pair.canonicalMessageId));
-        collapsed += result.changes;
+        const staleKey = messageKey(chatSourceId, pair.staleMessageId);
+        const canonicalKey = messageKey(chatSourceId, pair.canonicalMessageId);
+        const match = findPair.get(canonicalKey, staleKey) as { stale_id: number; canonical_id: number } | undefined;
+        if (!match) {
+          continue;
+        }
+        this.collapseMessagePair(match.canonical_id, match.stale_id);
+        quoteAffectedKeys.push(staleKey, canonicalKey);
+        collapsed += 1;
       }
     });
     transaction();
     if (collapsed > 0) {
       await this.markStaleMemoryForMissingMessages();
+      await this.markStaleEpisodesForQuotedReplies(quoteAffectedKeys);
     }
     return collapsed;
   }
@@ -3202,6 +3405,39 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     // Brain citations anchor on the message rowid; repoint them onto the
     // survivor before the dropped row (and its rowid) disappears.
     this.db.prepare(`UPDATE brain_citations SET message_id = ? WHERE message_id = ?`).run(keepId, dropId);
+    // Preserve a reply-owned snapshot while collapsing duplicate message rows.
+    // The newer/more complete snapshot only fills gaps on the survivor.
+    this.db
+      .prepare(
+        `INSERT INTO message_quoted_snapshots
+         (reply_message_key, quoted_source_message_id, quoted_source_chat_id, quoted_sender_source_jid, quoted_from_me, timestamp_ms,
+          message_type, raw_type_code, body, caption, media_mime_type, media_name, thumbnail, location_json, vcard_json, mentioned_jids_json, updated_at)
+         SELECT keep.source_message_key, qs.quoted_source_message_id, qs.quoted_source_chat_id, qs.quoted_sender_source_jid, qs.quoted_from_me, qs.timestamp_ms,
+                qs.message_type, qs.raw_type_code, qs.body, qs.caption, qs.media_mime_type, qs.media_name, qs.thumbnail, qs.location_json, qs.vcard_json, qs.mentioned_jids_json, ?
+         FROM message_quoted_snapshots qs JOIN messages keep ON keep.id = ?
+         WHERE qs.reply_message_key = (SELECT source_message_key FROM messages WHERE id = ?)
+         ON CONFLICT(reply_message_key) DO UPDATE SET
+           quoted_source_message_id = COALESCE(excluded.quoted_source_message_id, message_quoted_snapshots.quoted_source_message_id),
+           quoted_source_chat_id = COALESCE(excluded.quoted_source_chat_id, message_quoted_snapshots.quoted_source_chat_id),
+           quoted_sender_source_jid = COALESCE(excluded.quoted_sender_source_jid, message_quoted_snapshots.quoted_sender_source_jid),
+           quoted_from_me = COALESCE(excluded.quoted_from_me, message_quoted_snapshots.quoted_from_me),
+           timestamp_ms = COALESCE(excluded.timestamp_ms, message_quoted_snapshots.timestamp_ms),
+           message_type = CASE
+             WHEN message_quoted_snapshots.message_type LIKE 'unknown%' AND excluded.message_type NOT LIKE 'unknown%'
+             THEN excluded.message_type ELSE message_quoted_snapshots.message_type
+           END,
+           raw_type_code = COALESCE(excluded.raw_type_code, message_quoted_snapshots.raw_type_code),
+           body = COALESCE(NULLIF(excluded.body, ''), message_quoted_snapshots.body),
+           caption = COALESCE(NULLIF(excluded.caption, ''), message_quoted_snapshots.caption),
+           media_mime_type = COALESCE(excluded.media_mime_type, message_quoted_snapshots.media_mime_type),
+           media_name = COALESCE(excluded.media_name, message_quoted_snapshots.media_name),
+           thumbnail = COALESCE(excluded.thumbnail, message_quoted_snapshots.thumbnail),
+           location_json = COALESCE(excluded.location_json, message_quoted_snapshots.location_json),
+           vcard_json = COALESCE(excluded.vcard_json, message_quoted_snapshots.vcard_json),
+           mentioned_jids_json = COALESCE(excluded.mentioned_jids_json, message_quoted_snapshots.mentioned_jids_json),
+           updated_at = excluded.updated_at`
+      )
+      .run(currentIso(), keepId, dropId);
     // Merged tombstones keep their held content: deletion is a state marker,
     // never a content eraser (backup-store semantics).
     this.db.prepare(`DELETE FROM messages WHERE id = ?`).run(dropId);
@@ -3580,7 +3816,19 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         }
         const senderSourceJid =
           message.senderSourceJid === "me" ? "me" : this.canonicalJid(message.senderSourceJid) ?? message.senderSourceJid ?? null;
-        return { ...message, chatSourceId, senderSourceJid, sourceMessageKey: messageKey(chatSourceId, message.sourceMessageId) } as MessageRecord;
+        const quotedSnapshot = message.quotedSnapshot
+          ? {
+              ...message.quotedSnapshot,
+              quotedSourceChatId:
+                this.canonicalJid(message.quotedSnapshot.quotedSourceChatId) ?? message.quotedSnapshot.quotedSourceChatId ?? null,
+              quotedSenderSourceJid:
+                this.canonicalJid(message.quotedSnapshot.quotedSenderSourceJid) ?? message.quotedSnapshot.quotedSenderSourceJid ?? null,
+              mentionedJids: (message.quotedSnapshot.mentionedJids ?? [])
+                .map((jid) => this.canonicalJid(jid) ?? jid)
+                .filter((jid): jid is string => Boolean(jid))
+            }
+          : null;
+        return { ...message, quotedSnapshot, chatSourceId, senderSourceJid, sourceMessageKey: messageKey(chatSourceId, message.sourceMessageId) } as MessageRecord;
       })
       .filter((message): message is MessageRecord => message !== null);
 
@@ -3640,7 +3888,8 @@ export class SqliteArchiveRepository implements ArchiveRepository {
           ),
           mentionedJids: [
             ...new Set((message.mentionedJids ?? []).map((jid) => this.canonicalJid(jid)).filter((jid): jid is string => Boolean(jid)))
-          ]
+          ],
+          quotedSnapshot: message.quotedSnapshot ?? null
         };
       })
       .filter((row): row is NonNullable<typeof row> => row !== null);
@@ -3704,6 +3953,31 @@ export class SqliteArchiveRepository implements ArchiveRepository {
          is_starred = MAX(messages.is_starred, excluded.is_starred),
          raw_metadata_json = COALESCE(excluded.raw_metadata_json, messages.raw_metadata_json)`
     );
+    const readSnapshot = this.db.prepare(`SELECT * FROM message_quoted_snapshots WHERE reply_message_key = ?`);
+    const upsertSnapshot = this.db.prepare(
+      `INSERT INTO message_quoted_snapshots
+       (reply_message_key, quoted_source_message_id, quoted_source_chat_id, quoted_sender_source_jid, quoted_from_me, timestamp_ms,
+        message_type, raw_type_code, body, caption, media_mime_type, media_name, thumbnail, location_json, vcard_json, mentioned_jids_json, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(reply_message_key) DO UPDATE SET
+         quoted_source_message_id = COALESCE(excluded.quoted_source_message_id, message_quoted_snapshots.quoted_source_message_id),
+         quoted_source_chat_id = COALESCE(excluded.quoted_source_chat_id, message_quoted_snapshots.quoted_source_chat_id),
+         quoted_sender_source_jid = COALESCE(excluded.quoted_sender_source_jid, message_quoted_snapshots.quoted_sender_source_jid),
+         quoted_from_me = COALESCE(excluded.quoted_from_me, message_quoted_snapshots.quoted_from_me),
+         timestamp_ms = COALESCE(excluded.timestamp_ms, message_quoted_snapshots.timestamp_ms),
+         message_type = CASE WHEN message_quoted_snapshots.message_type LIKE 'unknown%' AND excluded.message_type NOT LIKE 'unknown%' THEN excluded.message_type ELSE message_quoted_snapshots.message_type END,
+         raw_type_code = COALESCE(excluded.raw_type_code, message_quoted_snapshots.raw_type_code),
+         body = COALESCE(NULLIF(excluded.body, ''), message_quoted_snapshots.body),
+         caption = COALESCE(NULLIF(excluded.caption, ''), message_quoted_snapshots.caption),
+         media_mime_type = COALESCE(excluded.media_mime_type, message_quoted_snapshots.media_mime_type),
+         media_name = COALESCE(excluded.media_name, message_quoted_snapshots.media_name),
+         thumbnail = COALESCE(excluded.thumbnail, message_quoted_snapshots.thumbnail),
+         location_json = COALESCE(excluded.location_json, message_quoted_snapshots.location_json),
+         vcard_json = COALESCE(excluded.vcard_json, message_quoted_snapshots.vcard_json),
+         mentioned_jids_json = COALESCE(excluded.mentioned_jids_json, message_quoted_snapshots.mentioned_jids_json),
+         updated_at = excluded.updated_at`
+    );
+    const enrichedQuoteKeys: string[] = [];
     const transaction = this.db.transaction(() => {
       for (const row of rows) {
         upsert.run(
@@ -3732,6 +4006,37 @@ export class SqliteArchiveRepository implements ArchiveRepository {
           row.rawMetadata,
           row.resolvedText
         );
+        if (row.quotedSnapshot) {
+          const before = readSnapshot.get(row.sourceMessageKey) as Record<string, unknown> | undefined;
+          const snapshot = row.quotedSnapshot;
+          upsertSnapshot.run(
+            row.sourceMessageKey,
+            snapshot.quotedSourceMessageId,
+            snapshot.quotedSourceChatId,
+            snapshot.quotedSenderSourceJid,
+            snapshot.quotedFromMe == null ? null : Number(snapshot.quotedFromMe),
+            snapshot.timestampMs,
+            snapshot.messageType,
+            snapshot.rawTypeCode == null ? null : String(snapshot.rawTypeCode),
+            snapshot.body,
+            snapshot.caption,
+            snapshot.mediaMimeType ?? null,
+            snapshot.mediaName ?? null,
+            snapshot.thumbnail ?? null,
+            stringifyJson(snapshot.location ?? null),
+            stringifyJson(snapshot.vcard ?? null),
+            stringifyJson(snapshot.mentionedJids ?? []),
+            currentIso()
+          );
+          const after = readSnapshot.get(row.sourceMessageKey) as Record<string, unknown> | undefined;
+          // `updated_at` is observation metadata, not quote context. A
+          // byte-for-byte re-import updates that clock but must not enqueue a
+          // brain regeneration; only a new or semantically enriched snapshot
+          // changes what an episode could have understood.
+          if (!quotedSnapshotRowsEqual(before, after)) {
+            enrichedQuoteKeys.push(row.sourceMessageKey);
+          }
+        }
       }
       // Conflict-merged rows may have kept older body/caption (tombstones,
       // contentless re-deliveries); recompute derived search state from the
@@ -3757,6 +4062,9 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       this.syncMessageDerivedState([...idsByKey.values()], explicitMentionsById);
     });
     transaction();
+    if (enrichedQuoteKeys.length > 0) {
+      await this.markStaleEpisodesForQuotedReplies(enrichedQuoteKeys);
+    }
     return rows.length;
   }
 
@@ -4674,6 +4982,17 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     return row?.thumbnail ?? null;
   }
 
+  async getQuotedSnapshotThumbnail(messageId: number): Promise<Uint8Array | null> {
+    const row = this.db
+      .prepare(
+        `SELECT qs.thumbnail FROM message_quoted_snapshots qs
+         JOIN messages m ON m.source_message_key = qs.reply_message_key
+         WHERE m.id = ?`
+      )
+      .get(messageId) as { thumbnail: Buffer | null } | undefined;
+    return row?.thumbnail ?? null;
+  }
+
   async listMessageEditRevisions(messageId: number): Promise<MessageEditRevisionRecord[]> {
     const rows = this.db
       .prepare(
@@ -5030,6 +5349,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
                 hasThumbnail: Boolean(row.preview_has_thumbnail)
               }
             : null,
+        quotedSnapshot: quoteSummaryFromRow(row),
         isEdited: Boolean(row.edited_flag) || Number(row.edit_revision_count ?? 0) > 0,
         editRevisionCount: Number(row.edit_revision_count ?? 0),
         isDeleted: Boolean(row.is_deleted),
@@ -5214,11 +5534,12 @@ export class SqliteArchiveRepository implements ArchiveRepository {
                 ${labelIsPushNameSql("c.")} AS sender_name_is_push_name,
                 m.timestamp_ms, m.sent_at, m.direction, m.message_type, m.is_deleted, m.is_forwarded, m.quoted_source_message_id, m.has_media, m.source_table,
                 COALESCE(NULLIF(m.body, ''), NULLIF(m.caption, '')) AS text,
-                ${MEDIA_STATE_SELECT}
+                ${MEDIA_STATE_SELECT}, ${QUOTED_SNAPSHOT_SELECT}
          FROM messages m
          JOIN chats ON chats.id = m.chat_id
          LEFT JOIN contacts c ON c.source_jid = m.sender_source_jid
          ${MEDIA_STATE_JOINS}
+         ${QUOTED_SNAPSHOT_JOINS}
          WHERE ${where.join(" AND ")}
          ORDER BY m.timestamp_ms ASC, m.id ASC
          LIMIT ?`
@@ -5532,11 +5853,12 @@ export class SqliteArchiveRepository implements ArchiveRepository {
                 ${contactLabelSql("c.")} AS sender_display_name,
                 m.timestamp_ms, m.sent_at, m.direction, m.message_type, m.is_deleted, m.has_media, m.source_table,
                 COALESCE(NULLIF(m.body, ''), NULLIF(m.caption, '')) AS text,
-                ${MEDIA_STATE_SELECT}
+                ${MEDIA_STATE_SELECT}, ${QUOTED_SNAPSHOT_SELECT}
          FROM messages m
          JOIN chats ON chats.id = m.chat_id
          LEFT JOIN contacts c ON c.source_jid = m.sender_source_jid
          ${MEDIA_STATE_JOINS}
+         ${QUOTED_SNAPSHOT_JOINS}
          WHERE m.chat_id = ? AND m.id BETWEEN ? AND ?
          ORDER BY m.timestamp_ms ASC, m.id ASC`
       )
@@ -5774,7 +6096,8 @@ function migrateAdditiveColumns(db: Database.Database): void {
     // reason, and the ledger's estimated-usage flag — all additive.
     { table: "brain_chat_watermarks", column: "assimilated_through_id", ddl: "ALTER TABLE brain_chat_watermarks ADD COLUMN assimilated_through_id INTEGER NOT NULL DEFAULT 0" },
     { table: "brain_episodes", column: "fallback_reason", ddl: "ALTER TABLE brain_episodes ADD COLUMN fallback_reason TEXT NULL" },
-    { table: "brain_llm_ledger", column: "estimated", ddl: "ALTER TABLE brain_llm_ledger ADD COLUMN estimated INTEGER NOT NULL DEFAULT 0" }
+    { table: "brain_llm_ledger", column: "estimated", ddl: "ALTER TABLE brain_llm_ledger ADD COLUMN estimated INTEGER NOT NULL DEFAULT 0" },
+    { table: "brain_episodes", column: "quoted_reply_anchors_json", ddl: "ALTER TABLE brain_episodes ADD COLUMN quoted_reply_anchors_json TEXT NULL" }
   ];
   for (const addition of additions) {
     const columns = db.prepare(`SELECT name FROM pragma_table_info(?)`).all(addition.table) as Array<{ name: string }>;
@@ -5881,6 +6204,69 @@ function stringifyJson(value: unknown): string | null {
     return null;
   }
   return JSON.stringify(value);
+}
+
+const QUOTED_SNAPSHOT_SEMANTIC_COLUMNS = [
+  "reply_message_key",
+  "quoted_source_message_id",
+  "quoted_source_chat_id",
+  "quoted_sender_source_jid",
+  "quoted_from_me",
+  "timestamp_ms",
+  "message_type",
+  "raw_type_code",
+  "body",
+  "caption",
+  "media_mime_type",
+  "media_name",
+  "thumbnail",
+  "location_json",
+  "vcard_json",
+  "mentioned_jids_json"
+] as const;
+
+const QUOTED_SNAPSHOT_JSON_COLUMNS = new Set<string>(["location_json", "vcard_json", "mentioned_jids_json"]);
+
+function quotedSnapshotRowsEqual(before: Record<string, unknown> | undefined, after: Record<string, unknown> | undefined): boolean {
+  if (!before || !after) {
+    return before === after;
+  }
+  return QUOTED_SNAPSHOT_SEMANTIC_COLUMNS.every((column) => quotedSnapshotValueEqual(before[column], after[column], column));
+}
+
+function quotedSnapshotValueEqual(left: unknown, right: unknown, column: string): boolean {
+  if (Buffer.isBuffer(left) || Buffer.isBuffer(right)) {
+    return Buffer.isBuffer(left) && Buffer.isBuffer(right) && left.equals(right);
+  }
+  if (QUOTED_SNAPSHOT_JSON_COLUMNS.has(column)) {
+    return canonicalJsonForComparison(left) === canonicalJsonForComparison(right);
+  }
+  return left === right;
+}
+
+function canonicalJsonForComparison(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return value == null ? null : String(value);
+  }
+  try {
+    return JSON.stringify(sortJsonValue(JSON.parse(value)));
+  } catch {
+    return value;
+  }
+}
+
+function sortJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(sortJsonValue);
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, nested]) => [key, sortJsonValue(nested)])
+    );
+  }
+  return value;
 }
 
 function parseJson(value: string | null | undefined): Record<string, unknown> | null {
@@ -6047,6 +6433,7 @@ function rowToMemoryEvidence(row: SqliteMemoryEvidenceRow, index: number): Memor
     // lookup); reactions are attached by listMemoryEvidenceMessages after the map.
     isForwarded: Boolean(row.is_forwarded),
     quotedSourceMessageId: row.quoted_source_message_id ?? null,
+    quotedSnapshot: quoteSummaryFromRow(row),
     reactions: [],
     // Provenance only applies when the label actually resolved from the contact
     // row; a displayPhoneFromJid fallback is a number, not a push name.
@@ -6377,7 +6764,7 @@ function rowToBrainRun(row: SqliteBrainRunRow): BrainRunSummary {
   };
 }
 
-interface SqliteMessageRow extends SqliteMediaStateColumns {
+interface SqliteMessageRow extends SqliteMediaStateColumns, QuotedSnapshotRow {
   id: number;
   source_message_id: string;
   sender_display_name: string | null;
@@ -6500,7 +6887,7 @@ interface SqliteMemoryWindowRow {
   created_at: string;
 }
 
-interface SqliteMemoryEvidenceRow extends SqliteMediaStateColumns {
+interface SqliteMemoryEvidenceRow extends SqliteMediaStateColumns, QuotedSnapshotRow {
   id: number;
   source_message_key: string;
   source_message_id: string;

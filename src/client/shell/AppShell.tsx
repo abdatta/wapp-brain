@@ -2,6 +2,7 @@ import { Loader2, MessageCircle, Moon, RefreshCcw, ShieldCheck } from "lucide-re
 import { Suspense, useEffect } from "react";
 import { Outlet, useLocation, useNavigate } from "react-router-dom";
 import { PairingModal } from "../panels";
+import { routeStateKey } from "../lib/routeState";
 import { useStatus } from "../state/StatusContext";
 import { useToast } from "../state/ToastContext";
 import { NavRail } from "./NavRail";
@@ -63,7 +64,7 @@ export function AppShell() {
       <ToastHost />
 
       <main className="routeOutlet">
-        <RouteErrorBoundary key={location.pathname}>
+        <RouteErrorBoundary key={routeStateKey(location.pathname)}>
           <Suspense
             fallback={
               <div className="routeLoading">

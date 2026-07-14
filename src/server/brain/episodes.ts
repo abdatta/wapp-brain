@@ -14,6 +14,7 @@ import type {
   BrainClaimInput,
   BrainClaimKind,
   BrainEntityKind,
+  BrainEpisodeInput,
   BrainEpisodeRecord,
   BrainMediaGapImpact,
   BrainMediaGapModality,
@@ -34,7 +35,7 @@ import { generateStructured, type BrainTokenUsage } from "./provider";
 // Do NOT bump for provider/model choice (the `model` column records that) or
 // topic-vocabulary offers (non-stamping input). `extraction_version <
 // EXTRACTION_VERSION` is the staleness predicate `brain regenerate` selects on.
-export const EXTRACTION_VERSION = 2;
+export const EXTRACTION_VERSION = 3;
 
 const SILENCE_GAP_MS = 90 * 60_000;
 const MIN_SEGMENT_FOR_SPLIT = 10;
@@ -159,6 +160,7 @@ function baseParticipant(jid: string | null, displayName: string | null, isPushN
 
 export interface PackLabeler {
   sender: (message: MemoryEvidenceMessage) => string;
+  quotedSender: (message: MemoryEvidenceMessage) => string;
   reactor: (reaction: MemoryEvidenceReaction) => string;
   ownerLabel: string;
   // Clean prose form of the owner's short name (no "(me)" marker).
@@ -184,20 +186,31 @@ export function buildPackLabeler(messages: MemoryEvidenceMessage[], ownerName: s
   const digitsByJid = new Map<string, string>();
   let ownerJid: string | null = null;
   let hasSelf = false;
-  for (const message of messages) {
-    const jid = message.senderSourceJid;
-    if (isSelfMessage(message)) {
+  const addParticipant = (jid: string | null, displayName: string | null, isPushName: boolean, isSelf: boolean) => {
+    if (isSelf) {
       hasSelf = true;
       if (jid && jid !== "me" && !ownerJid) {
         ownerJid = jid;
       }
-      continue;
+      return;
     }
     if (!jid || baseByJid.has(jid)) {
-      continue;
+      return;
     }
-    baseByJid.set(jid, baseParticipant(jid, message.senderDisplayName, message.senderNameIsPushName));
+    baseByJid.set(jid, baseParticipant(jid, displayName, isPushName));
     digitsByJid.set(jid, (jid.split("@")[0]?.split(":")[0] ?? "").replace(/\D/g, ""));
+  };
+  for (const message of messages) {
+    addParticipant(message.senderSourceJid, message.senderDisplayName, message.senderNameIsPushName, isSelfMessage(message));
+    const quote = message.quotedSnapshot;
+    if (quote) {
+      addParticipant(
+        quote.quotedSenderSourceJid,
+        quote.quotedSenderDisplayName,
+        quote.quotedSenderNameIsPushName,
+        quote.quotedFromMe === true || quote.quotedSenderSourceJid === "me"
+      );
+    }
   }
   // Find base labels shared by more than one identity → collisions to resolve.
   // The owner's short name participates: a participant named like the owner is
@@ -253,6 +266,13 @@ export function buildPackLabeler(messages: MemoryEvidenceMessage[], ownerName: s
       }
       const jid = message.senderSourceJid;
       return (jid && labelByJid.get(jid)) || baseParticipant(jid, message.senderDisplayName, message.senderNameIsPushName).label;
+    },
+    quotedSender: (message) => {
+      const quote = message.quotedSnapshot;
+      if (!quote) return "someone";
+      if (quote.quotedFromMe || quote.quotedSenderSourceJid === "me") return ownerLabel;
+      const jid = quote.quotedSenderSourceJid;
+      return (jid && labelByJid.get(jid)) || baseParticipant(jid, quote.quotedSenderDisplayName, quote.quotedSenderNameIsPushName).label;
     },
     reactor: (reaction) => {
       if (reaction.reactorJid === "me") {
@@ -421,11 +441,19 @@ function packPromptLines(
     const senderText = message.isForwarded ? `${label} (forwarded)` : label;
     const reactionsText = renderReactions(message.reactions, labeler);
     let referent = "";
-    const quotedId = message.quotedSourceMessageId;
+    // Pointer-only thread previews are synthesized for UI parity, but they
+    // must still take the bounded referent path here rather than masquerading
+    // as reply-owned, non-citable snapshot evidence.
+    const snapshot = message.quotedSnapshot?.captured === false ? null : message.quotedSnapshot;
+    const quotedId = snapshot?.quotedSourceMessageId ?? message.quotedSourceMessageId;
     if (quotedId) {
-      const inPack = inPackByQuotedId.get(quotedId);
+      const inPack = !snapshot?.quotedSourceChatId || snapshot.quotedSourceChatId === message.sourceChatId
+        ? inPackByQuotedId.get(quotedId)
+        : null;
       if (inPack && inPack.alias !== alias) {
         referent = `\n     ↳ replying to ${inPack.alias} (${inPack.sender}): "${inPack.snippet}"`;
+      } else if (snapshot) {
+        referent = `\n     ↳ replying to (${labeler.quotedSender(message)}): "${quotedSnapshotContext(snapshot)}" [non-citable snapshot]`;
       } else {
         const out = quotedReferents.get(quotedId);
         referent = out
@@ -436,6 +464,19 @@ function packPromptLines(
     return `${alias} | ${time} | ${senderText}: ${text}${reactionsText}${referent}`;
   });
   return { lines, keyByAlias };
+}
+
+function quotedSnapshotContext(snapshot: NonNullable<MemoryEvidenceMessage["quotedSnapshot"]>): string {
+  const text = snapshot.body?.trim() || snapshot.caption?.trim();
+  if (text) return text;
+  if (snapshot.location) {
+    const details = [snapshot.location.name, snapshot.location.address].filter(Boolean).join(" — ");
+    return details ? `[location: ${details}]` : "[location]";
+  }
+  if (snapshot.vcard) return snapshot.vcard.name ? `[contact: ${snapshot.vcard.name}]` : "[contact card]";
+  if (snapshot.mediaName) return `[${snapshot.messageType}: ${snapshot.mediaName}]`;
+  if (snapshot.mediaMimeType) return `[${snapshot.messageType}: ${snapshot.mediaMimeType}]`;
+  return `[${snapshot.messageType}]`;
 }
 
 // --- Contract v2 normalization (D7): mechanical salvage BEFORE validation so
@@ -784,14 +825,22 @@ export function lintClaimAnchoring(
 export function computePackStamps(
   pack: BrainEvidencePack,
   labeler: PackLabeler
-): { unresolvedParticipants: string[]; pushNameParticipants: string[]; uninterpretedMediaCount: number } {
+): { unresolvedParticipants: string[]; pushNameParticipants: string[]; uninterpretedMediaCount: number; quotedReplyAnchors: BrainEpisodeInput["quotedReplyAnchors"] } {
   const uninterpretedMediaCount = pack.messages.filter(
     (message) => !message.text?.trim() && !message.interpretation?.label
   ).length;
   return {
     unresolvedParticipants: labeler.numberTokenJids,
     pushNameParticipants: labeler.pushNameJids,
-    uninterpretedMediaCount
+    uninterpretedMediaCount,
+    quotedReplyAnchors: pack.messages
+      .filter((message) => Boolean(message.quotedSourceMessageId || message.quotedSnapshot))
+      .map((message) => ({
+        replySourceMessageKey: message.sourceMessageKey,
+        quotedSourceMessageId: message.quotedSnapshot?.quotedSourceMessageId ?? message.quotedSourceMessageId,
+        quotedSourceChatId: message.quotedSnapshot?.quotedSourceChatId ?? null,
+        snapshotPresent: message.quotedSnapshot?.captured !== false && Boolean(message.quotedSnapshot)
+      }))
   };
 }
 
@@ -1168,6 +1217,7 @@ export async function generateEpisodeForPack(
     unresolvedParticipants: stamps.unresolvedParticipants,
     pushNameParticipants: stamps.pushNameParticipants,
     uninterpretedMediaCount: stamps.uninterpretedMediaCount,
+    quotedReplyAnchors: stamps.quotedReplyAnchors,
     mediaGaps,
     advanceWatermark: options.advanceWatermark,
     supersedesEpisodeId: options.supersedesEpisodeId ?? null,

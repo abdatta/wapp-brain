@@ -319,6 +319,10 @@ export interface MessageRecord {
   mediaMimeType?: string | null;
   mediaName?: string | null;
   quotedSourceMessageId?: string | null;
+  // WhatsApp keeps a reply-owned, self-contained copy of the quoted message.
+  // It is deliberately not a normal archive message: it has no chat membership
+  // of its own and is never independently searchable or citable.
+  quotedSnapshot?: QuotedMessageSnapshot | null;
   isDeleted: boolean;
   isForwarded: boolean;
   isStarred: boolean;
@@ -326,6 +330,64 @@ export interface MessageRecord {
   // text-token "@digits" mentions are additionally derived at write time.
   mentionedJids?: string[] | null;
   rawMetadata?: Record<string, unknown> | null;
+}
+
+export interface QuotedMessageStructuredLocation {
+  latitude: number | null;
+  longitude: number | null;
+  name: string | null;
+  address: string | null;
+}
+
+export interface QuotedMessageStructuredVCard {
+  name: string | null;
+  vcard: string | null;
+}
+
+export interface QuotedMessageSnapshot {
+  quotedSourceMessageId: string | null;
+  quotedSourceChatId: string | null;
+  quotedSenderSourceJid: string | null;
+  quotedFromMe: boolean | null;
+  timestampMs: number | null;
+  messageType: string;
+  rawTypeCode?: string | number | null;
+  body: string | null;
+  caption: string | null;
+  mediaMimeType?: string | null;
+  mediaName?: string | null;
+  thumbnail?: Uint8Array | null;
+  location?: QuotedMessageStructuredLocation | null;
+  vcard?: QuotedMessageStructuredVCard | null;
+  mentionedJids?: string[] | null;
+}
+
+// The resolved, consumer-safe shape. Thumbnail bytes are intentionally omitted
+// from normal API/evidence projections and use a dedicated local endpoint.
+export interface QuotedMessageSnapshotSummary {
+  // True for a reply-owned backup/live capture. False is a bounded same-chat
+  // legacy-pointer preview synthesized only for read models. Omitted remains
+  // compatible with older callers and is treated as captured.
+  captured?: boolean;
+  quotedSourceMessageId: string | null;
+  quotedSourceChatId: string | null;
+  quotedSenderSourceJid: string | null;
+  quotedSenderDisplayName: string | null;
+  quotedSenderNameIsPushName: boolean;
+  quotedFromMe: boolean | null;
+  timestampMs: number | null;
+  messageType: string;
+  body: string | null;
+  caption: string | null;
+  mediaMimeType: string | null;
+  mediaName: string | null;
+  location: QuotedMessageStructuredLocation | null;
+  vcard: QuotedMessageStructuredVCard | null;
+  mentionedJids: string[];
+  hasThumbnail: boolean;
+  // Resolves only inside the reply's own chat. This intentionally stays null
+  // for Reply Privately and deleted/unarchived originals.
+  originalMessageId: number | null;
 }
 
 export interface ChatListItem {
@@ -380,6 +442,7 @@ export interface MessageListItem {
   media: MessageMediaSummary | null;
   // Stored sender-embedded link preview; null when the message carries none.
   linkPreview: LinkPreviewSummary | null;
+  quotedSnapshot: QuotedMessageSnapshotSummary | null;
   isEdited: boolean;
   // Retained prior revisions available for this message (live edits only).
   editRevisionCount: number;
@@ -472,6 +535,7 @@ export interface MemoryEvidenceMessage {
   // final reactor label is not baked here.
   isForwarded: boolean;
   quotedSourceMessageId: string | null;
+  quotedSnapshot: QuotedMessageSnapshotSummary | null;
   reactions: MemoryEvidenceReaction[];
   // Label provenance (contract v2): true when senderDisplayName came from the
   // contact's self-set push name because no saved display name exists. The
@@ -908,6 +972,7 @@ export interface BrainEpisodeInput {
   unresolvedParticipants?: string[];
   pushNameParticipants?: string[];
   uninterpretedMediaCount?: number;
+  quotedReplyAnchors?: QuotedReplyAnchor[];
   // Regeneration commits pass false: the watermark already covers the window.
   advanceWatermark?: boolean;
   // Regeneration: mark this episode 'superseded' in the same transaction as
@@ -938,9 +1003,17 @@ export interface BrainEpisodeRecord {
   unresolvedParticipants: string[];
   pushNameParticipants: string[];
   uninterpretedMediaCount: number;
+  quotedReplyAnchors: QuotedReplyAnchor[];
   mediaGaps: BrainMediaGapRecord[];
   createdAt: string;
   claims: BrainClaimRecord[];
+}
+
+export interface QuotedReplyAnchor {
+  replySourceMessageKey: string;
+  quotedSourceMessageId: string | null;
+  quotedSourceChatId: string | null;
+  snapshotPresent: boolean;
 }
 
 // --- Brain media-gap demand signal (contract v2, D13) ---

@@ -55,6 +55,8 @@ Dry-run evidence previews can contain message bodies. They are written only unde
 
 Live sync is explicit opt-in. Backup import does not pair with WhatsApp, connect to WhatsApp Web, or create live credentials.
 
+Captured reply-quote text, structured context, and embedded thumbnails remain inside the local archive. Quote thumbnails use a localhost-only route and never trigger a WhatsApp media fetch; quote text is never added as a standalone searchable or citable message.
+
 The live maintainer:
 - refuses pairing/start until an imported archive baseline exists and is recent enough for bounded recovery
 - stores auth/session files under `.wapp-brain/live`

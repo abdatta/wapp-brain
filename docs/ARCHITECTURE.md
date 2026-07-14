@@ -171,6 +171,8 @@ Messages and entities use stable source-derived keys where possible so repeated 
 
 Live sync is modeled as a separate source feeding the same normalized archive. Import runs remain distinct from live sync runs, while contacts, chats, and messages still converge through stable source-derived keys.
 
+Reply quote snapshots converge through that same message path. Backup and live envelopes monotonically enrich one local snapshot owned by the reply; evidence consumes it as non-citable context and the thread UI uses it for local previews. When an enrichment changes a reply used by a current episode, its exact window is marked stale and queued for replacement without advancing the archive watermark.
+
 Second-brain memory is derived data. SQLite stores the run ledger, source windows, page revisions, citations, validation issues, and job lock. Markdown pages and citation sidecars are written under `.wapp-brain/memory/` by default. Pages use YAML front matter, stable IDs, tags, aliases, and plain Markdown so the folder can be opened by Obsidian or another local Markdown tool later without coupling the core app to that tool.
 
 ## Future Postgres/Supabase Notes

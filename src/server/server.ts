@@ -878,6 +878,21 @@ app.get("/api/messages/:id/link-preview-thumbnail", async (req, res) => {
   }
 });
 
+app.get("/api/messages/:id/quoted-thumbnail", async (req, res) => {
+  try {
+    const thumbnail = await repository.getQuotedSnapshotThumbnail(Number(req.params.id));
+    if (!thumbnail?.length) {
+      res.status(404).json({ error: "No quoted-message thumbnail is stored for this message." });
+      return;
+    }
+    res.setHeader("Content-Type", "image/jpeg");
+    res.setHeader("Cache-Control", "private, max-age=31536000, immutable");
+    res.end(Buffer.from(thumbnail));
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
 app.get("/api/messages/:id/revisions", async (req, res) => {
   try {
     res.json(await repository.listMessageEditRevisions(Number(req.params.id)));

@@ -9,6 +9,7 @@ import type {
   MessageRecord,
   MessageSecretRecord,
   ParticipantRecord,
+  QuotedMessageSnapshot,
   RetainedPayloadRecord
 } from "../../shared/types";
 import { messageKey } from "../identity/keys";
@@ -135,6 +136,7 @@ export function normalizeBaileysMessage(message: BaileysLikeMessage, sourceTable
     mediaMimeType: extractMimeType(content),
     mediaName: extractMediaName(content),
     quotedSourceMessageId: extractQuotedMessageId(content),
+    quotedSnapshot: extractQuotedSnapshot(content),
     isDeleted: false,
     isForwarded: Boolean(nestedContext(content)?.isForwarded),
     isStarred: false,
@@ -943,6 +945,7 @@ async function resolveMessageJids(message: BaileysLikeMessage, resolveJid: LiveJ
   }
   return {
     ...message,
+    message: await resolveContextJids(message.message ?? null, resolveJid),
     participant: await resolveCanonicalJid(message.participant, resolveJid),
     key: {
       ...message.key,
@@ -950,6 +953,38 @@ async function resolveMessageJids(message: BaileysLikeMessage, resolveJid: LiveJ
       participant: await resolveCanonicalJid(message.key.participant, resolveJid)
     }
   };
+}
+
+// Canonicalize the reply's immediate ContextInfo identities as well as the
+// outer envelope. Keep quotedMessage content untouched except for its own
+// shallow context identities; quote nesting is deliberately ignored later.
+async function resolveContextJids(
+  message: Record<string, unknown> | null,
+  resolveJid: LiveJidResolver,
+  depth = 0
+): Promise<Record<string, unknown> | null> {
+  if (!message || depth > 2) return message;
+  const copy: Record<string, unknown> = { ...message };
+  for (const [key, value] of Object.entries(copy)) {
+    if (!value || typeof value !== "object") continue;
+    const node = value as Record<string, unknown>;
+    const context = node.contextInfo;
+    if (context && typeof context === "object") {
+      const next = { ...(context as Record<string, unknown>) };
+      if (typeof next.participant === "string") next.participant = await resolveCanonicalJid(next.participant, resolveJid);
+      if (typeof next.remoteJid === "string") next.remoteJid = await resolveCanonicalJid(next.remoteJid, resolveJid);
+      if (next.quotedMessage && typeof next.quotedMessage === "object") {
+        next.quotedMessage = await resolveContextJids(next.quotedMessage as Record<string, unknown>, resolveJid, depth + 1);
+      }
+      copy[key] = { ...node, contextInfo: next };
+      continue;
+    }
+    if (FUTURE_PROOF_WRAPPER_KEYS.includes(key as (typeof FUTURE_PROOF_WRAPPER_KEYS)[number])) {
+      const inner = node.message as Record<string, unknown> | null | undefined;
+      copy[key] = { ...node, message: await resolveContextJids(inner ?? null, resolveJid, depth + 1) };
+    }
+  }
+  return copy;
 }
 
 async function resolveCanonicalJid(jid: unknown, resolveJid: LiveJidResolver): Promise<string | null | undefined> {
@@ -1163,6 +1198,71 @@ function extractQuotedMessageId(content: Record<string, unknown> | null): string
   return typeof stanzaId === "string" ? stanzaId : null;
 }
 
+// One-level quote capture. The embedded message is a self-contained WhatsApp
+// snapshot; do not recurse into its own context or create a download descriptor.
+function extractQuotedSnapshot(content: Record<string, unknown> | null): QuotedMessageSnapshot | null {
+  const context = nestedContext(content);
+  const quotedMessage = context?.quotedMessage;
+  if (!quotedMessage || typeof quotedMessage !== "object") {
+    return null;
+  }
+  const quotedContent = unwrapMessageContent(quotedMessage as Record<string, unknown>);
+  if (!quotedContent) {
+    return null;
+  }
+  const participant = typeof context?.participant === "string" ? context.participant : null;
+  const remoteJid = typeof context?.remoteJid === "string" ? context.remoteJid : null;
+  const media = mediaContent(quotedContent);
+  const location = (quotedContent.locationMessage ?? quotedContent.liveLocationMessage) as Record<string, unknown> | undefined;
+  const contact = quotedContactContent(quotedContent);
+  const thumbnail = media?.jpegThumbnail;
+  return {
+    quotedSourceMessageId: typeof context?.stanzaId === "string" ? context.stanzaId : null,
+    quotedSourceChatId: remoteJid,
+    quotedSenderSourceJid: participant,
+    quotedFromMe: null,
+    timestampMs: null,
+    messageType: detectMessageType(quotedContent),
+    rawTypeCode: null,
+    body: extractText(quotedContent),
+    caption: extractCaption(quotedContent),
+    mediaMimeType: extractMimeType(quotedContent),
+    mediaName: extractMediaName(quotedContent),
+    thumbnail: thumbnail instanceof Uint8Array && thumbnail.length > 0 ? thumbnail : null,
+    location: location
+      ? {
+          latitude: longLikeToNumber(location.degreesLatitude ?? location.latitude),
+          longitude: longLikeToNumber(location.degreesLongitude ?? location.longitude),
+          name: nonEmptyString(location.name),
+          address: nonEmptyString(location.address)
+        }
+      : null,
+    vcard: contact
+      ? { name: nonEmptyString(contact.displayName ?? contact.name), vcard: nonEmptyString(contact.vcard) }
+      : null,
+    mentionedJids: extractMentionedJids(quotedContent) ?? []
+  };
+}
+
+// A contactsArrayMessage wraps its first contact under `contacts`, unlike the
+// single-contact envelope. We only retain the display-safe embedded vCard
+// metadata; no contact is created or looked up from a quote snapshot.
+function quotedContactContent(content: Record<string, unknown>): Record<string, unknown> | null {
+  const single = content.contactMessage;
+  if (single && typeof single === "object") {
+    return single as Record<string, unknown>;
+  }
+  const array = content.contactsArrayMessage;
+  if (!array || typeof array !== "object") {
+    return null;
+  }
+  const contacts = (array as { contacts?: unknown }).contacts;
+  if (Array.isArray(contacts) && contacts[0] && typeof contacts[0] === "object") {
+    return contacts[0] as Record<string, unknown>;
+  }
+  return array as Record<string, unknown>;
+}
+
 // Explicit mentioned JIDs from the transport contextInfo — the authoritative
 // identity behind each "@digits" token in the text. Bounded defensively.
 function extractMentionedJids(content: Record<string, unknown> | null): string[] | null {
@@ -1180,7 +1280,7 @@ function hasMediaContent(content: Record<string, unknown> | null): boolean {
 
 function mediaContent(content: Record<string, unknown> | null): Record<string, unknown> | null {
   if (!content) return null;
-  for (const key of ["imageMessage", "videoMessage", "audioMessage", "documentMessage", "stickerMessage"]) {
+  for (const key of ["imageMessage", "videoMessage", "audioMessage", "documentMessage", "stickerMessage", "ptvMessage"]) {
     const value = content[key];
     if (value && typeof value === "object") {
       return value as Record<string, unknown>;
@@ -1190,9 +1290,18 @@ function mediaContent(content: Record<string, unknown> | null): Record<string, u
 }
 
 function nestedContext(content: Record<string, unknown> | null): Record<string, unknown> | null {
-  const extended = content?.extendedTextMessage as { contextInfo?: Record<string, unknown> } | undefined;
-  const media = mediaContent(content) as { contextInfo?: Record<string, unknown> } | null;
-  return extended?.contextInfo ?? media?.contextInfo ?? null;
+  if (!content) return null;
+  // WhatsApp attaches contextInfo to many visible payload types. Scan only the
+  // immediate message members: a quote's nested context is intentionally not
+  // adopted by its parent reply.
+  const direct = content.contextInfo;
+  if (direct && typeof direct === "object") return direct as Record<string, unknown>;
+  for (const value of Object.values(content)) {
+    if (!value || typeof value !== "object") continue;
+    const candidate = (value as { contextInfo?: unknown }).contextInfo;
+    if (candidate && typeof candidate === "object") return candidate as Record<string, unknown>;
+  }
+  return null;
 }
 
 function firstNonEmpty(...values: Array<string | null | undefined>): string | null {

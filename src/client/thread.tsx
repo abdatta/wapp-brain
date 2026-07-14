@@ -38,6 +38,7 @@ import {
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { MouseEvent as ReactMouseEvent, ReactNode, RefObject } from "react";
 import { parseInlineSegments, parseWhatsAppBlocks, type InlineSegment } from "./whatsappFormat";
+import { quotePreviewModel } from "./quotePreview";
 import type {
   ArchiveChangeEvent,
   BackupDetectionManifest,
@@ -250,12 +251,14 @@ function MessageBubble({
   message,
   isGroup,
   onOpenMedia,
-  highlighted
+  highlighted,
+  onJumpToMessage
 }: {
   message: MessageListItem;
   isGroup: boolean;
   onOpenMedia: OnOpenMedia;
   highlighted?: boolean;
+  onJumpToMessage?: (messageId: number) => void;
 }) {
   const text = message.body || message.caption;
   const placeholder = messagePlaceholder(message);
@@ -299,6 +302,7 @@ function MessageBubble({
           <time>{formatTime(message.sentAt)}</time>
         </span>
       </div>
+      {message.quotedSnapshot && <QuotedPreview message={message} onJumpToMessage={onJumpToMessage} />}
       {message.media && <MessageMediaView message={message} onOpenMedia={onOpenMedia} />}
       {text ? (
         <div className="messageText">{renderRichText(text, message.mentions)}</div>
@@ -320,6 +324,43 @@ function MessageBubble({
       )}
       {historyOpen && <EditHistoryModal message={message} onClose={() => setHistoryOpen(false)} />}
     </article>
+  );
+}
+
+export function QuotedPreview({ message, onJumpToMessage }: { message: MessageListItem; onJumpToMessage?: (messageId: number) => void }) {
+  const [expanded, setExpanded] = useState(false);
+  const preview = quotePreviewModel(message);
+  if (!preview) return null;
+  const canJump = preview.jumpMessageId != null && onJumpToMessage != null;
+  const previewContent = (
+    <>
+      {preview.thumbnailUrl && <img className="quotedPreviewThumb" loading="lazy" src={preview.thumbnailUrl} alt="" />}
+      <div className="quotedPreviewBody">
+        <strong>{preview.sender}</strong>
+        <span className={expanded ? "quotedPreviewText full" : "quotedPreviewText"}>{preview.text}</span>
+      </div>
+    </>
+  );
+  return (
+    <section className={`quotedPreview ${expanded ? "expanded" : ""}`} aria-label={`Replying to ${preview.sender}`}>
+      {canJump ? (
+        <button
+          className="quotedPreviewTarget"
+          type="button"
+          onClick={() => onJumpToMessage(preview.jumpMessageId!)}
+          aria-label={`Jump to original message from ${preview.sender}`}
+        >
+          {previewContent}
+        </button>
+      ) : (
+        <div className="quotedPreviewStatic">{previewContent}</div>
+      )}
+      {preview.isLong && (
+        <button className="quotedPreviewAction" type="button" onClick={() => setExpanded((value) => !value)}>
+          {expanded ? "Show less" : "Show more"}
+        </button>
+      )}
+    </section>
   );
 }
 

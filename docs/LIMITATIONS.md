@@ -42,3 +42,6 @@ Exact re-runs of the same archive should not duplicate data. Cross-backup dedupe
 ## Future Services
 
 The app uses SQLite to avoid a required database service. A later Postgres/Supabase backend should implement the same archive repository interface. Do not use a remote service by default unless the user explicitly opts into uploading private archive data.
+## Reply Quote Coverage
+
+Quoted snapshots are best-effort outside modern Android and supported Baileys envelopes. Legacy/iOS schemas or replies without a snapshot retain pointer-only same-chat lookup and then an honest generic fallback. Cross-chat Reply Privately snapshots remain readable locally but intentionally do not offer cross-chat navigation.
