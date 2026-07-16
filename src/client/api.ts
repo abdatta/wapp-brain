@@ -35,10 +35,14 @@ import type {
   WaContactsSummary,
   GoogleContactsStatus,
   GoogleContactsSyncResult,
+  BrainResolutionDebtIdentity,
   IdentityRecentMessage,
   PersonAutoConnectSummary,
+  PersonCompareContext,
   PersonConnectResult,
   PersonDisconnectResult,
+  PersonLinkEventRecord,
+  PersonLinkSuppressionRecord,
   PersonLookupResult,
   PersonRecord,
   PersonScanStatus,
@@ -126,6 +130,41 @@ export function runPersonScan(): Promise<{ ok: boolean; autoConnect: PersonAutoC
 
 export function listIdentityRecentMessages(jid: string, limit = 20): Promise<{ messages: IdentityRecentMessage[] }> {
   return request(`/api/persons/identity-messages?jid=${encodeURIComponent(jid)}&limit=${limit}`);
+}
+
+export function undoPersonDismissal(jidLow: string, jidHigh: string): Promise<{ ok: boolean; restored: number }> {
+  return request("/api/persons/suggestions/undo", { method: "POST", body: JSON.stringify({ jidLow, jidHigh }) });
+}
+
+export function listPersonSuppressions(): Promise<{ suppressions: PersonLinkSuppressionRecord[] }> {
+  return request("/api/persons/suppressions");
+}
+
+export function releasePersonSuppression(jidLow: string, jidHigh: string): Promise<{ ok: boolean }> {
+  return request("/api/persons/suppressions/release", { method: "POST", body: JSON.stringify({ jidLow, jidHigh }) });
+}
+
+export function listPersonDebt(): Promise<{ episodesWithUnresolved: number; distinctIdentities: number; items: BrainResolutionDebtIdentity[] }> {
+  return request("/api/persons/debt");
+}
+
+export function getPersonCompareContext(jidA: string, jidB: string): Promise<PersonCompareContext> {
+  return request(`/api/persons/compare-context?jidA=${encodeURIComponent(jidA)}&jidB=${encodeURIComponent(jidB)}`);
+}
+
+export function personAvatarUrl(jid: string): string {
+  return `/api/persons/avatar?jid=${encodeURIComponent(jid)}`;
+}
+
+export function renamePersonIdentity(
+  jid: string,
+  name: string
+): Promise<{ ok: boolean; jid: string; name: string; repairedEpisodes: number; debtBefore: number; debtAfter: number }> {
+  return request("/api/persons/rename", { method: "POST", body: JSON.stringify({ jid, name }) });
+}
+
+export function listPersonEvents(limit = 100): Promise<{ events: PersonLinkEventRecord[] }> {
+  return request(`/api/persons/events?limit=${limit}`);
 }
 
 export function initDatabase(): Promise<{ ok: boolean; status: StatusSummary }> {

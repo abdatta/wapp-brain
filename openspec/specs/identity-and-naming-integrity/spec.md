@@ -169,7 +169,7 @@ The system SHALL report identity health — the counts of unnamed groups and unr
 - **THEN** no identity-health alert is shown
 
 ### Requirement: Visible Contact Enrichment
-Identity enrichment SHALL apply retroactively to already-archived chats, senders, and derived brain state (episodes, their claims, and the search index). Enrichment sources are the contact database (`wa.db`) where present, explicitly connected Google Contacts, and the message-store database's LID display-name table (`lid_display_name`) where present. A saved WhatsApp contact-database name SHALL take precedence over a Google Contacts name, and both SHALL take precedence over a message-store display-cache or push name for the same identity. Google enrichment SHALL only fill unresolved or weaker phone identities and MUST NOT guess a phone mapping. Each enrichment operation SHALL report source-appropriate counts so the user can tell whether it worked, including when a source contributes nothing. When an enrichment resolves a name for an identity that already appears as an unresolved participant in committed episodes, it SHALL route through the identity repair trigger so those episodes and the search index are brought up to date deterministically, with no model call.
+Identity enrichment SHALL apply retroactively to already-archived chats, senders, and derived brain state (episodes, their claims, and the search index). Enrichment sources are user-set names entered in-app, the contact database (`wa.db`) where present, explicitly connected Google Contacts, and the message-store database's LID display-name table (`lid_display_name`) where present. A user-set name SHALL take the highest precedence: it SHALL NOT be overwritten by any enrichment or import source, and SHALL be replaceable only by another user action. Below it, a saved WhatsApp contact-database name SHALL take precedence over a Google Contacts name, and both SHALL take precedence over a message-store display-cache or push name for the same identity. A user-set name SHALL be validated before persisting: masked-number placeholders and digit-restatements of the identity's own number SHALL be refused. Google enrichment SHALL only fill unresolved or weaker phone identities and MUST NOT guess a phone mapping. Each enrichment operation SHALL report source-appropriate counts so the user can tell whether it worked, including when a source contributes nothing. When an enrichment resolves a name for an identity that already appears as an unresolved participant in committed episodes, it SHALL route through the identity repair trigger so those episodes and the search index are brought up to date deterministically, with no model call — user-set names included.
 
 #### Scenario: Names improve after the fact
 - **WHEN** a `wa.db` with matching contacts is imported after messages already exist
@@ -186,6 +186,18 @@ Identity enrichment SHALL apply retroactively to already-archived chats, senders
 #### Scenario: Stronger saved names beat Google and display-cache names
 - **WHEN** the WhatsApp contact database, Google Contacts, and the message-store display cache carry names for the same identity
 - **THEN** the WhatsApp contact database's name is displayed, followed in precedence by Google Contacts and then the display cache
+
+#### Scenario: A user-set name outranks every enrichment source
+- **WHEN** the owner names an identity in-app and a later wa.db import or Google sync carries a different name for it
+- **THEN** the user-set name is preserved and displayed, and only another in-app user action can replace it
+
+#### Scenario: A user-set name repairs the brain like any other source
+- **WHEN** the owner names an identity that appears as an unresolved participant in committed episodes
+- **THEN** the name routes through the identity repair trigger and those episodes' prose and the search index update deterministically, with no model call
+
+#### Scenario: Invalid user-set names are refused
+- **WHEN** the owner submits a masked-number placeholder or a restatement of the identity's own digits as a name
+- **THEN** the rename is refused with the reason, and the stored name is unchanged
 
 #### Scenario: Enrichment is reported per source
 - **WHEN** a database import or Google Contacts sync completes

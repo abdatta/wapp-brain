@@ -38,6 +38,7 @@ import type {
   GroupMembershipEventRecord,
   GroupMembershipPeriodRecord,
   IdentityNumberChangeRecord,
+  IdentityRecentMedia,
   IdentityRecentMessage,
   IdentityRepairResult,
   ImportRunSummary,
@@ -1475,7 +1476,7 @@ const schemaStatements = [
   // Append-only audit trail for every person-layer operation.
   `CREATE TABLE IF NOT EXISTS person_link_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    action TEXT NOT NULL CHECK (action IN ('connect','disconnect','union','dissolve','suggest','accept','reject')),
+    action TEXT NOT NULL CHECK (action IN ('connect','disconnect','union','dissolve','suggest','accept','reject','unreject','release')),
     person_id TEXT NULL,
     identity_jid TEXT NULL,
     source TEXT NULL,
@@ -3553,7 +3554,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
   }
 
   private recordPersonEventTx(
-    action: "connect" | "disconnect" | "union" | "dissolve" | "suggest" | "accept" | "reject",
+    action: PersonLinkEventRecord["action"],
     fields: { personId?: string | null; identityJid?: string | null; source?: string | null; evidence?: Record<string, unknown> | null }
   ): void {
     this.db
@@ -4150,12 +4151,87 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     }));
   }
 
+  // Display labels for chat source ids (null when unresolved).
+  async getChatLabels(sourceChatIds: string[]): Promise<Map<string, string | null>> {
+    const labels = new Map<string, string | null>();
+    const unique = [...new Set(sourceChatIds.filter(Boolean))];
+    for (let index = 0; index < unique.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = unique.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      const rows = this.db
+        .prepare(
+          `SELECT source_chat_id AS id, NULLIF(TRIM(COALESCE(display_name, '')), '') AS label FROM chats WHERE source_chat_id IN (${batch.map(() => "?").join(",")})`
+        )
+        .all(...batch) as Array<{ id: string; label: string | null }>;
+      for (const row of rows) {
+        labels.set(row.id, row.label && row.label !== row.id ? row.label : displayPhoneFromJid(row.id));
+      }
+    }
+    for (const id of unique) {
+      if (!labels.has(id)) labels.set(id, null);
+    }
+    return labels;
+  }
+
+  // A sender's recent already-stored media for the compare dialog's strips —
+  // ids and labels only, never bytes.
+  async listRecentMediaBySender(jid: string, limit = 8): Promise<IdentityRecentMedia[]> {
+    const canonical = this.canonicalJid(jid) ?? jid;
+    const rows = this.db
+      .prepare(
+        `SELECT m.id AS messageId, a.id AS assetId, a.mime_type AS mimeType,
+                (a.thumbnail IS NOT NULL) AS hasThumbnail, m.timestamp_ms AS timestampMs,
+                NULLIF(TRIM(COALESCE(c.display_name, '')), '') AS chatLabel, c.source_chat_id AS chatSourceId
+         FROM media_assets a
+         JOIN messages m ON m.source_message_key = a.message_key
+         JOIN chats c ON c.id = m.chat_id
+         WHERE m.sender_source_jid = ?
+         ORDER BY m.timestamp_ms DESC, m.id DESC LIMIT ?`
+      )
+      .all(canonical, Math.max(1, limit)) as Array<{
+      messageId: number;
+      assetId: number;
+      mimeType: string | null;
+      hasThumbnail: number;
+      timestampMs: number | null;
+      chatLabel: string | null;
+      chatSourceId: string;
+    }>;
+    return rows.map((row) => ({
+      messageId: Number(row.messageId),
+      assetId: Number(row.assetId),
+      mimeType: row.mimeType,
+      hasThumbnail: Boolean(row.hasThumbnail),
+      timestampMs: row.timestampMs == null ? null : Number(row.timestampMs),
+      chatLabel: row.chatLabel && row.chatLabel !== row.chatSourceId ? row.chatLabel : displayPhoneFromJid(row.chatSourceId)
+    }));
+  }
+
   // Retire a detector kind's pending queue (rejected/accepted history stays).
   async supersedePersonSuggestionsByKind(kind: PersonSuggestionKind): Promise<number> {
     const result = this.db
       .prepare(`UPDATE person_suggestions SET status = 'superseded', updated_at = ? WHERE kind = ? AND status = 'pending'`)
       .run(currentIso(), kind);
     return result.changes;
+  }
+
+  // Human-only dismissal undo: every rejected row for the pair returns to
+  // pending (score/evidence kept) and the undo is audited. Detectors continue
+  // to never resurrect rejections themselves — this route is the only way back.
+  async unrejectPersonSuggestions(jidLowInput: string, jidHighInput: string): Promise<number> {
+    this.assertWritableIdentityVersion();
+    const a = this.canonicalJid(jidLowInput) ?? jidLowInput;
+    const b = this.canonicalJid(jidHighInput) ?? jidHighInput;
+    const [low, high] = this.personPair(a, b);
+    let restored = 0;
+    this.db.transaction(() => {
+      restored = this.db
+        .prepare(`UPDATE person_suggestions SET status = 'pending', updated_at = ? WHERE jid_low = ? AND jid_high = ? AND status = 'rejected'`)
+        .run(currentIso(), low, high).changes;
+      if (restored > 0) {
+        this.recordPersonEventTx("unreject", { evidence: { jidLow: low, jidHigh: high, restored } });
+      }
+    })();
+    return restored;
   }
 
   // Prune specific pending rows (e.g. pairs whose merge value dropped to
@@ -4212,12 +4288,40 @@ export class SqliteArchiveRepository implements ArchiveRepository {
   }
 
   async listPersonLinkSuppressions(limit = 200): Promise<PersonLinkSuppressionRecord[]> {
-    return this.db
+    const rows = this.db
       .prepare(
         `SELECT jid_low AS jidLow, jid_high AS jidHigh, reason, created_at AS createdAt
          FROM person_link_suppressions ORDER BY created_at DESC LIMIT ?`
       )
       .all(Math.max(1, limit)) as PersonLinkSuppressionRecord[];
+    const findPhone = this.db.prepare(`SELECT phone_number AS phone FROM contacts WHERE source_jid = ?`);
+    const phoneFor = (jid: string): string | null =>
+      ((findPhone.get(jid) as { phone: string | null } | undefined)?.phone ?? phoneFromJid(jid)) || null;
+    return rows.map((row) => ({
+      ...row,
+      lowLabel: this.labelForJid(row.jidLow),
+      highLabel: this.labelForJid(row.jidHigh),
+      lowPhone: phoneFor(row.jidLow),
+      highPhone: phoneFor(row.jidHigh)
+    }));
+  }
+
+  // Release a block: delete the suppression row only, so auto-connect and the
+  // detectors may re-evaluate the pair on their next pass. Nothing connects
+  // here — release is "let the system consider it again", not a connect.
+  async releasePersonLinkSuppression(jidA: string, jidB: string): Promise<boolean> {
+    this.assertWritableIdentityVersion();
+    const a = this.canonicalJid(jidA) ?? jidA;
+    const b = this.canonicalJid(jidB) ?? jidB;
+    const [low, high] = this.personPair(a, b);
+    let released = false;
+    this.db.transaction(() => {
+      released = this.db.prepare(`DELETE FROM person_link_suppressions WHERE jid_low = ? AND jid_high = ?`).run(low, high).changes > 0;
+      if (released) {
+        this.recordPersonEventTx("release", { evidence: { jidLow: low, jidHigh: high } });
+      }
+    })();
+    return released;
   }
 
   async listPersonLinkEvents(options: { limit?: number } = {}): Promise<PersonLinkEventRecord[]> {
@@ -4961,8 +5065,17 @@ export class SqliteArchiveRepository implements ArchiveRepository {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(source_jid) DO UPDATE SET
          phone_number = COALESCE(excluded.phone_number, contacts.phone_number),
-         display_name = COALESCE(NULLIF(excluded.display_name, ''), contacts.display_name),
-         display_name_source = CASE WHEN NULLIF(excluded.display_name, '') IS NOT NULL THEN excluded.display_name_source ELSE contacts.display_name_source END,
+         -- A user-set name is the strongest source: only another user write
+         -- may replace it. Every other incoming name defers to it.
+         display_name = CASE
+           WHEN contacts.display_name_source = 'user' AND excluded.display_name_source IS NOT 'user' THEN contacts.display_name
+           ELSE COALESCE(NULLIF(excluded.display_name, ''), contacts.display_name)
+         END,
+         display_name_source = CASE
+           WHEN contacts.display_name_source = 'user' AND excluded.display_name_source IS NOT 'user' THEN contacts.display_name_source
+           WHEN NULLIF(excluded.display_name, '') IS NOT NULL THEN excluded.display_name_source
+           ELSE contacts.display_name_source
+         END,
          push_name = COALESCE(NULLIF(excluded.push_name, ''), contacts.push_name),
          raw_metadata_json = COALESCE(excluded.raw_metadata_json, contacts.raw_metadata_json),
          last_seen_import_id = excluded.last_seen_import_id,
@@ -4974,7 +5087,13 @@ export class SqliteArchiveRepository implements ArchiveRepository {
           contact.sourceJid,
           contact.phoneNumber ?? null,
           contact.displayName ?? null,
-          contact.displayName?.trim() ? (contact.rawMetadata?.source === "lid_display_name" ? "display_cache" : "whatsapp_saved") : null,
+          contact.displayName?.trim()
+            ? contact.displayNameSource === "user"
+              ? "user"
+              : contact.rawMetadata?.source === "lid_display_name"
+                ? "display_cache"
+                : "whatsapp_saved"
+            : null,
           contact.pushName ?? null,
           stringifyJson(contact.rawMetadata ?? null),
           runId,
@@ -4984,7 +5103,22 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       }
     });
     transaction();
-    this.propagateContactNamesToDmChats([...unique.values()]);
+    // Propagate the STORED winners to DM chat titles, not the incoming batch
+    // values — an import name blocked by a user-set name must not leak into
+    // the chat list through propagation.
+    const storedNames = new Map<string, string | null>();
+    for (let index = 0; index < batchJids.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = batchJids.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      const rows = this.db
+        .prepare(`SELECT source_jid AS jid, display_name AS name FROM contacts WHERE source_jid IN (${batch.map(() => "?").join(",")})`)
+        .all(...batch) as Array<{ jid: string; name: string | null }>;
+      for (const row of rows) {
+        storedNames.set(row.jid, row.name);
+      }
+    }
+    this.propagateContactNamesToDmChats(
+      [...unique.values()].map((contact) => ({ ...contact, displayName: storedNames.get(contact.sourceJid) ?? contact.displayName ?? null }))
+    );
 
     // Identity late-resolution: any identity that just gained a genuine name is
     // routed through the one repair entry point (search text + brain prose), so
@@ -8122,6 +8256,7 @@ function configureDatabase(db: Database.Database): void {
 function ensureSchema(db: Database.Database): void {
   migrateLiveSessionStatuses(db);
   migrateLiveMessageUpdateTypes(db);
+  migratePersonLinkEventActions(db);
   rebuildBrainDerivedTablesIfStale(db);
   db.exec(schemaStatements.join(";\n"));
   migrateAdditiveColumns(db);
@@ -8209,6 +8344,36 @@ function migrateLiveMessageUpdateTypes(db: Database.Database): void {
     );
     db.exec(`DROP TABLE live_message_updates`);
     db.exec(`ALTER TABLE live_message_updates_migrated RENAME TO live_message_updates`);
+  })();
+}
+
+// SQLite cannot alter CHECK constraints in place; rebuild person_link_events
+// when an older archive lacks the newest audit action ('release'; 'unreject'
+// arrived the same way). The table is a small append-only audit trail —
+// copy-rename preserves it whole.
+function migratePersonLinkEventActions(db: Database.Database): void {
+  const existing = db
+    .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'person_link_events'`)
+    .get() as { sql: string } | undefined;
+  if (!existing?.sql || existing.sql.includes("'release'")) {
+    return;
+  }
+  db.transaction(() => {
+    db.exec(`CREATE TABLE person_link_events_migrated (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      action TEXT NOT NULL CHECK (action IN ('connect','disconnect','union','dissolve','suggest','accept','reject','unreject','release')),
+      person_id TEXT NULL,
+      identity_jid TEXT NULL,
+      source TEXT NULL,
+      evidence_json TEXT NULL,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    )`);
+    db.exec(
+      `INSERT INTO person_link_events_migrated (id, action, person_id, identity_jid, source, evidence_json, created_at)
+       SELECT id, action, person_id, identity_jid, source, evidence_json, created_at FROM person_link_events`
+    );
+    db.exec(`DROP TABLE person_link_events`);
+    db.exec(`ALTER TABLE person_link_events_migrated RENAME TO person_link_events`);
   })();
 }
 

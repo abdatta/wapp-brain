@@ -116,6 +116,58 @@ for (const kind of ["memory", "sqlite"] as const) {
       });
     });
 
+    it("undo restores a dismissed pair for the human, while detectors alone never do", async () => {
+      await withRepository(kind, async (repository) => {
+        const runId = await repository.startImportRun({ source: "suggest-test" });
+        await repository.upsertContacts(runId, [
+          { sourceJid: OLD, phoneNumber: OLD.split("@")[0], displayName: "Rohit" },
+          { sourceJid: NEW, phoneNumber: NEW.split("@")[0], displayName: "Rohit" }
+        ]);
+        await repository.upsertChats(runId, [{ sourceChatId: OLD, jid: OLD, chatType: "dm" }]);
+        await repository.upsertMessages([makeMessage(OLD, OLD, "un-1", T0)]);
+        await runPersonSuggestionDetectors(repository, { detectors: ["same_name"] });
+        const [pending] = await repository.listPersonSuggestions({ status: "pending" });
+        await repository.rejectPersonSuggestion(pending.id);
+
+        // Detectors re-running never resurrect the rejection...
+        await runPersonSuggestionDetectors(repository, { detectors: ["same_name"] });
+        expect(await repository.listPersonSuggestions({ status: "pending" })).toHaveLength(0);
+
+        // ...but the human undo does, restoring every rejected row of the pair
+        // and auditing the action.
+        const restored = await repository.unrejectPersonSuggestions(pending.jidLow, pending.jidHigh);
+        expect(restored).toBe(1);
+        expect(await repository.listPersonSuggestions({ status: "pending" })).toHaveLength(1);
+        const actions = (await repository.listPersonLinkEvents({ limit: 50 })).map((event) => event.action);
+        expect(actions).toContain("unreject");
+        // After undo, normal pending behavior applies: the next pass keeps it.
+        await runPersonSuggestionDetectors(repository, { detectors: ["same_name"] });
+        expect(await repository.listPersonSuggestions({ status: "pending" })).toHaveLength(1);
+        // Undoing a pair with nothing rejected restores zero.
+        expect(await repository.unrejectPersonSuggestions(OLD, NEW)).toBe(0);
+      });
+    });
+
+    it("an undone zero-value pair is honestly re-pruned by the next pass", async () => {
+      await withRepository(kind, async (repository) => {
+        const runId = await repository.startImportRun({ source: "suggest-test" });
+        await repository.upsertContacts(runId, [
+          { sourceJid: OLD, phoneNumber: OLD.split("@")[0], displayName: "Amit" },
+          { sourceJid: NEW, phoneNumber: NEW.split("@")[0], displayName: "Amit" }
+        ]);
+        await repository.upsertPersonSuggestions([{ jidA: OLD, jidB: NEW, kind: "same_name", score: 0.85, evidence: { name: "Amit" } }]);
+        const [pending] = await repository.listPersonSuggestions({ status: "pending" });
+        await repository.rejectPersonSuggestion(pending.id);
+        expect(await repository.unrejectPersonSuggestions(OLD, NEW)).toBe(1);
+        // The pair is pending again but has no unifiable history: hygiene
+        // supersedes it (NOT rejected — it self-resurfaces once a side speaks).
+        const sweep = await runPersonSuggestionDetectors(repository, { detectors: ["same_name"] });
+        expect(sweep.prunedZeroValue).toBe(1);
+        expect(await repository.listPersonSuggestions({ status: "pending" })).toHaveLength(0);
+        expect((await repository.listPersonSuggestions({ status: "superseded" })).length).toBeGreaterThan(0);
+      });
+    });
+
     it("prunes stale pending suggestions whose pair is already co-membered (transitively) or suppressed", async () => {
       await withRepository(kind, async (repository) => {
         const runId = await repository.startImportRun({ source: "suggest-test" });

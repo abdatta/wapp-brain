@@ -576,6 +576,10 @@ export interface ImportWarning {
 export interface ContactRecord {
   sourceJid: string;
   displayName?: string | null;
+  // Only the in-app rename path sets 'user'; imports and enrichment never do.
+  // A 'user'-sourced stored name outranks every other name source and is
+  // replaceable only by another user write.
+  displayNameSource?: "user" | null;
   phoneNumber?: string | null;
   pushName?: string | null;
   rawMetadata?: Record<string, unknown> | null;
@@ -712,6 +716,31 @@ export interface PersonSuggestionRecord {
   chatLabels: Record<string, string>;
 }
 
+// A sender's recent already-stored media, for the compare dialog's strips —
+// ids and labels only, never bytes.
+export interface IdentityRecentMedia {
+  messageId: number;
+  assetId: number;
+  mimeType: string | null;
+  hasThumbnail: boolean;
+  timestampMs: number | null;
+  chatLabel: string | null;
+}
+
+// Shared-group membership timeline entry for a compared pair.
+export interface CompareTimelineEntry {
+  groupSourceId: string;
+  label: string | null;
+  low: { joinedAtMs: number | null; leftAtMs: number | null } | null;
+  high: { joinedAtMs: number | null; leftAtMs: number | null } | null;
+}
+
+export interface PersonCompareContext {
+  lowMedia: IdentityRecentMedia[];
+  highMedia: IdentityRecentMedia[];
+  sharedGroups: CompareTimelineEntry[];
+}
+
 // A sender's recent activity across every chat (groups included) — the
 // compare dialog's answer for identities with no direct chat.
 export interface IdentityRecentMessage {
@@ -739,11 +768,17 @@ export interface PersonLinkSuppressionRecord {
   jidHigh: string;
   reason: "suggestion_rejected" | "disconnected";
   createdAt: string;
+  // Read-time display context (resolved labels + complete numbers) so the
+  // blocked-pairs review is human-readable.
+  lowLabel?: string | null;
+  highLabel?: string | null;
+  lowPhone?: string | null;
+  highPhone?: string | null;
 }
 
 export interface PersonLinkEventRecord {
   id: number;
-  action: "connect" | "disconnect" | "union" | "dissolve" | "suggest" | "accept" | "reject";
+  action: "connect" | "disconnect" | "union" | "dissolve" | "suggest" | "accept" | "reject" | "unreject" | "release";
   personId: string | null;
   identityJid: string | null;
   source: string | null;

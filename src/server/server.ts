@@ -28,6 +28,7 @@ import { LiveMaintainer } from "./live/maintainer";
 import { queryMemory, resolveMemoryCitation, runMemoryConsolidation, validateMemoryStore } from "./memory/consolidation";
 import { disableRemoteMemoryProvider, enableCodexProvider, getMemoryProviderStatus } from "./memory/provider";
 import { isLocalDatabaseError, publicErrorMessage } from "./privacy";
+import { isMaskedNumberLabel } from "./import/jid";
 import { GoogleContactsService } from "./googleContacts";
 import { getSearchReindexProgress, startSearchReindex } from "./search/reindexJob";
 import { withGuidedSetup } from "./onboarding";
@@ -125,6 +126,140 @@ app.get("/api/persons/suppressions", async (_req, res) => {
   catch (error) { res.status(400).json({ error: publicErrorMessage(error) }); }
 });
 
+// Append-only person-layer audit trail (sources and evidence, never bodies).
+// Registered before /api/persons/:id so the literal path wins.
+app.get("/api/persons/events", async (req, res) => {
+  try {
+    const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 100));
+    res.json({ events: await repository.listPersonLinkEvents({ limit }) });
+  } catch (error) { res.status(400).json({ error: publicErrorMessage(error) }); }
+});
+
+// Explorer context for a compared pair in one request: per-side media strips
+// (ids + labels, thumbnails served by the existing media route) and the
+// shared-group membership timeline.
+app.get("/api/persons/compare-context", async (req, res) => {
+  try {
+    const jidA = typeof req.query.jidA === "string" ? req.query.jidA.trim() : "";
+    const jidB = typeof req.query.jidB === "string" ? req.query.jidB.trim() : "";
+    if (!jidA || !jidB) {
+      res.status(400).json({ error: "Both identities are required." });
+      return;
+    }
+    const [lowMedia, highMedia, periodsA, periodsB] = await Promise.all([
+      repository.listRecentMediaBySender(jidA, 8),
+      repository.listRecentMediaBySender(jidB, 8),
+      repository.listGroupMembershipPeriods({ participantJid: jidA, limit: 200 }),
+      repository.listGroupMembershipPeriods({ participantJid: jidB, limit: 200 })
+    ]);
+    // Collapse a side's periods per group: earliest join; an open period
+    // (left == null) means "still in" and outranks any past leave.
+    const reduceSide = (periods: typeof periodsA) => {
+      const raw = new Map<string, { joins: number[]; lefts: number[]; hasOpen: boolean }>();
+      for (const period of periods) {
+        const entry = raw.get(period.groupSourceId) ?? { joins: [], lefts: [], hasOpen: false };
+        if (period.joinedAtMs != null) entry.joins.push(period.joinedAtMs);
+        if (period.leftAtMs == null) entry.hasOpen = true;
+        else entry.lefts.push(period.leftAtMs);
+        raw.set(period.groupSourceId, entry);
+      }
+      const byGroup = new Map<string, { joinedAtMs: number | null; leftAtMs: number | null }>();
+      for (const [groupId, entry] of raw) {
+        byGroup.set(groupId, {
+          joinedAtMs: entry.joins.length ? Math.min(...entry.joins) : null,
+          leftAtMs: entry.hasOpen ? null : entry.lefts.length ? Math.max(...entry.lefts) : null
+        });
+      }
+      return byGroup;
+    };
+    const sideA = reduceSide(periodsA);
+    const sideB = reduceSide(periodsB);
+    const sharedIds = [...sideA.keys()].filter((groupId) => sideB.has(groupId));
+    const labels = await repository.getChatLabels(sharedIds);
+    const sharedGroups = sharedIds.map((groupSourceId) => ({
+      groupSourceId,
+      label: labels.get(groupSourceId) ?? null,
+      low: sideA.get(groupSourceId) ?? null,
+      high: sideB.get(groupSourceId) ?? null
+    }));
+    res.json({ lowMedia, highMedia, sharedGroups });
+  } catch (error) { res.status(400).json({ error: publicErrorMessage(error) }); }
+});
+
+// Local avatar cache, live-fetched on demand: cache-first, TTL + negative
+// cache, immediate miss when no live session can supply a URL. Bytes stay
+// under .wapp-brain/ and are served privately.
+app.get("/api/persons/avatar", async (req, res) => {
+  try {
+    const jid = typeof req.query.jid === "string" ? req.query.jid.trim() : "";
+    if (!jid) {
+      res.status(400).json({ error: "An identity is required." });
+      return;
+    }
+    const canonical = await repository.resolveIdentityJid(jid);
+    const { getCachedAvatar } = await import("./persons/avatarCache");
+    const client = activeClient;
+    const avatar = await getCachedAvatar(canonical, client ? (target) => client.fetchProfilePictureUrl(target) : undefined);
+    if (!avatar) {
+      res.status(404).json({ error: "No profile photo is available." });
+      return;
+    }
+    res.setHeader("Cache-Control", "private, max-age=3600");
+    res.setHeader("Content-Type", avatar.mime);
+    fs.createReadStream(avatar.filePath).pipe(res);
+  } catch (error) { res.status(400).json({ error: publicErrorMessage(error) }); }
+});
+
+// Unresolved-name debt, ranked by the brain content a name would repair —
+// the hygiene queue's second item kind.
+app.get("/api/persons/debt", async (_req, res) => {
+  try {
+    const debt = await repository.getBrainResolutionDebt({ limit: 100 });
+    res.json({ episodesWithUnresolved: debt.episodesWithUnresolved, distinctIdentities: debt.distinctIdentities, items: debt.topIdentities });
+  } catch (error) { res.status(400).json({ error: publicErrorMessage(error) }); }
+});
+
+// In-app rename: the proven set-contact-name path promoted to a route, with
+// 'user' provenance (strongest source). Routes through the identity-repair
+// entry point — episodes and search update deterministically, no model call.
+app.post("/api/persons/rename", async (req, res) => {
+  try {
+    const { jid, name } = (req.body ?? {}) as { jid?: string; name?: string };
+    const trimmedName = name?.trim() ?? "";
+    const trimmedJid = jid?.trim() ?? "";
+    if (!trimmedJid || !trimmedName) {
+      res.status(400).json({ ok: false, error: "An identity and a name are both required." });
+      return;
+    }
+    if (isMaskedNumberLabel(trimmedName)) {
+      res.status(400).json({ ok: false, error: "That looks like a masked number placeholder, not a name." });
+      return;
+    }
+    const canonical = await repository.resolveIdentityJid(trimmedJid);
+    const localDigits = canonical.split("@")[0]?.split(":")[0] ?? canonical;
+    if (trimmedName === canonical || trimmedName === localDigits || trimmedName.replace(/\D/g, "") === localDigits) {
+      res.status(400).json({ ok: false, error: "That name just restates the number — enter a real name." });
+      return;
+    }
+    const before = await repository.getBrainResolutionDebt({ limit: 10_000 });
+    const willRepair = before.topIdentities.find((identity) => identity.jid === canonical)?.episodeCount ?? 0;
+    const phone = canonical.endsWith("@s.whatsapp.net") ? localDigits.replace(/\D/g, "") || null : null;
+    await repository.upsertContacts("user-rename", [
+      { sourceJid: canonical, displayName: trimmedName, displayNameSource: "user", phoneNumber: phone }
+    ]);
+    const after = await repository.getBrainResolutionDebt({ limit: 1 });
+    broadcastArchiveChanged({ source: "manual", chatSourceIds: [canonical], messageCount: 0, contactCount: 1 });
+    res.json({
+      ok: true,
+      jid: canonical,
+      name: trimmedName,
+      repairedEpisodes: willRepair,
+      debtBefore: before.episodesWithUnresolved,
+      debtAfter: after.episodesWithUnresolved
+    });
+  } catch (error) { res.status(400).json({ ok: false, error: publicErrorMessage(error) }); }
+});
+
 // Recent visible activity of one identity across every chat (groups
 // included) — the compare dialog's view for identities without a direct chat.
 app.get("/api/persons/identity-messages", async (req, res) => {
@@ -200,6 +335,41 @@ app.post("/api/persons/suggestions/:id/reject", async (req, res) => {
       return;
     }
     res.json({ ok: true });
+  } catch (error) { res.status(400).json({ ok: false, error: publicErrorMessage(error) }); }
+});
+
+// Release a blocked pair: lifts the suppression so the next sync/detector
+// pass may re-evaluate it. Never connects by itself.
+app.post("/api/persons/suppressions/release", async (req, res) => {
+  try {
+    const { jidLow, jidHigh } = (req.body ?? {}) as { jidLow?: string; jidHigh?: string };
+    if (!jidLow?.trim() || !jidHigh?.trim()) {
+      res.status(400).json({ ok: false, error: "Both identities of the blocked pair are required." });
+      return;
+    }
+    const released = await repository.releasePersonLinkSuppression(jidLow.trim(), jidHigh.trim());
+    if (!released) {
+      res.status(404).json({ ok: false, error: "No block exists for that pair." });
+      return;
+    }
+    res.json({ ok: true });
+  } catch (error) { res.status(400).json({ ok: false, error: publicErrorMessage(error) }); }
+});
+
+// Human-only dismissal undo: restores every rejected signal for the pair.
+app.post("/api/persons/suggestions/undo", async (req, res) => {
+  try {
+    const { jidLow, jidHigh } = (req.body ?? {}) as { jidLow?: string; jidHigh?: string };
+    if (!jidLow?.trim() || !jidHigh?.trim()) {
+      res.status(400).json({ ok: false, error: "Both identities of the dismissed pair are required." });
+      return;
+    }
+    const restored = await repository.unrejectPersonSuggestions(jidLow.trim(), jidHigh.trim());
+    if (restored === 0) {
+      res.status(404).json({ ok: false, error: "No dismissed suggestions exist for that pair." });
+      return;
+    }
+    res.json({ ok: true, restored });
   } catch (error) { res.status(400).json({ ok: false, error: publicErrorMessage(error) }); }
 });
 

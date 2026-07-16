@@ -31,6 +31,7 @@ import type {
   ChatSyncStateRecord,
   ContactRecord,
   EngagementAggregateRecord,
+  IdentityRecentMedia,
   IdentityRecentMessage,
   IdentityRepairResult,
   GroupMembershipEventRecord,
@@ -939,14 +940,25 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     const namedBefore = this.genuinelyNamedJids(batchJids);
     for (const contact of unique.values()) {
       const existing = this.contacts.get(contact.sourceJid);
+      // A user-set name is the strongest source: only another user write may
+      // replace it (mirror of the SQLite conflict-clause guard).
+      const userNameHolds = existing?.displayNameSource === "user" && contact.displayNameSource !== "user";
+      const winningName = userNameHolds ? existing?.displayName ?? null : contact.displayName || existing?.displayName || null;
+      const winningSource = userNameHolds
+        ? existing?.displayNameSource ?? null
+        : contact.displayName?.trim()
+          ? contact.displayNameSource ?? existing?.displayNameSource ?? null
+          : existing?.displayNameSource ?? null;
       this.contacts.set(contact.sourceJid, {
         ...existing,
         ...contact,
-        displayName: contact.displayName || existing?.displayName || null,
+        displayName: winningName,
+        displayNameSource: winningSource,
         id: existing?.id ?? this.nextContactId++
       });
       const chat = this.chats.get(contact.sourceJid);
-      const displayName = contact.displayName?.trim();
+      // Propagate the STORED winner to the chat title, never a blocked name.
+      const displayName = winningName?.trim();
       const pushName = contact.pushName?.trim();
       if (chat && displayName && (chat.chatType === "dm" || chat.chatType === "unknown")) {
         chat.displayName = displayName;
@@ -1406,6 +1418,45 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       });
   }
 
+  // Display labels for chat source ids (mirror of SQLite).
+  async getChatLabels(sourceChatIds: string[]): Promise<Map<string, string | null>> {
+    const labels = new Map<string, string | null>();
+    for (const id of new Set(sourceChatIds.filter(Boolean))) {
+      const chat = this.chats.get(id);
+      const label = chat?.displayName?.trim();
+      labels.set(id, label && label !== id ? label : chat ? displayPhoneFromJid(id) : null);
+    }
+    return labels;
+  }
+
+  // A sender's recent already-stored media (mirror of SQLite): ids and labels
+  // only, never bytes.
+  async listRecentMediaBySender(jid: string, limit = 8): Promise<IdentityRecentMedia[]> {
+    const canonical = this.canonicalJid(jid) ?? jid;
+    const byKey = new Map<string, MessageRecord & { id: number }>();
+    for (const message of this.messages.values()) {
+      if (message.senderSourceJid === canonical) {
+        byKey.set(message.sourceMessageKey, message);
+      }
+    }
+    const rows: IdentityRecentMedia[] = [];
+    for (const asset of this.mediaAssets.values()) {
+      const message = byKey.get(asset.messageKey);
+      if (!message) continue;
+      const chat = this.chats.get(message.chatSourceId);
+      const label = chat?.displayName?.trim();
+      rows.push({
+        messageId: message.id,
+        assetId: asset.id,
+        mimeType: asset.mimeType ?? null,
+        hasThumbnail: Boolean(asset.thumbnail?.length),
+        timestampMs: message.timestampMs ?? null,
+        chatLabel: label && label !== message.chatSourceId ? label : displayPhoneFromJid(message.chatSourceId)
+      });
+    }
+    return rows.sort((a, b) => (b.timestampMs ?? 0) - (a.timestampMs ?? 0) || b.messageId - a.messageId).slice(0, Math.max(1, limit));
+  }
+
   // A sender's recent visible messages across every chat (mirror of SQLite).
   async listRecentMessagesBySender(jid: string, limit = 20): Promise<IdentityRecentMessage[]> {
     const canonical = this.canonicalJid(jid) ?? jid;
@@ -1440,6 +1491,26 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       }
     }
     return changed;
+  }
+
+  // Human-only dismissal undo (mirror of SQLite): rejected rows for the pair
+  // return to pending and the undo is audited.
+  async unrejectPersonSuggestions(jidLowInput: string, jidHighInput: string): Promise<number> {
+    const a = this.canonicalJid(jidLowInput) ?? jidLowInput;
+    const b = this.canonicalJid(jidHighInput) ?? jidHighInput;
+    const [low, high] = this.personPair(a, b);
+    let restored = 0;
+    for (const suggestion of this.personSuggestions.values()) {
+      if (suggestion.jidLow === low && suggestion.jidHigh === high && suggestion.status === "rejected") {
+        suggestion.status = "pending";
+        suggestion.updatedAt = new Date().toISOString();
+        restored += 1;
+      }
+    }
+    if (restored > 0) {
+      this.recordPersonEvent("unreject", { evidence: { jidLow: low, jidHigh: high, restored } });
+    }
+    return restored;
   }
 
   // Prune specific pending rows (e.g. pairs whose merge value dropped to
@@ -1480,10 +1551,30 @@ export class MemoryArchiveRepository implements ArchiveRepository {
   }
 
   async listPersonLinkSuppressions(limit = 200): Promise<PersonLinkSuppressionRecord[]> {
+    const phoneFor = (jid: string): string | null => (this.contacts.get(jid)?.phoneNumber ?? phoneFromJid(jid)) || null;
     return [...this.personSuppressions.values()]
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
       .slice(0, Math.max(1, limit))
-      .map((row) => ({ ...row }));
+      .map((row) => ({
+        ...row,
+        lowLabel: this.resolveCurrentLabelForJid(row.jidLow) ?? row.jidLow,
+        highLabel: this.resolveCurrentLabelForJid(row.jidHigh) ?? row.jidHigh,
+        lowPhone: phoneFor(row.jidLow),
+        highPhone: phoneFor(row.jidHigh)
+      }));
+  }
+
+  // Release a block (mirror of SQLite): delete the suppression so passes may
+  // re-evaluate the pair; nothing connects here.
+  async releasePersonLinkSuppression(jidA: string, jidB: string): Promise<boolean> {
+    const a = this.canonicalJid(jidA) ?? jidA;
+    const b = this.canonicalJid(jidB) ?? jidB;
+    const released = this.personSuppressions.delete(this.personPairKey(a, b));
+    if (released) {
+      const [low, high] = this.personPair(a, b);
+      this.recordPersonEvent("release", { evidence: { jidLow: low, jidHigh: high } });
+    }
+    return released;
   }
 
   async listPersonLinkEvents(options: { limit?: number } = {}): Promise<PersonLinkEventRecord[]> {

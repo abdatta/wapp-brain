@@ -118,6 +118,21 @@ for (const kind of ["memory", "sqlite"] as const) {
         expect(after.googleConnected + after.numberChangeConnected).toBe(0);
         expect(after.skippedSuppressed).toBeGreaterThan(0);
         expect(await repository.resolvePersonForJid(A)).toBeNull();
+
+        // The block is reviewable with display context, and releasing it lets
+        // the very next pass reconnect — release itself connects nothing.
+        const [blocked] = await repository.listPersonLinkSuppressions();
+        expect(blocked.reason).toBe("disconnected");
+        expect(blocked.lowPhone).toBeTruthy();
+        expect(await repository.releasePersonLinkSuppression(blocked.jidLow, blocked.jidHigh)).toBe(true);
+        expect(await repository.resolvePersonForJid(A)).toBeNull();
+        const revived = await runPersonAutoConnectPass(repository);
+        expect(revived.googleConnected + revived.numberChangeConnected).toBeGreaterThan(0);
+        expect((await repository.resolvePersonForJid(A))?.members).toHaveLength(2);
+        const actions = (await repository.listPersonLinkEvents({ limit: 50 })).map((event) => event.action);
+        expect(actions).toContain("release");
+        // Releasing a non-existent block reports false.
+        expect(await repository.releasePersonLinkSuppression(A, C)).toBe(false);
       });
     });
 

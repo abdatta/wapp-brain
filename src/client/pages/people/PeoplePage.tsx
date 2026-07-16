@@ -1,9 +1,14 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { Loader2, RefreshCcw } from "lucide-react";
 import type {
+  ArchiveChangeEvent,
+  BrainResolutionDebtIdentity,
   IdentityRecentMessage,
   MessageListItem,
+  PersonCompareContext,
+  PersonLinkEventRecord,
+  PersonLinkSuppressionRecord,
   PersonRecord,
   PersonScanStatus,
   PersonSuggestionKind,
@@ -11,14 +16,25 @@ import type {
 } from "../../../shared/types";
 import {
   acceptPersonSuggestion,
+  connectPersonIdentities,
   disconnectPersonIdentity,
+  getPersonCompareContext,
   listIdentityRecentMessages,
   listMessages,
+  listPersonDebt,
+  listPersonEvents,
   listPersons,
   listPersonSuggestions,
+  listPersonSuppressions,
+  mediaThumbnailUrl,
+  personAvatarUrl,
   rejectPersonSuggestion,
-  runPersonScan
+  releasePersonSuppression,
+  renamePersonIdentity,
+  runPersonScan,
+  undoPersonDismissal
 } from "../../api";
+import { useArchiveEvents } from "../../state/StatusContext";
 import { useToast } from "../../state/ToastContext";
 
 // Person-management surface for the two-level person model. Suggestions are
@@ -149,14 +165,15 @@ function groupByPair(suggestions: PersonSuggestionRecord[]): SuggestionGroup[] {
   return [...groups.values()];
 }
 
-function mergeValue(group: SuggestionGroup): number {
+export function mergeValue(group: Pick<SuggestionGroup, "lowMessageCount" | "highMessageCount">): number {
   return Math.min(group.lowMessageCount, group.highMessageCount);
 }
 
-function recommendedScore(group: SuggestionGroup): number {
+export function recommendedScore(group: Pick<SuggestionGroup, "combinedScore" | "lowMessageCount" | "highMessageCount">): number {
   const valueNorm = Math.min(1, Math.log10(1 + mergeValue(group)) / 3.5);
   return 0.65 * group.combinedScore + 0.35 * valueNorm;
 }
+
 
 function relativeTime(ms: number | null | undefined): string | null {
   if (!ms) return null;
@@ -176,6 +193,58 @@ function formatDay(ms: unknown): string | null {
 
 function phoneChip(phone: string | null): string | null {
   return phone ? `+${phone.replace(/^\+/, "")}` : null;
+}
+
+// Audit-line identity formatting: complete number for phone-form JIDs, an
+// honest generic for anything else — never a raw internal identifier.
+function auditIdentity(jid: string | null): string | null {
+  if (!jid) return null;
+  if (jid.endsWith("@s.whatsapp.net")) return `+${jid.split("@")[0]}`;
+  if (jid.endsWith("@lid") || jid.endsWith("@hosted.lid")) return "an unresolved identity";
+  return jid;
+}
+
+const EVENT_VERBS: Record<PersonLinkEventRecord["action"], string> = {
+  connect: "Connected",
+  disconnect: "Disconnected",
+  union: "Merged two persons",
+  dissolve: "Dissolved a person",
+  suggest: "Suggested",
+  accept: "Accepted a suggestion",
+  reject: "Dismissed a suggestion",
+  unreject: "Undid a dismissal",
+  release: "Released a block"
+};
+
+const SUPPRESSION_REASONS: Record<PersonLinkSuppressionRecord["reason"], string> = {
+  disconnected: "you disconnected them",
+  suggestion_rejected: "you dismissed a suggestion"
+};
+
+// Accept a full JID or a human-typed number ("+91 90081 11144") and produce
+// the canonical phone-form JID.
+function jidFromInput(value: string): string | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (trimmed.includes("@")) return trimmed;
+  const digits = trimmed.replace(/\D/g, "");
+  return digits.length >= 8 ? `${digits}@s.whatsapp.net` : null;
+}
+
+function auditLine(event: PersonLinkEventRecord): string {
+  const identity = auditIdentity(event.identityJid);
+  const evidence = event.evidence ?? {};
+  const pair =
+    typeof evidence.jidLow === "string" && typeof evidence.jidHigh === "string"
+      ? `${auditIdentity(evidence.jidLow as string)} ↔ ${auditIdentity(evidence.jidHigh as string)}`
+      : null;
+  const parts = [EVENT_VERBS[event.action] ?? event.action];
+  if (identity) parts.push(identity);
+  else if (pair) parts.push(pair);
+  if (event.source) parts.push(`via ${SOURCE_LABELS[event.source]?.toLowerCase() ?? event.source}`);
+  const when = relativeTime(Date.parse(event.createdAt));
+  if (when) parts.push(`· ${when}`);
+  return parts.join(" ");
 }
 
 // Human-readable one-liners per signal; the raw payloads stay collapsed.
@@ -237,6 +306,64 @@ function IdentitySide({ label, phone }: { label: string | null; phone: string | 
       <strong>{label ?? "Unresolved"}</strong>
       {phone && label !== phoneChip(phone) && <span className="muted personPhone">{phoneChip(phone)}</span>}
     </span>
+  );
+}
+
+// Progressive-enhancement avatar: the cached/live-fetched photo when the
+// server has one, an initial-letter placeholder otherwise — never a gate.
+function Avatar({ jid, label }: { jid: string; label: string | null }) {
+  const [failed, setFailed] = useState(false);
+  const initial = (label ?? "").replace(/[^\p{L}]/gu, "").charAt(0).toUpperCase() || "#";
+  if (failed) {
+    return <span className="personAvatar personAvatarFallback">{initial}</span>;
+  }
+  // Deliberately not loading="lazy": a couple of tiny modal images gain
+  // nothing from it, and lazy images never load in zero-viewport embeds.
+  return <img className="personAvatar" src={personAvatarUrl(jid)} alt="" onError={() => setFailed(true)} />;
+}
+
+// A debt item: an identity the brain still refers to by bare number, fixable
+// in place — naming it repairs episodes and search deterministically.
+function DebtCard({ item, busy, onRename }: { item: BrainResolutionDebtIdentity; busy: boolean; onRename: (jid: string, name: string, label: string) => void }) {
+  const [name, setName] = useState("");
+  return (
+    <li className="personSuggestion personDebt">
+      <div className="personPair">
+        <span className="personIdentity">
+          <strong>{item.label}</strong>
+        </span>
+        <span
+          className="badge tipChip"
+          tabIndex={0}
+          data-tip="The brain's episodes still refer to this person by their bare number. Naming them repairs that prose and the search index deterministically — no model calls."
+        >
+          Needs a name
+        </span>
+      </div>
+      <ul className="personEvidenceLines">
+        <li className="muted">
+          Referred to by number in {item.episodeCount.toLocaleString()} episode(s) · {item.messageCount.toLocaleString()} messages behind them.
+        </li>
+      </ul>
+      <form
+        className="personRenameForm"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (name.trim()) onRename(item.jid, name.trim(), item.label);
+        }}
+      >
+        <input
+          type="text"
+          value={name}
+          placeholder="Who is this?"
+          onChange={(event) => setName(event.target.value)}
+          disabled={busy}
+        />
+        <button type="submit" disabled={busy || !name.trim()}>
+          Name contact
+        </button>
+      </form>
+    </li>
   );
 }
 
@@ -303,6 +430,7 @@ function CompareDialog({
     low: "loading",
     high: "loading"
   });
+  const [context, setContext] = useState<PersonCompareContext | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -332,6 +460,13 @@ function CompareDialog({
     void loadThread("high", group.highChatId);
     void loadActivity("low", group.jidLow);
     void loadActivity("high", group.jidHigh);
+    // Media strips + shared-group timeline arrive in one request; missing
+    // context degrades to text-only evidence, never a gate.
+    getPersonCompareContext(group.jidLow, group.jidHigh)
+      .then((response) => {
+        if (!cancelled) setContext(response);
+      })
+      .catch(() => undefined);
     return () => {
       cancelled = true;
     };
@@ -345,10 +480,16 @@ function CompareDialog({
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
-  const sides: Array<{ key: "low" | "high"; label: string | null; phone: string | null; chatId: number | null }> = [
-    { key: "low", label: group.lowLabel, phone: group.lowPhone, chatId: group.lowChatId },
-    { key: "high", label: group.highLabel, phone: group.highPhone, chatId: group.highChatId }
+  const sides: Array<{ key: "low" | "high"; jid: string; label: string | null; phone: string | null; chatId: number | null }> = [
+    { key: "low", jid: group.jidLow, label: group.lowLabel, phone: group.lowPhone, chatId: group.lowChatId },
+    { key: "high", jid: group.jidHigh, label: group.highLabel, phone: group.highPhone, chatId: group.highChatId }
   ];
+
+  const membershipWindow = (side: { joinedAtMs: number | null; leftAtMs: number | null } | null): string => {
+    if (!side) return "not a member";
+    const joined = side.joinedAtMs ? `joined ${formatDay(side.joinedAtMs)}` : "member";
+    return side.leftAtMs ? `${joined} · left ${formatDay(side.leftAtMs)}` : `${joined} · still in`;
+  };
 
   const renderActivity = (side: "low" | "high", hasDm: boolean) => {
     const rows = activity[side];
@@ -399,12 +540,25 @@ function CompareDialog({
             </li>
           ))}
         </ul>
+        {context && context.sharedGroups.length > 0 && (
+          <div className="personTimeline">
+            <span className="muted personCompareSection">Shared groups</span>
+            {context.sharedGroups.map((entry) => (
+              <p key={entry.groupSourceId} className="muted personTimelineRow">
+                <strong>{entry.label ?? "Unnamed group"}</strong>: {group.lowLabel ?? "A"} {membershipWindow(entry.low)} / {group.highLabel ?? "B"}{" "}
+                {membershipWindow(entry.high)}
+              </p>
+            ))}
+          </div>
+        )}
         <div className="personCompareColumns">
           {sides.map((side) => {
             const hasDm = side.chatId != null;
+            const media = (side.key === "low" ? context?.lowMedia : context?.highMedia)?.filter((item) => item.hasThumbnail) ?? [];
             return (
               <div key={side.key} className="personCompareColumn">
                 <div className="personCompareColumnHeader">
+                  <Avatar jid={side.jid} label={side.label} />
                   <strong>{side.label ?? "Unresolved"}</strong>
                   {side.phone && side.label !== phoneChip(side.phone) && <span className="muted">{phoneChip(side.phone)}</span>}
                   {hasDm && (
@@ -413,6 +567,18 @@ function CompareDialog({
                     </Link>
                   )}
                 </div>
+                {media.length > 0 && (
+                  <div className="personMediaStrip">
+                    {media.map((item) => (
+                      <img
+                        key={item.assetId}
+                        src={mediaThumbnailUrl(item.assetId)}
+                        alt=""
+                        title={`${item.chatLabel ?? ""}${item.timestampMs ? ` · ${new Date(item.timestampMs).toLocaleDateString()}` : ""}`}
+                      />
+                    ))}
+                  </div>
+                )}
                 <div className="personCompareThread">
                   {hasDm && (
                     <>
@@ -458,8 +624,13 @@ export function PeoplePage() {
   const [persons, setPersons] = useState<PersonRecord[]>([]);
   const [suggestions, setSuggestions] = useState<PersonSuggestionRecord[]>([]);
   const [dismissed, setDismissed] = useState<PersonSuggestionRecord[]>([]);
+  const [suppressions, setSuppressions] = useState<PersonLinkSuppressionRecord[]>([]);
+  const [debt, setDebt] = useState<BrainResolutionDebtIdentity[]>([]);
+  const [connectOpen, setConnectOpen] = useState(false);
+  const [connectA, setConnectA] = useState("");
+  const [connectB, setConnectB] = useState("");
   const [scan, setScan] = useState<PersonScanStatus | null>(null);
-  const [tab, setTab] = useState<"suggestions" | "connected" | "dismissed">("suggestions");
+  const [tab, setTab] = useState<"suggestions" | "debt" | "connected" | "dismissed">("suggestions");
   const [kindFilter, setKindFilter] = useState<PersonSuggestionKind | "all">("all");
   const [sortMode, setSortMode] = useState<SortMode>("recommended");
   const [sourceFilter, setSourceFilter] = useState<string>("all");
@@ -469,18 +640,25 @@ export function PeoplePage() {
   const [busy, setBusy] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [undoNote, setUndoNote] = useState<string | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [history, setHistory] = useState<PersonLinkEventRecord[] | null>(null);
 
   const refresh = useCallback(async () => {
     try {
-      const [personsResponse, pendingResponse, rejectedResponse] = await Promise.all([
+      const [personsResponse, pendingResponse, rejectedResponse, debtResponse, suppressionsResponse] = await Promise.all([
         listPersons(),
         listPersonSuggestions("pending"),
-        listPersonSuggestions("rejected")
+        listPersonSuggestions("rejected"),
+        listPersonDebt(),
+        listPersonSuppressions()
       ]);
       setPersons(personsResponse.persons);
       setScan(personsResponse.scan ?? null);
       setSuggestions(pendingResponse.suggestions);
       setDismissed(rejectedResponse.suggestions);
+      setDebt(debtResponse.items);
+      setSuppressions(suppressionsResponse.suppressions);
       setLoaded(true);
       setLoadError(null);
     } catch (err) {
@@ -493,6 +671,34 @@ export function PeoplePage() {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  // Background auto-connects, detector runs, and syncs surface without a
+  // reload: debounce-refresh on the archive-events stream.
+  const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const onArchiveEvent = useCallback(
+    (_change: ArchiveChangeEvent) => {
+      if (refreshTimer.current) clearTimeout(refreshTimer.current);
+      refreshTimer.current = setTimeout(() => {
+        void refresh();
+        if (historyOpen) {
+          listPersonEvents(100).then((response) => setHistory(response.events)).catch(() => undefined);
+        }
+      }, 1_500);
+    },
+    [refresh, historyOpen]
+  );
+  useArchiveEvents(onArchiveEvent);
+  useEffect(() => () => {
+    if (refreshTimer.current) clearTimeout(refreshTimer.current);
+  }, []);
+
+  useEffect(() => {
+    if (historyOpen && history === null) {
+      listPersonEvents(100)
+        .then((response) => setHistory(response.events))
+        .catch((err) => setError(err instanceof Error ? err.message : "Could not load the history."));
+    }
+  }, [historyOpen, history, setError]);
 
   const pairGroups = useMemo(() => groupByPair(suggestions), [suggestions]);
   const dismissedGroups = useMemo(() => groupByPair(dismissed), [dismissed]);
@@ -627,10 +833,138 @@ export function PeoplePage() {
     }
   }
 
+  // Release only lifts the block — the pair becomes eligible for auto-connect
+  // and suggestions again; nothing connects here.
+  async function handleRelease(suppression: PersonLinkSuppressionRecord) {
+    setBusy(true);
+    setError(null);
+    try {
+      await releasePersonSuppression(suppression.jidLow, suppression.jidHigh);
+      setNotice("Block released — the next sync or scan may reconnect or re-suggest this pair.");
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not release the block.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Manual connect: works for any two numbers, suggested or not; a user
+  // connect also clears any block on the pair.
+  async function handleManualConnect() {
+    const jidA = jidFromInput(connectA);
+    const jidB = jidFromInput(connectB);
+    if (!jidA || !jidB) {
+      setError("Enter two phone numbers (with country code) or identity ids.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await connectPersonIdentities(jidA, jidB);
+      if (result.result.outcome === "already_connected") {
+        setNotice("Those two are already the same person.");
+      } else if (result.result.outcome === "union") {
+        setNotice("Connected — two existing persons merged into one.");
+      } else {
+        setNotice(`Connected. ${result.person?.displayLabel ? `They now appear as ${result.person.displayLabel}.` : ""}`);
+      }
+      setConnectA("");
+      setConnectB("");
+      setConnectOpen(false);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not connect those identities.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleRename(jid: string, name: string, label: string) {
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await renamePersonIdentity(jid, name);
+      setNotice(
+        result.repairedEpisodes > 0
+          ? `Named ${label} as “${result.name}” — repaired ${result.repairedEpisodes.toLocaleString()} episode(s), no model calls.`
+          : `Named ${label} as “${result.name}”.`
+      );
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not save the name.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Undo is pair-level and honest about the race with hygiene pruning: after
+  // the restore, re-check whether the pair survived the refresh; a zero-value
+  // pair legitimately gets re-pruned by the next pass.
+  async function handleUndo(group: SuggestionGroup) {
+    setBusy(true);
+    setError(null);
+    setUndoNote(null);
+    try {
+      const result = await undoPersonDismissal(group.jidLow, group.jidHigh);
+      await refresh();
+      const nowPending = await listPersonSuggestions("pending");
+      const restoredVisible = nowPending.suggestions.some(
+        (suggestion) => suggestion.jidLow === group.jidLow && suggestion.jidHigh === group.jidHigh
+      );
+      if (restoredVisible) {
+        setNotice(`Restored ${result.restored} signal(s) — the pair is back in the queue.`);
+      } else {
+        setUndoNote(
+          `${group.lowLabel ?? group.jidLow} ↔ ${group.highLabel ?? group.jidHigh}: restored, then re-pruned by hygiene (no unifiable history yet — it returns when either number speaks).`
+        );
+        setNotice(`Restored ${result.restored} signal(s).`);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not undo the dismissal.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   function openCompareFromCard(event: React.MouseEvent, group: SuggestionGroup) {
-    if ((event.target as HTMLElement).closest("button, a, details, summary")) return;
+    if ((event.target as HTMLElement).closest("button, a, details, summary, input, form")) return;
     setCompare(group);
   }
+
+  const renderPairCard = (group: SuggestionGroup) => (
+    <li key={group.key} className="personSuggestion clickable" onClick={(event) => openCompareFromCard(event, group)} title="Click to compare both chats side by side">
+      <div className="personPair">
+        <IdentitySide label={group.lowLabel} phone={group.lowPhone} />
+        <span className="muted">↔</span>
+        <IdentitySide label={group.highLabel} phone={group.highPhone} />
+        <SignalChips group={group} />
+      </div>
+      <ValueLine group={group} />
+      <ul className="personEvidenceLines">
+        {groupEvidence(group).map((line, index) => (
+          <li key={index} className="muted">
+            {line}
+          </li>
+        ))}
+      </ul>
+      <details className="personRawEvidence">
+        <summary className="muted">Raw evidence</summary>
+        <pre>{JSON.stringify(Object.fromEntries(group.signals.map((signal) => [signal.kind, signal.evidence])), null, 1)}</pre>
+      </details>
+      <div className="personActions">
+        <button type="button" className="secondary" onClick={() => setCompare(group)}>
+          Compare chats
+        </button>
+        <button type="button" onClick={() => void handleAccept(group)} disabled={busy}>
+          Same person
+        </button>
+        <button type="button" className="secondary" onClick={() => void handleReject(group)} disabled={busy}>
+          Different people
+        </button>
+      </div>
+    </li>
+  );
 
   return (
     <div className="peoplePage">
@@ -677,15 +1011,35 @@ export function PeoplePage() {
 
       <div className="personTabs" role="tablist">
         <button type="button" role="tab" aria-selected={tab === "suggestions"} className={tab === "suggestions" ? "active" : ""} onClick={() => setTab("suggestions")}>
-          Suggestions ({pairGroups.length})
+          Suggested connections ({pairGroups.length})
+        </button>
+        <button type="button" role="tab" aria-selected={tab === "debt"} className={tab === "debt" ? "active" : ""} onClick={() => setTab("debt")}>
+          Needs names ({debt.length})
         </button>
         <button type="button" role="tab" aria-selected={tab === "connected"} className={tab === "connected" ? "active" : ""} onClick={() => setTab("connected")}>
           Connected people ({persons.length})
         </button>
         <button type="button" role="tab" aria-selected={tab === "dismissed"} className={tab === "dismissed" ? "active" : ""} onClick={() => setTab("dismissed")}>
-          Dismissed ({dismissedGroups.length})
+          Dismissed & blocked ({dismissedGroups.length + suppressions.length})
         </button>
       </div>
+
+      {tab === "debt" && (
+        <section className="panel">
+          <p className="muted">
+            People the brain's episodes still refer to by bare number, ranked by how much content a name would repair. Naming
+            them fixes episodes and search instantly — no model calls.
+          </p>
+          {debt.length === 0 && (
+            <p className="muted">{loaded ? "No naming needs — everyone in the brain's episodes has a name." : loadError ? "Not loaded." : "Loading…"}</p>
+          )}
+          <ul className="personSuggestionList">
+            {debt.map((item) => (
+              <DebtCard key={item.jid} item={item} busy={busy} onRename={(jid, name, label) => void handleRename(jid, name, label)} />
+            ))}
+          </ul>
+        </section>
+      )}
 
       {tab === "suggestions" && (
         <section className="panel">
@@ -711,49 +1065,40 @@ export function PeoplePage() {
               </select>
             </label>
           </div>
+          <p className="muted">
+            Pairs of numbers the detectors believe may be the same person — you decide. Confirming connects them; dismissing is
+            remembered.
+          </p>
           {visibleGroups.length === 0 && (
-            <p className="muted">{loaded ? "No pending suggestions." : loadError ? "Not loaded." : "Loading…"}</p>
+            <p className="muted">{loaded ? "No suggested connections right now." : loadError ? "Not loaded." : "Loading…"}</p>
           )}
-          <ul className="personSuggestionList">
-            {visibleGroups.map((group) => (
-              <li key={group.key} className="personSuggestion clickable" onClick={(event) => openCompareFromCard(event, group)} title="Click to compare both chats side by side">
-                <div className="personPair">
-                  <IdentitySide label={group.lowLabel} phone={group.lowPhone} />
-                  <span className="muted">↔</span>
-                  <IdentitySide label={group.highLabel} phone={group.highPhone} />
-                  <SignalChips group={group} />
-                </div>
-                <ValueLine group={group} />
-                <ul className="personEvidenceLines">
-                  {groupEvidence(group).map((line, index) => (
-                    <li key={index} className="muted">
-                      {line}
-                    </li>
-                  ))}
-                </ul>
-                <details className="personRawEvidence">
-                  <summary className="muted">Raw evidence</summary>
-                  <pre>{JSON.stringify(Object.fromEntries(group.signals.map((signal) => [signal.kind, signal.evidence])), null, 1)}</pre>
-                </details>
-                <div className="personActions">
-                  <button type="button" className="secondary" onClick={() => setCompare(group)}>
-                    Compare chats
-                  </button>
-                  <button type="button" onClick={() => void handleAccept(group)} disabled={busy}>
-                    Same person
-                  </button>
-                  <button type="button" className="secondary" onClick={() => void handleReject(group)} disabled={busy}>
-                    Different people
-                  </button>
-                </div>
-              </li>
-            ))}
-          </ul>
+          <ul className="personSuggestionList">{visibleGroups.map(renderPairCard)}</ul>
         </section>
       )}
 
       {tab === "connected" && (
         <section className="panel">
+          <div className="personConnectManual">
+            <button type="button" className="personLinkButton" onClick={() => setConnectOpen((current) => !current)}>
+              {connectOpen ? "Cancel" : "Connect two numbers manually"}
+            </button>
+            {connectOpen && (
+              <form
+                className="personRenameForm"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void handleManualConnect();
+                }}
+              >
+                <input type="text" value={connectA} placeholder="+91 98765 43210" onChange={(event) => setConnectA(event.target.value)} disabled={busy} />
+                <span className="muted">↔</span>
+                <input type="text" value={connectB} placeholder="+1 415 555 0100" onChange={(event) => setConnectB(event.target.value)} disabled={busy} />
+                <button type="submit" disabled={busy || !connectA.trim() || !connectB.trim()}>
+                  Connect
+                </button>
+              </form>
+            )}
+          </div>
           <div className="personListControls">
             {sourceCounts.length > 1 && (
               <div className="personFilters">
@@ -812,6 +1157,17 @@ export function PeoplePage() {
                       <span className="muted">{member.messageCount.toLocaleString()} msgs</span>
                       <button
                         type="button"
+                        className="secondary personRenameButton"
+                        onClick={() => {
+                          const name = window.prompt(`Name for ${member.displayLabel ?? member.identityJid}:`, member.displayLabel ?? "");
+                          if (name?.trim()) void handleRename(member.identityJid, name.trim(), member.displayLabel ?? member.identityJid);
+                        }}
+                        disabled={busy}
+                      >
+                        Rename
+                      </button>
+                      <button
+                        type="button"
                         className="secondary"
                         onClick={() => void handleDisconnect(member.identityJid, member.displayLabel)}
                         disabled={busy}
@@ -829,7 +1185,8 @@ export function PeoplePage() {
 
       {tab === "dismissed" && (
         <section className="panel">
-          <p className="muted">Dismissed pairs are remembered — the dismissed signals never suggest them again.</p>
+          <p className="muted">Dismissed pairs are remembered — the dismissed signals never suggest them again unless you undo.</p>
+          {undoNote && <p className="muted personUndoNote">{undoNote}</p>}
           {dismissedGroups.length === 0 && <p className="muted">{loaded ? "Nothing dismissed yet." : "Loading…"}</p>}
           <ul className="personSuggestionList">
             {dismissedGroups.map((group) => (
@@ -843,12 +1200,62 @@ export function PeoplePage() {
                       {KIND_LABELS[signal.kind] ?? signal.kind}
                     </span>
                   ))}
+                  <button type="button" className="secondary personUndoButton" onClick={() => void handleUndo(group)} disabled={busy}>
+                    Undo
+                  </button>
+                </div>
+              </li>
+            ))}
+          </ul>
+
+          <h3 className="personBlockedHeading">Blocked pairs {suppressions.length > 0 ? `(${suppressions.length})` : ""}</h3>
+          <p className="muted">
+            Pairs auto-connect will never silently redo. Releasing a block doesn't connect anything — it just lets the next
+            Google sync or scan consider the pair again.
+          </p>
+          {suppressions.length === 0 && <p className="muted">{loaded ? "No blocked pairs." : "Loading…"}</p>}
+          <ul className="personSuggestionList">
+            {suppressions.map((suppression) => (
+              <li key={`${suppression.jidLow}|${suppression.jidHigh}`} className="personSuggestion dismissed">
+                <div className="personPair">
+                  <IdentitySide label={suppression.lowLabel ?? suppression.jidLow} phone={suppression.lowPhone ?? null} />
+                  <span className="muted">↔</span>
+                  <IdentitySide label={suppression.highLabel ?? suppression.jidHigh} phone={suppression.highPhone ?? null} />
+                  <span className="badge tipChip" tabIndex={0} data-tip={`Blocked because ${SUPPRESSION_REASONS[suppression.reason]}. Auto-connect and detectors skip this pair until released.`}>
+                    Blocked · {SUPPRESSION_REASONS[suppression.reason]}
+                  </span>
+                  <button type="button" className="secondary personUndoButton" onClick={() => void handleRelease(suppression)} disabled={busy}>
+                    Release
+                  </button>
                 </div>
               </li>
             ))}
           </ul>
         </section>
       )}
+
+      <section className="panel personHistory">
+        <button type="button" className="personLinkButton" onClick={() => setHistoryOpen((current) => !current)}>
+          {historyOpen ? "Hide history" : "History"}
+        </button>
+        {historyOpen && (
+          <ul className="personEventList">
+            {history === null && <li className="muted">Loading…</li>}
+            {history?.length === 0 && <li className="muted">No person-layer actions recorded yet.</li>}
+            {history?.map((event) => (
+              <li key={event.id} className="personEvent">
+                <span>{auditLine(event)}</span>
+                {event.evidence && Object.keys(event.evidence).length > 0 && (
+                  <details className="personRawEvidence">
+                    <summary className="muted">Evidence</summary>
+                    <pre>{JSON.stringify(event.evidence, null, 1)}</pre>
+                  </details>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
 
       {compare && (
         <CompareDialog

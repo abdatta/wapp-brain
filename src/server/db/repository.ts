@@ -29,6 +29,7 @@ import type {
   GroupMembershipEventRecord,
   GroupMembershipPeriodRecord,
   IdentityNumberChangeRecord,
+  IdentityRecentMedia,
   IdentityRecentMessage,
   IdentityRepairResult,
   ImportTotals,
@@ -384,6 +385,9 @@ export interface ArchiveRepository {
   }): Promise<PersonSuggestionRecord[]>;
   acceptPersonSuggestion(suggestionId: string): Promise<PersonConnectResult>;
   rejectPersonSuggestion(suggestionId: string): Promise<boolean>;
+  // Human-only dismissal undo: every rejected row for the normalized pair
+  // returns to pending, audited as 'unreject'. Detectors never do this.
+  unrejectPersonSuggestions(jidLow: string, jidHigh: string): Promise<number>;
   // Retire a detector kind's pending queue (e.g. a detector removed after
   // real-data feedback); rejected/accepted history is preserved.
   supersedePersonSuggestionsByKind(kind: PersonSuggestionKind): Promise<number>;
@@ -394,7 +398,16 @@ export interface ArchiveRepository {
   // A sender's recent visible messages across every chat (groups included) —
   // the compare dialog's activity view for identities without a direct chat.
   listRecentMessagesBySender(jid: string, limit?: number): Promise<IdentityRecentMessage[]>;
+  // A sender's recent already-stored media (ids + labels, never bytes) for
+  // the compare dialog's media strips.
+  listRecentMediaBySender(jid: string, limit?: number): Promise<IdentityRecentMedia[]>;
+  // Display labels for chat source ids (null when unresolved) — read-path
+  // helper for surfaces that carry chat references.
+  getChatLabels(sourceChatIds: string[]): Promise<Map<string, string | null>>;
   listPersonLinkSuppressions(limit?: number): Promise<PersonLinkSuppressionRecord[]>;
+  // Delete one suppression so auto-connect/detectors may re-evaluate the
+  // pair. Audited as 'release'; never connects by itself.
+  releasePersonLinkSuppression(jidA: string, jidB: string): Promise<boolean>;
   listPersonLinkEvents(options?: { limit?: number }): Promise<PersonLinkEventRecord[]>;
   // Same-contact grouping persisted by the Google sync: full replace so the
   // stored groupings always mirror the provider's current state. Replacing

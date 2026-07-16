@@ -97,15 +97,34 @@ describe("person management API", () => {
       // Rejecting again is a clean 404, not an error.
       expect((await postRaw(`${base}/api/persons/suggestions/${sameName!.id}/reject`, {})).status).toBe(404);
 
+      // Human undo restores the dismissed pair and is audited; unknown pairs 404.
+      const undo = await postJson<{ ok: boolean; restored: number }>(`${base}/api/persons/suggestions/undo`, {
+        jidLow: sameName!.jidLow,
+        jidHigh: sameName!.jidHigh
+      });
+      expect(undo.restored).toBe(1);
+      const restoredPending = (await fetchJson<{ suggestions: PersonSuggestionRecord[] }>(`${base}/api/persons/suggestions`)).suggestions;
+      expect(restoredPending.some((suggestion) => suggestion.id === sameName!.id)).toBe(true);
+      expect((await postRaw(`${base}/api/persons/suggestions/undo`, { jidLow: "none@s.whatsapp.net", jidHigh: "nada@s.whatsapp.net" })).status).toBe(404);
+      const events = await fetchJson<{ events: Array<{ action: string }> }>(`${base}/api/persons/events?limit=50`);
+      expect(events.events.some((event) => event.action === "unreject")).toBe(true);
+      // Put it back to rejected so the remaining assertions see the original state.
+      await postJson(`${base}/api/persons/suggestions/${sameName!.id}/reject`, {});
+
       // Manual connect (clears nothing here, new pair) and disconnect with suppression.
       const connect = await postJson<{ ok: boolean; result: { outcome: string; personId: string }; person: PersonRecord }>(`${base}/api/persons/connect`, { jidA: A, jidB: B });
       expect(connect.result.outcome).toBe("connected");
       expect(connect.person.members).toHaveLength(3);
       const disconnect = await postJson<{ ok: boolean; result: { disconnected: boolean; personId: string; dissolved: boolean } }>(`${base}/api/persons/disconnect`, { jid: B });
       expect(disconnect.result).toMatchObject({ disconnected: true, dissolved: false });
-      const suppressions = (await fetchJson<{ suppressions: Array<{ jidLow: string; jidHigh: string; reason: string }> }>(`${base}/api/persons/suppressions`)).suppressions;
+      const suppressions = (await fetchJson<{ suppressions: Array<{ jidLow: string; jidHigh: string; reason: string; lowLabel?: string | null }> }>(`${base}/api/persons/suppressions`)).suppressions;
       expect(suppressions.length).toBeGreaterThanOrEqual(2);
       expect(suppressions.every((row) => row.reason === "disconnected" || row.reason === "suggestion_rejected")).toBe(true);
+      // Release lifts one block (idempotent second call 404s).
+      const releaseTarget = suppressions[0];
+      const release = await postJson<{ ok: boolean }>(`${base}/api/persons/suppressions/release`, { jidLow: releaseTarget.jidLow, jidHigh: releaseTarget.jidHigh });
+      expect(release.ok).toBe(true);
+      expect((await postRaw(`${base}/api/persons/suppressions/release`, { jidLow: releaseTarget.jidLow, jidHigh: releaseTarget.jidHigh })).status).toBe(404);
 
       // Disconnect down to a singleton dissolves; the held person id resolves
       // through a redirect instead of erroring.
@@ -145,6 +164,15 @@ describe("person management API", () => {
         { sourceJid: B, phoneNumber: B.split("@")[0], displayName: "Rohit" }
       ]);
       await seedMessageFrom(repository, runId, A);
+      // A shared group with membership periods for the compare-context check.
+      const GROUP = "120363000000000077@g.us";
+      await repository.upsertChats(runId, [{ sourceChatId: GROUP, jid: GROUP, displayName: "Shared Group", chatType: "group" }]);
+      await repository.upsertArchiveSignals({
+        membershipPeriods: [
+          { periodKey: "p-a", groupSourceId: GROUP, participantJid: A, joinedAtMs: 1_700_000_000_000, leftAtMs: null, role: null, source: "backup", sourceEventKey: "p-a", observedAtMs: 1_700_000_000_000, captureVersion: 1 },
+          { periodKey: "p-b", groupSourceId: GROUP, participantJid: B, joinedAtMs: 1_700_100_000_000, leftAtMs: null, role: null, source: "backup", sourceEventKey: "p-b", observedAtMs: 1_700_100_000_000, captureVersion: 1 }
+        ]
+      });
       await repository.close();
 
       const port = 6500 + Math.floor(Math.random() * 500);
@@ -165,6 +193,31 @@ describe("person management API", () => {
       expect(accept.person.members[0].evidence).toMatchObject({ suggestionId: pending.id });
       // Accepting twice is a clean client error.
       expect((await postRaw(`${base}/api/persons/suggestions/${pending.id}/accept`, {})).status).toBe(400);
+
+      // Hygiene-queue reads and the rename action.
+      const debt = await fetchJson<{ episodesWithUnresolved: number; distinctIdentities: number; items: unknown[] }>(`${base}/api/persons/debt`);
+      expect(Array.isArray(debt.items)).toBe(true);
+      expect((await postRaw(`${base}/api/persons/rename`, { jid: A, name: "+91∙∙∙∙∙∙∙∙01" })).status).toBe(400);
+      expect((await postRaw(`${base}/api/persons/rename`, { jid: A, name: "919000000001" })).status).toBe(400);
+      const rename = await postJson<{ ok: boolean; name: string; repairedEpisodes: number }>(`${base}/api/persons/rename`, {
+        jid: A,
+        name: "Rohit Prime"
+      });
+      expect(rename.ok).toBe(true);
+      expect(rename.repairedEpisodes).toBeGreaterThanOrEqual(0);
+      const renamedPersons = (await fetchJson<{ persons: PersonRecord[] }>(`${base}/api/persons`)).persons;
+      expect(renamedPersons[0].members.some((member) => member.displayLabel === "Rohit Prime")).toBe(true);
+
+      // Explorer context: shared-group timeline intersected with labels, media
+      // strips as id lists; avatars 404 immediately with no live session.
+      const context = await fetchJson<{ lowMedia: unknown[]; highMedia: unknown[]; sharedGroups: Array<{ label: string | null; low: { joinedAtMs: number | null } | null; high: unknown }> }>(
+        `${base}/api/persons/compare-context?jidA=${encodeURIComponent(A)}&jidB=${encodeURIComponent(B)}`
+      );
+      expect(context.sharedGroups).toHaveLength(1);
+      expect(context.sharedGroups[0].label).toBe("Shared Group");
+      expect(context.sharedGroups[0].low?.joinedAtMs).toBe(1_700_000_000_000);
+      expect(Array.isArray(context.lowMedia)).toBe(true);
+      expect((await fetch(`${base}/api/persons/avatar?jid=${encodeURIComponent(A)}`)).status).toBe(404);
     } finally {
       if (child) {
         child.kill();

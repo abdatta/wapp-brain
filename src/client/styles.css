@@ -4125,3 +4125,148 @@ button.fileButton:disabled {
   letter-spacing: 0.06em;
   margin-top: 4px;
 }
+
+/* Dismissal undo + person history */
+
+.personUndoButton {
+  margin-left: auto;
+}
+
+.personUndoNote {
+  font-size: 0.8rem;
+  font-style: italic;
+}
+
+.personHistory .personLinkButton {
+  font-size: 0.85rem;
+}
+
+.personEventList {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 0.84rem;
+}
+
+.personEvent {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* Hygiene queue: debt cards + rename form */
+
+.personDebt {
+  border-color: rgba(255, 200, 120, 0.25);
+}
+
+.personDebt .badge {
+  border-color: rgba(255, 200, 120, 0.5);
+  color: #f4cf94;
+}
+
+.personRenameForm {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.personRenameForm input {
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 5px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: #14171a;
+  color: #d9efe5;
+  min-width: 220px;
+}
+
+.personRenameForm button {
+  font: inherit;
+  font-size: 0.8rem;
+  padding: 5px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 200, 120, 0.5);
+  background: rgba(255, 200, 120, 0.12);
+  color: #f4e3c6;
+  cursor: pointer;
+}
+
+.personRenameForm button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.personMember .personRenameButton {
+  margin-left: auto;
+}
+
+.personMember .personRenameButton + button {
+  margin-left: 0;
+}
+
+/* Compare dialog: avatars, media strips, shared-group timeline */
+
+.personAvatar {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  object-fit: cover;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  flex-shrink: 0;
+}
+
+.personAvatarFallback {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(125, 224, 178, 0.12);
+  color: #7de0b2;
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
+.personMediaStrip {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  padding-bottom: 2px;
+}
+
+.personMediaStrip img {
+  width: 56px;
+  height: 56px;
+  border-radius: 8px;
+  object-fit: cover;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  flex-shrink: 0;
+}
+
+.personTimeline {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.personTimelineRow {
+  margin: 0;
+  font-size: 0.8rem;
+}
+
+/* Blocked pairs + manual connect */
+
+.personBlockedHeading {
+  margin: 18px 0 4px;
+  font-size: 0.95rem;
+}
+
+.personConnectManual {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 12px;
+}

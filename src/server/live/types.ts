@@ -120,6 +120,10 @@ export interface LiveWhatsAppClient {
   onEvent(handler: (event: LiveMessageEvent) => void | Promise<void>): void;
   fetchHistory?(request: LiveHistoryRequest): Promise<LiveHistoryResult>;
   fetchGroupMetadata?(jid: string): Promise<LiveGroupMetadataResult | null>;
+  // Read-only profile-photo URL lookup for the People compare view. Null on
+  // any failure or timeout — callers treat avatars as progressive enhancement
+  // and must never block on this.
+  fetchProfilePictureUrl?(jid: string): Promise<string | null>;
   // Passive CDN fetch + local decrypt of a queued media item; MAY issue a
   // media re-upload request when the link expired and options allow it —
   // never a read/played receipt or presence.

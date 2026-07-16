@@ -182,6 +182,39 @@ for (const kind of ["memory", "sqlite"] as const) {
       });
     });
 
+    it("lists only stored media for the compare strips — ids and labels, never bytes", async () => {
+      await withRepository(kind, async (repository) => {
+        await seedSameNameWorld(repository);
+        // ROHIT_1 sent two media messages; only one has a stored asset.
+        await repository.upsertMessages([
+          { ...makeMessage(GROUP, ROHIT_1, "med-1", T0 + 7000), messageType: "image", hasMedia: true, body: null },
+          { ...makeMessage(GROUP, ROHIT_1, "med-2", T0 + 8000), messageType: "image", hasMedia: true, body: null }
+        ]);
+        await repository.linkMediaAsset({
+          messageKey: messageKey(GROUP, "med-1"),
+          chatSourceId: GROUP,
+          sha256: "a".repeat(64),
+          storagePath: "media/aa/test.jpg",
+          mimeType: "image/jpeg",
+          byteSize: 1234,
+          width: 100,
+          height: 100,
+          durationMs: null,
+          thumbnail: new Uint8Array([1, 2, 3]),
+          source: "import-folder",
+          isViewOnce: false
+        });
+        const media = await repository.listRecentMediaBySender(ROHIT_1, 8);
+        expect(media).toHaveLength(1);
+        expect(media[0].hasThumbnail).toBe(true);
+        expect(media[0].mimeType).toBe("image/jpeg");
+        expect(media[0].chatLabel).toBe("Trip");
+        expect(Object.keys(media[0])).not.toContain("thumbnail");
+        // Another sender's media never leaks into the strip.
+        expect(await repository.listRecentMediaBySender(PRIYA, 8)).toHaveLength(0);
+      });
+    });
+
     it("hints and membership never reach evidence packs: rendering is identical with and without them", async () => {
       await withRepository(kind, async (repository) => {
         await seedSameNameWorld(repository);

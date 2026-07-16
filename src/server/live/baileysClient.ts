@@ -323,6 +323,23 @@ export class BaileysLiveWhatsAppClient implements LiveWhatsAppClient {
     }
   }
 
+  // Read-only profile-photo URL lookup (People compare view). Low-timeout and
+  // null on any failure — avatars are progressive enhancement, never a gate.
+  async fetchProfilePictureUrl(jid: string): Promise<string | null> {
+    if (!this.socket?.profilePictureUrl) {
+      return null;
+    }
+    try {
+      const url = await Promise.race([
+        this.socket.profilePictureUrl(jid, "image") as Promise<unknown>,
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 4_000))
+      ]);
+      return typeof url === "string" && url ? url : null;
+    } catch {
+      return null;
+    }
+  }
+
   async fetchGroupMetadata(jid: string): Promise<LiveGroupMetadataResult | null> {
     if (!this.socket?.groupMetadata) {
       return null;
