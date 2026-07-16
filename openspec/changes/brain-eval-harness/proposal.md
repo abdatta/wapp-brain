@@ -1,6 +1,6 @@
 # Brain Eval Harness
 
-> Proposal-level seed (2026-07-11). Expand with `/opsx:propose` when scheduled. See `openspec/changes/ROADMAP.md` for ordering and dependencies. **Recommended model: Opus.**
+> Proposal-level seed (2026-07-11; premises re-verified against the codebase 2026-07-16). Expand with `/opsx:propose` when scheduled. See `openspec/changes/ROADMAP.md` for ordering and dependencies. **Recommended model: Opus.**
 
 ## Why
 
@@ -10,10 +10,10 @@ The single critical finding of the 2026-07-11 architecture review: the design ma
 
 - **Golden query set**: ~30 versioned real queries across classes (paraphrase / person / commitment / temporal / code-mixed) with expected message keys, stored in-repo; extendable as new query classes emerge.
 - **`brain:eval` CLI**: runs the golden set against search (and later brain retrieval), writing recall@k per class into a `brain_eval_runs` table; comparable across runs so any retrieval or contract change shows its delta.
-- **Citation-precision sampling**: deterministically sample N committed claims, render claim beside its cited messages in the Brain panel for one-click manual grading (zero LLM cost, manual-first), grades persisted keyed on the episode's generator/model/extraction_version — per-model quality on *this* archive becomes queryable.
-- **Free interim signal**: extractive-fallback rate aggregated per model from existing episode columns and shown in the Brain panel — the citation gate already produces this signal; nothing reads it today.
+- **Citation-precision sampling**: deterministically sample N committed claims, render claim beside its cited messages in the Brain panel for one-click manual grading (zero LLM cost, manual-first), grades persisted keyed on the episode's generator/model/extraction_version — per-model quality on *this* archive becomes queryable. (`EXTRACTION_VERSION` is already at 4 and regeneration marks old episodes `superseded` — sample only `current` episodes, and expect graded claims to age out on regeneration.)
+- **Free interim signal**: extractive-fallback rate aggregated per model from existing episode columns and shown in the Brain panel — the panel already surfaces validation-issue counts and media-gap aggregates (2026-07-16), but the per-model fallback aggregation still has no reader; this adds it.
 - **Gate criteria rewritten**: downstream phase gates change from "run a paraphrase query" to "golden-set recall@k per class meets or exceeds the recorded baseline"; the embedding-rerank follow-up gets its actual data producer.
-- **Checkpoint**: run `brain:eval` on the 2–3 contract-v2 chats; grade ~20 claims for Terra vs Sonnet on the real archive; see a recall table and a per-model precision/fallback table — then (and only then) choose the backfill model.
+- **Checkpoint**: run `brain:eval` on the 2–3 contract-v2 chats; grade ~20 claims for Terra vs Sonnet on the real archive (the wired registry: codex `gpt-5.6-terra/sol/luna`, claude-cli `claude-haiku-4-5`/`claude-sonnet-5`/`claude-opus-4-8`/`claude-fable-5`; defaults terra and sonnet-5; per-call `effort` exists for codex only); see a recall table and a per-model precision/fallback table — then (and only then) choose the backfill model.
 
 ## Capabilities
 

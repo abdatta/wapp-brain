@@ -1,6 +1,6 @@
 # Brain Retrieval Pipeline
 
-> Proposal-level seed (2026-07-11). Expand with `/opsx:propose` when scheduled. See `openspec/changes/ROADMAP.md` for ordering and dependencies. **Recommended model: Fable.**
+> Proposal-level seed (2026-07-11; premises re-verified against the codebase 2026-07-16). Expand with `/opsx:propose` when scheduled. See `openspec/changes/ROADMAP.md` for ordering and dependencies. **Recommended model: Fable.**
 
 ## Why
 
@@ -19,14 +19,14 @@ The progressive-disclosure read path (L0 overview → L1 pages → L2 episodes �
 
 ## Capabilities
 
-### Modified Capabilities
+### New Capabilities
 
-- `brain-retrieval`: rewritten to the pinned design — sectioned layer results, RRF-only fusion, coverage verdicts with rendered gaps, deep-path predicate/construction/caching, timeline and claims routes, synthesis persistence, read-time naming.
+- `brain-retrieval`: created as a main spec here (none exists — `build-the-brain` never synced one) with the pinned design — sectioned layer results, RRF-only fusion, coverage verdicts with rendered gaps, deep-path predicate/construction/caching, timeline and claims routes, synthesis persistence, read-time naming — absorbing the L0 open-commitment semantics pinned by `commitment-lifecycle` (10).
 
 ## Impact
 
 - **Schema**: `brain_docs_fts`, `brain_query_cache` (normalized keys), query-artifact storage.
 - **Code**: `src/server/brain/retrieval.ts`, `/api/brain/query|timeline|claims|overview|pages|episodes|citations` routes, client brain panel query UI.
-- **Docs**: design.md D7 rewritten; brain-retrieval spec scenarios tightened (zero-hit, verdict, timeline, claims).
+- **Docs**: the D7 rewrite recorded in this change's own design.md (the archived `build-the-brain` design.md is a frozen baseline); brain-retrieval spec scenarios written fresh (zero-hit, verdict, timeline, claims).
 - **Tests**: cross-layer ranking (page surfaces above message flood), verdict/gap rendering for lagging watermarks, deep predicate, per-term RRF, timeline grouping/caps, claims pagination.
 - **Depends on**: `semantic-rollups` (docs to search), `knowledge-graph-foundation` (graph boosts/traversal), `retrieval-hardening` (shared FTS layer).

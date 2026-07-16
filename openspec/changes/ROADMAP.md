@@ -18,7 +18,7 @@
 |  | 5 | `two-level-person-model` | **Fable** | seeded | #3 | same-name stays separate; Google same-contact auto-connects; disconnect re-derives, zero episode changes |
 |  | 6 | `people-management-ui` | Sonnet | seeded | #4, #5, #19 | ranked hygiene queue; dismissed pair stays dismissed |
 |  | 7 | `brain-eval-harness` | Opus | seeded | #3 | recall table + per-model precision/fallback tables on the real archive |
-|  | 8 | `retrieval-hardening` | Opus | seeded | — (#7 soft, to measure delta; rename hook shared with #4) | typo'd query returns labelled relaxed results; "nhi" finds "nahi"; renamed contact searchable |
+|  | 8 | `retrieval-hardening` | Opus | seeded | — (#7 soft, to measure delta; #4 shipped the shared rename hook — only the rename-trigger gap remains) | typo'd query returns labelled relaxed results; "nhi" finds "nahi"; renamed contact searchable |
 |  | 9 | `knowledge-graph-foundation` | Opus | seeded | #3, #5 | nodes/edges from claim entities; open commitment survives salience recompute |
 |  | 10 | `commitment-lifecycle` | **Fable** | seeded | #2, #3, #9 | promise → reaction-acknowledged → cited closure; overdue flagged |
 |  | 11 | `semantic-rollups` | **Fable** | seeded | #9, #10 (adjacent) | coherent cited entity pages; undeclared claim-drop refused; mechanical rollback |
@@ -129,7 +129,7 @@ Changes within a wave can run in any order or in parallel; a wave starts when it
 
 1. **Contract before spend**: no archive-scale assimilation until `episode-contract-v2` + `brain-eval-harness` are green. Re-extraction is the only expensive do-over in the system.
 2. **Store references, render names**: derived layers key on JIDs/node ids and resolve display names at read time; names baked into generated prose must be number-labelled (substitutable) and stamped for repair. No derived layer may treat a display name as immutable input.
-3. **Late-binding inventory**: identity, media interpretation, quoted replies, reactions, forwards, chat names, topics — each needs an anchor, a version/coverage stamp, and a repair path. Any new feature baking an interpretation into stored text must say which row it adds to this table (kept in `build-the-brain/design.md`).
+3. **Late-binding inventory**: identity, media interpretation, quoted replies, reactions, forwards, chat names, topics — each needs an anchor, a version/coverage stamp, and a repair path. Any new feature baking an interpretation into stored text must say which row it adds to this table (kept in `archive/2026-07-13-episode-contract-v2/design.md` § Late-Binding Inventory; the archived `build-the-brain` design.md is the frozen D1–D13 baseline).
 4. **Under-merge beats over-merge**: person identity is an editable membership, never a destructive merge; suggestions are produced by detectors and applied only by certainty-grade sources or the user.
 5. **Deterministic first, model second**: repair, closure candidates, conflict candidates, input selection, and `brain_ask` are all pure-SQL scaffolding; model calls are reserved for synthesis the structure cannot do.
 6. **Weak model reads, mid model writes, strong model consolidates**: the read surface must satisfy a Haiku-class client (`brain_ask` gate); episode writes stay mid-tier with structural validation; flagship tiers are reserved for rollup-class synthesis.

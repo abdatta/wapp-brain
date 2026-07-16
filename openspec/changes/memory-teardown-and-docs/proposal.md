@@ -1,6 +1,6 @@
 # Memory Teardown And Docs
 
-> Proposal-level seed (2026-07-11). Expand with `/opsx:propose` when scheduled. See `openspec/changes/ROADMAP.md` for ordering and dependencies. **Recommended model: Sonnet.**
+> Proposal-level seed (2026-07-11; premises re-verified against the codebase 2026-07-16). Expand with `/opsx:propose` when scheduled. See `openspec/changes/ROADMAP.md` for ordering and dependencies. **Recommended model: Sonnet.**
 
 ## Why
 
@@ -25,5 +25,6 @@ The legacy `memory_*` subsystem was declared superseded when `build-the-brain` w
 ## Impact
 
 - **Removed code**: `src/server/memory/`, memory routes/scripts/panel, `memory_*` DDL and mirror methods, `tests/memory.test.ts` (replaced by brain suites).
+- **Keep-and-rename, not delete**: the brain imports memory-named shared machinery — `MemoryEvidenceMessage`/`MemoryEvidenceReaction` types and `listMemoryEvidenceMessages()` (used by `src/server/brain/episodes.ts`) — rename these to brain-neutral names during the teardown. `src/server/db/memoryRepository.ts` is the in-memory *test double*, unrelated to the legacy subsystem despite its name; it stays.
 - **Docs**: the six-document pass above.
 - **Depends on**: `brain-retrieval-pipeline` (read parity), `mcp-agent-surface` (README/security docs describe the final surface). Backfill need not be complete — coverage honesty is the designed answer to partial assimilation.

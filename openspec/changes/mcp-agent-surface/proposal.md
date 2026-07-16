@@ -1,6 +1,6 @@
 # MCP Agent Surface
 
-> Proposal-level seed (2026-07-11). Expand with `/opsx:propose` when scheduled. See `openspec/changes/ROADMAP.md` for ordering and dependencies. **Recommended model: Opus.**
+> Proposal-level seed (2026-07-11; premises re-verified against the codebase 2026-07-16). Expand with `/opsx:propose` when scheduled. See `openspec/changes/ROADMAP.md` for ordering and dependencies. **Recommended model: Opus.**
 
 ## Why
 
@@ -18,9 +18,9 @@ The north-star criterion — a weak model extracts real value, a strong model do
 
 ## Capabilities
 
-### Modified Capabilities
+### New Capabilities
 
-- `brain-mcp-access`: rewritten — `brain_ask` as the primary tool, `brain_claims`/`brain_timeline`/`brain_deep_result` added, spend-authority grants, per-purpose ledger attribution, pagination passthrough, weak-model acceptance scenario.
+- `brain-mcp-access`: created as a main spec here (none exists — the original Phase 5 plan was never synced) — `brain_ask` as the primary tool, `brain_claims`/`brain_timeline`/`brain_deep_result`, spend-authority grants, per-purpose ledger attribution (existing purposes: `episode`, `episode-regen`; this adds `mcp-deep`), pagination passthrough, weak-model acceptance scenario.
 
 ## Impact
 
