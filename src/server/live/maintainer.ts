@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { ArchiveRepository } from "../db/repository";
 import { config } from "../config";
 import { configuredTraceRecorder } from "../diagnostics/traceRecorder";
@@ -8,7 +9,8 @@ import { assertLiveDependencySafe } from "./dependency";
 import { auditChatGaps, auditMessageEventCheckpoint, GAP_TOLERANCE_MS } from "./auditor";
 import { recoverDueGaps } from "./recovery";
 import { runRetainedPayloadDecryptionPass } from "./secretsPass";
-import type { LiveSyncProgress, MediaDownloadQueueRecord } from "../../shared/types";
+import { ARCHIVE_SIGNAL_CAPTURE_VERSION } from "../../shared/types";
+import type { ArchiveSignalBatch, LiveSyncProgress, MediaDownloadQueueRecord, MessageRecord } from "../../shared/types";
 import { addEventToTotals, emptyLiveTotals, type LiveMaintainerOptions, type LiveMessageEvent, type LiveWhatsAppClient } from "./types";
 
 const INGEST_MESSAGE_CHUNK_SIZE = 500;
@@ -476,7 +478,19 @@ export class LiveMaintainer {
         }
       }
     }
+    // Direct group notifications do not include a WhatsApp message envelope,
+    // but their verified signal is still meaningful thread history. Create a
+    // local-only system anchor before persisting it so the same thread UI can
+    // render it. This never affects live totals or chat conversation recency.
+    const timeline = materializeUnanchoredLiveSystemEvents(event);
+    if (timeline.messages.length) {
+      await this.repository.upsertMessages(timeline.messages);
+    }
     if (event.updates?.length) await this.repository.applyLiveMessageUpdates(event.updates);
+    const archiveSignals = timeline.archiveSignals;
+    if (hasArchiveSignals(archiveSignals)) {
+      await this.repository.upsertArchiveSignals(archiveSignals);
+    }
     if (event.secrets?.length) await this.repository.recordMessageSecrets(event.secrets);
     if (event.retainedPayloads?.length) {
       await this.repository.retainEncryptedPayloads(event.retainedPayloads);
@@ -564,6 +578,31 @@ export class LiveMaintainer {
     for (const update of event.updates ?? []) collect(update.chatSourceId);
     for (const capture of event.mediaDescriptors ?? []) collect(capture.chatSourceId);
     for (const preview of event.linkPreviews ?? []) collect(preview.chatSourceId);
+    for (const signal of event.archiveSignals?.numberChanges ?? []) {
+      collect(signal.chatSourceId);
+      collect(signal.oldJid);
+      collect(signal.newJid);
+      collect(signal.actorJid);
+    }
+    for (const signal of event.archiveSignals?.membershipPeriods ?? []) {
+      collect(signal.groupSourceId);
+      collect(signal.participantJid);
+    }
+    for (const signal of event.archiveSignals?.membershipEvents ?? []) {
+      collect(signal.groupSourceId);
+      collect(signal.participantJid);
+      collect(signal.actorJid);
+    }
+    for (const signal of event.archiveSignals?.chatMetadataHistory ?? []) {
+      collect(signal.chatSourceId);
+      collect(signal.actorJid);
+    }
+    for (const signal of event.archiveSignals?.vcards ?? []) collect(signal.resolvedJid);
+    for (const signal of event.archiveSignals?.deletions ?? []) collect(signal.revokedByJid);
+    for (const signal of event.archiveSignals?.engagementAggregates ?? []) {
+      collect(signal.chatSourceId);
+      collect(signal.counterpartyJid);
+    }
     const canonical = new Map<string, string>();
     for (const jid of uniqueJids) {
       canonical.set(jid, await this.repository.resolveIdentityJid(jid));
@@ -629,7 +668,65 @@ export class LiveMaintainer {
       ...preview,
       chatSourceId: resolve(preview.chatSourceId) ?? preview.chatSourceId
     }));
-    return { ...event, messages, chats, participants, updates, mediaDescriptors, linkPreviews };
+    const sourceMessageKeys = new Map<string, string>();
+    for (let index = 0; index < (event.messages?.length ?? 0); index += 1) {
+      const before = event.messages![index];
+      const after = messages![index];
+      sourceMessageKeys.set(before.sourceMessageKey, after.sourceMessageKey);
+    }
+    const signalMessageKey = (sourceMessageKey: string | null): string | null =>
+      sourceMessageKey == null ? null : sourceMessageKeys.get(sourceMessageKey) ?? sourceMessageKey;
+    const archiveSignals = event.archiveSignals
+      ? {
+          ...event.archiveSignals,
+          numberChanges: event.archiveSignals.numberChanges?.map((signal) => ({
+            ...signal,
+            chatSourceId: signal.chatSourceId == null ? null : resolve(signal.chatSourceId) ?? signal.chatSourceId,
+            sourceMessageKey: signalMessageKey(signal.sourceMessageKey),
+            oldJid: resolve(signal.oldJid) ?? signal.oldJid,
+            newJid: resolve(signal.newJid) ?? signal.newJid,
+            actorJid: signal.actorJid == null ? null : resolve(signal.actorJid) ?? signal.actorJid
+          })),
+          membershipPeriods: event.archiveSignals.membershipPeriods?.map((signal) => ({
+            ...signal,
+            groupSourceId: resolve(signal.groupSourceId) ?? signal.groupSourceId,
+            participantJid: resolve(signal.participantJid) ?? signal.participantJid
+          })),
+          membershipEvents: event.archiveSignals.membershipEvents?.map((signal) => ({
+            ...signal,
+            groupSourceId: resolve(signal.groupSourceId) ?? signal.groupSourceId,
+            participantJid: resolve(signal.participantJid) ?? signal.participantJid,
+            actorJid: signal.actorJid == null ? null : resolve(signal.actorJid) ?? signal.actorJid,
+            sourceMessageKey: signalMessageKey(signal.sourceMessageKey)
+          })),
+          chatMetadataHistory: event.archiveSignals.chatMetadataHistory?.map((signal) => ({
+            ...signal,
+            chatSourceId: resolve(signal.chatSourceId) ?? signal.chatSourceId,
+            actorJid: signal.actorJid == null ? null : resolve(signal.actorJid) ?? signal.actorJid,
+            sourceMessageKey: signalMessageKey(signal.sourceMessageKey)
+          })),
+          locations: event.archiveSignals.locations?.map((signal) => ({ ...signal, sourceMessageKey: signalMessageKey(signal.sourceMessageKey)! })),
+          locationObservations: event.archiveSignals.locationObservations?.map((signal) => ({ ...signal, sourceMessageKey: signalMessageKey(signal.sourceMessageKey)! })),
+          vcards: event.archiveSignals.vcards?.map((signal) => ({
+            ...signal,
+            sourceMessageKey: signalMessageKey(signal.sourceMessageKey)!,
+            resolvedJid: signal.resolvedJid == null ? null : resolve(signal.resolvedJid) ?? signal.resolvedJid
+          })),
+          editEvents: event.archiveSignals.editEvents?.map((signal) => ({ ...signal, sourceMessageKey: signalMessageKey(signal.sourceMessageKey)! })),
+          deletions: event.archiveSignals.deletions?.map((signal) => ({
+            ...signal,
+            sourceMessageKey: signalMessageKey(signal.sourceMessageKey)!,
+            revokedByJid: signal.revokedByJid == null ? null : resolve(signal.revokedByJid) ?? signal.revokedByJid
+          })),
+          mediaInterpretations: event.archiveSignals.mediaInterpretations?.map((signal) => ({ ...signal, sourceMessageKey: signalMessageKey(signal.sourceMessageKey)! })),
+          engagementAggregates: event.archiveSignals.engagementAggregates?.map((signal) => ({
+            ...signal,
+            chatSourceId: resolve(signal.chatSourceId) ?? signal.chatSourceId,
+            counterpartyJid: signal.counterpartyJid == null ? null : resolve(signal.counterpartyJid) ?? signal.counterpartyJid
+          }))
+        }
+      : undefined;
+    return { ...event, messages, chats, participants, updates, mediaDescriptors, linkPreviews, archiveSignals };
   }
 
   // A gap closes only when ingested evidence for its chat reaches the gap's
@@ -701,8 +798,124 @@ export class LiveMaintainer {
   }
 }
 
+function archiveSignalsForEvent(event: LiveMessageEvent): ArchiveSignalBatch {
+  const batch: ArchiveSignalBatch = {
+    numberChanges: [...(event.archiveSignals?.numberChanges ?? [])],
+    membershipPeriods: [...(event.archiveSignals?.membershipPeriods ?? [])],
+    membershipEvents: [...(event.archiveSignals?.membershipEvents ?? [])],
+    chatMetadataHistory: [...(event.archiveSignals?.chatMetadataHistory ?? [])],
+    locations: [...(event.archiveSignals?.locations ?? [])],
+    locationObservations: [...(event.archiveSignals?.locationObservations ?? [])],
+    vcards: [...(event.archiveSignals?.vcards ?? [])],
+    editEvents: [...(event.archiveSignals?.editEvents ?? [])],
+    deletions: [...(event.archiveSignals?.deletions ?? [])],
+    mediaInterpretations: [...(event.archiveSignals?.mediaInterpretations ?? [])],
+    engagementAggregates: [...(event.archiveSignals?.engagementAggregates ?? [])]
+  };
+  for (const update of event.updates ?? []) {
+    const observedAtMs = update.occurredAtMs ?? event.occurredAtMs ?? null;
+    const provenance = {
+      source: "live" as const,
+      sourceEventKey: update.eventKey,
+      observedAtMs,
+      captureVersion: ARCHIVE_SIGNAL_CAPTURE_VERSION
+    };
+    if (update.updateType === "delete") {
+      batch.deletions?.push({
+        sourceMessageKey: update.sourceMessageKey,
+        revokedByJid: typeof update.metadata?.revokedByJid === "string" ? update.metadata.revokedByJid : null,
+        revokedByAdmin: typeof update.metadata?.revokedByAdmin === "boolean" ? update.metadata.revokedByAdmin : null,
+        deletionKind: typeof update.metadata?.deletionKind === "string" ? update.metadata.deletionKind : null,
+        ...provenance
+      });
+    } else if (update.updateType === "edit") {
+      batch.editEvents?.push({
+        eventKey: `live:edit:${update.eventKey}`,
+        sourceMessageKey: update.sourceMessageKey,
+        originalSourceMessageId: null,
+        observedEditMessageId: null,
+        ...provenance
+      });
+    }
+  }
+  return batch;
+}
+
+function hasArchiveSignals(batch: ArchiveSignalBatch): boolean {
+  return Object.values(batch).some((records) => records?.length);
+}
+
+// Baileys exposes some verified group changes as direct notifications rather
+// than message envelopes. We retain those as local timeline system rows only
+// when they came from live sync; unanchored backup history stays query-only so
+// the importer never invents a message that the source did not provide.
+function materializeUnanchoredLiveSystemEvents(event: LiveMessageEvent): { messages: MessageRecord[]; archiveSignals: ArchiveSignalBatch } {
+  const archiveSignals = archiveSignalsForEvent(event);
+  const messages: MessageRecord[] = [];
+  const addAnchor = (
+    kind: "number-change" | "membership" | "chat-metadata",
+    eventKey: string,
+    chatSourceId: string | null,
+    observedAtMs: number | null,
+    assign: (sourceMessageKey: string) => void
+  ) => {
+    if (!chatSourceId) {
+      return;
+    }
+    const hash = createHash("sha256").update(`${kind}:${eventKey}`).digest("hex").slice(0, 20);
+    const sourceMessageId = `live-system-${hash}`;
+    const sourceMessageKey = messageKey(chatSourceId, sourceMessageId);
+    assign(sourceMessageKey);
+    messages.push({
+      sourceMessageId,
+      sourceMessageKey,
+      sourceTable: "wa-web-system-timeline",
+      sourceRowId: sourceMessageId,
+      chatSourceId,
+      senderSourceJid: null,
+      timestampMs: observedAtMs,
+      sentAtIso: observedAtMs == null ? null : new Date(observedAtMs).toISOString(),
+      fromMe: null,
+      direction: "system",
+      messageType: "system",
+      rawTypeCode: "live-system-timeline",
+      body: null,
+      caption: null,
+      hasMedia: false,
+      mediaMimeType: null,
+      mediaName: null,
+      isDeleted: false,
+      isForwarded: false,
+      isStarred: false,
+      rawMetadata: { source: "wa-web-system-timeline", signalKind: kind }
+    });
+  };
+  for (const signal of archiveSignals.numberChanges ?? []) {
+    if (signal.source === "live" && signal.sourceMessageKey == null) {
+      addAnchor("number-change", signal.eventKey, signal.chatSourceId, signal.observedAtMs, (sourceMessageKey) => {
+        signal.sourceMessageKey = sourceMessageKey;
+      });
+    }
+  }
+  for (const signal of archiveSignals.membershipEvents ?? []) {
+    if (signal.source === "live" && signal.sourceMessageKey == null) {
+      addAnchor("membership", signal.eventKey, signal.groupSourceId, signal.observedAtMs, (sourceMessageKey) => {
+        signal.sourceMessageKey = sourceMessageKey;
+      });
+    }
+  }
+  for (const signal of archiveSignals.chatMetadataHistory ?? []) {
+    if (signal.source === "live" && signal.sourceMessageKey == null) {
+      addAnchor("chat-metadata", signal.eventKey, signal.chatSourceId, signal.observedAtMs, (sourceMessageKey) => {
+        signal.sourceMessageKey = sourceMessageKey;
+      });
+    }
+  }
+  return { messages, archiveSignals };
+}
+
 export function liveEventNeedsArchiveSnapshot(
-  event: Pick<LiveMessageEvent, "messages" | "updates" | "secrets" | "retainedPayloads" | "mediaDescriptors" | "linkPreviews">
+  event: Pick<LiveMessageEvent, "messages" | "updates" | "secrets" | "retainedPayloads" | "mediaDescriptors" | "linkPreviews" | "archiveSignals">
 ): boolean {
   return Boolean(
     event.messages?.length ||
@@ -710,7 +923,8 @@ export function liveEventNeedsArchiveSnapshot(
       event.secrets?.length ||
       event.retainedPayloads?.length ||
       event.mediaDescriptors?.length ||
-      event.linkPreviews?.length
+      event.linkPreviews?.length ||
+      hasArchiveSignals(event.archiveSignals ?? {})
   );
 }
 

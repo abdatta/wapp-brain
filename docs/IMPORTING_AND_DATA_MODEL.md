@@ -56,6 +56,31 @@ Where available, the importer stores:
 
 Modern Android imports defensively capture WhatsApp's reply-owned `message_quoted` snapshot and known media, location, vCard, and mention companions when present. The full captured quote stays local in a one-to-one archive record owned by the reply; absent or malformed optional tables keep the existing pointer-only reply behavior. Later backup or live observations can fill missing snapshot fields without erasing the earlier local capture.
 
+## Structured Signal Capture
+
+After canonical chats, messages, identities, and edit-key collapse are in place, import captures optional structured signals with `captureVersion` `1`. The same canonical records are also accepted from live notify and history events.
+
+- `identity_number_changes` records structurally verified old/new JID pairs. It is evidence for a later identity consumer, not an automatic person connection.
+- `group_membership_periods` and `group_membership_events` retain available current/past membership bounds, role, and verified `add`, `remove`, `join`, `leave`, `invite`, `accept`, `promote`, or `demote` actions. Actor and affected-person roles are separate. In particular, `message_system_group.is_me_joined` alone never creates an owner membership fact.
+- `chat_metadata_history` retains observed subject, description, photo, invite-link, announcement, restriction, member-add, join-approval, and disappearing-message settings with stable anchors; unverified action codes and unavailable fields are not guessed.
+- `message_locations`, `message_location_observations`, `message_vcards`, `message_edit_events`, `message_deletions`, `message_media_interpretations`, and `archive_signal_observations` retain complete local source observations. Location records can include quality, movement, sequence, duration/final, caption/comment/URL, and thumbnail-presence fields. vCards retain lossless parsed properties plus the source card when available.
+- sender-embedded link previews reuse `message_link_previews`; no URL is fetched during import.
+- `engagement_aggregates` retains only per-chat counters, bounds, exact median response latency, sample count, and algorithm version. Raw receipt/device rows and recipient identifiers never leave source SQLite.
+
+Optional tables and columns are inspected before use. A missing, renamed, malformed, or unreadable companion only skips that signal family/row and emits a content-free warning; ordinary messages and other compatible families continue importing.
+
+For engagement version 1, the denominator is eligible outgoing messages, delivery/read counts are backed by available receipt/device timestamps, and a response-latency sample is an incoming message immediately following an outgoing message in chronological order. SQLite ranks numeric samples to calculate the exact median, so the importer does not retain a latency array in Node memory.
+
+### Consumer Handoff
+
+Changes #5, #8, and #9 should consume the focused repository methods rather than parse message metadata: `listIdentityNumberChanges`, `listGroupMembershipPeriods`, `listGroupMembershipEvents`, `listChatMetadataHistory`, and `listEngagementAggregates`. Each row carries source, event key, observation time, and capture/algorithm versions. Consumers must represent unavailable or skipped fields as unknown, never infer a number change from a display name, a group action from an unverified numeric code, or a person match from a vCard hint.
+
+Signal re-imports use natural keys and monotonic enrichment: missing fields fill, newer/richer live observations are retained, and an enrichment of a message used by a brain episode marks only that episode stale. `brain_episode_signal_anchors` stores message key, signal kind, and capture version (never raw text); regeneration makes a replacement episode transactionally and does not advance an already-covered watermark.
+
+### Owner-Local Detail And Downloads
+
+The message-list API intentionally stays compact for pagination. Opening a message detail view calls the loopback-only focused detail route, which may return every retained field for the archive owner: exact location telemetry, raw vCard source and properties, edit/deletion timestamps and provenance, transcript/accessibility text, and system role/raw-type fields. Each vCard can be downloaded locally: source bytes are preferred; a minimal `.vcf` is constructed only from a trustworthy display name and phone-form JID. LID-only or otherwise insufficient records return no download.
+
 ## Schema Strategy
 
 WhatsApp Android schemas are unofficial and change over time. The parser should:

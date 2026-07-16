@@ -16,9 +16,11 @@ import {
   HardDrive,
   History,
   KeyRound,
-  Link2,
   Loader2,
   MessageCircle,
+  MapPin,
+  ContactRound,
+  Info,
   Moon,
   Pause,
   Play,
@@ -32,11 +34,11 @@ import {
   Trash2,
   Unlink,
   Upload,
-  Users,
   X
 } from "lucide-react";
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { MouseEvent as ReactMouseEvent, ReactNode, RefObject } from "react";
+import { createPortal } from "react-dom";
 import { parseInlineSegments, parseWhatsAppBlocks, type InlineSegment } from "./whatsappFormat";
 import { quotePreviewModel } from "./quotePreview";
 import type {
@@ -55,7 +57,8 @@ import type {
   LiveSyncProgress,
   MemoryCitationResolution,
   MemoryQueryResult,
-  MessageEditRevisionRecord,
+  ArchiveSignalObservation,
+  MessageDetail,
   MessageListItem,
   PickKind,
   SearchIndexStatus,
@@ -87,7 +90,6 @@ import {
   linkPreviewThumbnailUrl,
   listChats,
   listLiveGaps,
-  listMessageRevisions,
   listMessages,
   mediaAssetUrl,
   mediaThumbnailUrl,
@@ -108,6 +110,8 @@ import {
   unlinkLiveSession,
   verifyImportKey,
   getGoogleContactsStatus,
+  getMessageDetail,
+  messageVcardDownloadUrl,
   syncGoogleContacts,
   disconnectGoogleContacts
 } from "./api";
@@ -260,17 +264,40 @@ function MessageBubble({
   highlighted?: boolean;
   onJumpToMessage?: (messageId: number) => void;
 }) {
-  const text = message.body || message.caption;
+  const text = visibleMessageText(message);
   const placeholder = messagePlaceholder(message);
   const mediaWidth = mediaDisplayWidth(message.media, message.messageType);
   const [historyOpen, setHistoryOpen] = useState(false);
-  const hasHistory = message.editRevisionCount > 0;
+  const [detailFocus, setDetailFocus] = useState<MessageDetailFocus | null>(null);
+  const hasHistory = message.editRevisionCount > 0 || Boolean(message.structuredSignals?.edit);
+  const hasDeletionDetail = Boolean(message.structuredSignals?.deletion);
+  const hasStructuredCard = Boolean(message.structuredSignals?.location || message.structuredSignals?.vcards.length);
 
   if (isSystemEvent(message)) {
+    const summaries = message.systemEvents ?? [];
+    const visibleSummaries = summaries.slice(0, 2);
+    const remainingSummaryCount = Math.max(0, summaries.length - visibleSummaries.length);
+    const isBundle = summaries.length > 2;
     return (
       <article className={`systemChip ${highlighted ? "jumpHighlight" : ""}`} data-mid={message.id}>
-        <span>{text ? renderInlineText(text, message.mentions) : placeholder.label}</span>
+        <button className="systemEventTrigger" type="button" onClick={() => setDetailFocus("system")} aria-label="Open details for this system event">
+          <span className="systemEventDetails">
+            {summaries.length ? (
+              isBundle ? (
+                <>
+                  <strong>{summaries.length} group changes</strong>
+                  <span>{systemEventDisplaySummary(visibleSummaries[0]!)}</span>
+                  <small>+{remainingSummaryCount + 1} more</small>
+                </>
+              ) : visibleSummaries.map((event, index) => <span key={`${event.kind}:${event.captureVersion}:${index}`}>{systemEventDisplaySummary(event)}</span>)
+            ) : (
+              <span>{text && text.trim().toLowerCase() !== "system event" ? renderInlineText(text, message.mentions) : placeholder.label === "System event" || text?.trim().toLowerCase() === "system event" ? "Unclassified system event" : placeholder.label}</span>
+            )}
+          </span>
+          <Info className="systemEventInfo" size={13} aria-hidden="true" />
+        </button>
         <time>{formatTime(message.sentAt)}</time>
+        {detailFocus && <MessageDetailModal message={message} focus={detailFocus} onClose={() => setDetailFocus(null)} />}
       </article>
     );
   }
@@ -283,7 +310,18 @@ function MessageBubble({
       <div className="messageMeta">
         {isGroup && message.direction !== "outgoing" && <span className="metaName">{message.senderDisplayName ?? "Unresolved contact"}</span>}
         <span className="metaRight">
-          {message.isDeleted && <span className="deletedChip">deleted</span>}
+          {message.isDeleted && (hasDeletionDetail ? (
+            <button
+              className="deletedChip clickable"
+              type="button"
+              onClick={() => setDetailFocus("deletion")}
+              title="View deletion details"
+              aria-haspopup="dialog"
+              aria-expanded={detailFocus === "deletion"}
+            >
+              deleted
+            </button>
+          ) : <span className="deletedChip">deleted</span>)}
           {message.isEdited &&
             (hasHistory ? (
               <button
@@ -307,7 +345,7 @@ function MessageBubble({
       {text ? (
         <div className="messageText">{renderRichText(text, message.mentions)}</div>
       ) : (
-        !message.media && (
+        !message.media && !hasStructuredCard && (
           <p className="placeholderText">
             {placeholder.label}
             {placeholder.reason && <span className="placeholderReason">{placeholder.reason}</span>}
@@ -315,6 +353,7 @@ function MessageBubble({
         )
       )}
       {message.linkPreview && <LinkPreviewCard message={message} />}
+      {message.structuredSignals && <StructuredSignalDetails message={message} onOpenDetails={setDetailFocus} />}
       {(message.isForwarded || message.isStarred || (message.hasMedia && !message.media)) && (
         <div className="messageFlags">
           {message.hasMedia && !message.media && <span>{message.mediaMimeType ?? message.messageType}</span>}
@@ -323,8 +362,427 @@ function MessageBubble({
         </div>
       )}
       {historyOpen && <EditHistoryModal message={message} onClose={() => setHistoryOpen(false)} />}
+      {detailFocus && <MessageDetailModal message={message} focus={detailFocus} onClose={() => setDetailFocus(null)} />}
     </article>
   );
+}
+
+export function visibleMessageText(message: MessageListItem): string | null {
+  const text = message.body || message.caption;
+  if (!message.body || !message.structuredSignals) return text;
+  const body = message.body.trim();
+  if (message.structuredSignals.location) {
+    const generatedLocationLabel = message.structuredSignals.location.isLive ? /^live location$/i : /^location$/i;
+    if (generatedLocationLabel.test(body)) return message.caption;
+  }
+  if (message.structuredSignals.vcards.length) {
+    const generatedCount = body.match(/^(\d+)\s+contacts?$/i);
+    if (generatedCount && Number(generatedCount[1]) === message.structuredSignals.vcards.length) return message.caption;
+  }
+  return text;
+}
+
+export type MessageDetailFocus = "location" | "vcard" | "deletion" | "interpretation" | "system";
+
+function systemEventDisplaySummary(event: NonNullable<MessageListItem["systemEvents"]>[number]): string {
+  return event.kind === "generic" && event.summary === "System event" ? "Unclassified system event" : event.summary;
+}
+
+// Thread rows retain compact, scannable summaries. Complete retained archive
+// data is loaded only when the user explicitly opens details.
+function StructuredSignalDetails({ message, onOpenDetails }: { message: MessageListItem; onOpenDetails: (focus: MessageDetailFocus) => void }) {
+  const signals = message.structuredSignals;
+  if (!signals) return null;
+  return (
+    <div className="structuredSignals">
+      {signals.location && (
+        <button className="structuredCard locationCard" type="button" onClick={() => onOpenDetails("location")}>
+          <MapPin size={16} />
+          <span><strong>{signals.location.isLive ? "Live location" : "Location"}</strong><small>{compactLocationLabel(signals.location.name, signals.location.address) || "Open local location details"}</small></span>
+          <ChevronRight size={15} />
+        </button>
+      )}
+      {signals.vcards.length > 0 && (
+        <button className="structuredCard vcardCard" type="button" onClick={() => onOpenDetails("vcard")}>
+          <ContactRound size={16} />
+          <span><strong>{signals.vcards.length} contact card{signals.vcards.length === 1 ? "" : "s"}</strong><small>{signals.vcards.map((card) => card.displayName).filter(Boolean).join(" · ") || "Open contact details"}</small></span>
+          <ChevronRight size={15} />
+        </button>
+      )}
+      {signals.mediaInterpretations.length > 0 && <button className="detailDisclosure" type="button" onClick={() => onOpenDetails("interpretation")}><FileText size={13} /> Transcript <ChevronRight size={13} /></button>}
+    </div>
+  );
+}
+
+function MessageDetailModal({ message, focus, onClose }: { message: MessageListItem; focus: MessageDetailFocus; onClose: () => void }) {
+  const [detail, setDetail] = useState<MessageDetail | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    let cancelled = false;
+    getMessageDetail(message.id).then((result) => {
+      if (!cancelled) setDetail(result);
+    }).catch((reason: unknown) => {
+      if (!cancelled) setError(reason instanceof Error ? reason.message : "Unable to load local message details.");
+    });
+    return () => { cancelled = true; };
+  }, [message.id]);
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  useEffect(() => {
+    closeButtonRef.current?.focus();
+  }, []);
+  return createPortal(
+    <div className="modalBackdrop detailBackdrop" role="dialog" aria-modal="true" aria-label="Message details" onClick={onClose}>
+      <section className="messageDetailModal" onClick={(event) => event.stopPropagation()}>
+        <header className="detailModalHeader">
+          <div>
+            <span className="eyebrow"><Info size={14} /> Local archive</span>
+            <h2>{detail ? messageDetailTitle(detail, focus) : "Loading details"}</h2>
+            {detail && <p>{messageDetailSubtitle(detail, focus)}</p>}
+          </div>
+          <button ref={closeButtonRef} className="iconButton" type="button" onClick={onClose} aria-label="Close message details"><X size={16} /></button>
+        </header>
+        {error ? <p className="detailError">{error}</p> : !detail ? <div className="editTimelineLoading"><Loader2 className="spin" size={18} /> Loading local detail...</div> : <MessageDetailContent detail={detail} focus={focus} />}
+      </section>
+    </div>,
+    document.body
+  );
+}
+
+export function messageDetailTitle(detail: MessageDetail, focus: MessageDetailFocus): string {
+  if (focus === "system") return detail.systemEvents.length > 1 ? `${detail.systemEvents.length} group changes` : detail.systemEvents[0]?.kind === "generic" ? "Unclassified system event" : "System event";
+  if (focus === "deletion") return "Deleted message";
+  if (focus === "location") return detail.locations.some((location) => location.isLive) ? "Live location" : "Location";
+  if (focus === "vcard") return detail.vcards.length === 1 ? "Shared contact" : `${detail.vcards.length} shared contacts`;
+  return detail.mediaInterpretations.some((item) => item.kind === "transcription" || item.kind === "transcription_segment") ? "Transcript" : "Accessibility details";
+}
+
+export function messageDetailSubtitle(detail: MessageDetail, focus: MessageDetailFocus): string {
+  if (focus === "system") return detail.systemEvents.some((event) => event.kind === "generic")
+    ? "The source event is preserved, but its action could not be decoded safely."
+    : "Who acted and who was affected are kept as separate facts.";
+  if (focus === "deletion") return "What WhatsApp retained about when this message was removed.";
+  if (focus === "location") return "Exact coordinates and the location metadata retained by WhatsApp.";
+  if (focus === "vcard") return "Contact data exactly as preserved in your local archive.";
+  return "Source-provided text from WhatsApp — not generated by Wapp Brain.";
+}
+
+export function MessageDetailContent({ detail, focus }: { detail: MessageDetail; focus: MessageDetailFocus }) {
+  return (
+    <div className="messageDetailContent">
+      {focus === "location" && detail.locations.map((location, index) => <LocationDetailView location={location} key={`location:${index}`} />)}
+      {focus === "vcard" && detail.vcards.map((card) => <VCardDetailView card={card} messageId={detail.id} key={`vcard:${card.cardIndex}`} />)}
+      {focus === "deletion" && detail.deletion && <DeletionDetailView deletion={detail.deletion} />}
+      {focus === "interpretation" && <InterpretationDetailView items={detail.mediaInterpretations} />}
+      {focus === "system" && detail.systemEvents.map((event) => <SystemEventDetailSection event={event} compact={detail.systemEvents.length > 1} key={event.eventKey} />)}
+    </div>
+  );
+}
+
+function VCardDetailView({ card, messageId }: { card: MessageDetail["vcards"][number]; messageId: number }) {
+  const properties = card.properties ?? [];
+  const primaryProperties = properties.filter((property) => !["BEGIN", "END", "VERSION", "N", "FN"].includes(property.name.toUpperCase()));
+  return (
+    <section className="detailSection vcardDetail">
+      <div className="contactDetailHero">
+        <span className="detailIcon"><ContactRound size={18} /></span>
+        <div><span className="detailKind">Contact {card.cardIndex + 1}</span><h3>{card.displayName ?? `Contact card ${card.cardIndex + 1}`}</h3></div>
+      </div>
+      <DetailFieldGrid values={{
+        "Resolved identity": card.resolvedJid,
+        "vCard file": card.downloadKind === "source" ? "Original source retained" : card.downloadKind === "constructed" ? "Constructed from retained fields" : "Unavailable",
+        "Download filename": card.downloadFileName,
+        Observed: formatDetailDateTime(card.observedAtMs)
+      }} />
+      {primaryProperties.length > 0 && (
+        <div className="vcardPrimaryFields">
+          <span className="detailKind">Contact fields</span>
+          <VCardPropertyList properties={primaryProperties} />
+        </div>
+      )}
+      {card.downloadKind !== "unavailable" ? <a className="detailDownload" href={messageVcardDownloadUrl(messageId, card.cardIndex)} download><Download size={14} /> Download .vcf{card.downloadKind === "constructed" ? " (constructed)" : ""}</a> : <p className="detailEmpty">No trustworthy downloadable vCard can be constructed from the retained data.</p>}
+      {properties.length > 0 && <details><summary>All {properties.length} retained vCard fields</summary><VCardPropertyList properties={properties} /></details>}
+      {card.vcard && <details><summary>Original vCard source</summary><pre className="sourcePayload">{card.vcard}</pre></details>}
+      <SourceObservationDisclosure observations={card.provenance} />
+    </section>
+  );
+}
+
+function VCardPropertyList({ properties }: { properties: NonNullable<MessageDetail["vcards"][number]["properties"]> }) {
+  return (
+    <div className="vcardProperties">
+      {properties.map((property, index) => (
+        <div key={`${property.name}:${index}`}>
+          <strong>{property.group ? `${property.group}.` : ""}{property.name}{property.parameters.length ? `; ${property.parameters.map((parameter) => `${parameter.name}=${parameter.values.join(",")}`).join("; ")}` : ""}</strong>
+          <span>{property.value}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function LocationDetailView({ location }: { location: MessageDetail["locations"][number] }) {
+  const hasContext = Boolean(location.name || location.address || location.url || location.comment || location.caption);
+  const hasTelemetry = location.accuracyMeters != null || location.speedMps != null || location.headingDegrees != null;
+  const heroAddress = location.address && location.address.trim().toLocaleLowerCase() !== location.name?.trim().toLocaleLowerCase() ? location.address : null;
+  return (
+    <>
+      <section className="locationDetailHero">
+        <span className="locationTypeBadge"><Signal size={13} /> {location.isLive ? "Live share" : "Pinned location"}</span>
+        <code className="coordinatePair">{location.latitude ?? "—"}, {location.longitude ?? "—"}</code>
+        {(location.name || location.address) && <div className="locationPlace"><strong>{location.name ?? location.address}</strong>{heroAddress && <span>{heroAddress}</span>}</div>}
+      </section>
+      {location.isLive && (
+        <section className="detailSection">
+          <h3><History size={16} /> Share timeline</h3>
+          <DetailFactCards values={{
+            "First observed": formatDetailDateTime(location.observedAtMs),
+            "Share duration": location.liveShareDurationMs == null ? null : formatDetailDuration(location.liveShareDurationMs),
+            "Final update": location.finalAtMs == null ? null : formatDetailDateTime(location.finalAtMs)
+          }} />
+        </section>
+      )}
+      {hasContext && (
+        <section className="detailSection">
+          <h3><MapPin size={16} /> Place details</h3>
+          <DetailFieldGrid values={{ Name: location.name, Address: location.address, URL: location.url ?? null, Comment: location.comment ?? null, Caption: location.caption ?? null }} />
+        </section>
+      )}
+      {hasTelemetry && (
+        <section className="detailSection">
+          <h3><Signal size={16} /> Accuracy and motion</h3>
+          <DetailFactCards values={{ "Accuracy": location.accuracyMeters == null ? null : `${location.accuracyMeters} m`, "Speed": location.speedMps == null ? null : `${location.speedMps} m/s`, "Heading": location.headingDegrees == null ? null : `${location.headingDegrees}°` }} />
+        </section>
+      )}
+      <section className="detailSection quietDetailSection">
+        <details className="technicalDetails detailTechnicalDisclosure">
+          <summary>Retained source details</summary>
+          <DetailFieldGrid values={{
+            Latitude: location.latitude,
+            Longitude: location.longitude,
+            Sequence: location.sequenceNumber ?? null,
+            "Time offset": location.timeOffsetMs == null ? null : formatOffset(location.timeOffsetMs),
+            "Embedded thumbnail": location.hasThumbnail ? "Yes" : "No",
+            "Observed": formatDetailDateTime(location.observedAtMs)
+          }} />
+          {location.observations.length > 0 && <details><summary>{location.observations.length} retained update{location.observations.length === 1 ? "" : "s"}</summary><div className="detailList">{location.observations.map((sample, index) => <div className="locationObservation" key={sample.observationKey}><span>Update {index + 1}</span><DetailFieldGrid values={{ Sequence: sample.sequenceNumber, Latitude: sample.latitude, Longitude: sample.longitude, "Accuracy": sample.accuracyMeters == null ? null : `${sample.accuracyMeters} m`, "Speed": sample.speedMps == null ? null : `${sample.speedMps} m/s`, "Heading": sample.headingDegrees == null ? null : `${sample.headingDegrees}°`, "Observed": formatDetailDateTime(sample.observedAtMs) }} /></div>)}</div></details>}
+          <SourceObservationDisclosure observations={location.provenance} />
+        </details>
+      </section>
+    </>
+  );
+}
+
+function compactLocationLabel(name: string | null, address: string | null): string {
+  const values = [name, address].filter((value): value is string => Boolean(value?.trim()));
+  return values.filter((value, index) => values.findIndex((candidate) => candidate.trim().toLocaleLowerCase() === value.trim().toLocaleLowerCase()) === index).join(" · ");
+}
+
+function DeletionDetailView({ deletion }: { deletion: NonNullable<MessageDetail["deletion"]> }) {
+  const elapsed = formatElapsed(deletion.sentAtMs, deletion.deletedAtMs);
+  return (
+    <>
+      <section className="deletionTimeline" aria-label="Deletion timeline">
+        <div><span>Sent</span><strong>{formatDetailDateTime(deletion.sentAtMs)}</strong></div>
+        <ArrowRight size={18} aria-hidden="true" />
+        <div><span>Deleted</span><strong>{formatDetailDateTime(deletion.deletedAtMs)}</strong></div>
+        {elapsed && <span className="elapsedBadge">{elapsed} later</span>}
+      </section>
+      <p className={`detailNotice ${deletion.contentState === "retained" ? "success" : "neutral"}`}>
+        {deletion.contentState === "retained"
+          ? "The message was later deleted. Content already captured by the archive remains visible in the thread."
+          : "The archive received the deletion marker, but never captured the original message content."}
+      </p>
+      <section className="detailSection">
+        <h3><Trash2 size={16} /> Deletion source</h3>
+        <DetailFieldGrid values={{
+          "Deleted by": deletion.revokedByJid ?? "Unknown / not provided",
+          "Admin deletion": deletion.revokedByAdmin == null ? "Not provided" : deletion.revokedByAdmin ? "Yes" : "No",
+          "Deletion kind": deletion.deletionKind ?? "Not provided"
+        }} />
+        <SourceObservationDisclosure observations={deletion.observations} />
+      </section>
+    </>
+  );
+}
+
+function InterpretationDetailView({ items }: { items: MessageDetail["mediaInterpretations"] }) {
+  const primary = items.filter((item) => item.kind !== "transcription_segment");
+  const segments = items.filter((item) => item.kind === "transcription_segment");
+  return (
+    <>
+      {primary.map((item) => (
+        <section className="detailSection interpretationPrimary" key={`${item.kind}:${item.segmentIndex}`}>
+          <span className="detailKind">{item.kind === "accessibility_label" ? "WhatsApp accessibility description" : "WhatsApp transcription"}</span>
+          <p>{item.text}</p>
+          <small>Source-provided · {item.source === "live" ? "Live sync" : "Backup"} · {formatDetailDateTime(item.observedAtMs)}</small>
+        </section>
+      ))}
+      {segments.length > 0 && (
+        <section className="detailSection transcriptSegments">
+          <details open={primary.length === 0}>
+            <summary>{segments.length} transcript segment{segments.length === 1 ? "" : "s"}</summary>
+            <div className="detailList">{segments.map((item, index) => <div className="interpretationDetail" key={`${item.kind}:${item.segmentIndex}`}><strong>Segment {index + 1}</strong><span>{item.text}</span><small>{formatSegmentTiming(item.startMs, item.endMs)}</small></div>)}</div>
+          </details>
+        </section>
+      )}
+    </>
+  );
+}
+
+function DetailFactCards({ values }: { values: Record<string, string | number | null | undefined> }) {
+  const entries = Object.entries(values).filter(([, value]) => value !== null && value !== undefined && value !== "");
+  return <div className="detailFactCards">{entries.map(([label, value]) => <div key={label}><span>{label}</span><strong>{String(value)}</strong></div>)}</div>;
+}
+
+function SystemEventDetailSection({ event, compact = false }: { event: MessageDetail["systemEvents"][number]; compact?: boolean }) {
+  const actorApplies = event.kind === "number_change" || event.kind === "chat_metadata" || (event.kind === "membership" && !["join", "leave", "accept"].includes(event.action ?? ""));
+  const hasTechnical = Boolean(event.actorJid || event.participantJid || event.oldJid || event.newJid || event.rawType || event.rawParameters);
+  const technicalFields = { "Actor identity": event.actorJid, "Participant identity": event.participantJid, "Previous identity JID": event.oldJid, "New identity JID": event.newJid, "Raw event type": event.rawType };
+  return (
+    <section className={`detailSection systemEventDetailCard ${compact ? "compact" : ""}`}>
+      <div className="detailSectionHeading">
+        <span className="detailKind">{event.kind === "generic" ? "Unclassified" : event.kind.replaceAll("_", " ")}{event.action ? ` · ${event.action}` : ""}</span>
+        <h3><Info size={16} /> {event.summary}</h3>
+      </div>
+      {event.kind === "generic" && <p className="detailNotice neutral">No join, leave, role, number-change, or group-setting meaning could be verified from this source row. The original type is still available below.</p>}
+      <DetailFieldGrid values={{
+        "Event time": formatDetailDateTime(event.occurredAtMs),
+        Actor: actorApplies ? resolvedIdentityDisplay(event.actorLabel) : null,
+        "Affected participant": event.kind === "membership" ? resolvedIdentityDisplay(event.participantLabel) : null,
+        "Previous identity": event.kind === "number_change" ? resolvedIdentityDisplay(event.oldIdentityLabel) : null,
+        "New identity": event.kind === "number_change" ? resolvedIdentityDisplay(event.newIdentityLabel) : null,
+        Field: event.field,
+        "Previous value": event.oldValue,
+        "New value": event.newValue
+      }} />
+      {compact && (hasTechnical || event.observations.length > 0) ? (
+        <details className="technicalDetails">
+          <summary>Source details{event.observations.length ? ` · ${event.observations.length} record${event.observations.length === 1 ? "" : "s"}` : ""}</summary>
+          {hasTechnical && <DetailFieldGrid values={technicalFields} />}
+          {event.rawParameters && <pre className="sourcePayload">{formatRawPayload(event.rawParameters)}</pre>}
+          <SourceObservationRows observations={event.observations} />
+        </details>
+      ) : (
+        <>
+          {hasTechnical && (
+            <details className="technicalDetails">
+              <summary>Technical source data</summary>
+              <DetailFieldGrid values={technicalFields} />
+              {event.rawParameters && <pre className="sourcePayload">{formatRawPayload(event.rawParameters)}</pre>}
+            </details>
+          )}
+          <SourceObservationDisclosure observations={event.observations} />
+        </>
+      )}
+    </section>
+  );
+}
+
+function resolvedIdentityDisplay(label: string | null): string {
+  if (!label || /^(unknown|unresolved)(\s*\/\s*(unknown|unresolved|not provided))?( contact)?$/i.test(label.trim())) return "Unknown";
+  return label;
+}
+
+function EditTimeline({ entries }: { entries: MessageDetail["editTimeline"] }) {
+  return (
+    <div className="editTimeline">
+      {entries.map((entry, index) => (
+        <div className={`editTimelineEntry ${entry.kind === "current" ? "current" : ""}`} key={`${entry.kind}:${entry.timestampMs ?? ""}:${index}`}>
+          <div className="editTimelineHead">
+            <span className="editTimelineLabel">{editTimelineLabel(entry.kind)}</span>
+            <time>{formatDetailDateTime(entry.timestampMs)}</time>
+          </div>
+          {entry.text != null ? <p className="editTimelineText">{entry.text}</p> : <p className="editTimelineUnavailable">{entry.kind === "sent" ? "Original text was not retained" : "Text for this state was not retained"}</p>}
+          {entry.source !== "archive" && <small className="timelineSource">Timestamp from {entry.source === "live" ? "live sync" : "the backup edit record"}</small>}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function editTimelineLabel(kind: MessageDetail["editTimeline"][number]["kind"]): string {
+  if (kind === "sent") return "Original message sent";
+  if (kind === "held_revision") return "Previous text";
+  if (kind === "metadata_only_edit") return "Edit recorded";
+  return "Current text after edit";
+}
+
+export function editHistoryPresentation(detail: MessageDetail | null): {
+  sentAtMs: number | null;
+  lastEditedMs: number | null;
+  originalTextMissing: boolean;
+  hasDistinctTimes: boolean;
+} {
+  const entries = detail?.editTimeline ?? [];
+  const sent = entries.find((entry) => entry.kind === "sent") ?? null;
+  const editTimes = entries.filter((entry) => entry.kind !== "sent").map((entry) => entry.timestampMs).filter((value): value is number => value != null && Number.isFinite(value));
+  const lastEditedMs = editTimes.length ? Math.max(...editTimes) : null;
+  return {
+    sentAtMs: sent?.timestampMs ?? detail?.sentAtMs ?? null,
+    lastEditedMs,
+    originalTextMissing: Boolean(sent && sent.text == null),
+    hasDistinctTimes: sent?.timestampMs != null && lastEditedMs != null && sent.timestampMs !== lastEditedMs
+  };
+}
+
+function SourceObservationDisclosure({ observations }: { observations: ArchiveSignalObservation[] }) {
+  if (observations.length === 0) return null;
+  return (
+    <details className="technicalDetails">
+      <summary>{observations.length} source record{observations.length === 1 ? "" : "s"}</summary>
+      <SourceObservationRows observations={observations} />
+    </details>
+  );
+}
+
+function SourceObservationRows({ observations }: { observations: ArchiveSignalObservation[] }) {
+  if (observations.length === 0) return null;
+  return (
+    <div className="detailList">
+      {observations.map((observation, index) => <DetailFieldGrid key={`${observation.source}:${observation.sourceEventKey}:${index}`} values={{ Source: observation.source === "live" ? "Live sync" : "Backup", Observed: formatDetailDateTime(observation.observedAtMs), "Capture version": observation.captureVersion, "Source event key": observation.sourceEventKey }} />)}
+    </div>
+  );
+}
+
+function formatRawPayload(value: string): string {
+  try {
+    return JSON.stringify(JSON.parse(value), null, 2);
+  } catch {
+    return value;
+  }
+}
+
+function DetailFieldGrid({ values }: { values: Record<string, string | number | boolean | null | undefined> }) {
+  const entries = Object.entries(values).filter(([, value]) => value !== null && value !== undefined && value !== "");
+  return entries.length ? <dl className="detailFieldGrid">{entries.map(([label, value]) => <Fragment key={label}><dt>{label}</dt><dd>{String(value)}</dd></Fragment>)}</dl> : <p className="detailEmpty">Not available from this source.</p>;
+}
+
+function formatOffset(value: number | null): string {
+  if (value == null) return "Time unavailable";
+  return `${value} ms`;
+}
+
+function formatSegmentTiming(startMs: number | null, endMs: number | null): string {
+  if (startMs != null && endMs != null) return `${formatOffset(startMs)} – ${formatOffset(endMs)}`;
+  if (startMs != null) return `At ${formatOffset(startMs)}`;
+  if (endMs != null) return `Through ${formatOffset(endMs)}`;
+  return "Timing unavailable";
+}
+
+function formatElapsed(startMs: number | null, endMs: number | null): string | null {
+  if (startMs == null || endMs == null || endMs < startMs) return null;
+  const seconds = Math.floor((endMs - startMs) / 1000);
+  if (seconds < 60) return `${seconds} second${seconds === 1 ? "" : "s"}`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return `${hours} hour${hours === 1 ? "" : "s"}${remainingMinutes ? ` ${remainingMinutes} minute${remainingMinutes === 1 ? "" : "s"}` : ""}`;
 }
 
 export function QuotedPreview({ message, onJumpToMessage }: { message: MessageListItem; onJumpToMessage?: (messageId: number) => void }) {
@@ -364,64 +822,22 @@ export function QuotedPreview({ message, onJumpToMessage }: { message: MessageLi
   );
 }
 
-// A version in the reconstructed timeline: the text that was showing, and the
-// moment it became the message's content.
-interface EditTimelineEntry {
-  key: string;
-  label: string;
-  timeMs: number | null;
-  text: string;
-  current: boolean;
-}
-
-// Reconstruct the full version timeline from the message and its retained prior
-// revisions. Each revision stores the text of a past version and the time it
-// was replaced; a version therefore became active when the PREVIOUS one was
-// replaced (and the very first became active at the original send time). This
-// is what makes the timestamps read correctly — "Original 12:31 / Edited 12:32"
-// instead of tagging the old text with the time it was edited away.
-function buildEditTimeline(message: MessageListItem, revisions: MessageEditRevisionRecord[]): EditTimelineEntry[] {
-  const currentText = message.body ?? message.caption ?? "(no text)";
-  if (revisions.length === 0) {
-    return [{ key: "cur", label: "Current version", timeMs: message.timestampMs, text: currentText, current: true }];
-  }
-  const entries: EditTimelineEntry[] = [
-    { key: "orig", label: "Original", timeMs: message.timestampMs, text: revisions[0].body ?? revisions[0].caption ?? "(no text)", current: false }
-  ];
-  for (let index = 1; index < revisions.length; index += 1) {
-    entries.push({
-      key: `rev-${revisions[index].revisionIndex}`,
-      label: "Edited",
-      timeMs: revisions[index - 1].editedAtMs,
-      text: revisions[index].body ?? revisions[index].caption ?? "(no text)",
-      current: false
-    });
-  }
-  entries.push({
-    key: "cur",
-    label: "Current version",
-    timeMs: revisions[revisions.length - 1].editedAtMs,
-    text: currentText,
-    current: true
-  });
-  return entries;
-}
-
 // Modal timeline of a message's edits, oldest to newest, each version labeled
 // with when it became the message's content.
 function EditHistoryModal({ message, onClose }: { message: MessageListItem; onClose: () => void }) {
-  const [revisions, setRevisions] = useState<MessageEditRevisionRecord[] | null>(null);
+  const [detail, setDetail] = useState<MessageDetail | null>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
   // Fetch fresh whenever the modal opens, and re-fetch when a live edit adds a
   // revision (the count changes) — so the history never shows a stale snapshot.
   // Kept in the modal (not cached on the bubble) so reopening always reloads.
   useEffect(() => {
     let cancelled = false;
-    listMessageRevisions(message.id)
+    getMessageDetail(message.id)
       .then((result) => {
-        if (!cancelled) setRevisions(result);
+        if (!cancelled) setDetail(result);
       })
       .catch(() => {
-        if (!cancelled) setRevisions([]);
+        if (!cancelled) setDetail(null);
       });
     return () => {
       cancelled = true;
@@ -434,48 +850,44 @@ function EditHistoryModal({ message, onClose }: { message: MessageListItem; onCl
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
-  // Built oldest-to-newest for correct "became active" timestamps, shown
-  // newest-first so the current version is on top.
-  const timeline = revisions ? buildEditTimeline(message, revisions).reverse() : null;
-  const lastEditedMs = revisions && revisions.length > 0 ? revisions[revisions.length - 1].editedAtMs : null;
-  return (
+  useEffect(() => {
+    closeButtonRef.current?.focus();
+  }, []);
+  const timeline = detail?.editTimeline ?? null;
+  const presentation = editHistoryPresentation(detail);
+  return createPortal(
     <div className="modalBackdrop" role="dialog" aria-modal="true" aria-label="Message edit history" onClick={onClose}>
       <section className="editHistoryModal" onClick={(event) => event.stopPropagation()}>
         <div className="editHistoryModalHeader">
           <div>
             <span className="eyebrow">
               <History size={14} />
-              Edit history
+              Edited message
             </span>
-            <h2>
-              {timeline ? `${timeline.length} version${timeline.length === 1 ? "" : "s"}` : "Loading…"}
-            </h2>
-            {lastEditedMs != null && <p>Last edited {formatDateTime(lastEditedMs)}</p>}
+            <h2>{timeline ? "Edit details" : "Loading…"}</h2>
+            {timeline && <p className="editFactLine"><span>Sent {formatDetailDateTime(presentation.sentAtMs)}</span><ArrowRight size={13} /><span>{presentation.lastEditedMs == null ? "Edit time unavailable" : `Edit recorded ${formatDetailDateTime(presentation.lastEditedMs)}`}</span></p>}
           </div>
-          <button className="iconButton" type="button" onClick={onClose} aria-label="Close edit history">
+          <button ref={closeButtonRef} className="iconButton" type="button" onClick={onClose} aria-label="Close edit history">
             <X size={16} />
           </button>
         </div>
-        <div className="editTimeline">
+        <div className="editHistoryBody">
           {timeline == null ? (
             <div className="editTimelineLoading">
               <Loader2 className="spin" size={18} />
               Loading history…
             </div>
           ) : (
-            timeline.map((entry) => (
-              <div className={`editTimelineEntry ${entry.current ? "current" : ""}`} key={entry.key}>
-                <div className="editTimelineHead">
-                  <span className="editTimelineLabel">{entry.label}</span>
-                  <time>{formatDateTime(entry.timeMs)}</time>
-                </div>
-                <p className="editTimelineText">{entry.text}</p>
-              </div>
-            ))
+            <>
+              {presentation.originalTextMissing && <p className="detailNotice neutral editHistoryNotice">WhatsApp preserved a separate edit record, so the edit is certain. This backup did not retain the original text.</p>}
+              {!presentation.hasDistinctTimes && presentation.lastEditedMs == null && <p className="detailNotice neutral editHistoryNotice">The source proves an edit occurred but did not provide a trustworthy edit time. The sent time is never reused as the edit time.</p>}
+              <EditTimeline entries={timeline} />
+            </>
           )}
         </div>
       </section>
-    </div>
+    </div>,
+    document.body
   );
 }
 
@@ -777,6 +1189,7 @@ function isGridMedia(message: MessageListItem): boolean {
     message.media.assetId != null &&
     (mime.startsWith("image/") || mime.startsWith("video/")) &&
     message.messageType !== "sticker" &&
+    !message.isDeleted &&
     !message.body &&
     !message.caption
   );
@@ -825,7 +1238,20 @@ function formatDuration(durationMs: number): string {
   return `${minutes}:${String(seconds).padStart(2, "0")}`;
 }
 
+function formatDetailDuration(durationMs: number): string {
+  const totalSeconds = Math.max(0, Math.round(durationMs / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return [
+    hours ? `${hours} hr` : null,
+    minutes ? `${minutes} min` : null,
+    seconds || (!hours && !minutes) ? `${seconds} sec` : null
+  ].filter(Boolean).join(" ");
+}
+
 function isSystemEvent(message: MessageListItem): boolean {
+  if (message.isDeleted || message.messageType === "revoked") return false;
   return (
     message.direction === "system" ||
     message.messageType === "system" ||
@@ -931,8 +1357,15 @@ function formatTime(value: string | null | undefined): string {
 // Date + time for the edit-history timeline, where distinguishing when each
 // version became active (possibly across days) matters.
 function formatDateTime(ms: number | null | undefined): string {
-  if (ms == null || !Number.isFinite(ms)) return "Unknown time";
+  if (ms == null || !Number.isFinite(ms)) return "Time unavailable";
   return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }).format(new Date(ms));
+}
+
+// Focused detail views show seconds and the year. This keeps distinct source
+// facts visibly distinct even when WhatsApp recorded them within one minute.
+function formatDetailDateTime(ms: number | null | undefined): string {
+  if (ms == null || !Number.isFinite(ms)) return "Time unavailable";
+  return new Intl.DateTimeFormat(undefined, { year: "numeric", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", second: "2-digit" }).format(new Date(ms));
 }
 
 function formatBytes(value: number): string {
@@ -951,6 +1384,7 @@ export {
   formatDate,
   formatTime,
   formatDateTime,
+  formatDetailDateTime,
   formatBytes,
   msToIso,
   EmptyState,

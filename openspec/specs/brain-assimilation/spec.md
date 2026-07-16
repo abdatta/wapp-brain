@@ -77,12 +77,14 @@ Episodic consolidation SHALL produce structured digests conforming to extraction
 
 ### Requirement: Evidence Selection Policy
 
-Evidence packs SHALL contain only conversation messages per the visible-exchange definition, rendered in resolved identity text with interpretation labels for non-text content, bounded in message count, split at long silence gaps, and bounded to a maximum time span; system, reaction, and encrypted-update rows SHALL never consume model budget. Reactions on a pack message SHALL render as non-citable annotations on that message's evidence line, resolving each reactor to the same identity text as senders. A quoted reply SHALL resolve its referent in this order: the real quoted message's citation alias when that message is in the pack; otherwise the captured snapshot's full untruncated text or deterministic structured-content description as non-citable context; otherwise the legacy bounded same-chat pointer lookup; otherwise an honest generic fallback. Quoted snapshot annotations SHALL be exempt from a separate character cap but SHALL remain inside the untrusted-message fence, and thumbnail bytes SHALL never be sent to the model. Captured quoted senders SHALL join pack-local identity resolution and use the same saved-name, push-name, number-token, owner, and collision-disambiguation rules as other participants. A forwarded message SHALL be labelled as forwarded, with a prompt rule to attribute its content as shared or forwarded rather than said. A sender without a resolved display name SHALL be labelled by its verbatim number rather than the literal text "Unknown", and the prompt SHALL instruct referring to that participant by exactly that number. When two participants in one pack resolve to the same display name, each colliding label SHALL receive a deterministic disambiguating suffix and the prompt SHALL instruct using exactly the labels shown. Aliases SHALL be assigned only to real messages present in the pack; no annotation (reaction or out-of-pack quoted snapshot/referent) SHALL be citable.
+Evidence packs SHALL contain only conversation messages per the visible-exchange definition, rendered in resolved identity text with interpretation labels for non-text content, bounded in message count, split at long silence gaps, and bounded to a maximum time span; system, reaction, encrypted-update, number-change, membership-history, and chat-metadata-history rows SHALL never consume model budget. Reactions on a pack message SHALL render as non-citable annotations on that message's evidence line, resolving each reactor to the same identity text as senders. Authoritative structured mentions SHALL resolve through pack-local identity labels and join the entity-resolution set. A message-owned location, vCard, link preview, edit/delete state, or source-provided media interpretation SHALL render as a deterministic bounded annotation on that message's evidence line; it SHALL share the owning message's citation alias and SHALL NOT receive an independent alias. Deleted messages with held content SHALL retain that content plus a deletion annotation, while contentless tombstones SHALL render the honest deleted placeholder. Edit annotations SHALL distinguish an observed edit event from held prior revision content. Source-provided accessibility labels and transcriptions SHALL be labelled by provenance and SHALL NOT be described as model-generated interpretation. Owner-facing local detail may expose complete source values, but that SHALL NOT relax evidence bounds or authorize those values for a remote model. Link-preview thumbnails, embedded media bytes, complete transcript overflow, exact location telemetry, and raw vCard boilerplate SHALL never be sent to the model unless a separate explicit remote-use opt-in is introduced.
+
+A quoted reply SHALL resolve its referent in this order: the real quoted message's citation alias when that message is in the pack; otherwise the captured snapshot's full untruncated text or deterministic structured-content description as non-citable context; otherwise the legacy bounded same-chat pointer lookup; otherwise an honest generic fallback. Quoted snapshot annotations SHALL be exempt from a separate character cap but SHALL remain inside the untrusted-message fence, and thumbnail bytes SHALL never be sent to the model. Captured quoted senders SHALL join pack-local identity resolution and use the same saved-name, push-name, number-token, owner, and collision-disambiguation rules as other participants. A forwarded message SHALL be labelled as forwarded, with a prompt rule to attribute its content as shared or forwarded rather than said. A sender without a resolved display name SHALL be labelled by its verbatim number rather than the literal text "Unknown", and the prompt SHALL instruct referring to that participant by exactly that number. When two participants in one pack resolve to the same display name, each colliding label SHALL receive a deterministic disambiguating suffix and the prompt SHALL instruct using exactly the labels shown. Aliases SHALL be assigned only to real messages present in the pack; no annotation, reaction, or out-of-pack quoted snapshot/referent SHALL be independently citable.
 
 #### Scenario: Noise excluded from evidence
 
-- **WHEN** a window contains system events and reactions alongside conversation
-- **THEN** only conversation messages enter the evidence pack while reactions still appear as annotations on their target messages
+- **WHEN** a window contains system events, membership or metadata history, and reactions alongside conversation
+- **THEN** only conversation messages enter the evidence pack while reactions still appear as annotations on their target messages and history remains available to non-evidence consumers
 
 #### Scenario: Oversized window split
 
@@ -93,6 +95,46 @@ Evidence packs SHALL contain only conversation messages per the visible-exchange
 
 - **WHEN** a pack message has one or more reactions
 - **THEN** the reactions render inline on that message's evidence line with each reactor resolved to identity text, the reactions consume no alias and no budget line, and a claim about the acknowledgment cites the target message's alias
+
+#### Scenario: Structured mention resolves authoritatively
+
+- **WHEN** a pack message carries a structured mentioned JID that differs from or supplements text-token parsing
+- **THEN** the evidence line uses the pack-local identity label, the JID is available to claim entity anchoring, and the mention receives no independent citation alias
+
+#### Scenario: Location and vCard annotate their owning message
+
+- **WHEN** a visible message owns a captured location or one or more vCards
+- **THEN** its evidence line renders bounded type-specific place or shared-contact context and any source-resolved JID without making the attachment independently citable
+
+#### Scenario: Link preview renders without remote or binary content
+
+- **WHEN** a visible message owns a captured link-preview title, description, canonical URL, or thumbnail
+- **THEN** its evidence line renders bounded textual preview context, sends no thumbnail bytes, and performs no link-target fetch
+
+#### Scenario: Edited message distinguishes event from held revision
+
+- **WHEN** a visible message has edit-event metadata with or without retained prior content
+- **THEN** its evidence line marks the message edited, includes available event time, and states prior content is held only when an actual revision exists
+
+#### Scenario: Deleted message keeps captured context
+
+- **WHEN** a visible message is deleted after text, caption, media, or structured context was captured
+- **THEN** its evidence line preserves that context and adds available deletion actor/time metadata instead of replacing it with a bare placeholder
+
+#### Scenario: Contentless deletion stays honest
+
+- **WHEN** a deletion tombstone has no captured content
+- **THEN** its evidence line renders an honest deleted placeholder plus only the deletion metadata actually held
+
+#### Scenario: Source media interpretation is provenance-labelled
+
+- **WHEN** a visible media message carries a source accessibility label or transcription
+- **THEN** the evidence line renders bounded text explicitly labelled as source-provided interpretation and sends no media bytes
+
+#### Scenario: Full local detail does not expand model evidence
+
+- **WHEN** the owner can open an untruncated transcript, raw vCard, exact location telemetry, or raw system parameters in the local UI
+- **THEN** evidence rendering continues to use only its bounded documented annotations and does not include that additional detail by implication
 
 #### Scenario: In-pack quoted reply resolves to the referent alias
 
@@ -220,15 +262,19 @@ The brain SHALL compute scheduled episodic work — a nightly pass over chats wi
 - **THEN** the brain pass executes only after the media pass, holding the `brain` job lock, and yields so ingestion latency stays within normal bounds
 
 ### Requirement: Staleness Propagation
-Message edits, deletions, and interpretation upgrades affecting already-assimilated messages SHALL mark dependent episodes stale and enqueue regeneration tasks; staleness SHALL be visible in brain status. Name resolution SHALL also be a staleness source, but with a deterministic-repair-first policy: when an identity that appears as an unresolved participant in committed episodes gains a resolved name (or a known number where only a LID token was baked), the affected episodes SHALL first be repaired deterministically with no model call (token substitution in prose, stamp update, re-projection, and participant recompute, per the Deterministic Identity Prose Repair requirement) rather than being marked stale. Name resolution MAY additionally enqueue low-priority regeneration tasks as a quality upgrade so the model can weave the newly named person into context, but regeneration SHALL never be the mechanism that clears the resolution debt and SHALL never block the deterministic repair; the brain SHALL remain correct with regeneration disabled.
+Message edits, deletions, and captured signal enrichments affecting already-assimilated messages SHALL select dependent episodes by stable source message key, mark them stale, and enqueue regeneration tasks; staleness SHALL be visible in brain status. Signal enrichment includes newly captured or materially changed structured mentions, locations, vCards, link previews, edit/delete provenance, and source media interpretation. Name resolution SHALL also be a staleness source, but with a deterministic-repair-first policy: when an identity that appears as an unresolved participant in committed episodes gains a resolved name or known number replacing a LID token, the affected episodes SHALL first be repaired deterministically with no model call rather than being marked stale. Optional low-priority regeneration after identity repair MUST NOT be required to clear resolution debt.
 
 #### Scenario: Edit invalidates episode
-- **WHEN** a live edit changes a message cited by a committed episode
+- **WHEN** a backup or live edit changes a message cited by a committed episode
 - **THEN** the episode is marked stale and a regeneration task is enqueued
 
 #### Scenario: Deletion invalidates episode
-- **WHEN** a message cited by a committed episode is deleted
+- **WHEN** a message cited by a committed episode is deleted or gains material revoke metadata
 - **THEN** the episode is marked stale and a regeneration task is enqueued
+
+#### Scenario: Captured signal enrichment invalidates episode
+- **WHEN** re-import adds or materially enriches a mention, location, vCard, preview, or source media interpretation on an assimilated message
+- **THEN** episodes anchored to that message are marked stale and receive deduplicated regeneration work
 
 #### Scenario: Name resolution repairs deterministically, not by staleness
 - **WHEN** an identity that appears as an unresolved participant in committed episodes gains a resolved name
@@ -361,7 +407,7 @@ Every claim SHALL carry zero or more typed entities (`person`, `org`, `place`, `
 - **THEN** the prompt offers "visa" as preferred vocabulary and a reused topic links to the existing topic row rather than creating a near-duplicate
 
 ### Requirement: Extraction Versioning
-Every episode SHALL be stamped at commit with the extraction version from a single named constant, for model-generated and extractive episodes alike. The constant SHALL be bumped on any change to the prompt, the JSON contract, validation semantics, or evidence rendering that alters episode content; episodes with a stale version SHALL be selectable for regeneration.
+Every episode SHALL be stamped at commit with the extraction version from a single named constant, for model-generated and extractive episodes alike. The constant SHALL be bumped on any change to the prompt, JSON contract, validation semantics, or evidence rendering that alters episode content, including the addition or semantic change of captured-signal annotations. Episodes with a stale version SHALL be selectable for regeneration.
 
 #### Scenario: Episode stamped with the current version
 - **WHEN** any episode commits
@@ -370,6 +416,10 @@ Every episode SHALL be stamped at commit with the extraction version from a sing
 #### Scenario: Stale version is a regeneration predicate
 - **WHEN** the constant is bumped after episodes were committed under the previous version
 - **THEN** those episodes are selected by the regeneration path
+
+#### Scenario: Signal rendering bumps the version
+- **WHEN** mention, location, vCard, preview, edit/delete, or media-interpretation evidence rendering lands
+- **THEN** `EXTRACTION_VERSION` increases and episodes created without those annotations become regenerable
 
 ### Requirement: Lexical Anchoring Lint
 After a model episode is accepted, each claim SHALL be checked for lexical anchoring: sharing at least one distinctive token with the concatenated text of its cited messages (claims citing only text-less media messages exempt). A failing claim SHALL be recorded as an `unanchored` warning in the validation-issues table, keyed to its episode and claim sequence. The lint SHALL flag and never block: it consumes no model call and never rejects a commit.
@@ -394,7 +444,7 @@ The extraction system prompt SHALL state that message content is untrusted third
 - **THEN** the continuity block interpolates the most recent model-generated summary or is omitted entirely
 
 ### Requirement: Late-Binding Commit Stamps
-Every episode SHALL record at commit, computed mechanically from its evidence pack: the source JIDs of message or quoted-snapshot participants whose label fell through to a number token (`unresolved_participants`), the source JIDs of message or quoted-snapshot participants whose label was derived from a self-set push name rather than a saved contact name (`push_name_participants`), the count of pack messages contributing neither text nor an interpretation label (`uninterpreted_media_count`), and a quoted-reply anchor entry for each reply containing its source message key, quoted source-chat/key identity when known, and snapshot-present state (`quoted_reply_anchors`). These stamps SHALL apply to extractive episodes as well and SHALL be queryable as the debt/reverse-link surface for later repair (identity late-resolution, regeneration on saved-name binding or quote enrichment, and media interpretation upgrades).
+Every episode SHALL record at commit, computed mechanically from its evidence pack: the source JIDs of message or quoted-snapshot participants whose label fell through to a number token (`unresolved_participants`); the source JIDs whose label came from a self-set push name (`push_name_participants`); the count of pack messages contributing neither text nor an interpretation label (`uninterpreted_media_count`); a quoted-reply anchor for each reply; and an `archive_signal_anchors` entry for each evidence message carrying captured structured signals. Each signal anchor SHALL contain the owning source message key, signal kinds, and capture schema version, without duplicating sensitive payload content. These stamps SHALL apply to extractive episodes and SHALL be queryable as debt and reverse-link surfaces for deterministic repair, stale selection, and regeneration.
 
 #### Scenario: Unresolved participant stamped
 - **WHEN** a pack contains a sender labelled by a verbatim number token
@@ -415,6 +465,14 @@ Every episode SHALL record at commit, computed mechanically from its evidence pa
 #### Scenario: Uninterpreted media counted
 - **WHEN** a pack contains messages with no text and no interpretation label
 - **THEN** the committed episode records their count
+
+#### Scenario: Captured signal dependencies are stamped
+- **WHEN** a pack message carries one or more structured mentions, locations, vCards, previews, edit/delete records, or source media interpretations
+- **THEN** the episode records that message key, the distinct signal kinds, and capture version without copying their payload text into the stamp
+
+#### Scenario: Signal enrichment uses the reverse link
+- **WHEN** re-import enriches a signal on an already-assimilated source message key
+- **THEN** the signal-anchor index selects affected episodes for deduplicated stale marking and regeneration
 
 ### Requirement: Push-Name Label Provenance
 Evidence-pack labels derived from a self-set push name (no saved contact name exists) SHALL be visually distinguished on evidence lines with a leading tilde (`~name`), for senders, reactors, and captured quoted senders alike, with collision-disambiguation suffixes applied after the tilde. The prompt SHALL explain that a `~name` is self-reported and unverified, SHALL instruct referring to the person by the name without the tilde in prose, and SHALL require `hedged` confidence on claims that hinge on that person's identity rather than on what they said. Entity junction rows for push-name-labelled participants SHALL still carry their canonical JID.

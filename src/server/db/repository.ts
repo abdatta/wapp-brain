@@ -1,4 +1,7 @@
 import type {
+  ArchiveSignalBatch,
+  ChatMetadataHistoryRecord,
+  EngagementAggregateRecord,
   BrainChatBacklogItem,
   BrainEpisodeGenerator,
   BrainEpisodeInput,
@@ -23,6 +26,9 @@ import type {
   ContactRecord,
   GoogleContactCandidate,
   GoogleContactsSyncResult,
+  GroupMembershipEventRecord,
+  GroupMembershipPeriodRecord,
+  IdentityNumberChangeRecord,
   IdentityRepairResult,
   ImportTotals,
   ImportWarning,
@@ -40,6 +46,7 @@ import type {
   MediaDownloadQueueRecord,
   MediaQueueSummary,
   MessageEditRevisionRecord,
+  MessageDetail,
   MemoryCitationRecord,
   MemoryEvidenceMessage,
   MemoryEvidencePackRecord,
@@ -74,6 +81,20 @@ export interface ArchiveRepository {
   upsertChats(runId: string, chats: ChatRecord[]): Promise<Map<string, number>>;
   upsertParticipants(participants: ParticipantRecord[]): Promise<number>;
   upsertMessages(messages: MessageRecord[]): Promise<number>;
+  // Local-only structured source signals. A batch is idempotent and returns
+  // message anchors materially enriched so brain evidence can become stale
+  // without any raw WhatsApp rows escaping the importer.
+  upsertArchiveSignals(batch: ArchiveSignalBatch): Promise<{ changedMessageKeys: string[]; skippedUnanchoredRecords: number }>;
+  // One-time repair for the pre-role-correct parser bug. Only facts whose sole
+  // evidence was the ambiguous backup flag are removed; generic source
+  // messages and verified membership history remain untouched.
+  repairAmbiguousSelfMembershipFacts(): Promise<number>;
+  listIdentityNumberChanges(options?: { oldJid?: string; newJid?: string; limit?: number }): Promise<IdentityNumberChangeRecord[]>;
+  listGroupMembershipPeriods(options?: { groupSourceId?: string; participantJid?: string; limit?: number }): Promise<GroupMembershipPeriodRecord[]>;
+  listGroupMembershipEvents(options?: { groupSourceId?: string; participantJid?: string; limit?: number }): Promise<GroupMembershipEventRecord[]>;
+  listChatMetadataHistory(options?: { chatSourceId?: string; limit?: number }): Promise<ChatMetadataHistoryRecord[]>;
+  // Engagement is intentionally not returned by general message/status reads.
+  listEngagementAggregates(options?: { chatSourceId?: string; counterpartyJid?: string; limit?: number }): Promise<EngagementAggregateRecord[]>;
   recordIdentityLinks(links: Array<{ lid: string; pn: string; source?: string | null }>): Promise<string[]>;
   resolveIdentityJid(jid: string): Promise<string>;
   // Reverse of resolveIdentityJid: the LID form(s) known for a phone JID (or the
@@ -168,6 +189,9 @@ export interface ArchiveRepository {
   getQuotedSnapshotThumbnail(messageId: number): Promise<Uint8Array | null>;
   // Edit history: snapshot rides applyLiveMessageUpdates; this reads it back.
   listMessageEditRevisions(messageId: number): Promise<MessageEditRevisionRecord[]>;
+  // Focused owner-local payload; distinct from bounded thread pagination.
+  getMessageDetail(messageId: number): Promise<MessageDetail | null>;
+  getMessageVcardDownload(messageId: number, cardIndex: number): Promise<{ content: string; fileName: string; constructed: boolean } | null>;
   getLiveStatus(): Promise<LiveMaintainerStatusSummary>;
   listChats(options: ChatListOptions): Promise<ChatListItem[]>;
   listMessages(

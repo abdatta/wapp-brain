@@ -901,6 +901,38 @@ app.get("/api/messages/:id/revisions", async (req, res) => {
   }
 });
 
+// Exact structured payloads are intentionally available only from this
+// focused local-message route. Thread pagination, status, warnings, and
+// diagnostics stay separately allowlisted and never receive this response.
+app.get("/api/messages/:id/detail", async (req, res) => {
+  try {
+    const detail = await repository.getMessageDetail(Number(req.params.id));
+    if (!detail) {
+      res.status(404).json({ error: "Message was not found." });
+      return;
+    }
+    res.json(detail);
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+app.get("/api/messages/:id/vcards/:cardIndex/download", async (req, res) => {
+  try {
+    const download = await repository.getMessageVcardDownload(Number(req.params.id), Number(req.params.cardIndex));
+    if (!download) {
+      res.status(404).json({ error: "A downloadable contact card is not available." });
+      return;
+    }
+    res.setHeader("Content-Type", "text/vcard; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="${download.fileName.replace(/[\r\n"]/g, "")}"`);
+    res.setHeader("Cache-Control", "private, no-store");
+    res.end(download.content);
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
 // Retry control for stuck media downloads (failed/expired with a descriptor
 // still held); counts only in the response, never content.
 app.post("/api/media/retry", async (_req, res) => {

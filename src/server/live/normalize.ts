@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
+import { ARCHIVE_SIGNAL_CAPTURE_VERSION } from "../../shared/types";
 import type {
+  ArchiveSignalBatch,
   CapturedLinkPreview,
   CapturedMediaDescriptor,
   ChatRecord,
@@ -45,9 +47,14 @@ interface BaileysLikeMessage {
   pushName?: string | null;
   message?: Record<string, unknown> | null;
   messageStubType?: number | string | null;
-  messageStubParameters?: string[] | null;
+  messageStubParameters?: unknown[] | null;
   // WebMessageInfo carries the group sender here in history-sync payloads.
   participant?: string | null;
+  // Direct Baileys group notifications expose the verified acting role under
+  // these fields. They are distinct from the affected participant(s).
+  author?: string | null;
+  authorPn?: string | null;
+  authorUsername?: string | null;
 }
 
 interface LongLike {
@@ -214,7 +221,7 @@ export function updateFromBaileysMessage(message: BaileysLikeMessage): LiveMessa
   const content = unwrapMessageContent(message.message);
   const occurredAtMs = timestampToMs(message.messageTimestamp);
   const protocol = content?.protocolMessage as
-    | { type?: number | string | null; key?: BaileysLikeMessage["key"]; editedMessage?: Record<string, unknown> | null }
+    | { type?: number | string | null; key?: BaileysLikeMessage["key"]; editedMessage?: Record<string, unknown> | null; timestampMs?: number | LongLike | null }
     | undefined;
   if (protocol) {
     // ProtocolMessage.key is written from the sender's perspective (fromMe is
@@ -235,7 +242,10 @@ export function updateFromBaileysMessage(message: BaileysLikeMessage): LiveMessa
     if (isProtocolType(protocol.type, 14, "MESSAGE_EDIT")) {
       const edited = unwrapMessageContent(protocol.editedMessage ?? null);
       const body = extractText(edited) ?? extractCaption(edited);
-      return targetedUpdate("edit", targetKey, occurredAtMs, body == null ? null : { body });
+      // The outer envelope may retain the original message time during
+      // history sync. WhatsApp puts the edit transition time on the protocol
+      // message itself, so prefer that field and fall back only when absent.
+      return targetedUpdate("edit", targetKey, timestampToMs(protocol.timestampMs) ?? occurredAtMs, body == null ? null : { body });
     }
     return null;
   }
@@ -396,7 +406,12 @@ export function normalizeBaileysMessages(messages: BaileysLikeMessage[], sourceT
   const linkPreviews = messages
     .map((message) => capturedLinkPreviewFromBaileysMessage(message))
     .filter((preview): preview is CapturedLinkPreview => Boolean(preview));
-  return { ...eventFromMessages(normalized, sourceTable, updates), secrets, retainedPayloads, mediaDescriptors, linkPreviews };
+  const archiveSignals: ArchiveSignalBatch = {};
+  for (let index = 0; index < messages.length; index += 1) {
+    const record = normalizeBaileysMessage(messages[index], sourceTable, messages[index].key?.id ?? String(index));
+    if (record) appendArchiveSignals(archiveSignals, archiveSignalsFromLiveMessage(record, messages[index]));
+  }
+  return { ...eventFromMessages(normalized, sourceTable, updates), secrets, retainedPayloads, mediaDescriptors, linkPreviews, archiveSignals: hasArchiveSignals(archiveSignals) ? archiveSignals : undefined };
 }
 
 // Inner media content by wrapper-aware unwrap: the downloadable descriptor
@@ -563,7 +578,326 @@ export async function normalizeBaileysMessagesWithJidResolver(
   const linkPreviews = resolved
     .map((message) => capturedLinkPreviewFromBaileysMessage(message))
     .filter((preview): preview is CapturedLinkPreview => Boolean(preview));
-  return { ...eventFromMessages(normalized, sourceTable, updates), secrets, retainedPayloads, mediaDescriptors, linkPreviews };
+  const archiveSignals: ArchiveSignalBatch = {};
+  for (let index = 0; index < resolved.length; index += 1) {
+    const record = normalizeBaileysMessage(resolved[index], sourceTable, resolved[index].key?.id ?? String(index));
+    if (record) {
+      appendArchiveSignals(archiveSignals, archiveSignalsFromLiveMessage(record, resolved[index]));
+    }
+  }
+  return {
+    ...eventFromMessages(normalized, sourceTable, updates),
+    secrets,
+    retainedPayloads,
+    mediaDescriptors,
+    linkPreviews,
+    archiveSignals: hasArchiveSignals(archiveSignals) ? archiveSignals : undefined
+  };
+}
+
+function liveSignalProvenance(sourceEventKey: string, observedAtMs: number | null) {
+  return { source: "live" as const, sourceEventKey, observedAtMs, captureVersion: ARCHIVE_SIGNAL_CAPTURE_VERSION };
+}
+
+// Only fields present in the live transport envelope are retained. This
+// routine does not fetch media, resolve vCard people, or invoke any model.
+function archiveSignalsFromLiveMessage(message: MessageRecord, raw: BaileysLikeMessage): ArchiveSignalBatch {
+  const batch: ArchiveSignalBatch = {};
+  const content = unwrapMessageContent(raw.message);
+  const sourceEventKey = `live:message:${message.sourceMessageKey}`;
+  const location = (content?.liveLocationMessage ?? content?.locationMessage) as Record<string, unknown> | undefined;
+  if (location) {
+    const latitude = longLikeToNumber(location.degreesLatitude ?? location.latitude);
+    const longitude = longLikeToNumber(location.degreesLongitude ?? location.longitude);
+    const name = nonEmptyString(location.name);
+    const address = nonEmptyString(location.address);
+    const isLive = Boolean(content?.liveLocationMessage) || location.isLive === true;
+    if (latitude != null || longitude != null || name || address || nonEmptyString(location.url) || nonEmptyString(location.comment) || nonEmptyString(location.caption)) {
+      const provenance = liveSignalProvenance(`${sourceEventKey}:location`, message.timestampMs ?? null);
+      const sequenceNumber = longLikeToNumber(location.sequenceNumber);
+      const finalAtMs = longLikeToNumber(location.finalTimestamp ?? location.finalLiveLocationTimestamp);
+      // WhatsApp transports live-share duration in seconds; normalize at the
+      // ingestion boundary because the shared archive type is milliseconds.
+      const liveShareDurationSeconds = longLikeToNumber(location.liveLocationShareDuration ?? location.duration);
+      const record = {
+          sourceMessageKey: message.sourceMessageKey,
+          latitude,
+          longitude,
+          name,
+          address,
+          isLive,
+          accuracyMeters: longLikeToNumber(location.accuracyInMeters ?? location.accuracy),
+          url: nonEmptyString(location.url),
+          comment: nonEmptyString(location.comment),
+          caption: nonEmptyString(location.caption),
+          speedMps: longLikeToNumber(location.speedInMps ?? location.speed),
+          headingDegrees: longLikeToNumber(location.degreesClockwiseFromMagneticNorth ?? location.heading),
+          sequenceNumber,
+          timeOffsetMs: longLikeToNumber(location.timeOffset),
+          liveShareDurationMs: liveShareDurationSeconds == null ? null : Math.round(liveShareDurationSeconds * 1000),
+          finalAtMs,
+          hasThumbnail: location.jpegThumbnail instanceof Uint8Array && location.jpegThumbnail.length > 0,
+          ...provenance
+        };
+      batch.locations = [record];
+      if (isLive) {
+        batch.locationObservations = [{
+          observationKey: `live:location-observation:${message.sourceMessageKey}:${sequenceNumber ?? message.timestampMs ?? "unknown"}`,
+          sourceMessageKey: message.sourceMessageKey,
+          latitude,
+          longitude,
+          accuracyMeters: record.accuracyMeters,
+          speedMps: record.speedMps,
+          headingDegrees: record.headingDegrees,
+          sequenceNumber,
+          timeOffsetMs: record.timeOffsetMs,
+          finalAtMs,
+          hasThumbnail: record.hasThumbnail,
+          ...provenance
+        }];
+      }
+    }
+  }
+  const contact = content?.contactMessage as Record<string, unknown> | undefined;
+  const vcard = contact ? nonEmptyString(contact.vcard) : null;
+  if (vcard) {
+    batch.vcards = [
+      {
+        sourceMessageKey: message.sourceMessageKey,
+        cardIndex: 0,
+        displayName: nonEmptyString(contact?.displayName ?? contact?.name),
+        vcard,
+        // A contact card may expose a JID-like field. It is an identity hint
+        // only; no automatic person connection occurs at this boundary.
+        resolvedJid: normalizeJid(typeof contact?.jid === "string" ? contact.jid : null),
+        properties: parseVcardProperties(vcard),
+        downloadKind: "source",
+        downloadFileName: vcardFileName(nonEmptyString(contact?.displayName ?? contact?.name), 0),
+        ...liveSignalProvenance(`${sourceEventKey}:vcard:0`, message.timestampMs ?? null)
+      }
+    ];
+  }
+  const interpretations = [] as NonNullable<ArchiveSignalBatch["mediaInterpretations"]>;
+  for (const candidate of Object.values(content ?? {})) {
+    if (!candidate || typeof candidate !== "object") continue;
+    const media = candidate as Record<string, unknown>;
+    const accessibility = nonEmptyString(media.accessibilityLabel);
+    const transcript = nonEmptyString(media.rawTranscriptionText ?? media.transcription);
+    if (accessibility) {
+      interpretations.push({
+        sourceMessageKey: message.sourceMessageKey,
+        kind: "accessibility_label",
+        segmentIndex: 0,
+        text: accessibility,
+        startMs: null,
+        endMs: null,
+        ...liveSignalProvenance(`${sourceEventKey}:accessibility`, message.timestampMs ?? null)
+      });
+    }
+    if (transcript) {
+      interpretations.push({
+        sourceMessageKey: message.sourceMessageKey,
+        kind: "transcription",
+        segmentIndex: 0,
+        text: transcript,
+        startMs: null,
+        endMs: null,
+        ...liveSignalProvenance(`${sourceEventKey}:transcription`, message.timestampMs ?? null)
+      });
+    }
+  }
+  if (interpretations.length) batch.mediaInterpretations = interpretations;
+  const stub = baileysStubName(raw.messageStubType);
+  const parameters = raw.messageStubParameters ?? [];
+  const rawParameters = boundedStubParameters(parameters);
+  const provenance = liveSignalProvenance(`${sourceEventKey}:stub:${stub ?? "unknown"}`, message.timestampMs ?? null);
+  const actorJid = normalizeJid(raw.authorPn ?? raw.author ?? null);
+  const participantJids = participantJidsFromStubParameters(parameters);
+  const membershipAction = membershipActionFromStub(stub);
+  if (membershipAction) {
+    const records = participantJids.map((participantJid) => ({
+      eventKey: `${sourceEventKey}:membership:${participantJid}:${membershipAction}`,
+      groupSourceId: message.chatSourceId,
+      participantJid,
+      action: membershipAction,
+      actorJid,
+      sourceMessageKey: message.sourceMessageKey,
+      oldRole: membershipAction === "demote" ? "admin" : null,
+      newRole: membershipAction === "promote" ? "admin" : null,
+      rawType: stub,
+      rawParameters,
+      ...provenance
+    }));
+    if (records.length) batch.membershipEvents = records;
+  }
+  const numberChange = numberChangeFromStub(stub, parameters);
+  if (numberChange) {
+    batch.numberChanges = [{
+      eventKey: `${sourceEventKey}:number-change`, chatSourceId: message.chatSourceId, sourceMessageKey: message.sourceMessageKey,
+      oldJid: numberChange.oldJid, newJid: numberChange.newJid, actorJid,
+      ...provenance
+    }];
+  }
+  const metadata = chatMetadataFromStub(stub, parameters, message, actorJid, rawParameters, provenance);
+  if (metadata) batch.chatMetadataHistory = [metadata];
+  return batch;
+}
+
+const BAILEYS_STUB_NAMES: Record<number, string> = {
+  21: "GROUP_CHANGE_SUBJECT", 22: "GROUP_CHANGE_ICON", 23: "GROUP_CHANGE_INVITE_LINK", 24: "GROUP_CHANGE_DESCRIPTION",
+  25: "GROUP_CHANGE_RESTRICT", 26: "GROUP_CHANGE_ANNOUNCE", 27: "GROUP_PARTICIPANT_ADD", 28: "GROUP_PARTICIPANT_REMOVE",
+  29: "GROUP_PARTICIPANT_PROMOTE", 30: "GROUP_PARTICIPANT_DEMOTE", 31: "GROUP_PARTICIPANT_INVITE", 32: "GROUP_PARTICIPANT_LEAVE",
+  33: "GROUP_PARTICIPANT_CHANGE_NUMBER", 42: "INDIVIDUAL_CHANGE_NUMBER"
+};
+
+function baileysStubName(value: number | string | null | undefined): string | null {
+  if (typeof value === "number") return BAILEYS_STUB_NAMES[value] ?? null;
+  const name = typeof value === "string" ? value.trim().toUpperCase() : "";
+  return name || null;
+}
+
+function boundedStubParameters(parameters: unknown[]): string | null {
+  if (!parameters.length) return null;
+  try {
+    const value = JSON.stringify(parameters);
+    return value.length <= 8_000 ? value : `${value.slice(0, 7_997)}...`;
+  } catch {
+    return null;
+  }
+}
+
+function structuredStubParameter(value: unknown): Record<string, unknown> | null {
+  if (value && typeof value === "object" && !Array.isArray(value)) return value as Record<string, unknown>;
+  if (typeof value !== "string") return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
+}
+
+function participantJidsFromStubParameters(parameters: unknown[]): string[] {
+  const jids = new Set<string>();
+  for (const parameter of parameters) {
+    const structured = structuredStubParameter(parameter);
+    const candidate = structured?.phoneNumber ?? structured?.pn ?? structured?.id ?? structured?.jid ?? structured?.lid ?? parameter;
+    const jid = systemNumberChangeJid(candidate);
+    if (jid) jids.add(jid);
+  }
+  return [...jids];
+}
+
+function membershipActionFromStub(stub: string | null): import("../../shared/types").GroupMembershipAction | null {
+  switch (stub) {
+    case "GROUP_PARTICIPANT_ADD": return "add";
+    case "GROUP_PARTICIPANT_REMOVE": return "remove";
+    case "GROUP_PARTICIPANT_LEAVE": return "leave";
+    case "GROUP_PARTICIPANT_INVITE": return "invite";
+    case "GROUP_PARTICIPANT_PROMOTE": return "promote";
+    case "GROUP_PARTICIPANT_DEMOTE": return "demote";
+    default: return null;
+  }
+}
+
+function numberChangeFromStub(stub: string | null, parameters: unknown[]): { oldJid: string; newJid: string } | null {
+  if (stub !== "USER_CHANGED_NUMBER" && stub !== "INDIVIDUAL_CHANGE_NUMBER" && stub !== "GROUP_PARTICIPANT_CHANGE_NUMBER") return null;
+  for (const parameter of parameters) {
+    const structured = structuredStubParameter(parameter);
+    if (!structured) continue;
+    const oldJid = systemNumberChangeJid(structured.oldJid ?? structured.oldPn ?? structured.oldPhoneNumber);
+    const newJid = systemNumberChangeJid(structured.newJid ?? structured.newPn ?? structured.newPhoneNumber ?? structured.phoneNumber);
+    if (oldJid && newJid && oldJid !== newJid) return { oldJid, newJid };
+  }
+  if (parameters.length >= 2) {
+    const oldJid = systemNumberChangeJid(parameters[0]);
+    const newJid = systemNumberChangeJid(parameters[1]);
+    if (oldJid && newJid && oldJid !== newJid) return { oldJid, newJid };
+  }
+  return null;
+}
+
+function chatMetadataFromStub(
+  stub: string | null,
+  parameters: unknown[],
+  message: MessageRecord,
+  actorJid: string | null,
+  rawParameters: string | null,
+  provenance: ReturnType<typeof liveSignalProvenance>
+): NonNullable<ArchiveSignalBatch["chatMetadataHistory"]>[number] | null {
+  const value = typeof parameters[0] === "string" ? nonEmptyString(parameters[0]) : null;
+  const fields: Record<string, import("../../shared/types").ChatMetadataField> = {
+    GROUP_CHANGE_SUBJECT: "subject", GROUP_CHANGE_DESCRIPTION: "description", GROUP_CHANGE_ICON: "photo", GROUP_CHANGE_INVITE_LINK: "invite_link",
+    GROUP_CHANGE_ANNOUNCE: "announcement", GROUP_CHANGE_RESTRICT: "restriction", GROUP_MEMBER_ADD_MODE: "member_add",
+    GROUP_MEMBERSHIP_JOIN_APPROVAL_MODE: "join_approval", GROUP_CHANGE_EPHEMERAL: "disappearing"
+  };
+  const field = stub ? fields[stub] : null;
+  if (!field) return null;
+  return {
+    eventKey: `${message.sourceMessageKey}:metadata:${field}:${message.timestampMs ?? "unknown"}`,
+    chatSourceId: message.chatSourceId,
+    field,
+    sourceMessageKey: message.sourceMessageKey,
+    actorJid,
+    oldValue: null,
+    newValue: value,
+    rawType: stub,
+    rawParameters,
+    ...provenance
+  };
+}
+
+function systemNumberChangeJid(value: unknown): string | null {
+  const normalized = normalizeJid(typeof value === "string" ? value : null);
+  if (normalized) return normalized;
+  return typeof value === "string" && /^\d{5,16}$/.test(value) ? `${value}@s.whatsapp.net` : null;
+}
+
+function parseVcardProperties(vcard: string): import("../../shared/types").VCardProperty[] {
+  const properties: import("../../shared/types").VCardProperty[] = [];
+  for (const line of vcard.replace(/\r?\n[ \t]/g, "").split(/\r?\n/)) {
+    const separator = line.indexOf(":");
+    if (separator <= 0) continue;
+    const [head, ...parameterParts] = line.slice(0, separator).split(";");
+    const groupSeparator = head.lastIndexOf(".");
+    const group = groupSeparator > 0 ? head.slice(0, groupSeparator) : null;
+    const name = (groupSeparator > 0 ? head.slice(groupSeparator + 1) : head).trim().toUpperCase();
+    if (!name) continue;
+    properties.push({
+      name,
+      group,
+      parameters: parameterParts.map((part) => {
+        const equals = part.indexOf("=");
+        const rawValues = equals >= 0 ? part.slice(equals + 1) : part;
+        return { name: (equals >= 0 ? part.slice(0, equals) : "TYPE").trim().toUpperCase() || "TYPE", values: rawValues.split(",").map((value) => value.trim()).filter(Boolean) };
+      }),
+      value: line.slice(separator + 1)
+    });
+  }
+  return properties;
+}
+
+function vcardFileName(displayName: string | null, cardIndex: number): string {
+  const base = (displayName ?? `contact-${cardIndex + 1}`).replace(/[\\/:*?"<>|\u0000-\u001F]+/g, " ").replace(/\s+/g, " ").trim();
+  return `${base || `contact-${cardIndex + 1}`}.vcf`;
+}
+
+function appendArchiveSignals(target: ArchiveSignalBatch, source: ArchiveSignalBatch): void {
+  if (source.numberChanges?.length) target.numberChanges = [...(target.numberChanges ?? []), ...source.numberChanges];
+  if (source.membershipPeriods?.length) target.membershipPeriods = [...(target.membershipPeriods ?? []), ...source.membershipPeriods];
+  if (source.membershipEvents?.length) target.membershipEvents = [...(target.membershipEvents ?? []), ...source.membershipEvents];
+  if (source.chatMetadataHistory?.length) target.chatMetadataHistory = [...(target.chatMetadataHistory ?? []), ...source.chatMetadataHistory];
+  if (source.locations?.length) target.locations = [...(target.locations ?? []), ...source.locations];
+  if (source.locationObservations?.length) target.locationObservations = [...(target.locationObservations ?? []), ...source.locationObservations];
+  if (source.vcards?.length) target.vcards = [...(target.vcards ?? []), ...source.vcards];
+  if (source.editEvents?.length) target.editEvents = [...(target.editEvents ?? []), ...source.editEvents];
+  if (source.deletions?.length) target.deletions = [...(target.deletions ?? []), ...source.deletions];
+  if (source.mediaInterpretations?.length) target.mediaInterpretations = [...(target.mediaInterpretations ?? []), ...source.mediaInterpretations];
+  if (source.engagementAggregates?.length) target.engagementAggregates = [...(target.engagementAggregates ?? []), ...source.engagementAggregates];
+}
+
+function hasArchiveSignals(batch: ArchiveSignalBatch): boolean {
+  return Object.values(batch).some((records) => records?.length);
 }
 
 export async function normalizeBaileysContactsWithJidResolver(
@@ -757,10 +1091,15 @@ export async function normalizeBaileysReceiptsWithJidResolver(
 }
 
 export async function normalizeBaileysGroupUpdatesWithJidResolver(
-  groups: Array<{ id?: string | null; subject?: string | null; subjectTime?: number | LongLike | null }>,
+  groups: Array<{
+    id?: string | null; subject?: string | null; desc?: string | null; announce?: boolean | null; restrict?: boolean | null; inviteCode?: string | null;
+    memberAddMode?: boolean | null; joinApprovalMode?: boolean | null; ephemeralDuration?: number | LongLike | null; subjectTime?: number | LongLike | null;
+    author?: string | null; authorPn?: string | null;
+  }>,
   resolveJid: LiveJidResolver
 ): Promise<LiveMessageEvent> {
   const chats: ChatRecord[] = [];
+  const metadata: NonNullable<ArchiveSignalBatch["chatMetadataHistory"]> = [];
   for (const group of groups) {
     const jid = await resolveCanonicalJid(group.id, resolveJid);
     if (!jid) {
@@ -774,24 +1113,44 @@ export async function normalizeBaileysGroupUpdatesWithJidResolver(
       platformRecencyMs: timestampToMs(group.subjectTime ?? null),
       rawMetadata: { source: "wa-web-group-update", hasSubject: Boolean(group.subject) }
     });
+    const subject = firstNonEmpty(group.subject);
+    const observedAtMs = timestampToMs(group.subjectTime ?? null);
+    const actorJid = await resolveCanonicalJid(group.authorPn ?? group.author, resolveJid) ?? null;
+    const fields: Array<[import("../../shared/types").ChatMetadataField, string | null, string]> = [
+      ["subject", subject, "subject"], ["description", firstNonEmpty(group.desc), "description"], ["invite_link", firstNonEmpty(group.inviteCode), "invite"],
+      ["announcement", group.announce == null ? null : String(group.announce), "announcement"], ["restriction", group.restrict == null ? null : String(group.restrict), "restriction"],
+      ["member_add", group.memberAddMode == null ? null : String(group.memberAddMode), "member-add"], ["join_approval", group.joinApprovalMode == null ? null : String(group.joinApprovalMode), "join-approval"],
+      ["disappearing", group.ephemeralDuration == null ? null : String(longLikeToNumber(group.ephemeralDuration)), "disappearing"]
+    ];
+    for (const [field, value, rawType] of fields) {
+      if (value == null) continue;
+      metadata.push({
+        eventKey: `live:group-${rawType}:${jid}:${observedAtMs ?? "unknown"}`,
+        chatSourceId: jid, field, sourceMessageKey: null, actorJid, oldValue: null, newValue: value, rawType: `groups.update:${rawType}`, rawParameters: null,
+        ...liveSignalProvenance(`live:groups.update:${jid}:${rawType}`, observedAtMs)
+      });
+    }
   }
   return {
     eventKey: boundedEventKey("groups.update", chats.map((chat) => `${chat.sourceChatId}:${chat.displayName ?? ""}`)),
     eventType: "groups.update",
     mode: "update",
-    chats
+    chats,
+    archiveSignals: metadata.length ? { chatMetadataHistory: metadata } : undefined
   };
 }
 
-type BaileysLikeParticipant = string | { id?: string | null; phoneNumber?: string | null; lid?: string | null } | null | undefined;
+type BaileysLikeParticipant = string | { id?: string | null; phoneNumber?: string | null; lid?: string | null; username?: string | null; admin?: string | null } | null | undefined;
 
 export async function normalizeBaileysGroupParticipantsWithJidResolver(
-  event: { id?: string | null; participants?: BaileysLikeParticipant[] | null; action?: string | null },
+  event: { id?: string | null; participants?: BaileysLikeParticipant[] | null; action?: string | null; author?: string | null; authorPn?: string | null; authorUsername?: string | null },
   resolveJid: LiveJidResolver,
   occurredAtMs?: number | null
 ): Promise<LiveMessageEvent> {
   const chatSourceId = await resolveCanonicalJid(event.id, resolveJid);
   const participants: ParticipantRecord[] = [];
+  const membershipEvents: NonNullable<ArchiveSignalBatch["membershipEvents"]> = [];
+  const actorJid = await resolveCanonicalJid(event.authorPn ?? event.author, resolveJid) ?? null;
   if (chatSourceId) {
     for (const raw of event.participants ?? []) {
       // Baileys v7 sends GroupParticipant objects ({ id, phoneNumber?, lid? });
@@ -808,6 +1167,22 @@ export async function normalizeBaileysGroupParticipantsWithJidResolver(
         lastSeenAtMs: occurredAtMs ?? null,
         rawMetadata: { source: "wa-web-group-participants", action: event.action ?? null }
       });
+      const action = verifiedLiveMembershipAction(event.action);
+      if (action) {
+        membershipEvents.push({
+          eventKey: `live:group-participant:${chatSourceId}:${jid}:${action}:${occurredAtMs ?? "unknown"}`,
+          groupSourceId: chatSourceId,
+          participantJid: jid,
+          action,
+          actorJid,
+          sourceMessageKey: null,
+          oldRole: action === "demote" ? "admin" : null,
+          newRole: action === "promote" ? "admin" : typeof raw === "string" ? null : raw?.admin ?? null,
+          rawType: event.action?.trim().toLowerCase() ?? null,
+          rawParameters: null,
+          ...liveSignalProvenance(`live:group-participants.update:${chatSourceId}`, occurredAtMs ?? null)
+        });
+      }
     }
   }
   return {
@@ -818,8 +1193,30 @@ export async function normalizeBaileysGroupParticipantsWithJidResolver(
     chats: chatSourceId
       ? [{ sourceChatId: chatSourceId, jid: chatSourceId, displayName: null, chatType: inferChatType(chatSourceId) as ChatType, rawMetadata: { source: "wa-web-group-participants" } }]
       : [],
-    participants
+    participants,
+    archiveSignals: membershipEvents.length ? { membershipEvents } : undefined
   };
+}
+
+function verifiedLiveMembershipAction(value: string | null | undefined): import("../../shared/types").GroupMembershipAction | null {
+  switch (value?.trim().toLowerCase()) {
+    case "add":
+      return "add";
+    case "remove":
+      return "remove";
+    case "join":
+      return "join";
+    case "leave":
+      return "leave";
+    case "invite":
+      return "invite";
+    case "promote":
+      return "promote";
+    case "demote":
+      return "demote";
+    default:
+      return null;
+  }
 }
 
 function isRevokeStub(stubType: number | string | null | undefined): boolean {

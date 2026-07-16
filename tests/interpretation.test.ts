@@ -224,7 +224,12 @@ describe("message interpretation", () => {
       expect(revoked?.isDeleted).toBe(true);
       // Row keeps its post time; the revocation actor/time ride in metadata.
       expect(revoked?.timestampMs).toBe(1712000006000);
-      expect(revoked?.rawMetadata?.revoked).toEqual({ revokedByJid: "15550000003@s.whatsapp.net", revokedAtMs: 1712090000000 });
+      expect(revoked?.rawMetadata?.revoked).toEqual({
+        revokedByJid: "15550000003@s.whatsapp.net",
+        revokedAtMs: 1712090000000,
+        revokedByAdmin: true,
+        deletionKind: "admin_revoke"
+      });
 
       const album = records.get("ALB1");
       expect(album?.messageType).toBe("album");

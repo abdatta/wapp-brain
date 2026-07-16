@@ -38,8 +38,15 @@ Default logs must not include:
 - contact dumps
 - full private file paths when avoidable
 - live auth state, QR/pairing secrets, or raw WhatsApp Web payloads
+- raw receipt/device rows, coordinates, vCard bodies, or source-provided transcript text
 
 The CLI writes debug logs under `.wapp-brain/logs`. Keep those logs metadata-oriented and assume they may still be sensitive.
+
+## Structured Signal Boundaries
+
+Optional backup/live signal capture is local-only. The archive owner may intentionally view every retained message field through the focused loopback detail route, including raw vCard text, exact coordinates, source transcription text, edit/delete provenance, and system roles. Normal message-list, quote-preview, status, warning, diagnostic, export-style, and remote-evidence DTOs remain separately allowlisted and do not expose those complete values. Receipt/device rows are never exposed outside aggregate calculations. Embedded link previews are captured only from the message envelope; the app never requests the link target.
+
+The local vCard download route uses a private, no-store response. It returns held source text when present and constructs a minimal card only when the record has both a display name and a phone-form identity; it never fabricates a phone number from a LID.
 
 ## Second-Brain Memory
 

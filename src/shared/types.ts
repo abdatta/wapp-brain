@@ -63,6 +63,345 @@ export interface CapturedLinkPreview {
   thumbnail: Uint8Array | null;
 }
 
+// Source signals deliberately retain only information the archive can use
+// locally. Their provenance lets a backup re-import enrich a live observation
+// without ever treating display text as identity or retaining raw source rows.
+export type ArchiveSignalSource = "backup" | "live";
+export const ARCHIVE_SIGNAL_CAPTURE_VERSION = 1;
+
+export interface ArchiveSignalProvenance {
+  source: ArchiveSignalSource;
+  sourceEventKey: string | null;
+  observedAtMs: number | null;
+  captureVersion: number;
+}
+
+// A canonical signal can be observed by both an Android backup and live sync.
+// Keep those observations independently auditable without duplicating the
+// canonical payload in every source row. `detailJson` is deliberately only
+// available from the focused loopback detail surface; list/status/evidence
+// DTOs never include it.
+export type ArchiveSignalFamily =
+  | "number_change"
+  | "membership_period"
+  | "membership_event"
+  | "chat_metadata"
+  | "location"
+  | "location_observation"
+  | "vcard"
+  | "edit"
+  | "deletion"
+  | "media_interpretation";
+
+export interface ArchiveSignalObservation extends ArchiveSignalProvenance {
+  factKey: string;
+  family: ArchiveSignalFamily;
+  sourceMessageKey: string | null;
+  detailJson: string | null;
+}
+
+export interface IdentityNumberChangeRecord extends ArchiveSignalProvenance {
+  eventKey: string;
+  chatSourceId: string | null;
+  sourceMessageKey: string | null;
+  oldJid: string;
+  newJid: string;
+  actorJid: string | null;
+}
+
+export type GroupMembershipAction = "add" | "remove" | "join" | "leave" | "invite" | "accept" | "promote" | "demote";
+
+export interface GroupMembershipPeriodRecord extends ArchiveSignalProvenance {
+  periodKey: string;
+  groupSourceId: string;
+  participantJid: string;
+  joinedAtMs: number | null;
+  leftAtMs: number | null;
+  role: string | null;
+}
+
+export interface GroupMembershipEventRecord extends ArchiveSignalProvenance {
+  eventKey: string;
+  groupSourceId: string;
+  participantJid: string;
+  action: GroupMembershipAction;
+  actorJid: string | null;
+  sourceMessageKey: string | null;
+  oldRole?: string | null;
+  newRole?: string | null;
+  rawType?: string | null;
+  rawParameters?: string | null;
+}
+
+export type ChatMetadataField =
+  | "subject"
+  | "description"
+  | "photo"
+  | "invite_link"
+  | "announcement"
+  | "restriction"
+  | "member_add"
+  | "join_approval"
+  | "disappearing";
+
+export interface ChatMetadataHistoryRecord extends ArchiveSignalProvenance {
+  eventKey: string;
+  chatSourceId: string;
+  field: ChatMetadataField;
+  sourceMessageKey: string | null;
+  actorJid: string | null;
+  oldValue: string | null;
+  newValue: string | null;
+  rawType?: string | null;
+  rawParameters?: string | null;
+}
+
+export interface MessageLocationRecord extends ArchiveSignalProvenance {
+  sourceMessageKey: string;
+  latitude: number | null;
+  longitude: number | null;
+  name: string | null;
+  address: string | null;
+  isLive: boolean;
+  accuracyMeters: number | null;
+  url?: string | null;
+  comment?: string | null;
+  caption?: string | null;
+  speedMps?: number | null;
+  headingDegrees?: number | null;
+  sequenceNumber?: number | null;
+  timeOffsetMs?: number | null;
+  liveShareDurationMs?: number | null;
+  finalAtMs?: number | null;
+  hasThumbnail?: boolean;
+}
+
+export interface MessageLocationObservationRecord extends ArchiveSignalProvenance {
+  observationKey: string;
+  sourceMessageKey: string;
+  latitude: number | null;
+  longitude: number | null;
+  accuracyMeters: number | null;
+  speedMps: number | null;
+  headingDegrees: number | null;
+  sequenceNumber: number | null;
+  timeOffsetMs: number | null;
+  finalAtMs: number | null;
+  hasThumbnail: boolean;
+}
+
+export interface VCardProperty {
+  name: string;
+  group: string | null;
+  parameters: Array<{ name: string; values: string[] }>;
+  value: string;
+}
+
+export type VCardDownloadKind = "source" | "constructed" | "unavailable";
+
+export interface MessageVCardRecord extends ArchiveSignalProvenance {
+  sourceMessageKey: string;
+  cardIndex: number;
+  displayName: string | null;
+  vcard: string | null;
+  resolvedJid: string | null;
+  properties?: VCardProperty[];
+  downloadKind?: VCardDownloadKind;
+  downloadFileName?: string | null;
+}
+
+export interface MessageEditEventRecord extends ArchiveSignalProvenance {
+  eventKey: string;
+  sourceMessageKey: string;
+  originalSourceMessageId: string | null;
+  observedEditMessageId: string | null;
+}
+
+export interface MessageDeletionRecord extends ArchiveSignalProvenance {
+  sourceMessageKey: string;
+  revokedByJid: string | null;
+  revokedByAdmin?: boolean | null;
+  deletionKind?: string | null;
+}
+
+export type MessageMediaInterpretationKind = "accessibility_label" | "transcription" | "transcription_segment";
+
+export interface MessageMediaInterpretationRecord extends ArchiveSignalProvenance {
+  sourceMessageKey: string;
+  kind: MessageMediaInterpretationKind;
+  segmentIndex: number;
+  text: string;
+  startMs: number | null;
+  endMs: number | null;
+}
+
+// These are the only receipt-derived values that may leave the source backup.
+// They are internal repository inputs, never general message/status DTO fields.
+export interface EngagementAggregateRecord extends ArchiveSignalProvenance {
+  aggregateKey: string;
+  chatSourceId: string;
+  counterpartyJid: string | null;
+  eligibleOutgoingCount: number;
+  deliveredCount: number;
+  readCount: number;
+  responseLatencySampleCount: number;
+  medianResponseLatencyMs: number | null;
+  windowStartAtMs: number | null;
+  windowEndAtMs: number | null;
+  algorithmVersion: number;
+}
+
+export interface ArchiveSignalBatch {
+  numberChanges?: IdentityNumberChangeRecord[];
+  membershipPeriods?: GroupMembershipPeriodRecord[];
+  membershipEvents?: GroupMembershipEventRecord[];
+  chatMetadataHistory?: ChatMetadataHistoryRecord[];
+  locations?: MessageLocationRecord[];
+  locationObservations?: MessageLocationObservationRecord[];
+  vcards?: MessageVCardRecord[];
+  editEvents?: MessageEditEventRecord[];
+  deletions?: MessageDeletionRecord[];
+  mediaInterpretations?: MessageMediaInterpretationRecord[];
+  engagementAggregates?: EngagementAggregateRecord[];
+}
+
+export type ArchiveSignalKind =
+  | "mention"
+  | "location"
+  | "vcard"
+  | "link_preview"
+  | "edit"
+  | "deletion"
+  | "media_interpretation";
+
+export interface ArchiveSignalAnchor {
+  sourceMessageKey: string;
+  kinds: ArchiveSignalKind[];
+  captureVersion: number;
+}
+
+export interface MessageLocationSummary {
+  latitude: number | null;
+  longitude: number | null;
+  name: string | null;
+  address: string | null;
+  isLive: boolean;
+  detailAvailable?: boolean;
+}
+
+export interface MessageVCardSummary {
+  displayName: string | null;
+  resolvedJid: string | null;
+  downloadKind?: VCardDownloadKind;
+}
+
+export interface MessageDeletionSummary {
+  revokedByJid: string | null;
+  revokedAtMs: number | null;
+  detailAvailable?: boolean;
+}
+
+export interface MessageEditEventSummary {
+  observedAtMs: number | null;
+  hasHeldRevision: boolean;
+  detailAvailable?: boolean;
+}
+
+export interface MessageMediaInterpretationSummary {
+  kind: MessageMediaInterpretationKind;
+  text: string;
+  segmentIndex: number;
+}
+
+export interface MessageStructuredSignals {
+  mentionedJids: string[];
+  location: MessageLocationSummary | null;
+  vcards: MessageVCardSummary[];
+  deletion: MessageDeletionSummary | null;
+  edit: MessageEditEventSummary | null;
+  mediaInterpretations: MessageMediaInterpretationSummary[];
+  captureVersion: number | null;
+}
+
+export interface MessageDetailAvailability {
+  hasLocation: boolean;
+  vcardCount: number;
+  hasDeletion: boolean;
+  hasEditHistory: boolean;
+  hasSourceInterpretation: boolean;
+  hasSystemEventDetail: boolean;
+}
+
+export interface MessageEditTimelineEntry {
+  kind: "sent" | "held_revision" | "metadata_only_edit" | "current";
+  timestampMs: number | null;
+  text: string | null;
+  source: ArchiveSignalSource | "archive";
+  sourceEventKey: string | null;
+}
+
+export interface MessageDeletionDetail {
+  revokedByJid: string | null;
+  revokedByAdmin: boolean | null;
+  deletionKind: string | null;
+  deletedAtMs: number | null;
+  sentAtMs: number | null;
+  contentState: "retained" | "never_captured";
+  observations: ArchiveSignalObservation[];
+}
+
+export interface MessageSystemEventDetail {
+  kind: MessageSystemEventKind;
+  eventKey: string;
+  summary: string;
+  actorJid: string | null;
+  actorLabel: string | null;
+  participantJid: string | null;
+  participantLabel: string | null;
+  oldJid: string | null;
+  oldIdentityLabel: string | null;
+  newJid: string | null;
+  newIdentityLabel: string | null;
+  oldValue: string | null;
+  newValue: string | null;
+  action: GroupMembershipAction | null;
+  field: ChatMetadataField | null;
+  occurredAtMs: number | null;
+  rawType: string | null;
+  rawParameters: string | null;
+  observations: ArchiveSignalObservation[];
+}
+
+// Focused owner-local API response. All exact fields are intentionally kept
+// out of MessageListItem; callers load this only for an explicit message.
+export interface MessageDetail {
+  id: number;
+  sourceMessageKey: string;
+  sentAtMs: number | null;
+  availability: MessageDetailAvailability;
+  locations: Array<MessageLocationRecord & { observations: MessageLocationObservationRecord[]; provenance: ArchiveSignalObservation[] }>;
+  vcards: Array<MessageVCardRecord & { provenance: ArchiveSignalObservation[] }>;
+  mentionedJids: string[];
+  editTimeline: MessageEditTimelineEntry[];
+  deletion: MessageDeletionDetail | null;
+  mediaInterpretations: MessageMediaInterpretationRecord[];
+  linkPreview: LinkPreviewSummary | null;
+  systemEvents: MessageSystemEventDetail[];
+}
+
+// Thread/list DTO projection. Exact coordinates, raw JIDs, vCard bodies, and
+// transcript text are evidence-only local data, never general API payloads.
+export interface MessageStructuredSignalSummary {
+  mentionCount: number;
+  location: Pick<MessageLocationSummary, "name" | "address" | "isLive"> | null;
+  vcards: Array<Pick<MessageVCardSummary, "displayName">>;
+  deletion: Pick<MessageDeletionSummary, "revokedAtMs"> | null;
+  edit: MessageEditEventSummary | null;
+  mediaInterpretations: Array<Pick<MessageMediaInterpretationSummary, "kind" | "segmentIndex"> & { hasText: boolean }>;
+  captureVersion: number | null;
+  detailAvailability?: MessageDetailAvailability;
+}
+
 export interface MediaDownloadQueueRecord {
   id?: number;
   messageKey: string;
@@ -344,6 +683,15 @@ export interface QuotedMessageStructuredVCard {
   vcard: string | null;
 }
 
+export interface QuotedMessageStructuredLocationSummary {
+  name: string | null;
+  address: string | null;
+}
+
+export interface QuotedMessageStructuredVCardSummary {
+  name: string | null;
+}
+
 export interface QuotedMessageSnapshot {
   quotedSourceMessageId: string | null;
   quotedSourceChatId: string | null;
@@ -381,8 +729,10 @@ export interface QuotedMessageSnapshotSummary {
   caption: string | null;
   mediaMimeType: string | null;
   mediaName: string | null;
-  location: QuotedMessageStructuredLocation | null;
-  vcard: QuotedMessageStructuredVCard | null;
+  // Exact coordinates and raw vCard bodies remain on the local captured
+  // snapshot record; general message/evidence projections receive labels only.
+  location: QuotedMessageStructuredLocationSummary | null;
+  vcard: QuotedMessageStructuredVCardSummary | null;
   mentionedJids: string[];
   hasThumbnail: boolean;
   // Resolves only inside the reply's own chat. This intentionally stays null
@@ -420,6 +770,18 @@ export interface MessageInterpretationSummary {
   reason: string | null;
 }
 
+// A display-safe explanation for a verified system/history record owned by a
+// thread message. Raw JIDs, phone endpoints, event keys, and binary metadata
+// stay in the local canonical signal tables and never cross this DTO boundary.
+export type MessageSystemEventKind = "number_change" | "membership" | "chat_metadata" | "generic";
+
+export interface MessageSystemEventSummary {
+  kind: MessageSystemEventKind;
+  summary: string;
+  captureVersion: number;
+  detailAvailable?: boolean;
+}
+
 export interface MessageListItem {
   id: number;
   sourceMessageId: string;
@@ -441,7 +803,14 @@ export interface MessageListItem {
   // Media asset reference + honest availability; null for non-media messages.
   media: MessageMediaSummary | null;
   // Stored sender-embedded link preview; null when the message carries none.
-  linkPreview: LinkPreviewSummary | null;
+  linkPreview?: LinkPreviewSummary | null;
+  // Local-only structured source signals. The vCard payload and other raw
+  // source material stay behind focused repository reads; list consumers get
+  // only display-safe summaries.
+  structuredSignals?: MessageStructuredSignalSummary | null;
+  // Verified history records rendered in the local thread. Unlike a generic
+  // system-message interpretation, these are explicit, privacy-safe actions.
+  systemEvents?: MessageSystemEventSummary[];
   quotedSnapshot: QuotedMessageSnapshotSummary | null;
   isEdited: boolean;
   // Retained prior revisions available for this message (live edits only).
@@ -528,6 +897,9 @@ export interface MemoryEvidenceMessage {
   messageType: string;
   interpretation: MessageInterpretationSummary | null;
   text: string | null;
+  // Sender-embedded preview metadata only; thumbnail bytes remain on their
+  // dedicated local endpoint and never enter prompt/evidence text.
+  linkPreview: LinkPreviewSummary | null;
   // Evidence-pack fidelity: whether the row is a forward, the quoted message's
   // source id (resolved to a referent at prompt-assembly time), and reactions
   // targeting this message. Reactions carry the raw reactor identity so the
@@ -536,6 +908,7 @@ export interface MemoryEvidenceMessage {
   isForwarded: boolean;
   quotedSourceMessageId: string | null;
   quotedSnapshot: QuotedMessageSnapshotSummary | null;
+  structuredSignals?: MessageStructuredSignals | null;
   reactions: MemoryEvidenceReaction[];
   // Label provenance (contract v2): true when senderDisplayName came from the
   // contact's self-set push name because no saved display name exists. The
@@ -973,6 +1346,7 @@ export interface BrainEpisodeInput {
   pushNameParticipants?: string[];
   uninterpretedMediaCount?: number;
   quotedReplyAnchors?: QuotedReplyAnchor[];
+  archiveSignalAnchors?: ArchiveSignalAnchor[];
   // Regeneration commits pass false: the watermark already covers the window.
   advanceWatermark?: boolean;
   // Regeneration: mark this episode 'superseded' in the same transaction as
@@ -1004,6 +1378,7 @@ export interface BrainEpisodeRecord {
   pushNameParticipants: string[];
   uninterpretedMediaCount: number;
   quotedReplyAnchors: QuotedReplyAnchor[];
+  archiveSignalAnchors?: ArchiveSignalAnchor[];
   mediaGaps: BrainMediaGapRecord[];
   createdAt: string;
   claims: BrainClaimRecord[];
@@ -1190,6 +1565,7 @@ export type ImportProgressStep =
   | "identity-merge"
   | "chats"
   | "messages"
+  | "signals"
   | "addons"
   | "media"
   | "participants"

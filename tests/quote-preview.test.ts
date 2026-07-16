@@ -83,14 +83,14 @@ describe("quoted thread preview model", () => {
         ...snapshot,
         body: null,
         caption: null,
-        location: { latitude: 1, longitude: 2, name: "Cafe", address: null },
+        location: { name: "Cafe", address: null },
         hasThumbnail: false,
         originalMessageId: null
       })
     );
 
     expect(structured).toMatchObject({ text: "Cafe", thumbnailUrl: null, jumpMessageId: null });
-    expect(quotePreviewText({ ...snapshot, body: null, caption: null, location: null, vcard: { name: "Casey", vcard: null } })).toBe("Casey");
+    expect(quotePreviewText({ ...snapshot, body: null, caption: null, location: null, vcard: { name: "Casey" } })).toBe("Casey");
   });
 
   it("keeps pointer-only compatibility and honestly renders no preview for missing context", () => {

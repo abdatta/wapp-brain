@@ -22,6 +22,7 @@ import type {
   MemoryStatusSummary,
   MessageContextWindow,
   MessageEditRevisionRecord,
+  MessageDetail,
   MessageListItem,
   MessageListOrder,
   PickKind,
@@ -53,6 +54,14 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
 
 export function getStatus(): Promise<StatusSummary> {
   return request<StatusSummary>("/api/status");
+}
+
+export function getMessageDetail(messageId: number): Promise<MessageDetail> {
+  return request<MessageDetail>(`/api/messages/${messageId}/detail`);
+}
+
+export function messageVcardDownloadUrl(messageId: number, cardIndex: number): string {
+  return `/api/messages/${messageId}/vcards/${cardIndex}/download`;
 }
 
 export function getGoogleContactsStatus(): Promise<GoogleContactsStatus> {

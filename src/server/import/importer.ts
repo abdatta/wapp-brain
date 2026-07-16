@@ -3,6 +3,7 @@ import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { setImmediate } from "node:timers/promises";
 import type {
+  CapturedLinkPreview,
   ImportRequest,
   ImportTotals,
   ImportWarning,
@@ -277,6 +278,63 @@ export async function runImport(
           }
         ]);
       }
+    }
+
+    throwIfAborted(options.signal);
+    options.onProgress?.({ type: "step", step: "signals", message: "Importing structured local message signals." });
+    // Signal capture intentionally follows canonical messages, edit-key
+    // collapse, chats, and identity repair: every signal can now use the same
+    // durable message identity as its read and evidence consumers.
+    const repairedFalseSelfFacts = await repository.repairAmbiguousSelfMembershipFacts();
+    if (repairedFalseSelfFacts > 0) {
+      await repository.addWarnings(runId, [{
+        severity: "info",
+        code: "SYSTEM_ROLE_REPAIR",
+        entityType: "message",
+        message: `Repaired ${repairedFalseSelfFacts} ambiguous self-attributed group event(s); their source messages remain as generic system rows.`,
+        context: { repaired: repairedFalseSelfFacts }
+      }]);
+    }
+    const signalBatch = parsed.getArchiveSignalBatch();
+    const signalResult = await repository.upsertArchiveSignals(signalBatch);
+    let previewCount = 0;
+    let previewBatch: CapturedLinkPreview[] = [];
+    for (const preview of parsed.iterateLinkPreviews()) {
+      throwIfAborted(options.signal);
+      previewBatch.push(preview);
+      if (previewBatch.length >= ADD_ON_BATCH_SIZE) {
+        previewCount += await repository.recordLinkPreviews(previewBatch);
+        previewBatch = [];
+        await yieldToEventLoop(options.signal);
+      }
+    }
+    if (previewBatch.length > 0) {
+      previewCount += await repository.recordLinkPreviews(previewBatch);
+    }
+    const signalCounts = Object.fromEntries(
+      Object.entries(signalBatch).map(([family, rows]) => [family, rows?.length ?? 0])
+    );
+    if (Object.values(signalCounts).some((count) => count > 0) || previewCount > 0) {
+      await repository.addWarnings(runId, [
+        {
+          severity: "info",
+          code: "ARCHIVE_SIGNAL_CAPTURE",
+          entityType: "message",
+          message: `Structured signal capture completed: ${signalResult.changedMessageKeys.length} message anchor(s) enriched, ${previewCount} link preview(s) recorded, and ${signalResult.skippedUnanchoredRecords} unanchored companion record(s) skipped.`,
+          context: { ...signalCounts, linkPreviews: previewCount, skippedUnanchoredRecords: signalResult.skippedUnanchoredRecords }
+        }
+      ]);
+    }
+    if (parsed.warnings.length > persistedWarningCount) {
+      const newWarnings = parsed.warnings.slice(persistedWarningCount);
+      await repository.addWarnings(runId, newWarnings);
+      persistedWarningCount = parsed.warnings.length;
+      warningCount = persistedWarningCount;
+      options.onProgress?.({
+        type: "warnings",
+        count: parsed.warnings.length,
+        codes: [...new Set(parsed.warnings.map((warning) => warning.code))].slice(0, 20)
+      });
     }
 
     throwIfAborted(options.signal);

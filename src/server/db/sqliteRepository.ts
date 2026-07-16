@@ -1,7 +1,11 @@
 import Database from "better-sqlite3";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type {
+  ArchiveSignalBatch,
+  ArchiveSignalKind,
+  ArchiveSignalAnchor,
   BrainChatBacklogItem,
   BrainClaimEntityRecord,
   BrainEpisodeGenerator,
@@ -26,9 +30,14 @@ import type {
   ChatListItem,
   ChatListOptions,
   ChatRecord,
+  ChatMetadataHistoryRecord,
   ChatSyncStateRecord,
   ContactRecord,
+  EngagementAggregateRecord,
   GoogleContactCandidate,
+  GroupMembershipEventRecord,
+  GroupMembershipPeriodRecord,
+  IdentityNumberChangeRecord,
   IdentityRepairResult,
   ImportRunSummary,
   ImportTotals,
@@ -53,6 +62,9 @@ import type {
   MediaDownloadStatus,
   MediaQueueSummary,
   MessageEditRevisionRecord,
+  MessageDetail,
+  MessageLocationObservationRecord,
+  MessageStructuredSignals,
   MessageMediaSummary,
   MemoryCitationRecord,
   MemoryEvidenceMessage,
@@ -86,8 +98,9 @@ import { baselineFromStatus } from "../live/baseline";
 import { messageIdFromKey, messageKey } from "../identity/keys";
 import { applyMentionLabels, appliedMentionLabels, extractMentionDigits, mentionJidCandidates } from "../identity/mentions";
 import { mergeInteractionMetadata } from "./interactions";
+import { buildMessageEditTimeline, summarizeStructuredSignals, summarizeSystemEvents } from "./signalSummary";
 import { interpretMessage } from "../interpretation/messageInterpretation";
-import { displayPhoneFromJid, isMaskedNumberLabel, normalizeJid } from "../import/jid";
+import { displayPhoneFromJid, isMaskedNumberLabel, normalizeJid, phoneFromJid, resolveDisplayLabel } from "../import/jid";
 import { getMemoryProviderStatus } from "../memory/provider";
 import { PublicError } from "../privacy";
 import type { ArchiveRepository, ArchiveRestorePoint } from "./repository";
@@ -108,6 +121,18 @@ const ARCHIVE_TABLES = [
   "messages",
   "message_quoted_snapshots",
   "message_mentions",
+  "identity_number_changes",
+  "group_membership_periods",
+  "group_membership_events",
+  "chat_metadata_history",
+  "message_locations",
+  "message_location_observations",
+  "message_vcards",
+  "message_edit_events",
+  "message_deletions",
+  "message_media_interpretations",
+  "engagement_aggregates",
+  "archive_signal_observations",
   "import_warnings",
   "live_sessions",
   "live_sync_runs",
@@ -131,6 +156,7 @@ const ARCHIVE_TABLES = [
   "brain_claims",
   "brain_citations",
   "brain_claim_entities",
+  "brain_episode_signal_anchors",
   "brain_topics",
   "brain_episode_topics",
   "brain_validation_issues",
@@ -145,6 +171,7 @@ const DELETE_TABLE_ORDER = [
   "brain_claim_entities",
   "brain_citations",
   "brain_claims",
+  "brain_episode_signal_anchors",
   "brain_episodes",
   "brain_llm_ledger",
   "brain_runs",
@@ -164,6 +191,18 @@ const DELETE_TABLE_ORDER = [
   "live_chat_checkpoints",
   "live_sync_runs",
   "live_sessions",
+  "engagement_aggregates",
+  "archive_signal_observations",
+  "message_media_interpretations",
+  "message_deletions",
+  "message_edit_events",
+  "message_vcards",
+  "message_location_observations",
+  "message_locations",
+  "chat_metadata_history",
+  "group_membership_events",
+  "group_membership_periods",
+  "identity_number_changes",
   "message_mentions",
   "message_quoted_snapshots",
   "messages",
@@ -176,6 +215,14 @@ const DELETE_TABLE_ORDER = [
 
 const LIVE_SESSION_STATUSES = ["not_configured", "pairing", "connected", "disconnected", "stopped", "error", "logged_out"] as const;
 const MESSAGE_UPDATE_TYPES = ["delete", "edit", "reaction", "poll_vote", "event_response", "receipt", "call", "unknown"] as const;
+
+function stableSignalFactKey(family: string, parts: Array<string | number | null | undefined>): string {
+  return `${family}:${createHash("sha256").update(JSON.stringify(parts)).digest("hex")}`;
+}
+
+function isSyntheticSystemAnchor(sourceMessageKey: string | null | undefined): boolean {
+  return Boolean(sourceMessageKey && sourceMessageKey.includes("live-system-"));
+}
 
 // Shared per-message media-state projection: the asset (bytes stored) and the
 // download-queue row, from which every read path derives the same honest
@@ -253,7 +300,7 @@ function labelIsPushNameSql(alias = ""): string {
 // The full thread-view row projection, shared by offset paging and
 // anchor-centered context windows.
 function messageListSelectSql(whereClause: string, orderClause: string, limitClause: string): string {
-  return `SELECT m.id, m.source_message_id,
+  return `SELECT m.id, m.source_message_key, m.source_message_id,
                 ${contactLabelSql("c.")} AS sender_display_name,
                 m.sender_source_jid, m.timestamp_ms, m.sent_at, m.direction, m.message_type, m.body, m.caption,
                 m.has_media, m.media_mime_type, m.media_name, m.is_deleted, m.is_forwarded, m.is_starred,
@@ -410,12 +457,20 @@ function quoteSummaryFromRow(row: QuotedSnapshotRow): QuotedMessageSnapshotSumma
     caption: row.quoted_caption ?? null,
     mediaMimeType: row.quoted_media_mime_type ?? null,
     mediaName: row.quoted_media_name ?? null,
-    location: (parseJson(row.quoted_location_json ?? null) as QuotedMessageSnapshotSummary["location"]) ?? null,
-    vcard: (parseJson(row.quoted_vcard_json ?? null) as QuotedMessageSnapshotSummary["vcard"]) ?? null,
+    location: quoteLocationSummary(parseJson(row.quoted_location_json ?? null) as QuotedMessageSnapshot["location"]),
+    vcard: quoteVcardSummary(parseJson(row.quoted_vcard_json ?? null) as QuotedMessageSnapshot["vcard"]),
     mentionedJids: (parseJson(row.quoted_mentioned_jids_json ?? null) as string[] | null) ?? [],
     hasThumbnail: Boolean(row.quoted_has_thumbnail),
     originalMessageId: nullableNumber(row.quoted_original_message_id)
   };
+}
+
+function quoteLocationSummary(location: QuotedMessageSnapshot["location"]): QuotedMessageSnapshotSummary["location"] {
+  return location ? { name: location.name, address: location.address } : null;
+}
+
+function quoteVcardSummary(vcard: QuotedMessageSnapshot["vcard"]): QuotedMessageSnapshotSummary["vcard"] {
+  return vcard ? { name: vcard.name } : null;
 }
 
 interface SqliteMediaQueueRow {
@@ -645,9 +700,215 @@ const schemaStatements = [
   `CREATE TABLE IF NOT EXISTS message_mentions (
     message_id INTEGER NOT NULL,
     mentioned_jid TEXT NOT NULL,
+    -- Bit mask: 1 = text token fallback, 2 = authoritative structured source.
+    source_mask INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (message_id, mentioned_jid),
     FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
   ) WITHOUT ROWID`,
+
+  // Signal capture is additive archive state. Every row has a stable natural
+  // key and provenance; none stores raw receipt/device records.
+  `CREATE TABLE IF NOT EXISTS identity_number_changes (
+    event_key TEXT PRIMARY KEY,
+    chat_source_id TEXT NULL,
+    source_message_key TEXT NULL,
+    old_jid TEXT NOT NULL,
+    new_jid TEXT NOT NULL,
+    actor_jid TEXT NULL,
+    source TEXT NOT NULL CHECK (source IN ('backup','live')),
+    source_event_key TEXT NOT NULL DEFAULT '',
+    observed_at_ms INTEGER NULL,
+    capture_version INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS group_membership_periods (
+    period_key TEXT PRIMARY KEY,
+    group_source_id TEXT NOT NULL,
+    participant_jid TEXT NOT NULL,
+    joined_at_ms INTEGER NULL,
+    left_at_ms INTEGER NULL,
+    role TEXT NULL,
+    source TEXT NOT NULL CHECK (source IN ('backup','live')),
+    source_event_key TEXT NULL,
+    observed_at_ms INTEGER NULL,
+    capture_version INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS group_membership_events (
+    event_key TEXT PRIMARY KEY,
+    group_source_id TEXT NOT NULL,
+    participant_jid TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('add','remove','join','leave','invite','accept','promote','demote')),
+    actor_jid TEXT NULL,
+    source_message_key TEXT NULL,
+    old_role TEXT NULL,
+    new_role TEXT NULL,
+    raw_type TEXT NULL,
+    raw_parameters TEXT NULL,
+    source TEXT NOT NULL CHECK (source IN ('backup','live')),
+    source_event_key TEXT NULL,
+    observed_at_ms INTEGER NULL,
+    capture_version INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS chat_metadata_history (
+    event_key TEXT PRIMARY KEY,
+    chat_source_id TEXT NOT NULL,
+    field TEXT NOT NULL CHECK (field IN ('subject','description','photo','invite_link','announcement','restriction','member_add','join_approval','disappearing')),
+    source_message_key TEXT NULL,
+    actor_jid TEXT NULL,
+    old_value TEXT NULL,
+    new_value TEXT NULL,
+    raw_type TEXT NULL,
+    raw_parameters TEXT NULL,
+    source TEXT NOT NULL CHECK (source IN ('backup','live')),
+    source_event_key TEXT NULL,
+    observed_at_ms INTEGER NULL,
+    capture_version INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS message_locations (
+    source_message_key TEXT PRIMARY KEY,
+    latitude REAL NULL,
+    longitude REAL NULL,
+    name TEXT NULL,
+    address TEXT NULL,
+    is_live INTEGER NOT NULL DEFAULT 0,
+    accuracy_meters REAL NULL,
+    url TEXT NULL,
+    comment TEXT NULL,
+    caption TEXT NULL,
+    speed_mps REAL NULL,
+    heading_degrees REAL NULL,
+    sequence_number INTEGER NULL,
+    time_offset_ms INTEGER NULL,
+    live_share_duration_ms INTEGER NULL,
+    final_at_ms INTEGER NULL,
+    has_thumbnail INTEGER NOT NULL DEFAULT 0,
+    source TEXT NOT NULL CHECK (source IN ('backup','live')),
+    source_event_key TEXT NULL,
+    observed_at_ms INTEGER NULL,
+    capture_version INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    FOREIGN KEY (source_message_key) REFERENCES messages(source_message_key) ON UPDATE CASCADE ON DELETE CASCADE
+  )`,
+  `CREATE TABLE IF NOT EXISTS message_location_observations (
+    observation_key TEXT PRIMARY KEY,
+    source_message_key TEXT NOT NULL,
+    latitude REAL NULL,
+    longitude REAL NULL,
+    accuracy_meters REAL NULL,
+    speed_mps REAL NULL,
+    heading_degrees REAL NULL,
+    sequence_number INTEGER NULL,
+    time_offset_ms INTEGER NULL,
+    final_at_ms INTEGER NULL,
+    has_thumbnail INTEGER NOT NULL DEFAULT 0,
+    source TEXT NOT NULL CHECK (source IN ('backup','live')),
+    source_event_key TEXT NULL,
+    observed_at_ms INTEGER NULL,
+    capture_version INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    FOREIGN KEY (source_message_key) REFERENCES messages(source_message_key) ON UPDATE CASCADE ON DELETE CASCADE
+  )`,
+  `CREATE TABLE IF NOT EXISTS message_vcards (
+    source_message_key TEXT NOT NULL,
+    card_index INTEGER NOT NULL,
+    display_name TEXT NULL,
+    vcard TEXT NULL,
+    resolved_jid TEXT NULL,
+    properties_json TEXT NULL,
+    download_kind TEXT NOT NULL DEFAULT 'unavailable' CHECK (download_kind IN ('source','constructed','unavailable')),
+    download_file_name TEXT NULL,
+    source TEXT NOT NULL CHECK (source IN ('backup','live')),
+    source_event_key TEXT NULL,
+    observed_at_ms INTEGER NULL,
+    capture_version INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (source_message_key, card_index),
+    FOREIGN KEY (source_message_key) REFERENCES messages(source_message_key) ON UPDATE CASCADE ON DELETE CASCADE
+  ) WITHOUT ROWID`,
+  `CREATE TABLE IF NOT EXISTS message_edit_events (
+    event_key TEXT PRIMARY KEY,
+    source_message_key TEXT NOT NULL,
+    original_source_message_id TEXT NULL,
+    observed_edit_message_id TEXT NULL,
+    source TEXT NOT NULL CHECK (source IN ('backup','live')),
+    source_event_key TEXT NULL,
+    observed_at_ms INTEGER NULL,
+    capture_version INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    FOREIGN KEY (source_message_key) REFERENCES messages(source_message_key) ON UPDATE CASCADE ON DELETE CASCADE
+  )`,
+  `CREATE TABLE IF NOT EXISTS message_deletions (
+    source_message_key TEXT PRIMARY KEY,
+    revoked_by_jid TEXT NULL,
+    revoked_by_admin INTEGER NULL,
+    deletion_kind TEXT NULL,
+    source TEXT NOT NULL CHECK (source IN ('backup','live')),
+    source_event_key TEXT NULL,
+    observed_at_ms INTEGER NULL,
+    capture_version INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    FOREIGN KEY (source_message_key) REFERENCES messages(source_message_key) ON UPDATE CASCADE ON DELETE CASCADE
+  )`,
+  `CREATE TABLE IF NOT EXISTS archive_signal_observations (
+    fact_key TEXT NOT NULL,
+    family TEXT NOT NULL,
+    source TEXT NOT NULL CHECK (source IN ('backup','live')),
+    source_event_key TEXT NOT NULL DEFAULT '',
+    source_message_key TEXT NULL,
+    observed_at_ms INTEGER NULL,
+    capture_version INTEGER NOT NULL,
+    detail_json TEXT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (fact_key, family, source, source_event_key)
+  ) WITHOUT ROWID`,
+  `CREATE TABLE IF NOT EXISTS message_media_interpretations (
+    source_message_key TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('accessibility_label','transcription','transcription_segment')),
+    segment_index INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    start_ms INTEGER NULL,
+    end_ms INTEGER NULL,
+    source TEXT NOT NULL CHECK (source IN ('backup','live')),
+    source_event_key TEXT NULL,
+    observed_at_ms INTEGER NULL,
+    capture_version INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (source_message_key, kind, segment_index),
+    FOREIGN KEY (source_message_key) REFERENCES messages(source_message_key) ON UPDATE CASCADE ON DELETE CASCADE
+  ) WITHOUT ROWID`,
+  `CREATE TABLE IF NOT EXISTS engagement_aggregates (
+    aggregate_key TEXT PRIMARY KEY,
+    chat_source_id TEXT NOT NULL,
+    counterparty_jid TEXT NULL,
+    eligible_outgoing_count INTEGER NOT NULL,
+    delivered_count INTEGER NOT NULL,
+    read_count INTEGER NOT NULL,
+    response_latency_sample_count INTEGER NOT NULL,
+    median_response_latency_ms INTEGER NULL,
+    window_start_at_ms INTEGER NULL,
+    window_end_at_ms INTEGER NULL,
+    algorithm_version INTEGER NOT NULL,
+    source TEXT NOT NULL CHECK (source IN ('backup','live')),
+    source_event_key TEXT NULL,
+    observed_at_ms INTEGER NULL,
+    capture_version INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  )`,
 
   // Reply-owned WhatsApp quote snapshots. This is intentionally separate from
   // messages: it is embedded context, never independently visible/searchable
@@ -1015,6 +1276,7 @@ const schemaStatements = [
     push_name_participants_json TEXT NULL,
     uninterpreted_media_count INTEGER NOT NULL DEFAULT 0,
     quoted_reply_anchors_json TEXT NULL,
+    archive_signal_anchors_json TEXT NULL,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   )`,
 
@@ -1072,6 +1334,18 @@ const schemaStatements = [
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     FOREIGN KEY (episode_id) REFERENCES brain_episodes(id) ON DELETE CASCADE
   )`,
+
+  // Normalized reverse index for source-signal dependency stamps. The episode
+  // JSON remains the portable record; this table makes targeted stale marking
+  // cheap without copying vCards, transcript text, or coordinates.
+  `CREATE TABLE IF NOT EXISTS brain_episode_signal_anchors (
+    episode_id TEXT NOT NULL,
+    source_message_key TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('mention','location','vcard','link_preview','edit','deletion','media_interpretation')),
+    capture_version INTEGER NOT NULL,
+    PRIMARY KEY (episode_id, source_message_key, kind),
+    FOREIGN KEY (episode_id) REFERENCES brain_episodes(id) ON DELETE CASCADE
+  ) WITHOUT ROWID`,
 
   // Quality signals and salvage records (contract v2): structural failures that
   // exhausted the retry ('error'), quality lints like the anchoring check
@@ -1134,6 +1408,16 @@ const schemaStatements = [
   `CREATE INDEX IF NOT EXISTS idx_memory_citations_message ON memory_citations (source_message_key, message_id)`,
   `CREATE INDEX IF NOT EXISTS idx_memory_issues_run ON memory_validation_issues (run_id, severity, code)`,
   `CREATE INDEX IF NOT EXISTS idx_message_mentions_jid ON message_mentions (mentioned_jid, message_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_number_changes_old_new ON identity_number_changes (old_jid, new_jid, observed_at_ms)`,
+  `CREATE INDEX IF NOT EXISTS idx_group_periods_group_person ON group_membership_periods (group_source_id, participant_jid, joined_at_ms)`,
+  `CREATE INDEX IF NOT EXISTS idx_group_events_group_person ON group_membership_events (group_source_id, participant_jid, observed_at_ms)`,
+  `CREATE INDEX IF NOT EXISTS idx_chat_metadata_history_chat ON chat_metadata_history (chat_source_id, observed_at_ms)`,
+  `CREATE INDEX IF NOT EXISTS idx_location_observations_message_order ON message_location_observations (source_message_key, sequence_number, observed_at_ms)`,
+  `CREATE INDEX IF NOT EXISTS idx_vcards_resolved_jid ON message_vcards (resolved_jid, source_message_key)`,
+  `CREATE INDEX IF NOT EXISTS idx_edit_events_message ON message_edit_events (source_message_key, observed_at_ms)`,
+  `CREATE INDEX IF NOT EXISTS idx_media_interpretations_message ON message_media_interpretations (source_message_key, kind, segment_index)`,
+  `CREATE INDEX IF NOT EXISTS idx_signal_observations_fact ON archive_signal_observations (fact_key, family, observed_at_ms)`,
+  `CREATE INDEX IF NOT EXISTS idx_engagement_chat_identity ON engagement_aggregates (chat_source_id, counterparty_jid)`,
   `CREATE INDEX IF NOT EXISTS idx_quoted_snapshots_referent ON message_quoted_snapshots (quoted_source_chat_id, quoted_source_message_id)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_tasks_due ON brain_tasks (status, next_attempt_at_ms, priority, id)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_ledger_day ON brain_llm_ledger (day, purpose)`,
@@ -1141,6 +1425,7 @@ const schemaStatements = [
   `CREATE INDEX IF NOT EXISTS idx_brain_episodes_chat ON brain_episodes (chat_source_id, status, end_at_ms)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_episodes_status_end ON brain_episodes (status, end_at_ms)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_episodes_quote_stale ON brain_episodes (status, extraction_version)`,
+  `CREATE INDEX IF NOT EXISTS idx_brain_signal_anchors_message ON brain_episode_signal_anchors (source_message_key, episode_id)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_claims_episode ON brain_claims (episode_id, sequence)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_citations_claim ON brain_citations (claim_id)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_citations_key ON brain_citations (source_message_key)`,
@@ -1564,9 +1849,9 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       rows.map((row) => row.sender_source_jid).filter((jid): jid is string => Boolean(jid))
     );
     const updateResolved = this.db.prepare(`UPDATE messages SET resolved_text = ? WHERE id = ?`);
-    const selectMentions = this.db.prepare(`SELECT mentioned_jid FROM message_mentions WHERE message_id = ?`);
+    const selectMentions = this.db.prepare(`SELECT mentioned_jid, source_mask FROM message_mentions WHERE message_id = ?`);
     const deleteMentions = this.db.prepare(`DELETE FROM message_mentions WHERE message_id = ?`);
-    const insertMention = this.db.prepare(`INSERT OR IGNORE INTO message_mentions (message_id, mentioned_jid) VALUES (?, ?)`);
+    const insertMention = this.db.prepare(`INSERT OR REPLACE INTO message_mentions (message_id, mentioned_jid, source_mask) VALUES (?, ?, ?)`);
     for (const row of rows) {
       // The owner's messages index under the owner's saved name — never under
       // the importer's "me" sentinel contact (display name "Me").
@@ -1580,18 +1865,31 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       if ((resolved ?? null) !== (row.resolved_text ?? null)) {
         updateResolved.run(resolved, row.id);
       }
-      const desired = new Set<string>(explicitMentionsById?.get(row.id) ?? []);
+      const desired = new Map<string, number>();
+      for (const jid of explicitMentionsById?.get(row.id) ?? []) {
+        desired.set(jid, (desired.get(jid) ?? 0) | 2);
+      }
       for (const digits of extractMentionDigits([row.body, row.caption])) {
         const jid = mentionJids.get(digits);
         if (jid) {
-          desired.add(jid);
+          desired.set(jid, (desired.get(jid) ?? 0) | 1);
         }
       }
-      const existing = (selectMentions.all(row.id) as Array<{ mentioned_jid: string }>).map((mention) => mention.mentioned_jid);
-      if (existing.length !== desired.size || existing.some((jid) => !desired.has(jid))) {
+      // Structured observations remain authoritative across a derived-state
+      // recompute that does not carry a fresh MessageRecord batch.
+      const existing = selectMentions.all(row.id) as Array<{ mentioned_jid: string; source_mask: number }>;
+      for (const mention of existing) {
+        if ((Number(mention.source_mask) & 2) !== 0 && !desired.has(mention.mentioned_jid)) {
+          desired.set(mention.mentioned_jid, 2);
+        }
+      }
+      if (
+        existing.length !== desired.size ||
+        existing.some((mention) => Number(mention.source_mask) !== (desired.get(mention.mentioned_jid) ?? 0))
+      ) {
         deleteMentions.run(row.id);
-        for (const jid of desired) {
-          insertMention.run(row.id, jid);
+        for (const [jid, sourceMask] of desired) {
+          insertMention.run(row.id, jid, sourceMask);
         }
       }
     }
@@ -2199,8 +2497,8 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     const insertEpisode = this.db.prepare(
       `INSERT INTO brain_episodes
        (id, chat_source_id, start_at_ms, end_at_ms, message_count, participants_json, summary, markdown, generator, model, run_id, fallback_reason,
-        extraction_version, unresolved_participants_json, push_name_participants_json, uninterpreted_media_count, quoted_reply_anchors_json)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        extraction_version, unresolved_participants_json, push_name_participants_json, uninterpreted_media_count, quoted_reply_anchors_json, archive_signal_anchors_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     const insertClaim = this.db.prepare(
       `INSERT INTO brain_claims (id, episode_id, sequence, kind, text, event_at_ms, valid_until_ms, confidence) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
@@ -2215,6 +2513,9 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     );
     const insertMediaGap = this.db.prepare(
       `INSERT INTO brain_media_gaps (episode_id, source_message_key, modality, impact, note) VALUES (?, ?, ?, ?, ?)`
+    );
+    const insertSignalAnchor = this.db.prepare(
+      `INSERT OR REPLACE INTO brain_episode_signal_anchors (episode_id, source_message_key, kind, capture_version) VALUES (?, ?, ?, ?)`
     );
     // Case-insensitive topic convergence: the NOCASE unique index makes the
     // upsert reuse 'visa' when the model writes 'Visa'.
@@ -2244,7 +2545,8 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         stringifyJson(episode.unresolvedParticipants ?? []),
         stringifyJson(episode.pushNameParticipants ?? []),
         episode.uninterpretedMediaCount ?? 0,
-        stringifyJson(episode.quotedReplyAnchors ?? [])
+        stringifyJson(episode.quotedReplyAnchors ?? []),
+        stringifyJson(episode.archiveSignalAnchors ?? [])
       );
       episode.claims.forEach((claim, index) => {
         const claimId = crypto.randomUUID();
@@ -2279,6 +2581,11 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       }
       for (const gap of episode.mediaGaps ?? []) {
         insertMediaGap.run(id, gap.sourceMessageKey, gap.modality, gap.impact, gap.note ?? null);
+      }
+      for (const anchor of episode.archiveSignalAnchors ?? []) {
+        for (const kind of anchor.kinds) {
+          insertSignalAnchor.run(id, anchor.sourceMessageKey, kind, anchor.captureVersion);
+        }
       }
       // Regeneration commits leave the watermark alone: the window is already
       // covered and the cursor must never move backwards or churn.
@@ -2382,6 +2689,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       pushNameParticipants: (parseJson(row.push_name_participants_json as string | null) as string[] | null) ?? [],
       uninterpretedMediaCount: Number(row.uninterpreted_media_count ?? 0),
       quotedReplyAnchors: (parseJson(row.quoted_reply_anchors_json as string | null) as QuotedReplyAnchor[] | null) ?? [],
+      archiveSignalAnchors: (parseJson(row.archive_signal_anchors_json as string | null) as ArchiveSignalAnchor[] | null) ?? [],
       mediaGaps: (mediaGapsStmt.all(row.id) as Array<Record<string, unknown>>).map((gap) => ({
         sourceMessageKey: String(gap.source_message_key),
         modality: gap.modality as BrainMediaGapRecord["modality"],
@@ -2600,8 +2908,9 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     if (keys.length === 0) {
       return 0;
     }
-    // Reverse-map the changed keys to the 'current' episodes that cite them
-    // (index idx_brain_citations_key backs the lookup), de-duplicated by id.
+    // Reverse-map changed keys to the current episodes that either cite the
+    // message or stamped a structured signal from it. The latter preserves
+    // message-owned source annotations even when a model did not cite the line.
     const episodes = new Map<string, { chatSourceId: string; startAtMs: number; endAtMs: number }>();
     for (let index = 0; index < keys.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
       const batch = keys.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
@@ -2609,12 +2918,14 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       const rows = this.db
         .prepare(
           `SELECT DISTINCT e.id, e.chat_source_id, e.start_at_ms, e.end_at_ms
-           FROM brain_citations c
-           JOIN brain_claims cl ON cl.id = c.claim_id
-           JOIN brain_episodes e ON e.id = cl.episode_id
-           WHERE e.status = 'current' AND c.source_message_key IN (${placeholders})`
+           FROM brain_episodes e
+           LEFT JOIN brain_claims cl ON cl.episode_id = e.id
+           LEFT JOIN brain_citations c ON c.claim_id = cl.id
+           LEFT JOIN brain_episode_signal_anchors sa ON sa.episode_id = e.id
+           WHERE e.status = 'current'
+             AND (c.source_message_key IN (${placeholders}) OR sa.source_message_key IN (${placeholders}))`
         )
-        .all(...batch) as Array<{ id: string; chat_source_id: string; start_at_ms: number; end_at_ms: number }>;
+        .all(...batch, ...batch) as Array<{ id: string; chat_source_id: string; start_at_ms: number; end_at_ms: number }>;
       for (const row of rows) {
         episodes.set(row.id, {
           chatSourceId: String(row.chat_source_id),
@@ -2857,10 +3168,16 @@ export class SqliteArchiveRepository implements ArchiveRepository {
              OR EXISTS (SELECT 1 FROM contacts WHERE source_jid = ?)
              OR EXISTS (SELECT 1 FROM messages WHERE sender_source_jid = ?)
              OR EXISTS (SELECT 1 FROM chat_participants WHERE source_jid = ?)
+             OR EXISTS (SELECT 1 FROM identity_number_changes WHERE old_jid = ? OR new_jid = ? OR actor_jid = ?)
+             OR EXISTS (SELECT 1 FROM group_membership_periods WHERE group_source_id = ? OR participant_jid = ?)
+             OR EXISTS (SELECT 1 FROM group_membership_events WHERE group_source_id = ? OR participant_jid = ? OR actor_jid = ?)
+             OR EXISTS (SELECT 1 FROM message_vcards WHERE resolved_jid = ?)
+             OR EXISTS (SELECT 1 FROM message_deletions WHERE revoked_by_jid = ?)
+             OR EXISTS (SELECT 1 FROM engagement_aggregates WHERE chat_source_id = ? OR counterparty_jid = ?)
              OR EXISTS (SELECT 1 FROM live_chat_checkpoints WHERE chat_source_id = ?)
              OR EXISTS (SELECT 1 FROM live_gap_windows WHERE chat_source_id = ?) AS present`
       )
-      .get(lid, lid, lid, lid, lid, lid) as { present: number };
+      .get(lid, lid, lid, lid, lid, lid, lid, lid, lid, lid, lid, lid, lid, lid, lid, lid, lid, lid) as { present: number };
     if (!hasPresence.present) {
       return result;
     }
@@ -2934,6 +3251,22 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       // rows that would duplicate an existing canonical mention just drop.
       this.db.prepare(`UPDATE OR IGNORE message_mentions SET mentioned_jid = ? WHERE mentioned_jid = ?`).run(pn, lid);
       this.db.prepare(`DELETE FROM message_mentions WHERE mentioned_jid = ?`).run(lid);
+      // Every JID-bearing archive signal follows the same canonical identity
+      // merge. Signal rows are local evidence, never display-name joins.
+      this.db.prepare(`UPDATE identity_number_changes SET old_jid = ? WHERE old_jid = ?`).run(pn, lid);
+      this.db.prepare(`UPDATE identity_number_changes SET new_jid = ? WHERE new_jid = ?`).run(pn, lid);
+      this.db.prepare(`UPDATE identity_number_changes SET actor_jid = ? WHERE actor_jid = ?`).run(pn, lid);
+      this.db.prepare(`UPDATE group_membership_periods SET group_source_id = ? WHERE group_source_id = ?`).run(pn, lid);
+      this.db.prepare(`UPDATE group_membership_periods SET participant_jid = ? WHERE participant_jid = ?`).run(pn, lid);
+      this.db.prepare(`UPDATE group_membership_events SET group_source_id = ? WHERE group_source_id = ?`).run(pn, lid);
+      this.db.prepare(`UPDATE group_membership_events SET participant_jid = ? WHERE participant_jid = ?`).run(pn, lid);
+      this.db.prepare(`UPDATE group_membership_events SET actor_jid = ? WHERE actor_jid = ?`).run(pn, lid);
+      this.db.prepare(`UPDATE chat_metadata_history SET chat_source_id = ? WHERE chat_source_id = ?`).run(pn, lid);
+      this.db.prepare(`UPDATE chat_metadata_history SET actor_jid = ? WHERE actor_jid = ?`).run(pn, lid);
+      this.db.prepare(`UPDATE message_vcards SET resolved_jid = ? WHERE resolved_jid = ?`).run(pn, lid);
+      this.db.prepare(`UPDATE message_deletions SET revoked_by_jid = ? WHERE revoked_by_jid = ?`).run(pn, lid);
+      this.db.prepare(`UPDATE engagement_aggregates SET chat_source_id = ? WHERE chat_source_id = ?`).run(pn, lid);
+      this.db.prepare(`UPDATE engagement_aggregates SET counterparty_jid = ? WHERE counterparty_jid = ?`).run(pn, lid);
 
       // Live bookkeeping follows the merge.
       const pnCheckpoint = this.db.prepare(`SELECT chat_source_id FROM live_chat_checkpoints WHERE chat_source_id = ?`).get(pn);
@@ -4068,6 +4401,462 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     return rows.length;
   }
 
+  async upsertArchiveSignals(batch: ArchiveSignalBatch): Promise<{ changedMessageKeys: string[]; skippedUnanchoredRecords: number }> {
+    this.assertWritableIdentityVersion();
+    const changedMessageKeys = new Set<string>();
+    // Companion tables can contain retained rows for source messages that the
+    // defensive message importer skipped. Filter only the FK-bound companion
+    // families in bounded key batches so one orphan cannot abort the whole
+    // archive run (or manufacture a standalone evidence anchor).
+    const companionMessageKeys = [...new Set([
+      ...(batch.locations ?? []).map((row) => row.sourceMessageKey),
+      ...(batch.locationObservations ?? []).map((row) => row.sourceMessageKey),
+      ...(batch.vcards ?? []).map((row) => row.sourceMessageKey),
+      ...(batch.editEvents ?? []).map((row) => row.sourceMessageKey),
+      ...(batch.deletions ?? []).map((row) => row.sourceMessageKey),
+      ...(batch.mediaInterpretations ?? []).map((row) => row.sourceMessageKey)
+    ])];
+    const anchoredMessageKeys = new Set<string>();
+    for (let offset = 0; offset < companionMessageKeys.length; offset += 500) {
+      const keys = companionMessageKeys.slice(offset, offset + 500);
+      const placeholders = keys.map(() => "?").join(", ");
+      const rows = this.db.prepare(`SELECT source_message_key FROM messages WHERE source_message_key IN (${placeholders})`).all(...keys) as Array<{ source_message_key: string }>;
+      for (const row of rows) anchoredMessageKeys.add(row.source_message_key);
+    }
+    const retainAnchored = <T extends { sourceMessageKey: string }>(rows: T[] | undefined): T[] =>
+      (rows ?? []).filter((row) => anchoredMessageKeys.has(row.sourceMessageKey));
+    const locations = retainAnchored(batch.locations);
+    const locationObservations = retainAnchored(batch.locationObservations);
+    const vcards = retainAnchored(batch.vcards);
+    const deletions = retainAnchored(batch.deletions);
+    const mediaInterpretations = retainAnchored(batch.mediaInterpretations);
+    // Source row ids differ between backup and live sync. These conservative
+    // semantic keys use the shared message identity where available and exact
+    // verified role/value/timestamp tuples otherwise; they never dedupe by a
+    // broad time window.
+    const numberChanges = (batch.numberChanges ?? []).map((row) => ({
+      ...row,
+      eventKey: stableSignalFactKey("number_change", [row.sourceMessageKey, row.chatSourceId, row.oldJid, row.newJid, row.observedAtMs])
+    }));
+    const membershipPeriods = (batch.membershipPeriods ?? []).map((row) => ({
+      ...row,
+      periodKey: stableSignalFactKey("membership_period", [row.groupSourceId, row.participantJid, row.joinedAtMs, row.leftAtMs, row.role])
+    }));
+    const membershipEvents = (batch.membershipEvents ?? []).map((row) => ({
+      ...row,
+      eventKey: stableSignalFactKey("membership_event", [row.groupSourceId, row.participantJid, row.action, row.observedAtMs, row.oldRole, row.newRole])
+    }));
+    const chatMetadataHistory = (batch.chatMetadataHistory ?? []).map((row) => ({
+      ...row,
+      eventKey: stableSignalFactKey("chat_metadata", [row.chatSourceId, row.field, row.oldValue, row.newValue, row.observedAtMs])
+    }));
+    const editEvents = retainAnchored(batch.editEvents).map((row) => ({
+      ...row,
+      eventKey: stableSignalFactKey("edit", row.observedAtMs == null
+        ? [row.sourceMessageKey, null, row.originalSourceMessageId, row.observedEditMessageId, row.sourceEventKey]
+        : [row.sourceMessageKey, row.observedAtMs])
+    }));
+    const skippedUnanchoredRecords =
+      (batch.locations?.length ?? 0) - locations.length +
+      (batch.locationObservations?.length ?? 0) - locationObservations.length +
+      (batch.vcards?.length ?? 0) - vcards.length +
+      (batch.editEvents?.length ?? 0) - editEvents.length +
+      (batch.deletions?.length ?? 0) - deletions.length +
+      (batch.mediaInterpretations?.length ?? 0) - mediaInterpretations.length;
+    const canonical = (jid: string | null | undefined): string | null => (jid === "me" ? "me" : this.canonicalJid(jid) ?? jid ?? null);
+    // Canonical scalar provenance must not depend on which source arrived
+    // first. Newer observation time wins; an exact live/backup tie prefers
+    // live, while the per-source observation table retains both originals.
+    const incomingWins = `(existing.observed_at_ms IS NULL AND excluded.observed_at_ms IS NOT NULL)
+      OR (existing.observed_at_ms IS NOT NULL AND excluded.observed_at_ms IS NOT NULL AND excluded.observed_at_ms > existing.observed_at_ms)
+      OR (existing.observed_at_ms = excluded.observed_at_ms AND excluded.source = 'live' AND existing.source = 'backup')
+      OR (existing.observed_at_ms IS NULL AND excluded.observed_at_ms IS NULL AND excluded.source = 'live' AND existing.source = 'backup')`;
+    // SQLite's scalar MAX returns NULL when either operand is NULL. Observation
+    // time is nullable by contract, so use an explicit monotonic merge rather
+    // than accidentally erasing the one timestamp a source did provide.
+    const newestObservedAt = `CASE WHEN existing.observed_at_ms IS NULL THEN excluded.observed_at_ms WHEN excluded.observed_at_ms IS NULL THEN existing.observed_at_ms ELSE MAX(existing.observed_at_ms, excluded.observed_at_ms) END`;
+    const transaction = this.db.transaction(() => {
+      const numberChange = this.db.prepare(
+        `INSERT INTO identity_number_changes AS existing
+         (event_key, chat_source_id, source_message_key, old_jid, new_jid, actor_jid, source, source_event_key, observed_at_ms, capture_version, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(event_key) DO UPDATE SET
+           chat_source_id = COALESCE(existing.chat_source_id, excluded.chat_source_id),
+           source_message_key = CASE
+             WHEN existing.source_message_key IS NULL THEN excluded.source_message_key
+             WHEN INSTR(existing.source_message_key, 'live-system-') > 0 AND excluded.source_message_key IS NOT NULL AND INSTR(excluded.source_message_key, 'live-system-') = 0 THEN excluded.source_message_key
+             ELSE existing.source_message_key END,
+           old_jid = excluded.old_jid, new_jid = excluded.new_jid,
+           actor_jid = COALESCE(existing.actor_jid, excluded.actor_jid),
+           source = CASE WHEN ${incomingWins} THEN excluded.source ELSE existing.source END,
+           source_event_key = CASE WHEN ${incomingWins} THEN COALESCE(excluded.source_event_key, existing.source_event_key) ELSE COALESCE(existing.source_event_key, excluded.source_event_key) END,
+           observed_at_ms = ${newestObservedAt},
+           capture_version = MAX(existing.capture_version, excluded.capture_version), updated_at = excluded.updated_at`
+      );
+      const period = this.db.prepare(
+        `INSERT INTO group_membership_periods AS existing
+         (period_key, group_source_id, participant_jid, joined_at_ms, left_at_ms, role, source, source_event_key, observed_at_ms, capture_version, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(period_key) DO UPDATE SET
+           joined_at_ms = COALESCE(existing.joined_at_ms, excluded.joined_at_ms),
+           left_at_ms = COALESCE(existing.left_at_ms, excluded.left_at_ms), role = COALESCE(existing.role, excluded.role),
+           source = CASE WHEN ${incomingWins} THEN excluded.source ELSE existing.source END,
+           source_event_key = CASE WHEN ${incomingWins} THEN COALESCE(excluded.source_event_key, existing.source_event_key) ELSE COALESCE(existing.source_event_key, excluded.source_event_key) END,
+           observed_at_ms = ${newestObservedAt},
+           capture_version = MAX(existing.capture_version, excluded.capture_version), updated_at = excluded.updated_at`
+      );
+      const membershipEvent = this.db.prepare(
+        `INSERT INTO group_membership_events AS existing
+         (event_key, group_source_id, participant_jid, action, actor_jid, source_message_key, old_role, new_role, raw_type, raw_parameters, source, source_event_key, observed_at_ms, capture_version, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(event_key) DO UPDATE SET
+           actor_jid = COALESCE(existing.actor_jid, excluded.actor_jid), source_message_key = CASE
+             WHEN existing.source_message_key IS NULL THEN excluded.source_message_key
+             WHEN INSTR(existing.source_message_key, 'live-system-') > 0 AND excluded.source_message_key IS NOT NULL AND INSTR(excluded.source_message_key, 'live-system-') = 0 THEN excluded.source_message_key
+             ELSE existing.source_message_key END,
+           old_role = COALESCE(existing.old_role, excluded.old_role), new_role = COALESCE(existing.new_role, excluded.new_role),
+           raw_type = COALESCE(existing.raw_type, excluded.raw_type), raw_parameters = COALESCE(existing.raw_parameters, excluded.raw_parameters),
+           source = CASE WHEN ${incomingWins} THEN excluded.source ELSE existing.source END,
+           source_event_key = CASE WHEN ${incomingWins} THEN COALESCE(excluded.source_event_key, existing.source_event_key) ELSE COALESCE(existing.source_event_key, excluded.source_event_key) END, observed_at_ms = ${newestObservedAt},
+           capture_version = MAX(existing.capture_version, excluded.capture_version), updated_at = excluded.updated_at`
+      );
+      const metadata = this.db.prepare(
+        `INSERT INTO chat_metadata_history AS existing
+         (event_key, chat_source_id, field, source_message_key, actor_jid, old_value, new_value, raw_type, raw_parameters, source, source_event_key, observed_at_ms, capture_version, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(event_key) DO UPDATE SET
+           source_message_key = CASE
+             WHEN existing.source_message_key IS NULL THEN excluded.source_message_key
+             WHEN INSTR(existing.source_message_key, 'live-system-') > 0 AND excluded.source_message_key IS NOT NULL AND INSTR(excluded.source_message_key, 'live-system-') = 0 THEN excluded.source_message_key
+             ELSE existing.source_message_key END, actor_jid = COALESCE(existing.actor_jid, excluded.actor_jid),
+           old_value = COALESCE(existing.old_value, excluded.old_value), new_value = COALESCE(existing.new_value, excluded.new_value),
+           raw_type = COALESCE(existing.raw_type, excluded.raw_type), raw_parameters = COALESCE(existing.raw_parameters, excluded.raw_parameters),
+           source = CASE WHEN ${incomingWins} THEN excluded.source ELSE existing.source END,
+           source_event_key = CASE WHEN ${incomingWins} THEN COALESCE(excluded.source_event_key, existing.source_event_key) ELSE COALESCE(existing.source_event_key, excluded.source_event_key) END, observed_at_ms = ${newestObservedAt},
+           capture_version = MAX(existing.capture_version, excluded.capture_version), updated_at = excluded.updated_at`
+      );
+      const location = this.db.prepare(
+        `INSERT INTO message_locations AS existing
+         (source_message_key, latitude, longitude, name, address, is_live, accuracy_meters, url, comment, caption, speed_mps, heading_degrees, sequence_number, time_offset_ms, live_share_duration_ms, final_at_ms, has_thumbnail, source, source_event_key, observed_at_ms, capture_version, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(source_message_key) DO UPDATE SET
+           latitude = COALESCE(existing.latitude, excluded.latitude), longitude = COALESCE(existing.longitude, excluded.longitude),
+           name = COALESCE(existing.name, excluded.name), address = COALESCE(existing.address, excluded.address),
+           is_live = CASE
+             WHEN existing.live_share_duration_ms = 0 AND existing.sequence_number = 0 AND existing.final_at_ms IS NULL
+              AND excluded.live_share_duration_ms IS NULL AND excluded.sequence_number IS NULL AND excluded.final_at_ms IS NULL
+              AND excluded.is_live = 0
+             THEN 0
+             ELSE MAX(existing.is_live, excluded.is_live)
+           END,
+           accuracy_meters = COALESCE(existing.accuracy_meters, excluded.accuracy_meters),
+           url = COALESCE(existing.url, excluded.url), comment = COALESCE(existing.comment, excluded.comment), caption = COALESCE(existing.caption, excluded.caption),
+           speed_mps = COALESCE(existing.speed_mps, excluded.speed_mps), heading_degrees = COALESCE(existing.heading_degrees, excluded.heading_degrees),
+           sequence_number = CASE
+             WHEN existing.live_share_duration_ms = 0 AND existing.sequence_number = 0 AND existing.final_at_ms IS NULL
+              AND excluded.live_share_duration_ms IS NULL AND excluded.sequence_number IS NULL AND excluded.final_at_ms IS NULL
+              AND excluded.is_live = 0
+             THEN NULL
+             ELSE COALESCE(existing.sequence_number, excluded.sequence_number)
+           END,
+           time_offset_ms = COALESCE(existing.time_offset_ms, excluded.time_offset_ms),
+           live_share_duration_ms = CASE
+             WHEN existing.live_share_duration_ms = 0 AND existing.sequence_number = 0 AND existing.final_at_ms IS NULL
+              AND excluded.live_share_duration_ms IS NULL AND excluded.sequence_number IS NULL AND excluded.final_at_ms IS NULL
+              AND excluded.is_live = 0
+             THEN NULL
+             WHEN existing.live_share_duration_ms IS NOT NULL
+              AND excluded.live_share_duration_ms = existing.live_share_duration_ms * 1000
+             THEN excluded.live_share_duration_ms
+             ELSE COALESCE(existing.live_share_duration_ms, excluded.live_share_duration_ms)
+           END,
+           final_at_ms = COALESCE(existing.final_at_ms, excluded.final_at_ms),
+           has_thumbnail = MAX(existing.has_thumbnail, excluded.has_thumbnail),
+           source = CASE WHEN ${incomingWins} THEN excluded.source ELSE existing.source END,
+           source_event_key = CASE WHEN ${incomingWins} THEN COALESCE(excluded.source_event_key, existing.source_event_key) ELSE COALESCE(existing.source_event_key, excluded.source_event_key) END, observed_at_ms = ${newestObservedAt},
+           capture_version = MAX(existing.capture_version, excluded.capture_version), updated_at = excluded.updated_at
+         WHERE existing.latitude IS NULL AND excluded.latitude IS NOT NULL
+            OR existing.longitude IS NULL AND excluded.longitude IS NOT NULL
+            OR existing.name IS NULL AND excluded.name IS NOT NULL
+            OR existing.address IS NULL AND excluded.address IS NOT NULL
+            OR existing.accuracy_meters IS NULL AND excluded.accuracy_meters IS NOT NULL
+            OR existing.url IS NULL AND excluded.url IS NOT NULL
+            OR existing.comment IS NULL AND excluded.comment IS NOT NULL
+            OR existing.caption IS NULL AND excluded.caption IS NOT NULL
+            OR existing.speed_mps IS NULL AND excluded.speed_mps IS NOT NULL
+            OR existing.heading_degrees IS NULL AND excluded.heading_degrees IS NOT NULL
+            OR existing.sequence_number IS NULL AND excluded.sequence_number IS NOT NULL
+            OR existing.time_offset_ms IS NULL AND excluded.time_offset_ms IS NOT NULL
+            OR existing.live_share_duration_ms IS NULL AND excluded.live_share_duration_ms IS NOT NULL
+            OR existing.live_share_duration_ms IS NOT NULL AND excluded.live_share_duration_ms = existing.live_share_duration_ms * 1000
+            OR existing.live_share_duration_ms = 0 AND existing.sequence_number = 0 AND existing.final_at_ms IS NULL AND excluded.live_share_duration_ms IS NULL AND excluded.sequence_number IS NULL AND excluded.final_at_ms IS NULL AND excluded.is_live = 0
+            OR existing.final_at_ms IS NULL AND excluded.final_at_ms IS NOT NULL
+            OR existing.has_thumbnail <> MAX(existing.has_thumbnail, excluded.has_thumbnail)
+            OR existing.is_live <> MAX(existing.is_live, excluded.is_live)
+            OR existing.capture_version < excluded.capture_version`
+      );
+      const vcard = this.db.prepare(
+        `INSERT INTO message_vcards AS existing
+         (source_message_key, card_index, display_name, vcard, resolved_jid, properties_json, download_kind, download_file_name, source, source_event_key, observed_at_ms, capture_version, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(source_message_key, card_index) DO UPDATE SET
+           display_name = COALESCE(existing.display_name, excluded.display_name), vcard = COALESCE(existing.vcard, excluded.vcard),
+           resolved_jid = COALESCE(existing.resolved_jid, excluded.resolved_jid), properties_json = COALESCE(existing.properties_json, excluded.properties_json),
+           download_kind = CASE WHEN existing.download_kind = 'unavailable' THEN excluded.download_kind ELSE existing.download_kind END,
+           download_file_name = COALESCE(existing.download_file_name, excluded.download_file_name), source = CASE WHEN ${incomingWins} THEN excluded.source ELSE existing.source END,
+           source_event_key = CASE WHEN ${incomingWins} THEN COALESCE(excluded.source_event_key, existing.source_event_key) ELSE COALESCE(existing.source_event_key, excluded.source_event_key) END, observed_at_ms = ${newestObservedAt},
+           capture_version = MAX(existing.capture_version, excluded.capture_version), updated_at = excluded.updated_at
+         WHERE existing.display_name IS NULL AND excluded.display_name IS NOT NULL
+            OR existing.vcard IS NULL AND excluded.vcard IS NOT NULL
+            OR existing.resolved_jid IS NULL AND excluded.resolved_jid IS NOT NULL
+            OR existing.properties_json IS NULL AND excluded.properties_json IS NOT NULL
+            OR existing.download_kind = 'unavailable' AND excluded.download_kind <> 'unavailable'
+            OR existing.capture_version < excluded.capture_version`
+      );
+      const locationObservation = this.db.prepare(
+        `INSERT INTO message_location_observations AS existing
+         (observation_key, source_message_key, latitude, longitude, accuracy_meters, speed_mps, heading_degrees, sequence_number, time_offset_ms, final_at_ms, has_thumbnail, source, source_event_key, observed_at_ms, capture_version, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(observation_key) DO UPDATE SET
+           latitude = COALESCE(existing.latitude, excluded.latitude), longitude = COALESCE(existing.longitude, excluded.longitude),
+           accuracy_meters = COALESCE(existing.accuracy_meters, excluded.accuracy_meters), speed_mps = COALESCE(existing.speed_mps, excluded.speed_mps),
+           heading_degrees = COALESCE(existing.heading_degrees, excluded.heading_degrees), sequence_number = COALESCE(existing.sequence_number, excluded.sequence_number),
+           time_offset_ms = COALESCE(existing.time_offset_ms, excluded.time_offset_ms), final_at_ms = COALESCE(existing.final_at_ms, excluded.final_at_ms),
+           has_thumbnail = MAX(existing.has_thumbnail, excluded.has_thumbnail), source = CASE WHEN ${incomingWins} THEN excluded.source ELSE existing.source END,
+           source_event_key = CASE WHEN ${incomingWins} THEN COALESCE(excluded.source_event_key, existing.source_event_key) ELSE COALESCE(existing.source_event_key, excluded.source_event_key) END, observed_at_ms = ${newestObservedAt}, capture_version = MAX(existing.capture_version, excluded.capture_version), updated_at = excluded.updated_at`
+      );
+      const edit = this.db.prepare(
+        `INSERT INTO message_edit_events AS existing
+         (event_key, source_message_key, original_source_message_id, observed_edit_message_id, source, source_event_key, observed_at_ms, capture_version, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(event_key) DO UPDATE SET
+           original_source_message_id = COALESCE(existing.original_source_message_id, excluded.original_source_message_id),
+           observed_edit_message_id = COALESCE(existing.observed_edit_message_id, excluded.observed_edit_message_id),
+           source = CASE WHEN ${incomingWins} THEN excluded.source ELSE existing.source END,
+           source_event_key = CASE WHEN ${incomingWins} THEN COALESCE(excluded.source_event_key, existing.source_event_key) ELSE COALESCE(existing.source_event_key, excluded.source_event_key) END, observed_at_ms = ${newestObservedAt},
+           capture_version = MAX(existing.capture_version, excluded.capture_version), updated_at = excluded.updated_at`
+      );
+      const deletion = this.db.prepare(
+        `INSERT INTO message_deletions AS existing
+         (source_message_key, revoked_by_jid, revoked_by_admin, deletion_kind, source, source_event_key, observed_at_ms, capture_version, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(source_message_key) DO UPDATE SET
+           revoked_by_jid = COALESCE(existing.revoked_by_jid, excluded.revoked_by_jid),
+           revoked_by_admin = COALESCE(existing.revoked_by_admin, excluded.revoked_by_admin), deletion_kind = COALESCE(existing.deletion_kind, excluded.deletion_kind),
+           source = CASE WHEN ${incomingWins} THEN excluded.source ELSE existing.source END,
+           source_event_key = CASE WHEN ${incomingWins} THEN COALESCE(excluded.source_event_key, existing.source_event_key) ELSE COALESCE(existing.source_event_key, excluded.source_event_key) END, observed_at_ms = ${newestObservedAt},
+           capture_version = MAX(existing.capture_version, excluded.capture_version), updated_at = excluded.updated_at
+         WHERE existing.revoked_by_jid IS NULL AND excluded.revoked_by_jid IS NOT NULL
+            OR existing.revoked_by_admin IS NULL AND excluded.revoked_by_admin IS NOT NULL
+            OR existing.deletion_kind IS NULL AND excluded.deletion_kind IS NOT NULL
+            OR existing.observed_at_ms IS NULL AND excluded.observed_at_ms IS NOT NULL
+            OR existing.capture_version < excluded.capture_version`
+      );
+      const interpretation = this.db.prepare(
+        `INSERT INTO message_media_interpretations AS existing
+         (source_message_key, kind, segment_index, text, start_ms, end_ms, source, source_event_key, observed_at_ms, capture_version, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(source_message_key, kind, segment_index) DO UPDATE SET
+           text = CASE WHEN LENGTH(existing.text) >= LENGTH(excluded.text) THEN existing.text ELSE excluded.text END,
+           start_ms = COALESCE(existing.start_ms, excluded.start_ms),
+           end_ms = CASE
+             WHEN existing.kind = 'transcription_segment'
+              AND excluded.end_ms IS NULL
+              AND existing.start_ms IS NOT NULL
+              AND existing.end_ms = existing.start_ms
+             THEN NULL
+             ELSE COALESCE(existing.end_ms, excluded.end_ms)
+           END,
+           source = CASE WHEN ${incomingWins} THEN excluded.source ELSE existing.source END,
+           source_event_key = CASE WHEN ${incomingWins} THEN COALESCE(excluded.source_event_key, existing.source_event_key) ELSE COALESCE(existing.source_event_key, excluded.source_event_key) END, observed_at_ms = ${newestObservedAt},
+           capture_version = MAX(existing.capture_version, excluded.capture_version), updated_at = excluded.updated_at
+         WHERE LENGTH(excluded.text) > LENGTH(existing.text)
+            OR existing.capture_version < excluded.capture_version
+            OR existing.kind = 'transcription_segment' AND excluded.end_ms IS NULL AND existing.start_ms IS NOT NULL AND existing.end_ms = existing.start_ms`
+      );
+      const aggregate = this.db.prepare(
+        `INSERT INTO engagement_aggregates AS existing
+         (aggregate_key, chat_source_id, counterparty_jid, eligible_outgoing_count, delivered_count, read_count, response_latency_sample_count,
+          median_response_latency_ms, window_start_at_ms, window_end_at_ms, algorithm_version, source, source_event_key, observed_at_ms, capture_version, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(aggregate_key) DO UPDATE SET
+           eligible_outgoing_count = CASE WHEN excluded.eligible_outgoing_count >= existing.eligible_outgoing_count THEN excluded.eligible_outgoing_count ELSE existing.eligible_outgoing_count END,
+           delivered_count = CASE WHEN excluded.delivered_count >= existing.delivered_count THEN excluded.delivered_count ELSE existing.delivered_count END,
+           read_count = CASE WHEN excluded.read_count >= existing.read_count THEN excluded.read_count ELSE existing.read_count END,
+           response_latency_sample_count = CASE WHEN excluded.response_latency_sample_count >= existing.response_latency_sample_count THEN excluded.response_latency_sample_count ELSE existing.response_latency_sample_count END,
+           median_response_latency_ms = COALESCE(excluded.median_response_latency_ms, existing.median_response_latency_ms),
+           window_start_at_ms = COALESCE(existing.window_start_at_ms, excluded.window_start_at_ms),
+           window_end_at_ms = CASE WHEN existing.window_end_at_ms IS NULL THEN excluded.window_end_at_ms WHEN excluded.window_end_at_ms IS NULL THEN existing.window_end_at_ms ELSE MAX(existing.window_end_at_ms, excluded.window_end_at_ms) END,
+           algorithm_version = MAX(existing.algorithm_version, excluded.algorithm_version), source = CASE WHEN ${incomingWins} THEN excluded.source ELSE existing.source END,
+           source_event_key = CASE WHEN ${incomingWins} THEN COALESCE(excluded.source_event_key, existing.source_event_key) ELSE COALESCE(existing.source_event_key, excluded.source_event_key) END, observed_at_ms = ${newestObservedAt}, capture_version = MAX(existing.capture_version, excluded.capture_version), updated_at = excluded.updated_at`
+      );
+      const observation = this.db.prepare(
+        `INSERT INTO archive_signal_observations AS existing
+         (fact_key, family, source, source_event_key, source_message_key, observed_at_ms, capture_version, detail_json, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(fact_key, family, source, source_event_key) DO UPDATE SET
+           source_message_key = COALESCE(existing.source_message_key, excluded.source_message_key),
+           observed_at_ms = ${newestObservedAt}, capture_version = MAX(existing.capture_version, excluded.capture_version),
+           detail_json = COALESCE(existing.detail_json, excluded.detail_json), updated_at = excluded.updated_at`
+      );
+      const priorEditBySourceObservation = this.db.prepare(
+        `SELECT event_key FROM message_edit_events
+         WHERE source_message_key = ? AND source = ? AND source_event_key = ? AND event_key <> ?`
+      );
+      const legacyEnvelopeTimeEdits = this.db.prepare(
+        `SELECT e.event_key
+         FROM message_edit_events e
+         JOIN messages m ON m.source_message_key = e.source_message_key
+         WHERE e.source_message_key = ?
+           AND e.source = 'live'
+           AND e.source_event_key LIKE 'wa-web:edit:%'
+           AND e.observed_at_ms = m.timestamp_ms
+           AND ? > m.timestamp_ms
+           AND e.event_key <> ?`
+      );
+      const moveEditObservations = this.db.prepare(
+        `INSERT OR IGNORE INTO archive_signal_observations
+         (fact_key, family, source, source_event_key, source_message_key, observed_at_ms, capture_version, detail_json, updated_at)
+         SELECT ?, family, source, source_event_key, source_message_key, observed_at_ms, capture_version, detail_json, ?
+         FROM archive_signal_observations WHERE fact_key = ? AND family = 'edit'`
+      );
+      const deleteEditObservations = this.db.prepare(
+        `DELETE FROM archive_signal_observations WHERE fact_key = ? AND family = 'edit'`
+      );
+      const deleteEditFact = this.db.prepare(`DELETE FROM message_edit_events WHERE event_key = ?`);
+      const now = currentIso();
+      const observe = (factKey: string, family: string, row: { source: string; sourceEventKey: string | null; observedAtMs: number | null; captureVersion: number; sourceMessageKey?: string | null }, detail: unknown = null) =>
+        observation.run(factKey, family, row.source, row.sourceEventKey ?? "", row.sourceMessageKey ?? null, row.observedAtMs, row.captureVersion, detail == null ? null : JSON.stringify(detail), now);
+      for (const row of numberChanges) {
+        numberChange.run(row.eventKey, canonical(row.chatSourceId), row.sourceMessageKey, canonical(row.oldJid), canonical(row.newJid), canonical(row.actorJid), row.source, row.sourceEventKey, row.observedAtMs, row.captureVersion, now);
+        observe(row.eventKey, "number_change", row);
+      }
+      for (const row of membershipPeriods) period.run(row.periodKey, canonical(row.groupSourceId), canonical(row.participantJid), row.joinedAtMs, row.leftAtMs, row.role, row.source, row.sourceEventKey, row.observedAtMs, row.captureVersion, now);
+      for (const row of membershipPeriods) observe(row.periodKey, "membership_period", row);
+      for (const row of membershipEvents) {
+        membershipEvent.run(row.eventKey, canonical(row.groupSourceId), canonical(row.participantJid), row.action, canonical(row.actorJid), row.sourceMessageKey, row.oldRole ?? null, row.newRole ?? null, row.rawType ?? null, row.rawParameters ?? null, row.source, row.sourceEventKey, row.observedAtMs, row.captureVersion, now);
+        observe(row.eventKey, "membership_event", row, { rawType: row.rawType ?? null, rawParameters: row.rawParameters ?? null });
+      }
+      for (const row of chatMetadataHistory) {
+        metadata.run(row.eventKey, canonical(row.chatSourceId), row.field, row.sourceMessageKey, canonical(row.actorJid), row.oldValue, row.newValue, row.rawType ?? null, row.rawParameters ?? null, row.source, row.sourceEventKey, row.observedAtMs, row.captureVersion, now);
+        observe(row.eventKey, "chat_metadata", row, { rawType: row.rawType ?? null, rawParameters: row.rawParameters ?? null });
+      }
+      for (const row of locations) {
+        if (location.run(row.sourceMessageKey, row.latitude, row.longitude, row.name, row.address, Number(row.isLive), row.accuracyMeters, row.url ?? null, row.comment ?? null, row.caption ?? null, row.speedMps ?? null, row.headingDegrees ?? null, row.sequenceNumber ?? null, row.timeOffsetMs ?? null, row.liveShareDurationMs ?? null, row.finalAtMs ?? null, Number(row.hasThumbnail ?? false), row.source, row.sourceEventKey, row.observedAtMs, row.captureVersion, now).changes) changedMessageKeys.add(row.sourceMessageKey);
+        observe(row.sourceMessageKey, "location", row);
+      }
+      for (const row of locationObservations) {
+        if (locationObservation.run(row.observationKey, row.sourceMessageKey, row.latitude, row.longitude, row.accuracyMeters, row.speedMps, row.headingDegrees, row.sequenceNumber, row.timeOffsetMs, row.finalAtMs, Number(row.hasThumbnail), row.source, row.sourceEventKey, row.observedAtMs, row.captureVersion, now).changes) changedMessageKeys.add(row.sourceMessageKey);
+        observe(row.observationKey, "location_observation", row);
+      }
+      for (const row of vcards) {
+        if (vcard.run(row.sourceMessageKey, row.cardIndex, row.displayName, row.vcard, canonical(row.resolvedJid), row.properties ? JSON.stringify(row.properties) : null, row.downloadKind ?? (row.vcard ? "source" : "unavailable"), row.downloadFileName ?? null, row.source, row.sourceEventKey, row.observedAtMs, row.captureVersion, now).changes) changedMessageKeys.add(row.sourceMessageKey);
+        observe(`${row.sourceMessageKey}:${row.cardIndex}`, "vcard", row);
+      }
+      for (const row of editEvents) {
+        const legacyKeys = new Set<string>();
+        if (row.sourceEventKey) {
+          for (const prior of priorEditBySourceObservation.all(row.sourceMessageKey, row.source, row.sourceEventKey, row.eventKey) as Array<{ event_key: string }>) legacyKeys.add(prior.event_key);
+        }
+        if (row.observedAtMs != null) {
+          for (const prior of legacyEnvelopeTimeEdits.all(row.sourceMessageKey, row.observedAtMs, row.eventKey) as Array<{ event_key: string }>) legacyKeys.add(prior.event_key);
+        }
+        for (const oldKey of legacyKeys) {
+          moveEditObservations.run(row.eventKey, now, oldKey);
+          deleteEditObservations.run(oldKey);
+          deleteEditFact.run(oldKey);
+        }
+        if (edit.run(row.eventKey, row.sourceMessageKey, row.originalSourceMessageId, row.observedEditMessageId, row.source, row.sourceEventKey, row.observedAtMs, row.captureVersion, now).changes) changedMessageKeys.add(row.sourceMessageKey);
+        observe(row.eventKey, "edit", row);
+      }
+      for (const row of deletions) {
+        if (deletion.run(row.sourceMessageKey, canonical(row.revokedByJid), row.revokedByAdmin == null ? null : Number(row.revokedByAdmin), row.deletionKind ?? null, row.source, row.sourceEventKey, row.observedAtMs, row.captureVersion, now).changes) changedMessageKeys.add(row.sourceMessageKey);
+        observe(row.sourceMessageKey, "deletion", row);
+      }
+      for (const row of mediaInterpretations) {
+        if (interpretation.run(row.sourceMessageKey, row.kind, row.segmentIndex, row.text, row.startMs, row.endMs, row.source, row.sourceEventKey, row.observedAtMs, row.captureVersion, now).changes) changedMessageKeys.add(row.sourceMessageKey);
+        observe(`${row.sourceMessageKey}:${row.kind}:${row.segmentIndex}`, "media_interpretation", row);
+      }
+      for (const row of batch.engagementAggregates ?? []) aggregate.run(row.aggregateKey, canonical(row.chatSourceId), canonical(row.counterpartyJid), row.eligibleOutgoingCount, row.deliveredCount, row.readCount, row.responseLatencySampleCount, row.medianResponseLatencyMs, row.windowStartAtMs, row.windowEndAtMs, row.algorithmVersion, row.source, row.sourceEventKey, row.observedAtMs, row.captureVersion, now);
+    });
+    transaction();
+    const changed = [...changedMessageKeys];
+    if (changed.length > 0) {
+      await this.markStaleEpisodesForMessages(changed);
+    }
+    return { changedMessageKeys: changed, skippedUnanchoredRecords };
+  }
+
+  async repairAmbiguousSelfMembershipFacts(): Promise<number> {
+    const rows = this.db.prepare(
+      `SELECT event_key FROM group_membership_events
+       WHERE participant_jid = 'me' AND source = 'backup' AND source_event_key LIKE 'backup:message_system_group:%'`
+    ).all() as Array<{ event_key: string }>;
+    if (rows.length === 0) return 0;
+    // This is the only destructive repair in this change. Snapshot first; the
+    // source system messages stay in place as generic rows, so no timeline
+    // content is lost if the repair is later rolled back.
+    await this.createRestorePoint("before-role-correct-system-event-repair");
+    this.db.transaction(() => {
+      const removeObservation = this.db.prepare(`DELETE FROM archive_signal_observations WHERE family = 'membership_event' AND fact_key = ?`);
+      const removeEvent = this.db.prepare(`DELETE FROM group_membership_events WHERE event_key = ?`);
+      for (const row of rows) {
+        removeObservation.run(row.event_key);
+        removeEvent.run(row.event_key);
+      }
+    })();
+    return rows.length;
+  }
+
+  async listIdentityNumberChanges(options: { oldJid?: string; newJid?: string; limit?: number } = {}): Promise<IdentityNumberChangeRecord[]> {
+    const values: unknown[] = [];
+    const clauses: string[] = [];
+    if (options.oldJid) { clauses.push("old_jid = ?"); values.push(this.canonicalJid(options.oldJid) ?? options.oldJid); }
+    if (options.newJid) { clauses.push("new_jid = ?"); values.push(this.canonicalJid(options.newJid) ?? options.newJid); }
+    values.push(options.limit ?? 500);
+    const rows = this.db.prepare(`SELECT * FROM identity_number_changes ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""} ORDER BY observed_at_ms DESC LIMIT ?`).all(...values) as Array<Record<string, unknown>>;
+    return rows.map((row) => numberChangeFromRow(row));
+  }
+
+  async listGroupMembershipPeriods(options: { groupSourceId?: string; participantJid?: string; limit?: number } = {}): Promise<GroupMembershipPeriodRecord[]> {
+    const values: unknown[] = [];
+    const clauses: string[] = [];
+    if (options.groupSourceId) { clauses.push("group_source_id = ?"); values.push(this.canonicalJid(options.groupSourceId) ?? options.groupSourceId); }
+    if (options.participantJid) { clauses.push("participant_jid = ?"); values.push(this.canonicalJid(options.participantJid) ?? options.participantJid); }
+    values.push(options.limit ?? 500);
+    const rows = this.db.prepare(`SELECT * FROM group_membership_periods ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""} ORDER BY joined_at_ms DESC LIMIT ?`).all(...values) as Array<Record<string, unknown>>;
+    return rows.map((row) => membershipPeriodFromRow(row));
+  }
+
+  async listGroupMembershipEvents(options: { groupSourceId?: string; participantJid?: string; limit?: number } = {}): Promise<GroupMembershipEventRecord[]> {
+    const values: unknown[] = [];
+    const clauses: string[] = [];
+    if (options.groupSourceId) { clauses.push("group_source_id = ?"); values.push(this.canonicalJid(options.groupSourceId) ?? options.groupSourceId); }
+    if (options.participantJid) { clauses.push("participant_jid = ?"); values.push(this.canonicalJid(options.participantJid) ?? options.participantJid); }
+    values.push(options.limit ?? 500);
+    const rows = this.db.prepare(`SELECT * FROM group_membership_events ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""} ORDER BY observed_at_ms DESC LIMIT ?`).all(...values) as Array<Record<string, unknown>>;
+    return rows.map((row) => membershipEventFromRow(row));
+  }
+
+  async listChatMetadataHistory(options: { chatSourceId?: string; limit?: number } = {}): Promise<ChatMetadataHistoryRecord[]> {
+    const values: unknown[] = [];
+    const where = options.chatSourceId ? "WHERE chat_source_id = ?" : "";
+    if (options.chatSourceId) values.push(this.canonicalJid(options.chatSourceId) ?? options.chatSourceId);
+    values.push(options.limit ?? 500);
+    const rows = this.db.prepare(`SELECT * FROM chat_metadata_history ${where} ORDER BY observed_at_ms DESC LIMIT ?`).all(...values) as Array<Record<string, unknown>>;
+    return rows.map((row) => chatMetadataFromRow(row));
+  }
+
+  async listEngagementAggregates(options: { chatSourceId?: string; counterpartyJid?: string; limit?: number } = {}): Promise<EngagementAggregateRecord[]> {
+    const values: unknown[] = [];
+    const clauses: string[] = [];
+    if (options.chatSourceId) { clauses.push("chat_source_id = ?"); values.push(this.canonicalJid(options.chatSourceId) ?? options.chatSourceId); }
+    if (options.counterpartyJid) { clauses.push("counterparty_jid = ?"); values.push(this.canonicalJid(options.counterpartyJid) ?? options.counterpartyJid); }
+    values.push(options.limit ?? 500);
+    const rows = this.db.prepare(`SELECT * FROM engagement_aggregates ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""} ORDER BY window_end_at_ms DESC LIMIT ?`).all(...values) as Array<Record<string, unknown>>;
+    return rows.map((row) => engagementFromRow(row));
+  }
+
   async refreshChatStats(chatSourceIds?: string[]): Promise<void> {
     // Chat recency mirrors WhatsApp: only user-visible conversation messages
     // advance a chat's position/date; system, status, and reaction events do not.
@@ -4947,17 +5736,27 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     const insert = this.db.prepare(
       `INSERT INTO message_link_previews (message_key, chat_source_id, title, description, canonical_url, thumbnail)
        VALUES (?, ?, ?, ?, ?, ?)
-       ON CONFLICT(message_key) DO NOTHING`
+       ON CONFLICT(message_key) DO UPDATE SET
+         title = COALESCE(message_link_previews.title, excluded.title),
+         description = COALESCE(message_link_previews.description, excluded.description),
+         canonical_url = COALESCE(message_link_previews.canonical_url, excluded.canonical_url),
+         thumbnail = COALESCE(message_link_previews.thumbnail, excluded.thumbnail)
+       WHERE (message_link_previews.title IS NULL AND excluded.title IS NOT NULL)
+          OR (message_link_previews.description IS NULL AND excluded.description IS NOT NULL)
+          OR (message_link_previews.canonical_url IS NULL AND excluded.canonical_url IS NOT NULL)
+          OR (message_link_previews.thumbnail IS NULL AND excluded.thumbnail IS NOT NULL)`
     );
     let recorded = 0;
+    const changedMessageKeys = new Set<string>();
     const transaction = this.db.transaction(() => {
       for (const preview of previews) {
         const chatSourceId = this.canonicalJid(preview.chatSourceId) ?? preview.chatSourceId;
         if (!chatSourceId || !preview.sourceMessageId) {
           continue;
         }
+        const sourceMessageKey = messageKey(chatSourceId, preview.sourceMessageId);
         const result = insert.run(
-          messageKey(chatSourceId, preview.sourceMessageId),
+          sourceMessageKey,
           chatSourceId,
           preview.title ?? null,
           preview.description ?? null,
@@ -4965,9 +5764,15 @@ export class SqliteArchiveRepository implements ArchiveRepository {
           preview.thumbnail?.length ? Buffer.from(preview.thumbnail) : null
         );
         recorded += result.changes;
+        if (result.changes) {
+          changedMessageKeys.add(sourceMessageKey);
+        }
       }
     });
     transaction();
+    if (changedMessageKeys.size > 0) {
+      await this.markStaleEpisodesForMessages([...changedMessageKeys]);
+    }
     return recorded;
   }
 
@@ -5020,6 +5825,123 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       editedAtMs: nullableNumber(row.edited_at_ms),
       createdAt: row.created_at
     }));
+  }
+
+  async getMessageDetail(messageId: number): Promise<MessageDetail | null> {
+    const message = this.db.prepare(
+      `SELECT id, source_message_key, timestamp_ms, body, caption, is_deleted, message_type, raw_type_code, raw_metadata_json
+       FROM messages WHERE id = ?`
+    ).get(messageId) as { id: number; source_message_key: string; timestamp_ms: number | null; body: string | null; caption: string | null; is_deleted: number; message_type: string; raw_type_code: string | null; raw_metadata_json: string | null } | undefined;
+    if (!message) return null;
+    const sourceMessageKey = message.source_message_key;
+    const observationRows = (factKey: string, family: string) =>
+      (this.db.prepare(`SELECT * FROM archive_signal_observations WHERE fact_key = ? AND family = ? ORDER BY observed_at_ms, source`).all(factKey, family) as Array<Record<string, unknown>>)
+        .map(archiveSignalObservationFromRow);
+    const locationRow = this.db.prepare(`SELECT * FROM message_locations WHERE source_message_key = ?`).get(sourceMessageKey) as Record<string, unknown> | undefined;
+    const locationObservations = (this.db.prepare(`SELECT * FROM message_location_observations WHERE source_message_key = ? ORDER BY sequence_number, observed_at_ms, observation_key`).all(sourceMessageKey) as Array<Record<string, unknown>>)
+      .map(locationObservationFromRow);
+    const locations = locationRow
+      ? [{ ...locationFromRow(locationRow), observations: locationObservations, provenance: observationRows(sourceMessageKey, "location") }]
+      : [];
+    const vcards = (this.db.prepare(`SELECT * FROM message_vcards WHERE source_message_key = ? ORDER BY card_index`).all(sourceMessageKey) as Array<Record<string, unknown>>)
+      .map((row) => {
+        const parsed = vcardFromRow(row);
+        const card = !parsed.vcard && parsed.displayName && phoneFromJid(parsed.resolvedJid)
+          ? { ...parsed, downloadKind: "constructed" as const }
+          : parsed;
+        return { ...card, provenance: observationRows(`${sourceMessageKey}:${card.cardIndex}`, "vcard") };
+      });
+    const mentionedJids = (this.db.prepare(
+      `SELECT mentioned_jid FROM message_mentions mm JOIN messages m ON m.id = mm.message_id WHERE m.id = ? ORDER BY mentioned_jid`
+    ).all(messageId) as Array<{ mentioned_jid: string }>).map((row) => row.mentioned_jid);
+    const editRows = (this.db.prepare(`SELECT * FROM message_edit_events WHERE source_message_key = ? ORDER BY observed_at_ms, event_key`).all(sourceMessageKey) as Array<Record<string, unknown>>)
+      .map((row) => ({
+        eventKey: String(row.event_key), timestampMs: nullableNumber(row.observed_at_ms as number | null), source: String(row.source) as "backup" | "live",
+        sourceEventKey: (row.source_event_key as string | null) ?? null
+      }));
+    const revisions = await this.listMessageEditRevisions(messageId);
+    const editTimeline = buildMessageEditTimeline({
+      sentAtMs: nullableNumber(message.timestamp_ms),
+      currentText: message.body ?? message.caption ?? null,
+      revisions,
+      events: editRows
+    });
+    const deletionRow = this.db.prepare(`SELECT * FROM message_deletions WHERE source_message_key = ?`).get(sourceMessageKey) as Record<string, unknown> | undefined;
+    const deletion = deletionRow
+      ? {
+          revokedByJid: (deletionRow.revoked_by_jid as string | null) ?? null,
+          revokedByAdmin: deletionRow.revoked_by_admin == null ? null : Boolean(deletionRow.revoked_by_admin),
+          deletionKind: (deletionRow.deletion_kind as string | null) ?? null,
+          deletedAtMs: nullableNumber(deletionRow.observed_at_ms as number | null),
+          sentAtMs: nullableNumber(message.timestamp_ms),
+          contentState: message.body || message.caption || locations.length || vcards.length ? "retained" as const : "never_captured" as const,
+          observations: observationRows(sourceMessageKey, "deletion")
+        }
+      : null;
+    const mediaInterpretations = (this.db.prepare(`SELECT * FROM message_media_interpretations WHERE source_message_key = ? ORDER BY kind, segment_index`).all(sourceMessageKey) as Array<Record<string, unknown>>)
+      .map((row) => ({
+        sourceMessageKey, kind: String(row.kind) as MessageDetail["mediaInterpretations"][number]["kind"], segmentIndex: Number(row.segment_index), text: String(row.text),
+        startMs: nullableNumber(row.start_ms as number | null), endMs: nullableNumber(row.end_ms as number | null), ...signalProvenanceFromRow(row)
+      }));
+    const preview = this.db.prepare(`SELECT title, description, canonical_url, thumbnail FROM message_link_previews WHERE message_key = ?`).get(sourceMessageKey) as { title: string | null; description: string | null; canonical_url: string | null; thumbnail: Buffer | null } | undefined;
+    const systemEvents = this.systemEventDetailsForMessage(sourceMessageKey, observationRows);
+    if (message.message_type === "system" && systemEvents.length === 0) {
+      systemEvents.push({
+        kind: "generic",
+        eventKey: `generic:${sourceMessageKey}`,
+        summary: "System event",
+        actorJid: null,
+        actorLabel: null,
+        participantJid: null,
+        participantLabel: null,
+        oldJid: null,
+        oldIdentityLabel: null,
+        newJid: null,
+        newIdentityLabel: null,
+        oldValue: null,
+        newValue: null,
+        action: null,
+        field: null,
+        occurredAtMs: nullableNumber(message.timestamp_ms),
+        rawType: message.raw_type_code ?? null,
+        rawParameters: message.raw_metadata_json ?? null,
+        observations: []
+      });
+    }
+    return {
+      id: Number(message.id),
+      sourceMessageKey,
+      sentAtMs: nullableNumber(message.timestamp_ms),
+      availability: {
+        hasLocation: locations.length > 0,
+        vcardCount: vcards.length,
+        hasDeletion: Boolean(deletion),
+        hasEditHistory: editRows.length > 0 || revisions.length > 0,
+        hasSourceInterpretation: mediaInterpretations.length > 0,
+        hasSystemEventDetail: systemEvents.length > 0
+      },
+      locations,
+      vcards,
+      mentionedJids,
+      editTimeline,
+      deletion,
+      mediaInterpretations,
+      linkPreview: preview ? { title: preview.title, description: preview.description, canonicalUrl: preview.canonical_url, hasThumbnail: Boolean(preview.thumbnail?.length) } : null,
+      systemEvents
+    };
+  }
+
+  async getMessageVcardDownload(messageId: number, cardIndex: number): Promise<{ content: string; fileName: string; constructed: boolean } | null> {
+    const row = this.db.prepare(
+      `SELECT v.* FROM message_vcards v JOIN messages m ON m.source_message_key = v.source_message_key
+       WHERE m.id = ? AND v.card_index = ?`
+    ).get(messageId, cardIndex) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    const card = vcardFromRow(row);
+    if (card.vcard?.trim()) return { content: card.vcard, fileName: safeVcardFileName(card.downloadFileName ?? card.displayName, card.cardIndex), constructed: false };
+    const phone = phoneFromJid(card.resolvedJid);
+    if (!card.displayName?.trim() || !phone) return null;
+    return { content: constructMinimalVcard(card.displayName, phone), fileName: safeVcardFileName(card.downloadFileName ?? card.displayName, card.cardIndex), constructed: true };
   }
 
   async listPendingLiveMessageUpdates(limit = 500): Promise<LiveMessageUpdateRecord[]> {
@@ -5349,6 +6271,8 @@ export class SqliteArchiveRepository implements ArchiveRepository {
                 hasThumbnail: Boolean(row.preview_has_thumbnail)
               }
             : null,
+        structuredSignals: summarizeStructuredSignals(this.structuredSignalsForMessage(row.id, row.source_message_key)),
+        systemEvents: this.systemEventsForMessage(row.source_message_key),
         quotedSnapshot: quoteSummaryFromRow(row),
         isEdited: Boolean(row.edited_flag) || Number(row.edit_revision_count ?? 0) > 0,
         editRevisionCount: Number(row.edit_revision_count ?? 0),
@@ -5356,6 +6280,103 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         isForwarded: Boolean(row.is_forwarded),
         isStarred: Boolean(row.is_starred)
       };
+    });
+  }
+
+  private structuredSignalsForMessage(messageId: number, sourceMessageKey: string): MessageStructuredSignals | null {
+    const mentions = (this.db.prepare(`SELECT mentioned_jid FROM message_mentions WHERE message_id = ? ORDER BY mentioned_jid`).all(messageId) as Array<{ mentioned_jid: string }>).map((row) => row.mentioned_jid);
+    const location = this.db.prepare(`SELECT latitude, longitude, name, address, is_live, capture_version FROM message_locations WHERE source_message_key = ?`).get(sourceMessageKey) as Record<string, unknown> | undefined;
+    const vcards = this.db.prepare(`SELECT display_name, resolved_jid, capture_version FROM message_vcards WHERE source_message_key = ? ORDER BY card_index`).all(sourceMessageKey) as Array<Record<string, unknown>>;
+    const deletion = this.db.prepare(`SELECT revoked_by_jid, observed_at_ms, capture_version FROM message_deletions WHERE source_message_key = ?`).get(sourceMessageKey) as Record<string, unknown> | undefined;
+    const edit = this.db.prepare(`SELECT MAX(observed_at_ms) AS observed_at_ms, MAX(capture_version) AS capture_version FROM message_edit_events WHERE source_message_key = ?`).get(sourceMessageKey) as Record<string, unknown>;
+    const revisionCount = Number((this.db.prepare(`SELECT COUNT(*) AS count FROM message_edit_revisions WHERE message_key = ?`).get(sourceMessageKey) as { count: number }).count);
+    const interpretations = this.db.prepare(`SELECT kind, text, segment_index, capture_version FROM message_media_interpretations WHERE source_message_key = ? ORDER BY kind, segment_index`).all(sourceMessageKey) as Array<Record<string, unknown>>;
+    const preview = this.db.prepare(`SELECT 1 AS found FROM message_link_previews WHERE message_key = ?`).get(sourceMessageKey) as { found: number } | undefined;
+    const versions = [
+      location?.capture_version, deletion?.capture_version, edit.capture_version, ...vcards.map((row) => row.capture_version), ...interpretations.map((row) => row.capture_version),
+      preview || mentions.length ? 1 : 0
+    ].map((value) => Number(value ?? 0));
+    if (!location && vcards.length === 0 && !deletion && !edit.observed_at_ms && interpretations.length === 0 && !preview && mentions.length === 0) return null;
+    return {
+      mentionedJids: mentions,
+      location: location ? { latitude: nullableNumber(location.latitude as number | null), longitude: nullableNumber(location.longitude as number | null), name: (location.name as string | null) ?? null, address: (location.address as string | null) ?? null, isLive: Boolean(location.is_live) } : null,
+      vcards: vcards.map((row) => ({ displayName: (row.display_name as string | null) ?? null, resolvedJid: (row.resolved_jid as string | null) ?? null })),
+      deletion: deletion ? { revokedByJid: (deletion.revoked_by_jid as string | null) ?? null, revokedAtMs: nullableNumber(deletion.observed_at_ms as number | null) } : null,
+      edit: edit.observed_at_ms ? { observedAtMs: nullableNumber(edit.observed_at_ms as number | null), hasHeldRevision: revisionCount > 0 } : null,
+      mediaInterpretations: interpretations.map((row) => ({ kind: row.kind as MessageStructuredSignals["mediaInterpretations"][number]["kind"], text: String(row.text), segmentIndex: Number(row.segment_index) })),
+      captureVersion: Math.max(...versions) || null
+    };
+  }
+
+  private systemEventDetailsForMessage(
+    sourceMessageKey: string,
+    observationsFor: (factKey: string, family: string) => import("../../shared/types").ArchiveSignalObservation[]
+  ): MessageDetail["systemEvents"] {
+    const numberChanges = (this.db.prepare(`SELECT * FROM identity_number_changes WHERE source_message_key = ? ORDER BY event_key`).all(sourceMessageKey) as Array<Record<string, unknown>>).map(numberChangeFromRow);
+    const membershipEvents = (this.db.prepare(`SELECT * FROM group_membership_events WHERE source_message_key = ? ORDER BY event_key`).all(sourceMessageKey) as Array<Record<string, unknown>>).map(membershipEventFromRow);
+    const chatMetadataHistory = (this.db.prepare(`SELECT * FROM chat_metadata_history WHERE source_message_key = ? ORDER BY event_key`).all(sourceMessageKey) as Array<Record<string, unknown>>).map(chatMetadataFromRow);
+    const labels = new Map<string, string | null>();
+    const displayNameForJid = (jid: string | null) => {
+      if (jid === "me") return "You";
+      if (!jid) return null;
+      if (labels.has(jid)) return labels.get(jid) ?? null;
+      const contact = this.db.prepare(`SELECT display_name, push_name, phone_number FROM contacts WHERE source_jid = ?`).get(jid) as { display_name?: string | null; push_name?: string | null; phone_number?: string | null } | undefined;
+      const label = resolveDisplayLabel({ displayName: contact?.display_name, pushName: contact?.push_name, phoneNumber: contact?.phone_number, jid });
+      labels.set(jid, label);
+      return label;
+    };
+    const detailLabelForJid = (jid: string | null) => displayNameForJid(jid) ?? "Unknown";
+    const detail: MessageDetail["systemEvents"] = [];
+    for (const record of numberChanges) {
+      const summary = summarizeSystemEvents({ numberChanges: [record], membershipEvents: [], chatMetadataHistory: [], displayNameForJid })[0];
+      if (!summary) continue;
+      detail.push({ kind: "number_change", eventKey: record.eventKey, summary: summary.summary, actorJid: record.actorJid, actorLabel: detailLabelForJid(record.actorJid), participantJid: null, participantLabel: null, oldJid: record.oldJid, oldIdentityLabel: detailLabelForJid(record.oldJid), newJid: record.newJid, newIdentityLabel: detailLabelForJid(record.newJid), oldValue: null, newValue: null, action: null, field: null, occurredAtMs: record.observedAtMs, rawType: null, rawParameters: null, observations: observationsFor(record.eventKey, "number_change") });
+    }
+    for (const record of membershipEvents) {
+      const summary = summarizeSystemEvents({ numberChanges: [], membershipEvents: [record], chatMetadataHistory: [], displayNameForJid })[0];
+      if (!summary) continue;
+      detail.push({ kind: "membership", eventKey: record.eventKey, summary: summary.summary, actorJid: record.actorJid, actorLabel: detailLabelForJid(record.actorJid), participantJid: record.participantJid, participantLabel: detailLabelForJid(record.participantJid), oldJid: null, oldIdentityLabel: null, newJid: null, newIdentityLabel: null, oldValue: record.oldRole ?? null, newValue: record.newRole ?? null, action: record.action, field: null, occurredAtMs: record.observedAtMs, rawType: record.rawType ?? null, rawParameters: record.rawParameters ?? null, observations: observationsFor(record.eventKey, "membership_event") });
+    }
+    for (const record of chatMetadataHistory) {
+      const summary = summarizeSystemEvents({ numberChanges: [], membershipEvents: [], chatMetadataHistory: [record], displayNameForJid })[0];
+      if (!summary) continue;
+      detail.push({ kind: "chat_metadata", eventKey: record.eventKey, summary: summary.summary, actorJid: record.actorJid, actorLabel: detailLabelForJid(record.actorJid), participantJid: null, participantLabel: null, oldJid: null, oldIdentityLabel: null, newJid: null, newIdentityLabel: null, oldValue: record.oldValue, newValue: record.newValue, action: null, field: record.field, occurredAtMs: record.observedAtMs, rawType: record.rawType ?? null, rawParameters: record.rawParameters ?? null, observations: observationsFor(record.eventKey, "chat_metadata") });
+    }
+    return detail.sort((left, right) => (left.occurredAtMs ?? 0) - (right.occurredAtMs ?? 0));
+  }
+
+  private systemEventsForMessage(sourceMessageKey: string) {
+    const numberChanges = (
+      this.db.prepare(`SELECT * FROM identity_number_changes WHERE source_message_key = ? ORDER BY event_key`).all(sourceMessageKey) as Array<Record<string, unknown>>
+    ).map(numberChangeFromRow);
+    const membershipEvents = (
+      this.db.prepare(`SELECT * FROM group_membership_events WHERE source_message_key = ? ORDER BY event_key`).all(sourceMessageKey) as Array<Record<string, unknown>>
+    ).map(membershipEventFromRow);
+    const chatMetadataHistory = (
+      this.db.prepare(`SELECT * FROM chat_metadata_history WHERE source_message_key = ? ORDER BY event_key`).all(sourceMessageKey) as Array<Record<string, unknown>>
+    ).map(chatMetadataFromRow);
+    const labels = new Map<string, string | null>();
+    return summarizeSystemEvents({
+      numberChanges,
+      membershipEvents,
+      chatMetadataHistory,
+      displayNameForJid: (jid) => {
+        if (jid === "me") {
+          return "You";
+        }
+        if (!jid) {
+          return null;
+        }
+        if (labels.has(jid)) {
+          return labels.get(jid) ?? null;
+        }
+        const contact = this.db
+          .prepare(`SELECT display_name, push_name, phone_number FROM contacts WHERE source_jid = ?`)
+          .get(jid) as { display_name?: string | null; push_name?: string | null; phone_number?: string | null } | undefined;
+        const label = resolveDisplayLabel({ displayName: contact?.display_name, pushName: contact?.push_name, phoneNumber: contact?.phone_number, jid });
+        labels.set(jid, label);
+        return label;
+      }
     });
   }
 
@@ -5534,11 +6555,14 @@ export class SqliteArchiveRepository implements ArchiveRepository {
                 ${labelIsPushNameSql("c.")} AS sender_name_is_push_name,
                 m.timestamp_ms, m.sent_at, m.direction, m.message_type, m.is_deleted, m.is_forwarded, m.quoted_source_message_id, m.has_media, m.source_table,
                 COALESCE(NULLIF(m.body, ''), NULLIF(m.caption, '')) AS text,
+                lp.title AS preview_title, lp.description AS preview_description, lp.canonical_url AS preview_url,
+                (lp.thumbnail IS NOT NULL) AS preview_has_thumbnail,
                 ${MEDIA_STATE_SELECT}, ${QUOTED_SNAPSHOT_SELECT}
          FROM messages m
          JOIN chats ON chats.id = m.chat_id
          LEFT JOIN contacts c ON c.source_jid = m.sender_source_jid
          ${MEDIA_STATE_JOINS}
+         LEFT JOIN message_link_previews lp ON lp.message_key = m.source_message_key
          ${QUOTED_SNAPSHOT_JOINS}
          WHERE ${where.join(" AND ")}
          ORDER BY m.timestamp_ms ASC, m.id ASC
@@ -5546,6 +6570,9 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       )
       .all(...params) as SqliteMemoryEvidenceRow[];
     const evidence = rows.map((row, index) => rowToMemoryEvidence(row, index));
+    for (const message of evidence) {
+      message.structuredSignals = this.structuredSignalsForMessage(message.messageId, message.sourceMessageKey);
+    }
     this.attachReactions(evidence);
     return evidence;
   }
@@ -5863,7 +6890,11 @@ export class SqliteArchiveRepository implements ArchiveRepository {
          ORDER BY m.timestamp_ms ASC, m.id ASC`
       )
       .all(base.chat_id, messageId - radius, messageId + radius) as SqliteMemoryEvidenceRow[];
-    return rows.map((row, index) => rowToMemoryEvidence(row, index));
+    return rows.map((row, index) => {
+      const evidence = rowToMemoryEvidence(row, index);
+      evidence.structuredSignals = this.structuredSignalsForMessage(evidence.messageId, evidence.sourceMessageKey);
+      return evidence;
+    });
   }
 
   async close(): Promise<void> {
@@ -6003,6 +7034,8 @@ function ensureSchema(db: Database.Database): void {
   rebuildBrainDerivedTablesIfStale(db);
   db.exec(schemaStatements.join(";\n"));
   migrateAdditiveColumns(db);
+  migrateArchiveSignalTables(db);
+  backfillBrainEpisodeSignalAnchors(db);
   ensureSearchSchema(db);
   // Drop the removed view-once recovery queue if a prior build created it. It
   // only ever held transient request state (message keys, no content), so this
@@ -6027,6 +7060,7 @@ function rebuildBrainDerivedTablesIfStale(db: Database.Database): void {
   }
   const dropped = [
     "brain_media_gaps",
+    "brain_episode_signal_anchors",
     "brain_validation_issues",
     "brain_episode_topics",
     "brain_topics",
@@ -6097,7 +7131,9 @@ function migrateAdditiveColumns(db: Database.Database): void {
     { table: "brain_chat_watermarks", column: "assimilated_through_id", ddl: "ALTER TABLE brain_chat_watermarks ADD COLUMN assimilated_through_id INTEGER NOT NULL DEFAULT 0" },
     { table: "brain_episodes", column: "fallback_reason", ddl: "ALTER TABLE brain_episodes ADD COLUMN fallback_reason TEXT NULL" },
     { table: "brain_llm_ledger", column: "estimated", ddl: "ALTER TABLE brain_llm_ledger ADD COLUMN estimated INTEGER NOT NULL DEFAULT 0" },
-    { table: "brain_episodes", column: "quoted_reply_anchors_json", ddl: "ALTER TABLE brain_episodes ADD COLUMN quoted_reply_anchors_json TEXT NULL" }
+    { table: "brain_episodes", column: "quoted_reply_anchors_json", ddl: "ALTER TABLE brain_episodes ADD COLUMN quoted_reply_anchors_json TEXT NULL" },
+    { table: "brain_episodes", column: "archive_signal_anchors_json", ddl: "ALTER TABLE brain_episodes ADD COLUMN archive_signal_anchors_json TEXT NULL" },
+    { table: "message_mentions", column: "source_mask", ddl: "ALTER TABLE message_mentions ADD COLUMN source_mask INTEGER NOT NULL DEFAULT 0" }
   ];
   for (const addition of additions) {
     const columns = db.prepare(`SELECT name FROM pragma_table_info(?)`).all(addition.table) as Array<{ name: string }>;
@@ -6105,6 +7141,164 @@ function migrateAdditiveColumns(db: Database.Database): void {
       db.exec(addition.ddl);
     }
   }
+}
+
+// Signal capture originally stored one winning source on each canonical row.
+// These migrations are additive for payload tables and rebuild only the two
+// narrow CHECK-constrained history tables so newer verified actions can be
+// represented without weakening any existing rows.
+function migrateArchiveSignalTables(db: Database.Database): void {
+  const additions: Array<{ table: string; column: string; ddl: string }> = [
+    { table: "group_membership_events", column: "old_role", ddl: "ALTER TABLE group_membership_events ADD COLUMN old_role TEXT NULL" },
+    { table: "group_membership_events", column: "new_role", ddl: "ALTER TABLE group_membership_events ADD COLUMN new_role TEXT NULL" },
+    { table: "group_membership_events", column: "raw_type", ddl: "ALTER TABLE group_membership_events ADD COLUMN raw_type TEXT NULL" },
+    { table: "group_membership_events", column: "raw_parameters", ddl: "ALTER TABLE group_membership_events ADD COLUMN raw_parameters TEXT NULL" },
+    { table: "chat_metadata_history", column: "raw_type", ddl: "ALTER TABLE chat_metadata_history ADD COLUMN raw_type TEXT NULL" },
+    { table: "chat_metadata_history", column: "raw_parameters", ddl: "ALTER TABLE chat_metadata_history ADD COLUMN raw_parameters TEXT NULL" },
+    { table: "message_locations", column: "url", ddl: "ALTER TABLE message_locations ADD COLUMN url TEXT NULL" },
+    { table: "message_locations", column: "comment", ddl: "ALTER TABLE message_locations ADD COLUMN comment TEXT NULL" },
+    { table: "message_locations", column: "caption", ddl: "ALTER TABLE message_locations ADD COLUMN caption TEXT NULL" },
+    { table: "message_locations", column: "speed_mps", ddl: "ALTER TABLE message_locations ADD COLUMN speed_mps REAL NULL" },
+    { table: "message_locations", column: "heading_degrees", ddl: "ALTER TABLE message_locations ADD COLUMN heading_degrees REAL NULL" },
+    { table: "message_locations", column: "sequence_number", ddl: "ALTER TABLE message_locations ADD COLUMN sequence_number INTEGER NULL" },
+    { table: "message_locations", column: "time_offset_ms", ddl: "ALTER TABLE message_locations ADD COLUMN time_offset_ms INTEGER NULL" },
+    { table: "message_locations", column: "live_share_duration_ms", ddl: "ALTER TABLE message_locations ADD COLUMN live_share_duration_ms INTEGER NULL" },
+    { table: "message_locations", column: "final_at_ms", ddl: "ALTER TABLE message_locations ADD COLUMN final_at_ms INTEGER NULL" },
+    { table: "message_locations", column: "has_thumbnail", ddl: "ALTER TABLE message_locations ADD COLUMN has_thumbnail INTEGER NOT NULL DEFAULT 0" },
+    { table: "message_vcards", column: "properties_json", ddl: "ALTER TABLE message_vcards ADD COLUMN properties_json TEXT NULL" },
+    { table: "message_vcards", column: "download_kind", ddl: "ALTER TABLE message_vcards ADD COLUMN download_kind TEXT NOT NULL DEFAULT 'unavailable'" },
+    { table: "message_vcards", column: "download_file_name", ddl: "ALTER TABLE message_vcards ADD COLUMN download_file_name TEXT NULL" },
+    { table: "message_deletions", column: "revoked_by_admin", ddl: "ALTER TABLE message_deletions ADD COLUMN revoked_by_admin INTEGER NULL" },
+    { table: "message_deletions", column: "deletion_kind", ddl: "ALTER TABLE message_deletions ADD COLUMN deletion_kind TEXT NULL" }
+  ];
+  for (const addition of additions) {
+    const columns = db.prepare(`SELECT name FROM pragma_table_info(?)`).all(addition.table) as Array<{ name: string }>;
+    if (!columns.some((column) => column.name === addition.column)) db.exec(addition.ddl);
+  }
+  rebuildSignalHistoryChecks(db);
+  backfillArchiveSignalObservations(db);
+  backfillRetainedVcardDetails(db);
+}
+
+function rebuildSignalHistoryChecks(db: Database.Database): void {
+  const membershipSql = (db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'group_membership_events'`).get() as { sql?: string } | undefined)?.sql ?? "";
+  const metadataSql = (db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'chat_metadata_history'`).get() as { sql?: string } | undefined)?.sql ?? "";
+  if (!membershipSql.includes("'promote'")) {
+    db.transaction(() => {
+      db.exec(`CREATE TABLE group_membership_events_migrated (
+        event_key TEXT PRIMARY KEY, group_source_id TEXT NOT NULL, participant_jid TEXT NOT NULL,
+        action TEXT NOT NULL CHECK (action IN ('add','remove','join','leave','invite','accept','promote','demote')),
+        actor_jid TEXT NULL, source_message_key TEXT NULL, old_role TEXT NULL, new_role TEXT NULL, raw_type TEXT NULL, raw_parameters TEXT NULL,
+        source TEXT NOT NULL CHECK (source IN ('backup','live')), source_event_key TEXT NULL, observed_at_ms INTEGER NULL, capture_version INTEGER NOT NULL,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      )`);
+      db.exec(`INSERT INTO group_membership_events_migrated
+        (event_key, group_source_id, participant_jid, action, actor_jid, source_message_key, old_role, new_role, raw_type, raw_parameters, source, source_event_key, observed_at_ms, capture_version, created_at, updated_at)
+        SELECT event_key, group_source_id, participant_jid, action, actor_jid, source_message_key, old_role, new_role, raw_type, raw_parameters, source, source_event_key, observed_at_ms, capture_version, created_at, updated_at FROM group_membership_events`);
+      db.exec(`DROP TABLE group_membership_events`);
+      db.exec(`ALTER TABLE group_membership_events_migrated RENAME TO group_membership_events`);
+    })();
+  }
+  if (!metadataSql.includes("'invite_link'")) {
+    db.transaction(() => {
+      db.exec(`CREATE TABLE chat_metadata_history_migrated (
+        event_key TEXT PRIMARY KEY, chat_source_id TEXT NOT NULL,
+        field TEXT NOT NULL CHECK (field IN ('subject','description','photo','invite_link','announcement','restriction','member_add','join_approval','disappearing')),
+        source_message_key TEXT NULL, actor_jid TEXT NULL, old_value TEXT NULL, new_value TEXT NULL, raw_type TEXT NULL, raw_parameters TEXT NULL,
+        source TEXT NOT NULL CHECK (source IN ('backup','live')), source_event_key TEXT NULL, observed_at_ms INTEGER NULL, capture_version INTEGER NOT NULL,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      )`);
+      db.exec(`INSERT INTO chat_metadata_history_migrated
+        (event_key, chat_source_id, field, source_message_key, actor_jid, old_value, new_value, raw_type, raw_parameters, source, source_event_key, observed_at_ms, capture_version, created_at, updated_at)
+        SELECT event_key, chat_source_id, field, source_message_key, actor_jid, old_value, new_value, raw_type, raw_parameters, source, source_event_key, observed_at_ms, capture_version, created_at, updated_at FROM chat_metadata_history`);
+      db.exec(`DROP TABLE chat_metadata_history`);
+      db.exec(`ALTER TABLE chat_metadata_history_migrated RENAME TO chat_metadata_history`);
+    })();
+  }
+}
+
+function backfillArchiveSignalObservations(db: Database.Database): void {
+  const statements = [
+    `INSERT OR IGNORE INTO archive_signal_observations (fact_key, family, source, source_event_key, source_message_key, observed_at_ms, capture_version, detail_json)
+     SELECT event_key, 'number_change', source, COALESCE(source_event_key, ''), source_message_key, observed_at_ms, capture_version, NULL FROM identity_number_changes`,
+    `INSERT OR IGNORE INTO archive_signal_observations (fact_key, family, source, source_event_key, source_message_key, observed_at_ms, capture_version, detail_json)
+     SELECT period_key, 'membership_period', source, COALESCE(source_event_key, ''), NULL, observed_at_ms, capture_version, NULL FROM group_membership_periods`,
+    `INSERT OR IGNORE INTO archive_signal_observations (fact_key, family, source, source_event_key, source_message_key, observed_at_ms, capture_version, detail_json)
+     SELECT event_key, 'membership_event', source, COALESCE(source_event_key, ''), source_message_key, observed_at_ms, capture_version, NULL FROM group_membership_events`,
+    `INSERT OR IGNORE INTO archive_signal_observations (fact_key, family, source, source_event_key, source_message_key, observed_at_ms, capture_version, detail_json)
+     SELECT event_key, 'chat_metadata', source, COALESCE(source_event_key, ''), source_message_key, observed_at_ms, capture_version, NULL FROM chat_metadata_history`,
+    `INSERT OR IGNORE INTO archive_signal_observations (fact_key, family, source, source_event_key, source_message_key, observed_at_ms, capture_version, detail_json)
+     SELECT source_message_key, 'location', source, COALESCE(source_event_key, ''), source_message_key, observed_at_ms, capture_version, NULL FROM message_locations`,
+    `INSERT OR IGNORE INTO archive_signal_observations (fact_key, family, source, source_event_key, source_message_key, observed_at_ms, capture_version, detail_json)
+     SELECT source_message_key || ':' || card_index, 'vcard', source, COALESCE(source_event_key, ''), source_message_key, observed_at_ms, capture_version, NULL FROM message_vcards`,
+    `INSERT OR IGNORE INTO archive_signal_observations (fact_key, family, source, source_event_key, source_message_key, observed_at_ms, capture_version, detail_json)
+     SELECT event_key, 'edit', source, COALESCE(source_event_key, ''), source_message_key, observed_at_ms, capture_version, NULL FROM message_edit_events`,
+    `INSERT OR IGNORE INTO archive_signal_observations (fact_key, family, source, source_event_key, source_message_key, observed_at_ms, capture_version, detail_json)
+     SELECT source_message_key, 'deletion', source, COALESCE(source_event_key, ''), source_message_key, observed_at_ms, capture_version, NULL FROM message_deletions`,
+    `INSERT OR IGNORE INTO archive_signal_observations (fact_key, family, source, source_event_key, source_message_key, observed_at_ms, capture_version, detail_json)
+     SELECT source_message_key || ':' || kind || ':' || segment_index, 'media_interpretation', source, COALESCE(source_event_key, ''), source_message_key, observed_at_ms, capture_version, NULL FROM message_media_interpretations`
+  ];
+  db.transaction(() => statements.forEach((statement) => db.exec(statement)))();
+}
+
+// Existing archives already retain source vCards. Populate the presentation
+// metadata in place so opening a detail card after upgrade never requires a
+// re-import and does not discard an unknown property or folded source line.
+function backfillRetainedVcardDetails(db: Database.Database): void {
+  const rows = db.prepare(
+    `SELECT source_message_key, card_index, display_name, vcard, properties_json, download_kind, download_file_name
+     FROM message_vcards WHERE vcard IS NOT NULL AND TRIM(vcard) <> ''`
+  ).all() as Array<{
+    source_message_key: string;
+    card_index: number;
+    display_name: string | null;
+    vcard: string;
+    properties_json: string | null;
+    download_kind: string | null;
+    download_file_name: string | null;
+  }>;
+  const update = db.prepare(
+    `UPDATE message_vcards
+     SET properties_json = ?, download_kind = ?, download_file_name = ?
+     WHERE source_message_key = ? AND card_index = ?`
+  );
+  db.transaction(() => {
+    for (const row of rows) {
+      const hasProperties = Array.isArray(parseJson(row.properties_json));
+      const properties = hasProperties ? row.properties_json : JSON.stringify(parseVcardPropertiesForStorage(row.vcard));
+      const downloadKind = row.download_kind === "source" ? row.download_kind : "source";
+      const fileName = row.download_file_name ?? safeVcardFileName(row.display_name, Number(row.card_index));
+      if (!hasProperties || row.download_kind !== downloadKind || row.download_file_name == null) {
+        update.run(properties, downloadKind, fileName, row.source_message_key, row.card_index);
+      }
+    }
+  })();
+}
+
+function backfillBrainEpisodeSignalAnchors(db: Database.Database): void {
+  const hasTable = db
+    .prepare(`SELECT 1 AS found FROM sqlite_master WHERE type = 'table' AND name = 'brain_episode_signal_anchors'`)
+    .get() as { found: number } | undefined;
+  if (!hasTable) return;
+  const rows = db
+    .prepare(`SELECT id, archive_signal_anchors_json FROM brain_episodes WHERE archive_signal_anchors_json IS NOT NULL`)
+    .all() as Array<{ id: string; archive_signal_anchors_json: string | null }>;
+  const insert = db.prepare(
+    `INSERT OR IGNORE INTO brain_episode_signal_anchors (episode_id, source_message_key, kind, capture_version) VALUES (?, ?, ?, ?)`
+  );
+  db.transaction(() => {
+    for (const row of rows) {
+      const anchors = parseJson(row.archive_signal_anchors_json) as Array<ArchiveSignalAnchor> | null;
+      for (const anchor of anchors ?? []) {
+        if (!anchor?.sourceMessageKey || !Array.isArray(anchor.kinds)) continue;
+        for (const kind of anchor.kinds) {
+          if (["mention", "location", "vcard", "link_preview", "edit", "deletion", "media_interpretation"].includes(kind)) {
+            insert.run(row.id, anchor.sourceMessageKey, kind, Math.max(1, Number(anchor.captureVersion ?? 1)));
+          }
+        }
+      }
+    }
+  })();
 }
 
 // FTS + triggers land after column migration (they reference resolved_text).
@@ -6429,6 +7623,15 @@ function rowToMemoryEvidence(row: SqliteMemoryEvidenceRow, index: number): Memor
       mediaAvailability: availability
     }),
     text: row.text,
+    linkPreview:
+      row.preview_title || row.preview_description || row.preview_url || row.preview_has_thumbnail
+        ? {
+            title: row.preview_title ?? null,
+            description: row.preview_description ?? null,
+            canonicalUrl: row.preview_url ?? null,
+            hasThumbnail: Boolean(row.preview_has_thumbnail)
+          }
+        : null,
     // Tolerant of callers whose SELECT omits these columns (e.g. nearby-context
     // lookup); reactions are attached by listMemoryEvidenceMessages after the map.
     isForwarded: Boolean(row.is_forwarded),
@@ -6676,6 +7879,129 @@ function nullableNumber(value: number | null | undefined): number | null {
   return value == null ? null : Number(value);
 }
 
+function signalProvenanceFromRow(row: Record<string, unknown>) {
+  return {
+    source: String(row.source) as "backup" | "live",
+    sourceEventKey: (row.source_event_key as string | null) ?? null,
+    observedAtMs: nullableNumber(row.observed_at_ms as number | null),
+    captureVersion: Number(row.capture_version ?? 1)
+  };
+}
+
+function numberChangeFromRow(row: Record<string, unknown>): IdentityNumberChangeRecord {
+  return {
+    ...signalProvenanceFromRow(row), eventKey: String(row.event_key), chatSourceId: (row.chat_source_id as string | null) ?? null,
+    sourceMessageKey: (row.source_message_key as string | null) ?? null, oldJid: String(row.old_jid), newJid: String(row.new_jid), actorJid: (row.actor_jid as string | null) ?? null
+  };
+}
+
+function membershipPeriodFromRow(row: Record<string, unknown>): GroupMembershipPeriodRecord {
+  return {
+    ...signalProvenanceFromRow(row), periodKey: String(row.period_key), groupSourceId: String(row.group_source_id), participantJid: String(row.participant_jid),
+    joinedAtMs: nullableNumber(row.joined_at_ms as number | null), leftAtMs: nullableNumber(row.left_at_ms as number | null), role: (row.role as string | null) ?? null
+  };
+}
+
+function membershipEventFromRow(row: Record<string, unknown>): GroupMembershipEventRecord {
+  return {
+    ...signalProvenanceFromRow(row), eventKey: String(row.event_key), groupSourceId: String(row.group_source_id), participantJid: String(row.participant_jid),
+    action: String(row.action) as GroupMembershipEventRecord["action"], actorJid: (row.actor_jid as string | null) ?? null, sourceMessageKey: (row.source_message_key as string | null) ?? null,
+    oldRole: (row.old_role as string | null) ?? null, newRole: (row.new_role as string | null) ?? null,
+    rawType: (row.raw_type as string | null) ?? null, rawParameters: (row.raw_parameters as string | null) ?? null
+  };
+}
+
+function chatMetadataFromRow(row: Record<string, unknown>): ChatMetadataHistoryRecord {
+  return {
+    ...signalProvenanceFromRow(row), eventKey: String(row.event_key), chatSourceId: String(row.chat_source_id), field: String(row.field) as ChatMetadataHistoryRecord["field"],
+    sourceMessageKey: (row.source_message_key as string | null) ?? null, actorJid: (row.actor_jid as string | null) ?? null,
+    oldValue: (row.old_value as string | null) ?? null, newValue: (row.new_value as string | null) ?? null,
+    rawType: (row.raw_type as string | null) ?? null, rawParameters: (row.raw_parameters as string | null) ?? null
+  };
+}
+
+function locationFromRow(row: Record<string, unknown>): import("../../shared/types").MessageLocationRecord {
+  return {
+    ...signalProvenanceFromRow(row), sourceMessageKey: String(row.source_message_key), latitude: nullableNumber(row.latitude as number | null), longitude: nullableNumber(row.longitude as number | null),
+    name: (row.name as string | null) ?? null, address: (row.address as string | null) ?? null, isLive: Boolean(row.is_live), accuracyMeters: nullableNumber(row.accuracy_meters as number | null),
+    url: (row.url as string | null) ?? null, comment: (row.comment as string | null) ?? null, caption: (row.caption as string | null) ?? null,
+    speedMps: nullableNumber(row.speed_mps as number | null), headingDegrees: nullableNumber(row.heading_degrees as number | null), sequenceNumber: nullableNumber(row.sequence_number as number | null),
+    timeOffsetMs: nullableNumber(row.time_offset_ms as number | null), liveShareDurationMs: nullableNumber(row.live_share_duration_ms as number | null), finalAtMs: nullableNumber(row.final_at_ms as number | null), hasThumbnail: Boolean(row.has_thumbnail)
+  };
+}
+
+function locationObservationFromRow(row: Record<string, unknown>): MessageLocationObservationRecord {
+  return {
+    ...signalProvenanceFromRow(row), observationKey: String(row.observation_key), sourceMessageKey: String(row.source_message_key), latitude: nullableNumber(row.latitude as number | null), longitude: nullableNumber(row.longitude as number | null),
+    accuracyMeters: nullableNumber(row.accuracy_meters as number | null), speedMps: nullableNumber(row.speed_mps as number | null), headingDegrees: nullableNumber(row.heading_degrees as number | null),
+    sequenceNumber: nullableNumber(row.sequence_number as number | null), timeOffsetMs: nullableNumber(row.time_offset_ms as number | null), finalAtMs: nullableNumber(row.final_at_ms as number | null), hasThumbnail: Boolean(row.has_thumbnail)
+  };
+}
+
+function vcardFromRow(row: Record<string, unknown>): import("../../shared/types").MessageVCardRecord {
+  const properties = parseJson(row.properties_json as string | null);
+  return {
+    ...signalProvenanceFromRow(row), sourceMessageKey: String(row.source_message_key), cardIndex: Number(row.card_index), displayName: (row.display_name as string | null) ?? null,
+    vcard: (row.vcard as string | null) ?? null, resolvedJid: (row.resolved_jid as string | null) ?? null,
+    properties: Array.isArray(properties) ? properties as import("../../shared/types").VCardProperty[] : [],
+    downloadKind: (row.download_kind as import("../../shared/types").VCardDownloadKind | null) ?? ((row.vcard as string | null) ? "source" : "unavailable"),
+    downloadFileName: (row.download_file_name as string | null) ?? null
+  };
+}
+
+function archiveSignalObservationFromRow(row: Record<string, unknown>): import("../../shared/types").ArchiveSignalObservation {
+  return {
+    ...signalProvenanceFromRow(row), factKey: String(row.fact_key), family: String(row.family) as import("../../shared/types").ArchiveSignalFamily,
+    sourceMessageKey: (row.source_message_key as string | null) ?? null, sourceEventKey: (row.source_event_key as string | null) || null,
+    detailJson: (row.detail_json as string | null) ?? null
+  };
+}
+
+function safeVcardFileName(candidate: string | null, cardIndex: number): string {
+  const base = (candidate ?? `contact-${cardIndex + 1}`).replace(/[\\/:*?"<>|\u0000-\u001F]+/g, " ").replace(/\s+/g, " ").trim();
+  const withoutExtension = base.replace(/\.vcf$/i, "").slice(0, 120).trim();
+  return `${withoutExtension || `contact-${cardIndex + 1}`}.vcf`;
+}
+
+function constructMinimalVcard(displayName: string, phone: string): string {
+  const escape = (value: string) => value.replace(/\\/g, "\\\\").replace(/\n/g, "\\n").replace(/;/g, "\\;").replace(/,/g, "\\,");
+  return `BEGIN:VCARD\r\nVERSION:3.0\r\nFN:${escape(displayName)}\r\nTEL;TYPE=CELL:+${phone}\r\nEND:VCARD\r\n`;
+}
+
+function parseVcardPropertiesForStorage(vcard: string): import("../../shared/types").VCardProperty[] {
+  const unfolded = vcard.replace(/\r?\n[ \t]/g, "").split(/\r?\n/);
+  const properties: import("../../shared/types").VCardProperty[] = [];
+  for (const line of unfolded) {
+    const separator = line.indexOf(":");
+    if (separator <= 0) continue;
+    const [head, ...parameters] = line.slice(0, separator).split(";");
+    const groupSeparator = head.lastIndexOf(".");
+    const group = groupSeparator > 0 ? head.slice(0, groupSeparator) : null;
+    const name = (groupSeparator > 0 ? head.slice(groupSeparator + 1) : head).trim().toUpperCase();
+    if (!name) continue;
+    properties.push({
+      name,
+      group,
+      parameters: parameters.map((parameter) => {
+        const equals = parameter.indexOf("=");
+        const rawValues = equals >= 0 ? parameter.slice(equals + 1) : parameter;
+        return { name: (equals >= 0 ? parameter.slice(0, equals) : "TYPE").trim().toUpperCase() || "TYPE", values: rawValues.split(",").map((value) => value.trim()).filter(Boolean) };
+      }),
+      value: line.slice(separator + 1)
+    });
+  }
+  return properties;
+}
+
+function engagementFromRow(row: Record<string, unknown>): EngagementAggregateRecord {
+  return {
+    ...signalProvenanceFromRow(row), aggregateKey: String(row.aggregate_key), chatSourceId: String(row.chat_source_id), counterpartyJid: (row.counterparty_jid as string | null) ?? null,
+    eligibleOutgoingCount: Number(row.eligible_outgoing_count), deliveredCount: Number(row.delivered_count), readCount: Number(row.read_count),
+    responseLatencySampleCount: Number(row.response_latency_sample_count), medianResponseLatencyMs: nullableNumber(row.median_response_latency_ms as number | null),
+    windowStartAtMs: nullableNumber(row.window_start_at_ms as number | null), windowEndAtMs: nullableNumber(row.window_end_at_ms as number | null), algorithmVersion: Number(row.algorithm_version)
+  };
+}
+
 function localPartFromJid(jid: string): string {
   return jid.split("@")[0]?.split(":")[0] ?? jid;
 }
@@ -6766,6 +8092,7 @@ function rowToBrainRun(row: SqliteBrainRunRow): BrainRunSummary {
 
 interface SqliteMessageRow extends SqliteMediaStateColumns, QuotedSnapshotRow {
   id: number;
+  source_message_key: string;
   source_message_id: string;
   sender_display_name: string | null;
   sender_source_jid: string | null;
@@ -6906,6 +8233,10 @@ interface SqliteMemoryEvidenceRow extends SqliteMediaStateColumns, QuotedSnapsho
   is_forwarded?: number;
   quoted_source_message_id?: string | null;
   text: string | null;
+  preview_title?: string | null;
+  preview_description?: string | null;
+  preview_url?: string | null;
+  preview_has_thumbnail?: number | null;
 }
 
 interface SqliteMemoryRevisionRow {

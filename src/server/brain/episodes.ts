@@ -10,6 +10,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type {
+  ArchiveSignalAnchor,
   BrainClaimConfidence,
   BrainClaimInput,
   BrainClaimKind,
@@ -35,7 +36,7 @@ import { generateStructured, type BrainTokenUsage } from "./provider";
 // Do NOT bump for provider/model choice (the `model` column records that) or
 // topic-vocabulary offers (non-stamping input). `extraction_version <
 // EXTRACTION_VERSION` is the staleness predicate `brain regenerate` selects on.
-export const EXTRACTION_VERSION = 3;
+export const EXTRACTION_VERSION = 4;
 
 const SILENCE_GAP_MS = 90 * 60_000;
 const MIN_SEGMENT_FOR_SPLIT = 10;
@@ -162,6 +163,7 @@ export interface PackLabeler {
   sender: (message: MemoryEvidenceMessage) => string;
   quotedSender: (message: MemoryEvidenceMessage) => string;
   reactor: (reaction: MemoryEvidenceReaction) => string;
+  identity: (jid: string) => string;
   ownerLabel: string;
   // Clean prose form of the owner's short name (no "(me)" marker).
   ownerProseName: string;
@@ -202,6 +204,11 @@ export function buildPackLabeler(messages: MemoryEvidenceMessage[], ownerName: s
   };
   for (const message of messages) {
     addParticipant(message.senderSourceJid, message.senderDisplayName, message.senderNameIsPushName, isSelfMessage(message));
+    for (const mentionedJid of message.structuredSignals?.mentionedJids ?? []) {
+      // Structured mention JIDs belong to the owning message's evidence; they
+      // participate in pack-local labelling but never cause a global lookup.
+      addParticipant(mentionedJid, null, false, mentionedJid === "me");
+    }
     const quote = message.quotedSnapshot;
     if (quote) {
       addParticipant(
@@ -282,6 +289,10 @@ export function buildPackLabeler(messages: MemoryEvidenceMessage[], ownerName: s
         (reaction.reactorJid && labelByJid.get(reaction.reactorJid)) ||
         baseParticipant(reaction.reactorJid, reaction.reactorDisplayName, reaction.reactorNameIsPushName).label
       );
+    },
+    identity: (jid) => {
+      if (jid === "me") return ownerLabel;
+      return labelByJid.get(jid) ?? baseParticipant(jid, null, false).label;
     },
     ownerLabel,
     ownerProseName,
@@ -397,6 +408,53 @@ function maxOutputTokensForCap(claimCap: number): number {
 }
 
 const MAX_REACTIONS_PER_LINE = 8;
+const MAX_SIGNAL_ANNOTATIONS_PER_LINE = 8;
+const MAX_SIGNAL_TEXT_CHARS = 320;
+
+function boundedSignalText(value: string | null | undefined, limit = MAX_SIGNAL_TEXT_CHARS): string {
+  if (!value) return "";
+  const flattened = value.replace(/[\r\n\t]+/g, " ").replace(/\s+/g, " ").trim();
+  return flattened.length > limit ? `${flattened.slice(0, Math.max(0, limit - 1))}…` : flattened;
+}
+
+// Structured annotations are attached to their owning message alias. They are
+// context for interpreting that message, never independently citable lines.
+function renderStructuredSignals(message: MemoryEvidenceMessage, labeler: PackLabeler): string {
+  const signals = message.structuredSignals;
+  const annotations: string[] = [];
+  if (signals?.mentionedJids.length) {
+    const labels = signals.mentionedJids.slice(0, 6).map((jid) => labeler.identity(jid));
+    annotations.push(`[mentions: ${labels.join(", ")}${signals.mentionedJids.length > labels.length ? ", …" : ""}]`);
+  }
+  if (signals?.location) {
+    const place = [signals.location.name, signals.location.address].filter(Boolean).join(" — ");
+    const coordinates =
+      signals.location.latitude != null && signals.location.longitude != null
+        ? `${signals.location.latitude.toFixed(4)}, ${signals.location.longitude.toFixed(4)}`
+        : "";
+    annotations.push(`[${signals.location.isLive ? "live " : ""}location: ${place || coordinates || "shared"}]`);
+  }
+  if (signals?.vcards.length) {
+    const cards = signals.vcards.slice(0, 4).map((card) => card.displayName || (card.resolvedJid ? labeler.identity(card.resolvedJid) : "contact card"));
+    annotations.push(`[contact card: ${cards.join(", ")}${signals.vcards.length > cards.length ? ", …" : ""}]`);
+  }
+  if (message.linkPreview) {
+    const preview = [message.linkPreview.title, message.linkPreview.description].filter(Boolean).map((value) => boundedSignalText(value, 160)).join(" — ");
+    annotations.push(`[link preview: ${preview || "embedded preview"}]`);
+  }
+  if (signals?.edit) {
+    annotations.push(`[edited${signals.edit.observedAtMs ? ` at ${new Date(signals.edit.observedAtMs).toISOString().slice(0, 16).replace("T", " ")}` : ""}${signals.edit.hasHeldRevision ? "; prior content retained" : ""}]`);
+  }
+  if (signals?.deletion) {
+    annotations.push(`[deleted for everyone${signals.deletion.revokedByJid ? ` by ${labeler.identity(signals.deletion.revokedByJid)}` : ""}; held content may remain]`);
+  }
+  for (const interpretation of signals?.mediaInterpretations ?? []) {
+    const source = interpretation.kind === "accessibility_label" ? "source accessibility label" : interpretation.kind === "transcription" ? "source transcription" : "source transcript segment";
+    const text = boundedSignalText(interpretation.text);
+    if (text) annotations.push(`[${source}: "${text}"]`);
+  }
+  return annotations.length ? ` ${annotations.slice(0, MAX_SIGNAL_ANNOTATIONS_PER_LINE).join(" ")}${annotations.length > MAX_SIGNAL_ANNOTATIONS_PER_LINE ? " [+more source annotations]" : ""}` : "";
+}
 
 // Reactions render inline on their target line as non-citable annotations; they
 // consume no alias and no budget line. A claim about an acknowledgment cites the
@@ -440,6 +498,7 @@ function packPromptLines(
     const label = labeler.sender(message);
     const senderText = message.isForwarded ? `${label} (forwarded)` : label;
     const reactionsText = renderReactions(message.reactions, labeler);
+    const structuredSignalsText = renderStructuredSignals(message, labeler);
     let referent = "";
     // Pointer-only thread previews are synthesized for UI parity, but they
     // must still take the bounded referent path here rather than masquerading
@@ -461,7 +520,7 @@ function packPromptLines(
           : "\n     ↳ replying to an earlier message";
       }
     }
-    return `${alias} | ${time} | ${senderText}: ${text}${reactionsText}${referent}`;
+    return `${alias} | ${time} | ${senderText}: ${text}${reactionsText}${structuredSignalsText}${referent}`;
   });
   return { lines, keyByAlias };
 }
@@ -477,6 +536,13 @@ function quotedSnapshotContext(snapshot: NonNullable<MemoryEvidenceMessage["quot
   if (snapshot.mediaName) return `[${snapshot.messageType}: ${snapshot.mediaName}]`;
   if (snapshot.mediaMimeType) return `[${snapshot.messageType}: ${snapshot.mediaMimeType}]`;
   return `[${snapshot.messageType}]`;
+}
+
+// Testable deterministic surface used by both the model prompt and extractive
+// generation. No caller receives thumbnail bytes or raw vCard text here.
+export function renderEvidenceLines(pack: BrainEvidencePack, ownerName = "the archive owner"): string[] {
+  const labeler = buildPackLabeler(pack.messages, ownerName);
+  return packPromptLines(pack, labeler, new Map()).lines;
 }
 
 // --- Contract v2 normalization (D7): mechanical salvage BEFORE validation so
@@ -842,6 +908,32 @@ export function computePackStamps(
         snapshotPresent: message.quotedSnapshot?.captured !== false && Boolean(message.quotedSnapshot)
       }))
   };
+}
+
+// A compact dependency stamp: it carries only the message key, signal kind,
+// and capture version. It intentionally excludes all payload text and lets a
+// later re-import stale exactly the episodes whose evidence changed.
+export function computeArchiveSignalAnchors(pack: BrainEvidencePack): ArchiveSignalAnchor[] {
+  const anchors: ArchiveSignalAnchor[] = [];
+  for (const message of pack.messages) {
+    const signals = message.structuredSignals;
+    const kinds = new Set<ArchiveSignalAnchor["kinds"][number]>();
+    if (signals?.mentionedJids.length) kinds.add("mention");
+    if (signals?.location) kinds.add("location");
+    if (signals?.vcards.length) kinds.add("vcard");
+    if (message.linkPreview) kinds.add("link_preview");
+    if (signals?.edit) kinds.add("edit");
+    if (signals?.deletion) kinds.add("deletion");
+    if (signals?.mediaInterpretations.length) kinds.add("media_interpretation");
+    if (kinds.size > 0) {
+      anchors.push({
+        sourceMessageKey: message.sourceMessageKey,
+        kinds: [...kinds].sort(),
+        captureVersion: signals?.captureVersion ?? 1
+      });
+    }
+  }
+  return anchors;
 }
 
 // Entity identity resolution at commit (D3): the model emits names only; the
@@ -1218,6 +1310,7 @@ export async function generateEpisodeForPack(
     pushNameParticipants: stamps.pushNameParticipants,
     uninterpretedMediaCount: stamps.uninterpretedMediaCount,
     quotedReplyAnchors: stamps.quotedReplyAnchors,
+    archiveSignalAnchors: computeArchiveSignalAnchors(pack),
     mediaGaps,
     advanceWatermark: options.advanceWatermark,
     supersedesEpisodeId: options.supersedesEpisodeId ?? null,

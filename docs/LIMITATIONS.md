@@ -39,6 +39,13 @@ The importer batches message writes and the UI paginates chats/messages. Very la
 
 Exact re-runs of the same archive should not duplicate data. Cross-backup dedupe can still be imperfect if WhatsApp changes row identity and key IDs are unavailable.
 
+## Rich Message Details
+
+- Complete detail reflects only fields present in the backup or linked-device event; it never geocodes locations, fetches map/link data, or invents an edit/delete time, group actor, original text, vCard phone number, or transcript.
+- A metadata-only edit is shown as such with an explicit original-text-unknown entry. A deletion can preserve previously captured content but cannot recover content that was never archived.
+- Unknown or unverified system action shapes remain generic. `You` appears only when the exact relevant role is the owner; missing actor/participant identity is shown as unresolved rather than guessed.
+- A vCard download is unavailable when neither source bytes nor a display name plus phone-form JID are retained. LID-only cards intentionally cannot be converted to phone cards.
+
 ## Future Services
 
 The app uses SQLite to avoid a required database service. A later Postgres/Supabase backend should implement the same archive repository interface. Do not use a remote service by default unless the user explicitly opts into uploading private archive data.

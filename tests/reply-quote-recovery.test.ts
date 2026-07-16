@@ -663,7 +663,7 @@ describe("reply quote recovery", () => {
     expect(text?.quotedSnapshot?.body).toBe("complete quoted text");
     expect(media?.quotedSnapshot).toMatchObject({ quotedSourceChatId: "group@g.us", caption: "image context", mediaMimeType: "image/jpeg" });
     expect(media?.quotedSnapshot?.thumbnail).toEqual(new Uint8Array([8]));
-    expect(contact?.quotedSnapshot).toMatchObject({ messageType: "contact", vcard: { name: "Casey", vcard: "BEGIN:VCARD" }, timestampMs: null });
+    expect(contact?.quotedSnapshot).toMatchObject({ messageType: "contact", vcard: { name: "Casey" }, timestampMs: null });
     expect(pointer?.quotedSourceMessageId).toBe("source-only");
     expect(pointer?.quotedSnapshot).toBeNull();
 

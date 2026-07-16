@@ -3,6 +3,8 @@ import type {
   ArchiveRestorePoint
 } from "./repository";
 import type {
+  ArchiveSignalBatch,
+  ArchiveSignalObservation,
   BrainChatBacklogItem,
   BrainEpisodeGenerator,
   BrainEpisodeInput,
@@ -25,9 +27,14 @@ import type {
   ChatListItem,
   ChatListOptions,
   ChatRecord,
+  ChatMetadataHistoryRecord,
   ChatSyncStateRecord,
   ContactRecord,
+  EngagementAggregateRecord,
   IdentityRepairResult,
+  GroupMembershipEventRecord,
+  GroupMembershipPeriodRecord,
+  IdentityNumberChangeRecord,
   ImportRunSummary,
   ImportTotals,
   ImportWarning,
@@ -46,6 +53,9 @@ import type {
   MediaDownloadQueueRecord,
   MediaQueueSummary,
   MessageEditRevisionRecord,
+  MessageDetail,
+  MessageLocationObservationRecord,
+  MessageStructuredSignals,
   MessageMediaSummary,
   MemoryCitationRecord,
   MemoryEvidenceMessage,
@@ -71,15 +81,36 @@ import type {
   SearchResultItem,
   StatusSummary
 } from "../../shared/types";
+import { createHash } from "node:crypto";
 import { SEARCH_HIGHLIGHT_END, SEARCH_HIGHLIGHT_START } from "../../shared/types";
 import { config } from "../config";
 import { baselineFromStatus } from "../live/baseline";
 import { messageIdFromKey, messageKey } from "../identity/keys";
 import { applyMentionLabels, appliedMentionLabels, extractMentionDigits, mentionJidCandidates } from "../identity/mentions";
 import { mergeInteractionMetadata } from "./interactions";
+import { buildMessageEditTimeline, summarizeStructuredSignals, summarizeSystemEvents } from "./signalSummary";
 import { interpretMessage } from "../interpretation/messageInterpretation";
-import { isMaskedNumberLabel, normalizeJid } from "../import/jid";
+import { isMaskedNumberLabel, normalizeJid, phoneFromJid, resolveDisplayLabel } from "../import/jid";
 import { getMemoryProviderStatus } from "../memory/provider";
+
+function stableSignalFactKey(family: string, parts: Array<string | number | null | undefined>): string {
+  return `${family}:${createHash("sha256").update(JSON.stringify(parts)).digest("hex")}`;
+}
+
+function isSyntheticSystemAnchor(sourceMessageKey: string | null | undefined): boolean {
+  return Boolean(sourceMessageKey && sourceMessageKey.includes("live-system-"));
+}
+
+function safeVcardFileName(candidate: string | null, cardIndex: number): string {
+  const base = (candidate ?? `contact-${cardIndex + 1}`).replace(/[\\/:*?"<>|\u0000-\u001F]+/g, " ").replace(/\s+/g, " ").trim();
+  const withoutExtension = base.replace(/\.vcf$/i, "").slice(0, 120).trim();
+  return `${withoutExtension || `contact-${cardIndex + 1}`}.vcf`;
+}
+
+function constructMinimalVcard(displayName: string, phone: string): string {
+  const escape = (value: string) => value.replace(/\\/g, "\\\\").replace(/\n/g, "\\n").replace(/;/g, "\\;").replace(/,/g, "\\,");
+  return `BEGIN:VCARD\r\nVERSION:3.0\r\nFN:${escape(displayName)}\r\nTEL;TYPE=CELL:+${phone}\r\nEND:VCARD\r\n`;
+}
 
 export class MemoryArchiveRepository implements ArchiveRepository {
   private importRuns = new Map<string, ImportRunSummary>();
@@ -100,6 +131,18 @@ export class MemoryArchiveRepository implements ArchiveRepository {
   private mediaQueue = new Map<string, MediaDownloadQueueRecord & { id: number }>();
   private mediaAssets = new Map<number, MediaAssetRecord & { id: number }>();
   private linkPreviews = new Map<string, CapturedLinkPreview>();
+  private numberChanges = new Map<string, IdentityNumberChangeRecord>();
+  private membershipPeriods = new Map<string, GroupMembershipPeriodRecord>();
+  private membershipEvents = new Map<string, GroupMembershipEventRecord>();
+  private chatMetadataHistory = new Map<string, ChatMetadataHistoryRecord>();
+  private locations = new Map<string, import("../../shared/types").MessageLocationRecord>();
+  private locationObservations = new Map<string, MessageLocationObservationRecord>();
+  private vcards = new Map<string, import("../../shared/types").MessageVCardRecord>();
+  private editEvents = new Map<string, import("../../shared/types").MessageEditEventRecord>();
+  private deletions = new Map<string, import("../../shared/types").MessageDeletionRecord>();
+  private mediaInterpretations = new Map<string, import("../../shared/types").MessageMediaInterpretationRecord>();
+  private engagementAggregates = new Map<string, EngagementAggregateRecord>();
+  private signalObservations = new Map<string, ArchiveSignalObservation>();
   private brainWatermarks = new Map<string, { assimilatedThroughMs: number; assimilatedThroughId: number; lastEpisodeAt: string | null }>();
   private brainTasks = new Map<string, BrainTaskRecord>();
   private nextBrainTaskId = 1;
@@ -225,8 +268,8 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       caption: snapshot.caption,
       mediaMimeType: snapshot.mediaMimeType ?? null,
       mediaName: snapshot.mediaName ?? null,
-      location: snapshot.location ?? null,
-      vcard: snapshot.vcard ?? null,
+      location: snapshot.location ? { name: snapshot.location.name, address: snapshot.location.address } : null,
+      vcard: snapshot.vcard ? { name: snapshot.vcard.name } : null,
       mentionedJids: snapshot.mentionedJids ?? [],
       hasThumbnail: Boolean(snapshot.thumbnail?.length),
       originalMessageId: original?.id ?? null
@@ -425,6 +468,37 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       if (message.senderSourceJid === lid) {
         message.senderSourceJid = pn;
       }
+      if (message.mentionedJids?.length) {
+        message.mentionedJids = [...new Set(message.mentionedJids.map((jid) => (jid === lid ? pn : jid)))];
+      }
+      if (message.quotedSnapshot?.mentionedJids?.length) {
+        message.quotedSnapshot.mentionedJids = [...new Set(message.quotedSnapshot.mentionedJids.map((jid) => (jid === lid ? pn : jid)))];
+      }
+    }
+    for (const row of this.numberChanges.values()) {
+      if (row.oldJid === lid) row.oldJid = pn;
+      if (row.newJid === lid) row.newJid = pn;
+      if (row.actorJid === lid) row.actorJid = pn;
+      if (row.chatSourceId === lid) row.chatSourceId = pn;
+    }
+    for (const row of this.membershipPeriods.values()) {
+      if (row.groupSourceId === lid) row.groupSourceId = pn;
+      if (row.participantJid === lid) row.participantJid = pn;
+    }
+    for (const row of this.membershipEvents.values()) {
+      if (row.groupSourceId === lid) row.groupSourceId = pn;
+      if (row.participantJid === lid) row.participantJid = pn;
+      if (row.actorJid === lid) row.actorJid = pn;
+    }
+    for (const row of this.chatMetadataHistory.values()) {
+      if (row.chatSourceId === lid) row.chatSourceId = pn;
+      if (row.actorJid === lid) row.actorJid = pn;
+    }
+    for (const row of this.vcards.values()) if (row.resolvedJid === lid) row.resolvedJid = pn;
+    for (const row of this.deletions.values()) if (row.revokedByJid === lid) row.revokedByJid = pn;
+    for (const row of this.engagementAggregates.values()) {
+      if (row.chatSourceId === lid) row.chatSourceId = pn;
+      if (row.counterpartyJid === lid) row.counterpartyJid = pn;
     }
     const rekeyedParticipants: ParticipantRecord[] = [];
     for (const [key, participant] of [...this.participants]) {
@@ -963,6 +1037,273 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     return messages.length;
   }
 
+  async upsertArchiveSignals(batch: ArchiveSignalBatch): Promise<{ changedMessageKeys: string[]; skippedUnanchoredRecords: number }> {
+    const changed = new Set<string>();
+    // Keep the in-memory implementation aligned with SQLite's foreign-key
+    // contract. Some WhatsApp companion tables can retain rows for messages
+    // the defensive importer cannot archive, so those companions are not
+    // meaningful evidence anchors on their own.
+    const retainAnchored = <T extends { sourceMessageKey: string }>(rows: T[] | undefined): T[] =>
+      (rows ?? []).filter((row) => this.messages.has(row.sourceMessageKey));
+    const locations = retainAnchored(batch.locations);
+    const locationObservations = retainAnchored(batch.locationObservations);
+    const vcards = retainAnchored(batch.vcards);
+    const deletions = retainAnchored(batch.deletions);
+    const mediaInterpretations = retainAnchored(batch.mediaInterpretations);
+    const numberChanges = (batch.numberChanges ?? []).map((row) => ({
+      ...row,
+      eventKey: stableSignalFactKey("number_change", [row.sourceMessageKey, row.chatSourceId, row.oldJid, row.newJid, row.observedAtMs])
+    }));
+    const membershipPeriods = (batch.membershipPeriods ?? []).map((row) => ({
+      ...row,
+      periodKey: stableSignalFactKey("membership_period", [row.groupSourceId, row.participantJid, row.joinedAtMs, row.leftAtMs, row.role])
+    }));
+    const membershipEvents = (batch.membershipEvents ?? []).map((row) => ({
+      ...row,
+      eventKey: stableSignalFactKey("membership_event", [row.groupSourceId, row.participantJid, row.action, row.observedAtMs, row.oldRole, row.newRole])
+    }));
+    const chatMetadataHistory = (batch.chatMetadataHistory ?? []).map((row) => ({
+      ...row,
+      eventKey: stableSignalFactKey("chat_metadata", [row.chatSourceId, row.field, row.oldValue, row.newValue, row.observedAtMs])
+    }));
+    const editEvents = retainAnchored(batch.editEvents).map((row) => ({
+      ...row,
+      eventKey: stableSignalFactKey("edit", row.observedAtMs == null
+        ? [row.sourceMessageKey, null, row.originalSourceMessageId, row.observedEditMessageId, row.sourceEventKey]
+        : [row.sourceMessageKey, row.observedAtMs])
+    }));
+    const skippedUnanchoredRecords =
+      (batch.locations?.length ?? 0) - locations.length +
+      (batch.locationObservations?.length ?? 0) - locationObservations.length +
+      (batch.vcards?.length ?? 0) - vcards.length +
+      (batch.editEvents?.length ?? 0) - editEvents.length +
+      (batch.deletions?.length ?? 0) - deletions.length +
+      (batch.mediaInterpretations?.length ?? 0) - mediaInterpretations.length;
+    const aggregateMaxFields = new Set([
+      "eligibleOutgoingCount",
+      "deliveredCount",
+      "readCount",
+      "responseLatencySampleCount",
+      "algorithmVersion"
+    ]);
+    const merge = <T extends { captureVersion: number; observedAtMs: number | null }>(map: Map<string, T>, key: string, incoming: T, messageKey: string | null = null): void => {
+      const existing = map.get(key);
+      if (!existing) {
+        map.set(key, structuredClone(incoming));
+        if (messageKey) changed.add(messageKey);
+        return;
+      }
+      const next: Record<string, unknown> = { ...existing };
+      let enriched = false;
+      const existingRecord = existing as T & { kind?: unknown; startMs?: unknown; endMs?: unknown };
+      const incomingRecord = incoming as T & { kind?: unknown; endMs?: unknown; isLive?: unknown; liveShareDurationMs?: unknown; sequenceNumber?: unknown; finalAtMs?: unknown };
+      if (
+        existingRecord.kind === "transcription_segment" &&
+        incomingRecord.endMs == null &&
+        typeof existingRecord.startMs === "number" &&
+        existingRecord.endMs === existingRecord.startMs
+      ) {
+        // A capture-v1 importer represented an unavailable segment duration as
+        // a zero-length range. A same-segment replay can safely restore the
+        // source's honest "timestamp only" state.
+        next.endMs = null;
+        enriched = true;
+      }
+      const existingLocation = existing as T & { isLive?: unknown; liveShareDurationMs?: unknown; sequenceNumber?: unknown; finalAtMs?: unknown };
+      if (
+        existingLocation.liveShareDurationMs === 0 &&
+        existingLocation.sequenceNumber === 0 &&
+        existingLocation.finalAtMs == null &&
+        incomingRecord.liveShareDurationMs == null &&
+        incomingRecord.sequenceNumber == null &&
+        incomingRecord.finalAtMs == null &&
+        incomingRecord.isLive === false
+      ) {
+        // SQL NULL was once coerced to zero for these two Android columns,
+        // making a static location look live. Only clear the exact legacy
+        // signature when the replayed source has no live-location fields.
+        next.liveShareDurationMs = null;
+        next.sequenceNumber = null;
+        next.isLive = false;
+        enriched = true;
+      }
+      for (const [field, value] of Object.entries(incoming) as Array<[string, unknown]>) {
+        if (field === "source" || field === "sourceEventKey" || field === "observedAtMs" || field === "captureVersion") continue;
+        const current = next[field];
+        if (value != null && current == null) {
+          next[field] = value;
+          enriched = true;
+        } else if (aggregateMaxFields.has(field) && typeof value === "number" && typeof current === "number" && value > current) {
+          next[field] = value;
+          enriched = true;
+        } else if (field === "windowEndAtMs" && typeof value === "number" && typeof current === "number" && value > current) {
+          next[field] = value;
+          enriched = true;
+        } else if (field === "medianResponseLatencyMs" && typeof value === "number" && value !== current) {
+          // An aggregate recomputation may retain the same count while
+          // improving its exact median; SQLite accepts any non-null result.
+          next[field] = value;
+          enriched = true;
+        } else if (field === "liveShareDurationMs" && typeof value === "number" && typeof current === "number" && value === current * 1000) {
+          // Capture v1 briefly persisted Android's seconds value under the
+          // millisecond archive field. Recognize only that exact legacy unit
+          // relationship so a replay can repair it without weakening the
+          // normal non-destructive merge contract.
+          next[field] = value;
+          enriched = true;
+        } else if (field === "text" && typeof value === "string" && value.length > String(current ?? "").length) {
+          // Source interpretations have one natural lossless tie-breaker:
+          // retain the longer non-empty source-provided text.
+          next[field] = value;
+          enriched = true;
+        } else if (typeof value === "boolean" && value && current !== true) {
+          // The only boolean source signal today is live-location state; like
+          // SQLite's MAX(existing.is_live, excluded.is_live), a positive
+          // observation enriches a prior false/unknown value but never drops it.
+          next[field] = true;
+          enriched = true;
+        }
+      }
+      const nextCaptureVersion = Math.max(Number(existing.captureVersion ?? 1), Number(incoming.captureVersion ?? 1));
+      next.captureVersion = nextCaptureVersion;
+      const incomingIsNewer =
+        (existing.observedAtMs == null && incoming.observedAtMs != null) ||
+        (existing.observedAtMs != null && incoming.observedAtMs != null && incoming.observedAtMs > existing.observedAtMs) ||
+        (existing.observedAtMs === incoming.observedAtMs && (incoming as T & { source?: unknown }).source === "live" && (existing as T & { source?: unknown }).source === "backup");
+      next.observedAtMs = Math.max(Number(existing.observedAtMs ?? 0), Number(incoming.observedAtMs ?? 0)) || null;
+      const incomingSource = incoming as T & { source?: unknown; sourceEventKey?: unknown };
+      const existingSource = existing as T & { source?: unknown; sourceEventKey?: unknown };
+      const nextSource = incomingIsNewer ? incomingSource.source : existingSource.source;
+      const nextSourceEventKey = incomingIsNewer
+        ? incomingSource.sourceEventKey ?? existingSource.sourceEventKey
+        : existingSource.sourceEventKey ?? incomingSource.sourceEventKey;
+      const provenanceChanged = nextSource !== existingSource.source || nextSourceEventKey !== existingSource.sourceEventKey;
+      if (enriched || nextCaptureVersion !== existing.captureVersion || provenanceChanged) {
+        next.source = nextSource;
+        next.sourceEventKey = nextSourceEventKey;
+        map.set(key, next as T);
+        if (messageKey && (enriched || nextCaptureVersion !== existing.captureVersion)) changed.add(messageKey);
+      }
+    };
+    const canonical = (jid: string | null | undefined): string | null => this.canonicalJid(jid);
+    const allowRealAnchorToReplaceSynthetic = <T extends { sourceMessageKey?: string | null }>(map: Map<string, T>, key: string, incoming: T) => {
+      const existing = map.get(key);
+      if (existing && isSyntheticSystemAnchor(existing.sourceMessageKey) && incoming.sourceMessageKey && !isSyntheticSystemAnchor(incoming.sourceMessageKey)) {
+        map.set(key, { ...existing, sourceMessageKey: null });
+      }
+    };
+    for (const row of numberChanges) {
+      allowRealAnchorToReplaceSynthetic(this.numberChanges, row.eventKey, row);
+      merge(this.numberChanges, row.eventKey, { ...row, chatSourceId: canonical(row.chatSourceId), oldJid: canonical(row.oldJid) ?? row.oldJid, newJid: canonical(row.newJid) ?? row.newJid, actorJid: canonical(row.actorJid) });
+    }
+    for (const row of membershipPeriods) merge(this.membershipPeriods, row.periodKey, { ...row, groupSourceId: canonical(row.groupSourceId) ?? row.groupSourceId, participantJid: canonical(row.participantJid) ?? row.participantJid });
+    for (const row of membershipEvents) {
+      allowRealAnchorToReplaceSynthetic(this.membershipEvents, row.eventKey, row);
+      merge(this.membershipEvents, row.eventKey, { ...row, groupSourceId: canonical(row.groupSourceId) ?? row.groupSourceId, participantJid: canonical(row.participantJid) ?? row.participantJid, actorJid: canonical(row.actorJid) });
+    }
+    for (const row of chatMetadataHistory) {
+      allowRealAnchorToReplaceSynthetic(this.chatMetadataHistory, row.eventKey, row);
+      merge(this.chatMetadataHistory, row.eventKey, { ...row, chatSourceId: canonical(row.chatSourceId) ?? row.chatSourceId, actorJid: canonical(row.actorJid) });
+    }
+    for (const row of locations) merge(this.locations, row.sourceMessageKey, row, row.sourceMessageKey);
+    for (const row of locationObservations) merge(this.locationObservations, row.observationKey, row, row.sourceMessageKey);
+    for (const row of vcards) merge(this.vcards, `${row.sourceMessageKey}:${row.cardIndex}`, { ...row, resolvedJid: canonical(row.resolvedJid) }, row.sourceMessageKey);
+    const rekeyEditObservations = (oldFactKey: string, newFactKey: string) => {
+      if (oldFactKey === newFactKey) return;
+      for (const [key, observation] of [...this.signalObservations]) {
+        if (observation.family !== "edit" || observation.factKey !== oldFactKey) continue;
+        this.signalObservations.delete(key);
+        const next = { ...observation, factKey: newFactKey };
+        this.signalObservations.set(`${newFactKey}:edit:${next.source}:${next.sourceEventKey ?? ""}`, next);
+      }
+    };
+    for (const row of editEvents) {
+      for (const [existingKey, existing] of [...this.editEvents]) {
+        const sameSourceObservation = row.sourceEventKey != null
+          && existing.source === row.source
+          && existing.sourceEventKey === row.sourceEventKey;
+        const message = this.messages.get(row.sourceMessageKey);
+        const legacyEnvelopeTime = row.observedAtMs != null
+          && message?.timestampMs != null
+          && row.observedAtMs > message.timestampMs
+          && existing.source === "live"
+          && existing.sourceEventKey?.startsWith("wa-web:edit:")
+          && existing.observedAtMs === message.timestampMs;
+        if (existingKey === row.eventKey || (!sameSourceObservation && !legacyEnvelopeTime)) continue;
+        rekeyEditObservations(existingKey, row.eventKey);
+        this.editEvents.delete(existingKey);
+      }
+      merge(this.editEvents, row.eventKey, row, row.sourceMessageKey);
+    }
+    for (const row of deletions) merge(this.deletions, row.sourceMessageKey, { ...row, revokedByJid: canonical(row.revokedByJid) }, row.sourceMessageKey);
+    for (const row of mediaInterpretations) merge(this.mediaInterpretations, `${row.sourceMessageKey}:${row.kind}:${row.segmentIndex}`, row, row.sourceMessageKey);
+    for (const row of batch.engagementAggregates ?? []) merge(this.engagementAggregates, row.aggregateKey, { ...row, chatSourceId: canonical(row.chatSourceId) ?? row.chatSourceId, counterpartyJid: canonical(row.counterpartyJid) });
+    const observe = (
+      factKey: string,
+      family: ArchiveSignalObservation["family"],
+      row: { source: ArchiveSignalObservation["source"]; sourceEventKey: string | null; observedAtMs: number | null; captureVersion: number; sourceMessageKey?: string | null },
+      detailJson: string | null = null
+    ) => {
+      const key = `${factKey}:${family}:${row.source}:${row.sourceEventKey ?? ""}`;
+      merge(this.signalObservations, key, { factKey, family, source: row.source, sourceEventKey: row.sourceEventKey, sourceMessageKey: row.sourceMessageKey ?? null, observedAtMs: row.observedAtMs, captureVersion: row.captureVersion, detailJson }, row.sourceMessageKey ?? null);
+    };
+    for (const row of numberChanges) observe(row.eventKey, "number_change", row);
+    for (const row of membershipPeriods) observe(row.periodKey, "membership_period", row);
+    for (const row of membershipEvents) observe(row.eventKey, "membership_event", row, row.rawType || row.rawParameters ? JSON.stringify({ rawType: row.rawType ?? null, rawParameters: row.rawParameters ?? null }) : null);
+    for (const row of chatMetadataHistory) observe(row.eventKey, "chat_metadata", row, row.rawType || row.rawParameters ? JSON.stringify({ rawType: row.rawType ?? null, rawParameters: row.rawParameters ?? null }) : null);
+    for (const row of locations) observe(row.sourceMessageKey, "location", row);
+    for (const row of locationObservations) observe(row.observationKey, "location_observation", row);
+    for (const row of vcards) observe(`${row.sourceMessageKey}:${row.cardIndex}`, "vcard", row);
+    for (const row of editEvents) observe(row.eventKey, "edit", row);
+    for (const row of deletions) observe(row.sourceMessageKey, "deletion", row);
+    for (const row of mediaInterpretations) observe(`${row.sourceMessageKey}:${row.kind}:${row.segmentIndex}`, "media_interpretation", row);
+    const keys = [...changed];
+    if (keys.length) await this.markStaleEpisodesForMessages(keys);
+    return { changedMessageKeys: keys, skippedUnanchoredRecords };
+  }
+
+  async repairAmbiguousSelfMembershipFacts(): Promise<number> {
+    const keys = [...this.membershipEvents.values()]
+      .filter((row) => row.participantJid === "me" && row.source === "backup" && row.sourceEventKey?.startsWith("backup:message_system_group:"))
+      .map((row) => row.eventKey);
+    for (const key of keys) {
+      this.membershipEvents.delete(key);
+      for (const [observationKey, observation] of this.signalObservations) {
+        if (observation.family === "membership_event" && observation.factKey === key) this.signalObservations.delete(observationKey);
+      }
+    }
+    return keys.length;
+  }
+
+  async listIdentityNumberChanges(options: { oldJid?: string; newJid?: string; limit?: number } = {}): Promise<IdentityNumberChangeRecord[]> {
+    const oldJid = options.oldJid ? this.canonicalJid(options.oldJid) ?? options.oldJid : null;
+    const newJid = options.newJid ? this.canonicalJid(options.newJid) ?? options.newJid : null;
+    return [...this.numberChanges.values()].filter((row) => (!oldJid || row.oldJid === oldJid) && (!newJid || row.newJid === newJid)).sort((a, b) => (b.observedAtMs ?? 0) - (a.observedAtMs ?? 0)).slice(0, options.limit ?? 500).map((row) => structuredClone(row));
+  }
+
+  async listGroupMembershipPeriods(options: { groupSourceId?: string; participantJid?: string; limit?: number } = {}): Promise<GroupMembershipPeriodRecord[]> {
+    const group = options.groupSourceId ? this.canonicalJid(options.groupSourceId) ?? options.groupSourceId : null;
+    const participant = options.participantJid ? this.canonicalJid(options.participantJid) ?? options.participantJid : null;
+    return [...this.membershipPeriods.values()].filter((row) => (!group || row.groupSourceId === group) && (!participant || row.participantJid === participant)).sort((a, b) => (b.joinedAtMs ?? 0) - (a.joinedAtMs ?? 0)).slice(0, options.limit ?? 500).map((row) => structuredClone(row));
+  }
+
+  async listGroupMembershipEvents(options: { groupSourceId?: string; participantJid?: string; limit?: number } = {}): Promise<GroupMembershipEventRecord[]> {
+    const group = options.groupSourceId ? this.canonicalJid(options.groupSourceId) ?? options.groupSourceId : null;
+    const participant = options.participantJid ? this.canonicalJid(options.participantJid) ?? options.participantJid : null;
+    return [...this.membershipEvents.values()].filter((row) => (!group || row.groupSourceId === group) && (!participant || row.participantJid === participant)).sort((a, b) => (b.observedAtMs ?? 0) - (a.observedAtMs ?? 0)).slice(0, options.limit ?? 500).map((row) => structuredClone(row));
+  }
+
+  async listChatMetadataHistory(options: { chatSourceId?: string; limit?: number } = {}): Promise<ChatMetadataHistoryRecord[]> {
+    const chat = options.chatSourceId ? this.canonicalJid(options.chatSourceId) ?? options.chatSourceId : null;
+    return [...this.chatMetadataHistory.values()].filter((row) => !chat || row.chatSourceId === chat).sort((a, b) => (b.observedAtMs ?? 0) - (a.observedAtMs ?? 0)).slice(0, options.limit ?? 500).map((row) => structuredClone(row));
+  }
+
+  async listEngagementAggregates(options: { chatSourceId?: string; counterpartyJid?: string; limit?: number } = {}): Promise<EngagementAggregateRecord[]> {
+    const chat = options.chatSourceId ? this.canonicalJid(options.chatSourceId) ?? options.chatSourceId : null;
+    const person = options.counterpartyJid ? this.canonicalJid(options.counterpartyJid) ?? options.counterpartyJid : null;
+    return [...this.engagementAggregates.values()].filter((row) => (!chat || row.chatSourceId === chat) && (!person || row.counterpartyJid === person)).sort((a, b) => (b.windowEndAtMs ?? 0) - (a.windowEndAtMs ?? 0)).slice(0, options.limit ?? 500).map((row) => structuredClone(row));
+  }
+
   async refreshChatStats(chatSourceIds?: string[]): Promise<void> {
     const scope = chatSourceIds ? new Set(chatSourceIds) : null;
     for (const chat of this.chats.values()) {
@@ -989,6 +1330,18 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     this.chats.clear();
     this.participants.clear();
     this.messages.clear();
+    this.numberChanges.clear();
+    this.membershipPeriods.clear();
+    this.membershipEvents.clear();
+    this.chatMetadataHistory.clear();
+    this.locations.clear();
+    this.locationObservations.clear();
+    this.vcards.clear();
+    this.editEvents.clear();
+    this.deletions.clear();
+    this.mediaInterpretations.clear();
+    this.engagementAggregates.clear();
+    this.signalObservations.clear();
     this.liveRuns.clear();
     this.liveCheckpoints.clear();
     this.liveGaps.clear();
@@ -1427,16 +1780,35 @@ export class MemoryArchiveRepository implements ArchiveRepository {
 
   async recordLinkPreviews(previews: CapturedLinkPreview[]): Promise<number> {
     let recorded = 0;
+    const changedMessageKeys: string[] = [];
     for (const preview of previews) {
       const chatSourceId = this.canonicalJid(preview.chatSourceId) ?? preview.chatSourceId;
       if (!chatSourceId || !preview.sourceMessageId) {
         continue;
       }
       const key = messageKey(chatSourceId, preview.sourceMessageId);
-      if (!this.linkPreviews.has(key)) {
+      const existing = this.linkPreviews.get(key);
+      if (!existing) {
         this.linkPreviews.set(key, { ...preview, chatSourceId });
         recorded += 1;
+        changedMessageKeys.push(key);
+        continue;
       }
+      const enriched = {
+        ...existing,
+        title: existing.title ?? preview.title ?? null,
+        description: existing.description ?? preview.description ?? null,
+        canonicalUrl: existing.canonicalUrl ?? preview.canonicalUrl ?? null,
+        thumbnail: existing.thumbnail ?? preview.thumbnail ?? null
+      };
+      if (JSON.stringify(existing) !== JSON.stringify(enriched)) {
+        this.linkPreviews.set(key, enriched);
+        recorded += 1;
+        changedMessageKeys.push(key);
+      }
+    }
+    if (changedMessageKeys.length > 0) {
+      await this.markStaleEpisodesForMessages(changedMessageKeys);
     }
     return recorded;
   }
@@ -1460,6 +1832,89 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       return [];
     }
     return [...(this.editRevisions.get(message.sourceMessageKey) ?? [])].sort((a, b) => a.revisionIndex - b.revisionIndex);
+  }
+
+  async getMessageDetail(messageId: number): Promise<MessageDetail | null> {
+    const message = [...this.messages.values()].find((candidate) => candidate.id === messageId);
+    if (!message) return null;
+    const sourceMessageKey = message.sourceMessageKey;
+    const observationsFor = (factKey: string, family: import("../../shared/types").ArchiveSignalObservation["family"]) =>
+      [...this.signalObservations.values()].filter((row) => row.factKey === factKey && row.family === family).sort((a, b) => (a.observedAtMs ?? 0) - (b.observedAtMs ?? 0)).map((row) => structuredClone(row));
+    const location = this.locations.get(sourceMessageKey);
+    const locationObservations = [...this.locationObservations.values()].filter((row) => row.sourceMessageKey === sourceMessageKey).sort((a, b) => (a.sequenceNumber ?? Number.MAX_SAFE_INTEGER) - (b.sequenceNumber ?? Number.MAX_SAFE_INTEGER) || (a.observedAtMs ?? 0) - (b.observedAtMs ?? 0));
+    const locations = location ? [{ ...structuredClone(location), observations: structuredClone(locationObservations), provenance: observationsFor(sourceMessageKey, "location") }] : [];
+    const vcards = [...this.vcards.values()].filter((row) => row.sourceMessageKey === sourceMessageKey).sort((a, b) => a.cardIndex - b.cardIndex).map((row) => {
+      const card = structuredClone(row);
+      return { ...(!card.vcard && card.displayName && phoneFromJid(card.resolvedJid) ? { ...card, downloadKind: "constructed" as const } : card), provenance: observationsFor(`${sourceMessageKey}:${row.cardIndex}`, "vcard") };
+    });
+    const revisions = await this.listMessageEditRevisions(messageId);
+    const edits = [...this.editEvents.values()].filter((row) => row.sourceMessageKey === sourceMessageKey).sort((a, b) => (a.observedAtMs ?? 0) - (b.observedAtMs ?? 0));
+    const editTimeline = buildMessageEditTimeline({
+      sentAtMs: message.timestampMs ?? null,
+      currentText: message.body ?? message.caption ?? null,
+      revisions,
+      events: edits.map((edit) => ({ timestampMs: edit.observedAtMs, source: edit.source, sourceEventKey: edit.sourceEventKey }))
+    });
+    const deletionRecord = this.deletions.get(sourceMessageKey) ?? null;
+    const deletion = deletionRecord ? {
+      revokedByJid: deletionRecord.revokedByJid,
+      revokedByAdmin: deletionRecord.revokedByAdmin ?? null,
+      deletionKind: deletionRecord.deletionKind ?? null,
+      deletedAtMs: deletionRecord.observedAtMs,
+      sentAtMs: message.timestampMs ?? null,
+      contentState: message.body || message.caption || locations.length || vcards.length ? "retained" as const : "never_captured" as const,
+      observations: observationsFor(sourceMessageKey, "deletion")
+    } : null;
+    const mediaInterpretations = [...this.mediaInterpretations.values()].filter((row) => row.sourceMessageKey === sourceMessageKey).sort((a, b) => a.kind.localeCompare(b.kind) || a.segmentIndex - b.segmentIndex).map((row) => structuredClone(row));
+    const preview = this.linkPreviews.get(sourceMessageKey);
+    const systemEvents = this.systemEventDetails(message, observationsFor);
+    if (message.messageType === "system" && systemEvents.length === 0) {
+      systemEvents.push({
+        kind: "generic",
+        eventKey: `generic:${sourceMessageKey}`,
+        summary: "System event",
+        actorJid: null,
+        actorLabel: null,
+        participantJid: null,
+        participantLabel: null,
+        oldJid: null,
+        oldIdentityLabel: null,
+        newJid: null,
+        newIdentityLabel: null,
+        oldValue: null,
+        newValue: null,
+        action: null,
+        field: null,
+        occurredAtMs: message.timestampMs ?? null,
+        rawType: message.rawTypeCode == null ? null : String(message.rawTypeCode),
+        rawParameters: message.rawMetadata == null ? null : JSON.stringify(message.rawMetadata),
+        observations: []
+      });
+    }
+    return {
+      id: message.id,
+      sourceMessageKey,
+      sentAtMs: message.timestampMs ?? null,
+      availability: { hasLocation: locations.length > 0, vcardCount: vcards.length, hasDeletion: Boolean(deletion), hasEditHistory: edits.length > 0 || revisions.length > 0, hasSourceInterpretation: mediaInterpretations.length > 0, hasSystemEventDetail: systemEvents.length > 0 },
+      locations,
+      vcards,
+      mentionedJids: [...(message.mentionedJids ?? [])],
+      editTimeline,
+      deletion,
+      mediaInterpretations,
+      linkPreview: preview ? { title: preview.title, description: preview.description, canonicalUrl: preview.canonicalUrl, hasThumbnail: Boolean(preview.thumbnail?.length) } : null,
+      systemEvents
+    };
+  }
+
+  async getMessageVcardDownload(messageId: number, cardIndex: number): Promise<{ content: string; fileName: string; constructed: boolean } | null> {
+    const message = [...this.messages.values()].find((candidate) => candidate.id === messageId);
+    const card = message ? this.vcards.get(`${message.sourceMessageKey}:${cardIndex}`) : null;
+    if (!card) return null;
+    if (card.vcard?.trim()) return { content: card.vcard, fileName: safeVcardFileName(card.downloadFileName ?? card.displayName, card.cardIndex), constructed: false };
+    const phone = phoneFromJid(card.resolvedJid);
+    if (!card.displayName?.trim() || !phone) return null;
+    return { content: constructMinimalVcard(card.displayName, phone), fileName: safeVcardFileName(card.downloadFileName ?? card.displayName, card.cardIndex), constructed: true };
   }
 
   // Mirrors the SQLite availability derivation for parity in tests.
@@ -1695,6 +2150,8 @@ export class MemoryArchiveRepository implements ArchiveRepository {
                 hasThumbnail: Boolean(preview.thumbnail?.length)
               }
             : null,
+          structuredSignals: summarizeStructuredSignals(this.structuredSignals(message)),
+          systemEvents: this.systemEventsForMessage(message),
           quotedSnapshot: this.quoteSummary(message),
           isEdited: Boolean(message.rawMetadata?.edited) || revisions.length > 0,
           editRevisionCount: revisions.length,
@@ -2182,6 +2639,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       pushNameParticipants: episode.pushNameParticipants ?? [],
       uninterpretedMediaCount: episode.uninterpretedMediaCount ?? 0,
       quotedReplyAnchors: structuredClone(episode.quotedReplyAnchors ?? []),
+      archiveSignalAnchors: structuredClone(episode.archiveSignalAnchors ?? []),
       mediaGaps: structuredClone(episode.mediaGaps ?? []),
       createdAt: new Date().toISOString(),
       claims: episode.claims.map((claim) => ({
@@ -2377,7 +2835,8 @@ export class MemoryArchiveRepository implements ArchiveRepository {
         continue;
       }
       const cited = episode.claims.some((claim) => claim.citations.some((citation) => keys.has(citation.sourceMessageKey)));
-      if (!cited) {
+      const signalAnchored = episode.archiveSignalAnchors?.some((anchor) => keys.has(anchor.sourceMessageKey));
+      if (!cited && !signalAnchored) {
         continue;
       }
       episode.status = "stale";
@@ -2679,14 +3138,104 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       messageType: message.messageType,
       interpretation: interpretMessage({ messageType: message.messageType }),
       text: message.body ?? message.caption ?? null,
+      linkPreview: (() => {
+        const preview = this.linkPreviews.get(message.sourceMessageKey);
+        return preview
+          ? {
+              title: preview.title,
+              description: preview.description,
+              canonicalUrl: preview.canonicalUrl,
+              hasThumbnail: Boolean(preview.thumbnail?.length)
+            }
+          : null;
+      })(),
       isForwarded: Boolean(message.isForwarded),
       quotedSourceMessageId: message.quotedSourceMessageId ?? null,
       quotedSnapshot: this.quoteSummary(message),
+      structuredSignals: this.structuredSignals(message),
       reactions: [],
       // Label provenance (contract v2): the label above resolved from the
       // self-set push name because no saved display name exists.
       senderNameIsPushName: Boolean(!sender?.displayName?.trim() && sender?.pushName?.trim())
     };
+  }
+
+  private structuredSignals(message: MessageRecord & { id: number }): MessageStructuredSignals | null {
+    const location = this.locations.get(message.sourceMessageKey) ?? null;
+    const vcards = [...this.vcards.values()]
+      .filter((row) => row.sourceMessageKey === message.sourceMessageKey)
+      .sort((a, b) => a.cardIndex - b.cardIndex)
+      .map((row) => ({ displayName: row.displayName, resolvedJid: row.resolvedJid }));
+    const deletion = this.deletions.get(message.sourceMessageKey) ?? null;
+    const edits = [...this.editEvents.values()].filter((row) => row.sourceMessageKey === message.sourceMessageKey);
+    const interpretations = [...this.mediaInterpretations.values()]
+      .filter((row) => row.sourceMessageKey === message.sourceMessageKey)
+      .sort((a, b) => a.segmentIndex - b.segmentIndex)
+      .map((row) => ({ kind: row.kind, text: row.text, segmentIndex: row.segmentIndex }));
+    const revisions = this.editRevisions.get(message.sourceMessageKey) ?? [];
+    const preview = this.linkPreviews.has(message.sourceMessageKey);
+    const mentionedJids = message.mentionedJids ?? [];
+    const captureVersion = Math.max(
+      location?.captureVersion ?? 0,
+      ...[...this.vcards.values()].filter((row) => row.sourceMessageKey === message.sourceMessageKey).map((row) => row.captureVersion),
+      deletion?.captureVersion ?? 0,
+      ...edits.map((row) => row.captureVersion),
+      ...[...this.mediaInterpretations.values()].filter((row) => row.sourceMessageKey === message.sourceMessageKey).map((row) => row.captureVersion),
+      preview || mentionedJids.length ? 1 : 0
+    );
+    if (!location && vcards.length === 0 && !deletion && edits.length === 0 && interpretations.length === 0 && !preview && mentionedJids.length === 0) return null;
+    return {
+      mentionedJids: [...mentionedJids],
+      location: location ? { latitude: location.latitude, longitude: location.longitude, name: location.name, address: location.address, isLive: location.isLive } : null,
+      vcards,
+      deletion: deletion ? { revokedByJid: deletion.revokedByJid, revokedAtMs: deletion.observedAtMs } : null,
+      edit: edits.length ? { observedAtMs: edits.reduce<number | null>((latest, row) => Math.max(latest ?? 0, row.observedAtMs ?? 0) || null, null), hasHeldRevision: revisions.length > 0 } : null,
+      mediaInterpretations: interpretations,
+      captureVersion: captureVersion || null
+    };
+  }
+
+  private systemEventsForMessage(message: MessageRecord & { id: number }) {
+    const sourceMessageKey = message.sourceMessageKey;
+    return summarizeSystemEvents({
+      numberChanges: [...this.numberChanges.values()].filter((record) => record.sourceMessageKey === sourceMessageKey),
+      membershipEvents: [...this.membershipEvents.values()].filter((record) => record.sourceMessageKey === sourceMessageKey),
+      chatMetadataHistory: [...this.chatMetadataHistory.values()].filter((record) => record.sourceMessageKey === sourceMessageKey),
+      displayNameForJid: (jid) => this.systemEventDisplayName(jid)
+    });
+  }
+
+  private systemEventDetails(
+    message: MessageRecord & { id: number },
+    observationsFor: (factKey: string, family: import("../../shared/types").ArchiveSignalObservation["family"]) => import("../../shared/types").ArchiveSignalObservation[]
+  ): MessageDetail["systemEvents"] {
+    const numberChanges = [...this.numberChanges.values()].filter((record) => record.sourceMessageKey === message.sourceMessageKey);
+    const membershipEvents = [...this.membershipEvents.values()].filter((record) => record.sourceMessageKey === message.sourceMessageKey);
+    const chatMetadataHistory = [...this.chatMetadataHistory.values()].filter((record) => record.sourceMessageKey === message.sourceMessageKey);
+    const details: MessageDetail["systemEvents"] = [];
+    const detailLabelForJid = (jid: string | null) => this.systemEventDisplayName(jid) ?? "Unknown";
+    for (const record of numberChanges) {
+      const summary = summarizeSystemEvents({ numberChanges: [record], membershipEvents: [], chatMetadataHistory: [], displayNameForJid: (jid) => this.systemEventDisplayName(jid) })[0];
+      if (summary) details.push({ kind: "number_change", eventKey: record.eventKey, summary: summary.summary, actorJid: record.actorJid, actorLabel: detailLabelForJid(record.actorJid), participantJid: null, participantLabel: null, oldJid: record.oldJid, oldIdentityLabel: detailLabelForJid(record.oldJid), newJid: record.newJid, newIdentityLabel: detailLabelForJid(record.newJid), oldValue: null, newValue: null, action: null, field: null, occurredAtMs: record.observedAtMs, rawType: null, rawParameters: null, observations: observationsFor(record.eventKey, "number_change") });
+    }
+    for (const record of membershipEvents) {
+      const summary = summarizeSystemEvents({ numberChanges: [], membershipEvents: [record], chatMetadataHistory: [], displayNameForJid: (jid) => this.systemEventDisplayName(jid) })[0];
+      if (summary) details.push({ kind: "membership", eventKey: record.eventKey, summary: summary.summary, actorJid: record.actorJid, actorLabel: detailLabelForJid(record.actorJid), participantJid: record.participantJid, participantLabel: detailLabelForJid(record.participantJid), oldJid: null, oldIdentityLabel: null, newJid: null, newIdentityLabel: null, oldValue: record.oldRole ?? null, newValue: record.newRole ?? null, action: record.action, field: null, occurredAtMs: record.observedAtMs, rawType: record.rawType ?? null, rawParameters: record.rawParameters ?? null, observations: observationsFor(record.eventKey, "membership_event") });
+    }
+    for (const record of chatMetadataHistory) {
+      const summary = summarizeSystemEvents({ numberChanges: [], membershipEvents: [], chatMetadataHistory: [record], displayNameForJid: (jid) => this.systemEventDisplayName(jid) })[0];
+      if (summary) details.push({ kind: "chat_metadata", eventKey: record.eventKey, summary: summary.summary, actorJid: record.actorJid, actorLabel: detailLabelForJid(record.actorJid), participantJid: null, participantLabel: null, oldJid: null, oldIdentityLabel: null, newJid: null, newIdentityLabel: null, oldValue: record.oldValue, newValue: record.newValue, action: null, field: record.field, occurredAtMs: record.observedAtMs, rawType: record.rawType ?? null, rawParameters: record.rawParameters ?? null, observations: observationsFor(record.eventKey, "chat_metadata") });
+    }
+    return details.sort((a, b) => (a.occurredAtMs ?? 0) - (b.occurredAtMs ?? 0));
+  }
+
+  private systemEventDisplayName(jid: string | null): string | null {
+    if (jid === "me") {
+      return "You";
+    }
+    const canonical = jid ? this.canonicalJid(jid) ?? jid : null;
+    const contact = canonical ? this.contacts.get(canonical) : null;
+    return resolveDisplayLabel({ displayName: contact?.displayName, pushName: contact?.pushName, phoneNumber: contact?.phoneNumber, jid: canonical });
   }
 
   private attachReactions(evidence: MemoryEvidenceMessage[]): void {

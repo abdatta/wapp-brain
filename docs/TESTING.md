@@ -73,6 +73,8 @@ The test suite covers:
 - provider-disabled refusal for Codex generation
 - layered memory query across committed pages and short-term messages
 - stale citation marking after archive replacement
+- structured signal capture across legacy, modern, iOS-shaped, malformed, and large receipt/history fixtures
+- backup/live canonical parity, signal-anchor staleness, regeneration, and public-DTO privacy canaries for vCards, coordinates, transcripts, and receipt data
 
 ## Fixture Policy
 
@@ -107,6 +109,10 @@ The local UI should make it easy to verify:
 - timestamps are plausible
 - warnings are visible but privacy-safe
 - re-running import does not duplicate rows
+- structured locations/cards/previews/edits appear as safe thread summaries, while exact coordinates, vCard bodies, and transcript text do not appear in status or message-list payloads
+- opening a compact location, vCard, deletion, transcript, edit, or system-event control lazy-loads its complete local detail; Escape closes the dialog and vCard downloads remain local/no-store
+- group summaries name an actor only when that role was verified; missing roles say `Unknown/Unresolved contact`, and ambiguous backup self-membership flags never display as `You`
+- a small local brain regeneration keeps citations stable, labels source-provided media interpretation honestly, and does not expose receipt data
 - running memory REM creates Markdown under `.wapp-brain/memory/pages`
 - memory pages include YAML front matter and citation labels
 - memory query can find committed memory and current short-term messages

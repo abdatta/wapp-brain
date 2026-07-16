@@ -1,4 +1,5 @@
 import type {
+  ArchiveSignalBatch,
   CapturedLinkPreview,
   CapturedMediaDescriptor,
   ChatRecord,
@@ -72,6 +73,9 @@ export interface LiveMessageEvent {
   mediaDescriptors?: CapturedMediaDescriptor[];
   // Sender-embedded link previews (title/description/URL/thumbnail bytes).
   linkPreviews?: CapturedLinkPreview[];
+  // Normalized source-provided structured observations. These deliberately
+  // contain no fetched or model-derived media interpretation.
+  archiveSignals?: ArchiveSignalBatch;
   rawMetadata?: Record<string, unknown> | null;
 }
 

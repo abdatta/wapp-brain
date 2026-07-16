@@ -844,22 +844,95 @@ h1 {
 .systemChip {
   justify-self: center;
   display: inline-flex;
-  align-items: center;
-  gap: 8px;
+  align-items: stretch;
   max-width: min(540px, 92%);
+  overflow: hidden;
   border-radius: 7px;
   background: #1b2928;
   color: #bdd0cb;
   font-size: 12px;
   line-height: 1.35;
-  padding: 6px 9px;
   text-align: center;
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.18);
 }
 
 .systemChip time {
+  display: flex;
+  align-items: center;
+  padding: 6px 9px 6px 4px;
   color: #8fa19c;
   white-space: nowrap;
+}
+
+.detailDisclosure {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  border: 0;
+  border-radius: 6px;
+  background: rgba(117, 211, 154, 0.12);
+  color: #a8e7c0;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1;
+  padding: 5px 7px;
+  cursor: pointer;
+}
+
+.detailDisclosure:hover {
+  background: rgba(117, 211, 154, 0.22);
+}
+
+.systemEventTrigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  padding: 6px 5px 6px 10px;
+  text-align: center;
+  font: inherit;
+  cursor: pointer;
+}
+
+.systemEventTrigger:hover,
+.systemEventTrigger:focus-visible {
+  background: rgba(117, 211, 154, 0.1);
+  outline: 0;
+}
+
+.systemEventTrigger:focus-visible {
+  box-shadow: inset 0 0 0 1px rgba(117, 211, 154, 0.5);
+}
+
+.systemEventDetails {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.systemEventDetails span,
+.systemEventDetails strong,
+.systemEventDetails small {
+  overflow-wrap: anywhere;
+}
+
+.systemEventDetails strong {
+  color: #dcebe5;
+  font-size: 12px;
+}
+
+.systemEventDetails small {
+  color: #91b8a3;
+  font-size: 10px;
+}
+
+.systemEventInfo {
+  flex: none;
+  color: #7fa692;
 }
 
 .messageMeta {
@@ -1057,6 +1130,67 @@ h1 {
   padding: 4px 7px;
 }
 
+.structuredSignals {
+  display: grid;
+  gap: 6px;
+  margin-top: 8px;
+  color: #9fb2aa;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.structuredCard {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  border: 1px solid rgba(117, 211, 154, 0.17);
+  border-radius: 7px;
+  background: rgba(8, 20, 19, 0.24);
+  color: #cfe1da;
+  padding: 7px 8px;
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+}
+
+.structuredCard:hover {
+  background: rgba(117, 211, 154, 0.11);
+  border-color: rgba(117, 211, 154, 0.35);
+}
+
+.structuredCard > svg:first-child {
+  color: #78d9a0;
+}
+
+.structuredCard > span {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.structuredCard strong,
+.structuredCard small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.structuredCard strong {
+  color: #e5f5ed;
+  font-size: 12px;
+}
+
+.structuredCard small {
+  color: #9db4aa;
+  font-size: 11px;
+}
+
+.detailDisclosure {
+  justify-self: start;
+}
+
 /* Archived media inside bubbles */
 .metaRight {
   display: inline-flex;
@@ -1066,7 +1200,6 @@ h1 {
 
 .messageBubble.deleted {
   border-style: dashed;
-  opacity: 0.92;
 }
 
 .deletedChip,
@@ -1089,14 +1222,21 @@ h1 {
   border: none;
 }
 
+.deletedChip.clickable,
 .editedChip.clickable {
+  border: none;
   cursor: pointer;
   font: inherit;
   font-size: 10px;
 }
 
-.editedChip.clickable:hover {
+.deletedChip.clickable:hover,
+.editedChip.clickable:hover,
+.deletedChip.clickable:focus-visible,
+.editedChip.clickable:focus-visible {
   background: rgba(255, 255, 255, 0.16);
+  outline: 1px solid rgba(117, 211, 154, 0.42);
+  outline-offset: 1px;
 }
 
 /* Edit history is a modal timeline (a fixed overlay, so it never clips against
@@ -1109,8 +1249,471 @@ h1 {
   border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: 12px;
   background: #141b1a;
+  isolation: isolate;
   box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
   overflow: hidden;
+}
+
+.messageDetailModal {
+  width: min(720px, 96vw);
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 12px;
+  background: #141b1a;
+  isolation: isolate;
+  color: #e7f0ec;
+  text-align: left;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.54);
+  overflow: hidden;
+}
+
+.detailModalHeader {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 18px 20px 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.detailModalHeader h2 {
+  margin: 6px 0 0;
+  font-size: 18px;
+}
+
+.detailModalHeader p {
+  max-width: 560px;
+  margin: 4px 0 0;
+  color: #8fa19c;
+  font-size: 12px;
+}
+
+.messageDetailContent {
+  display: grid;
+  gap: 14px;
+  overflow-y: auto;
+  padding: 16px 20px 22px;
+}
+
+.detailSection {
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.025);
+  padding: 12px;
+}
+
+.detailSection h3 {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0 0 10px;
+  color: #d9eee4;
+  font-size: 14px;
+}
+
+.detailSectionHeading {
+  margin-bottom: 10px;
+}
+
+.detailSectionHeading h3 {
+  margin-bottom: 0;
+}
+
+.detailKind {
+  display: block;
+  margin-bottom: 5px;
+  color: #7fa692;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.systemEventDetailCard {
+  border-color: rgba(117, 211, 154, 0.16);
+  background: linear-gradient(145deg, rgba(117, 211, 154, 0.045), rgba(255, 255, 255, 0.018));
+}
+
+.systemEventDetailCard.compact {
+  padding: 10px 12px;
+}
+
+.systemEventDetailCard.compact .detailSectionHeading {
+  margin-bottom: 7px;
+}
+
+.systemEventDetailCard.compact .detailSectionHeading h3 {
+  font-size: 13px;
+}
+
+.locationDetailHero {
+  display: grid;
+  justify-items: start;
+  gap: 8px;
+  padding: 16px;
+  border: 1px solid rgba(117, 211, 154, 0.2);
+  border-radius: 10px;
+  background: radial-gradient(circle at top right, rgba(117, 211, 154, 0.12), transparent 45%), #162220;
+}
+
+.locationTypeBadge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border-radius: 999px;
+  background: rgba(117, 211, 154, 0.13);
+  color: #a5e7bf;
+  padding: 4px 7px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.coordinatePair {
+  color: #effaf5;
+  font-size: clamp(18px, 3.4vw, 26px);
+  line-height: 1.15;
+  overflow-wrap: anywhere;
+}
+
+.locationPlace {
+  display: grid;
+  gap: 2px;
+  color: #aebeb8;
+  font-size: 12px;
+}
+
+.locationPlace strong {
+  color: #e1eee8;
+  font-size: 14px;
+}
+
+.detailFactCards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 8px;
+}
+
+.detailFactCards > div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.035);
+  padding: 9px 10px;
+}
+
+.detailFactCards span {
+  color: #8fa19c;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.detailFactCards strong {
+  color: #e2eee8;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.quietDetailSection {
+  background: transparent;
+  padding: 0 12px;
+}
+
+.detailTechnicalDisclosure {
+  margin: 0;
+  padding: 10px 0;
+  border-top: 0;
+}
+
+.locationObservation {
+  display: grid;
+  gap: 6px;
+  border-left: 2px solid rgba(117, 211, 154, 0.28);
+  padding-left: 9px;
+}
+
+.locationObservation > span {
+  color: #a9dfbe;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.contactDetailHero {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.contactDetailHero h3 {
+  margin: 0;
+}
+
+.detailIcon {
+  width: 38px;
+  height: 38px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: rgba(117, 211, 154, 0.13);
+  color: #94e4b4;
+}
+
+.deletionTimeline {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid rgba(235, 161, 151, 0.19);
+  border-radius: 10px;
+  background: linear-gradient(135deg, rgba(235, 161, 151, 0.06), rgba(255, 255, 255, 0.02));
+}
+
+.deletionTimeline > div {
+  display: grid;
+  gap: 4px;
+}
+
+.deletionTimeline > div:last-of-type {
+  text-align: right;
+}
+
+.deletionTimeline div span {
+  color: #9aa9a4;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.deletionTimeline div strong {
+  color: #edf4f1;
+  font-size: 12px;
+}
+
+.deletionTimeline > svg {
+  color: #b88e89;
+}
+
+.elapsedBadge {
+  position: absolute;
+  left: 50%;
+  bottom: -9px;
+  transform: translateX(-50%);
+  border: 1px solid rgba(235, 161, 151, 0.18);
+  border-radius: 999px;
+  background: #1e2423;
+  color: #d8aaa4;
+  padding: 3px 7px;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.detailNotice {
+  margin: 0;
+  border-radius: 8px;
+  padding: 10px 11px;
+  color: #bdcbc5;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.detailNotice.neutral {
+  border: 1px solid rgba(174, 190, 184, 0.12);
+  background: rgba(174, 190, 184, 0.055);
+}
+
+.detailNotice.success {
+  border: 1px solid rgba(117, 211, 154, 0.17);
+  background: rgba(117, 211, 154, 0.07);
+  color: #c9e5d4;
+}
+
+.interpretationPrimary p {
+  margin: 0 0 10px;
+  color: #edf4f1;
+  font-size: 14px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
+.interpretationPrimary small {
+  color: #84968f;
+  font-size: 10px;
+}
+
+.transcriptSegments details > summary {
+  margin-top: 0;
+}
+
+.detailFieldGrid {
+  display: grid;
+  grid-template-columns: minmax(110px, 0.42fr) minmax(0, 1fr);
+  gap: 5px 12px;
+  margin: 0;
+  font-size: 12px;
+}
+
+.detailFieldGrid dt {
+  color: #8fa19c;
+}
+
+.detailFieldGrid dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: #e2ece7;
+}
+
+.detailEmpty,
+.detailError {
+  margin: 0;
+  color: #aabbb4;
+  font-size: 12px;
+}
+
+.detailError {
+  padding: 20px;
+  color: #f1b1a9;
+}
+
+.detailList,
+.vcardProperties {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.vcardProperties > div,
+.interpretationDetail {
+  display: grid;
+  gap: 3px;
+  border-left: 2px solid rgba(117, 211, 154, 0.35);
+  padding-left: 8px;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+.vcardPrimaryFields {
+  margin-top: 14px;
+}
+
+.vcardPrimaryFields .detailKind {
+  margin-bottom: 7px;
+}
+
+.vcardProperties strong,
+.interpretationDetail strong {
+  color: #a9e0bc;
+}
+
+.interpretationDetail small {
+  color: #8fa19c;
+}
+
+.detailDownload {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: fit-content;
+  margin-top: 10px;
+  color: #91e8b5;
+  font-size: 12px;
+}
+
+.sourcePayload {
+  max-height: 260px;
+  overflow: auto;
+  padding: 10px;
+  border-radius: 6px;
+  background: #0e1415;
+  color: #d5e6de;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.detailSection details > summary {
+  margin-top: 10px;
+  color: #9be5b9;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.technicalDetails {
+  margin-top: 10px;
+  padding-top: 9px;
+  border-top: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.technicalDetails > summary {
+  margin-top: 0 !important;
+  color: #91b8a3 !important;
+}
+
+.technicalDetails > .detailFieldGrid,
+.technicalDetails > .detailList {
+  margin-top: 10px;
+}
+
+.identityList {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.identityList code {
+  padding: 4px 7px;
+  border-radius: 5px;
+  background: #0e1415;
+  color: #b8d9c8;
+  font-size: 11px;
+}
+
+.editTimelineUnavailable {
+  margin: 7px 0 0;
+  color: #9eaaa5;
+  font-size: 12px;
+  font-style: italic;
+}
+
+.timelineSource {
+  display: block;
+  margin-top: 6px;
+  color: #7f918a;
+  font-size: 10px;
+}
+
+.editHistoryBody {
+  overflow-y: auto;
+  padding: 14px 18px 18px;
+}
+
+.editHistoryBody .editTimeline {
+  overflow: visible;
+  padding: 0;
+}
+
+.editHistoryNotice {
+  margin-bottom: 12px;
+}
+
+.editFactLine {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.editFactLine svg {
+  color: #668178;
 }
 
 .editHistoryModalHeader {
@@ -2374,6 +2977,35 @@ button.fileButton:disabled {
 
   .messageBubble {
     max-width: 92%;
+  }
+
+  .messageDetailModal,
+  .editHistoryModal {
+    width: min(96vw, 720px);
+    max-height: 92vh;
+  }
+
+  .detailModalHeader,
+  .editHistoryModalHeader {
+    padding-inline: 15px;
+  }
+
+  .messageDetailContent {
+    padding-inline: 15px;
+  }
+
+  .deletionTimeline {
+    grid-template-columns: 1fr;
+    justify-items: start;
+    padding-bottom: 26px;
+  }
+
+  .deletionTimeline > div:last-of-type {
+    text-align: left;
+  }
+
+  .deletionTimeline > svg {
+    transform: rotate(90deg);
   }
 
   .wizardSteps,

@@ -1,5 +1,8 @@
 import type Database from "better-sqlite3";
+import { ARCHIVE_SIGNAL_CAPTURE_VERSION } from "../../shared/types";
 import type {
+  ArchiveSignalBatch,
+  CapturedLinkPreview,
   ChatRecord,
   ContactRecord,
   ImportWarning,
@@ -9,6 +12,7 @@ import type {
   MessageSecretRecord,
   ParticipantRecord,
   QuotedMessageSnapshot
+  ,VCardProperty
 } from "../../shared/types";
 import { inferChatType, isMaskedNumberLabel, normalizeJid, phoneFromJid } from "./jid";
 import { boolish, directionFromFromMe, isMediaMessageType, messageTypeFromCode, normalizeTimestampMs } from "./messageTypes";
@@ -119,6 +123,13 @@ export interface ParsedWhatsAppSource {
   // Media sidecar mappings (message_media, message_view_once_media, thumbnail
   // tables) used to match files in the user-provided media folder.
   iterateMediaRefs: () => IterableIterator<ImportMediaRef>;
+  // Source-derived structured signals are collected only after canonical
+  // messages are persisted, so every message-owned record has a stable local
+  // anchor. Optional tables never make an otherwise valid import fail.
+  getArchiveSignalBatch: () => ArchiveSignalBatch;
+  // Backup-supplied previews use the existing local-only preview contract;
+  // thumbnails are embedded source bytes and are never fetched from the URL.
+  iterateLinkPreviews: () => IterableIterator<CapturedLinkPreview>;
   // Available after iterateMessages completes: stale edit-key identities to
   // collapse onto their canonical (original-key) rows.
   getEditRekeys: () => Array<{ chatSourceId: string; staleMessageId: string; canonicalMessageId: string }>;
@@ -292,6 +303,14 @@ export function parseWhatsAppSource(
           downloadDescriptor
         };
       }
+    },
+    getArchiveSignalBatch: () =>
+      collectBackupSignalBatch(msgstoreDb, msgInspection, jidMap, chatRowJidMap, sidecars, warnings, sourceFingerprint ?? null),
+    iterateLinkPreviews: function* () {
+      if (adapter !== "modern") {
+        return;
+      }
+      yield* iterateBackupLinkPreviews(msgstoreDb, msgInspection, jidMap, chatRowJidMap, sidecars, warnings, sourceFingerprint ?? null);
     },
     getParticipants: () => [...participantMap.values()],
     getSkippedRows: () => skippedRows,
@@ -733,7 +752,7 @@ interface InterpretationSidecars {
   templates: Map<number, { contentText: string | null; footerText: string | null; buttons: string[] }>;
   uiElements: Map<number, SqlRow>;
   groupInvites: Map<number, SqlRow>;
-  revoked: Map<number, { revokedByJid: string | null; revokedAtMs: number | null }>;
+  revoked: Map<number, { revokedByJid: string | null; revokedByAdmin: boolean | null; deletionKind: string | null; revokedAtMs: number | null }>;
   calls: Map<number, { videoCall: boolean; durationSeconds: number | null; missed: boolean }>;
   // Android re-keys an edited message in place: the row's key_id becomes the
   // latest edit's key while message_edit_info preserves the original. Live
@@ -752,6 +771,9 @@ interface InterpretationSidecars {
   // Current Android schemas put the reply's own message row id on
   // message_quoted, rather than putting a quoted-row pointer on message.
   quotedSnapshotsByReplyRowId: Map<number, QuotedMessageSnapshot>;
+  // Explicit envelope mentions are authoritative. The derived text-token
+  // parser runs later only as a fallback for messages that lack this data.
+  mentions: Map<number, string[]>;
 }
 
 interface MediaSidecarInfo {
@@ -772,6 +794,8 @@ interface MediaSidecarInfo {
   url: string | null;
   mediaKeyTimestamp: number | null;
   fileLength: number | null;
+  accessibilityLabel: string | null;
+  rawTranscriptionText: string | null;
 }
 
 function loadInterpretationSidecars(
@@ -794,7 +818,8 @@ function loadInterpretationSidecars(
     editRekeys: [],
     media: new Map(),
     quotedSnapshots: new Map(),
-    quotedSnapshotsByReplyRowId: new Map()
+    quotedSnapshotsByReplyRowId: new Map(),
+    mentions: new Map()
   };
   const rowsOf = (table: string, columns: string[]): SqlRow[] => {
     if (!hasColumns(inspection, table, columns)) {
@@ -850,6 +875,8 @@ function loadInterpretationSidecars(
     const revokedAtMs = normalizeTimestampMs(row.revoke_timestamp);
     sidecars.revoked.set(Number(row.message_row_id), {
       revokedByJid: adminRowId == null ? null : jidMap.get(adminRowId) ?? null,
+      revokedByAdmin: adminRowId == null ? null : true,
+      deletionKind: adminRowId == null ? null : "admin_revoke",
       revokedAtMs
     });
   }
@@ -882,8 +909,24 @@ function loadInterpretationSidecars(
   for (const row of rowsOf("message_edit_info", ["message_row_id", "original_key_id"])) {
     sidecars.edits.set(Number(row.message_row_id), {
       originalKeyId: stringOrNull(row.original_key_id),
-      editedAtMs: normalizeTimestampMs(row.edited_timestamp ?? row.sender_timestamp)
+      // sender_timestamp is the edit transition time carried by WhatsApp's
+      // protocol message and is the value live sync can observe as
+      // ProtocolMessage.timestampMs. edited_timestamp is the server-side
+      // companion and remains the compatibility fallback.
+      editedAtMs: normalizeTimestampMs(row.sender_timestamp ?? row.edited_timestamp)
     });
+  }
+  for (const row of rowsOf("message_mentions", ["message_row_id", "jid_row_id"])) {
+    const messageRowId = Number(row.message_row_id);
+    const jid = jidMap.get(Number(row.jid_row_id));
+    if (!Number.isFinite(messageRowId) || !jid) {
+      continue;
+    }
+    const mentions = sidecars.mentions.get(messageRowId) ?? [];
+    if (!mentions.includes(jid)) {
+      mentions.push(jid);
+      sidecars.mentions.set(messageRowId, mentions);
+    }
   }
   // Media mappings can run to hundreds of thousands of rows; stream only the
   // columns that exist. message_view_once_media mirrors message_media's shape
@@ -902,6 +945,810 @@ function loadInterpretationSidecars(
   return sidecars;
 }
 
+interface SignalMessageAnchor {
+  rowId: number;
+  chatSourceId: string;
+  sourceMessageId: string;
+  sourceMessageKey: string;
+  observedAtMs: number | null;
+  senderJid: string | null;
+  keyId: string | null;
+}
+
+function signalProvenance(sourceEventKey: string, observedAtMs: number | null) {
+  return {
+    source: "backup" as const,
+    sourceEventKey,
+    observedAtMs,
+    captureVersion: ARCHIVE_SIGNAL_CAPTURE_VERSION
+  };
+}
+
+// All signal readers share this narrow boundary: only checked, allowlisted
+// columns are selected; a companion-table failure remains local to that family
+// and warnings deliberately omit values, raw rows, and database errors.
+function readOptionalSignalFamily<T>(
+  warnings: ImportWarning[],
+  family: string,
+  sourceTable: string,
+  read: () => T
+): T | null {
+  try {
+    return read();
+  } catch {
+    warnings.push({
+      severity: "warning",
+      code: `SIGNAL_${family}_SKIPPED`,
+      entityType: "message",
+      sourceTable,
+      message: `A supported optional ${family.toLowerCase().replace(/_/g, " ")} companion was skipped.`
+    });
+    return null;
+  }
+}
+
+function buildSignalMessageAnchors(
+  db: Database.Database,
+  inspection: SQLiteInspection,
+  jidMap: Map<number, string>,
+  chatRowJidMap: Map<number, string>,
+  sidecars: InterpretationSidecars,
+  sourceFingerprint: string | null
+): Map<number, SignalMessageAnchor> {
+  const anchors = new Map<number, SignalMessageAnchor>();
+  if (!hasColumns(inspection, "message", ["_id", "chat_row_id"])) {
+    return anchors;
+  }
+  const columns = columnsFor(inspection, "message");
+  const selected = ["_id", "chat_row_id", "key_id", "timestamp", "received_timestamp", "sender_jid_row_id", "from_me", "key_from_me"].filter(
+    (column) => columns.has(column)
+  );
+  const rows = db
+    .prepare(`SELECT ${selected.map(quoteIdentifier).join(", ")} FROM message ORDER BY _id ASC`)
+    .iterate() as Iterable<SqlRow>;
+  for (const row of rows) {
+    const rowId = Number(row._id);
+    const chatSourceId = chatRowJidMap.get(Number(row.chat_row_id));
+    if (!Number.isFinite(rowId) || !chatSourceId) {
+      continue;
+    }
+    const keyId = stringOrNull(row.key_id);
+    const originalKeyId = sidecars.edits.get(rowId)?.originalKeyId;
+    const sourceMessageId = originalKeyId ?? keyId ?? surrogateMessageId("modern", String(rowId), sourceFingerprint);
+    anchors.set(rowId, {
+      rowId,
+      chatSourceId,
+      sourceMessageId,
+      sourceMessageKey: messageKey(chatSourceId, sourceMessageId),
+      observedAtMs: normalizeTimestampMs(row.timestamp ?? row.received_timestamp),
+      senderJid: boolish(row.from_me ?? row.key_from_me) ? "me" : jidMap.get(Number(row.sender_jid_row_id)) ?? null,
+      keyId
+    });
+  }
+  return anchors;
+}
+
+function collectBackupSignalBatch(
+  db: Database.Database,
+  inspection: SQLiteInspection,
+  jidMap: Map<number, string>,
+  chatRowJidMap: Map<number, string>,
+  sidecars: InterpretationSidecars,
+  warnings: ImportWarning[],
+  sourceFingerprint: string | null
+): ArchiveSignalBatch {
+  const anchors = buildSignalMessageAnchors(db, inspection, jidMap, chatRowJidMap, sidecars, sourceFingerprint);
+  const batch: ArchiveSignalBatch = {
+    numberChanges: [],
+    membershipPeriods: [],
+    membershipEvents: [],
+    chatMetadataHistory: [],
+    locations: [],
+    locationObservations: [],
+    vcards: [],
+    editEvents: [],
+    deletions: [],
+    mediaInterpretations: [],
+    engagementAggregates: []
+  };
+  if (anchors.size === 0) {
+    return batch;
+  }
+
+  readLocations(db, inspection, anchors, warnings, batch);
+  readVcards(db, inspection, jidMap, anchors, warnings, batch);
+  readNumberChanges(db, inspection, jidMap, anchors, warnings, batch);
+  readGroupSignalHistory(db, inspection, jidMap, chatRowJidMap, anchors, warnings, batch);
+  readEditAndDeletionSignals(anchors, sidecars, batch);
+  readMediaInterpretations(db, inspection, anchors, sidecars, warnings, batch);
+  readEngagementAggregates(db, inspection, chatRowJidMap, warnings, batch);
+  return batch;
+}
+
+function readLocations(
+  db: Database.Database,
+  inspection: SQLiteInspection,
+  anchors: Map<number, SignalMessageAnchor>,
+  warnings: ImportWarning[],
+  batch: ArchiveSignalBatch
+): void {
+  if (!hasColumns(inspection, "message_location", ["message_row_id"])) return;
+  readOptionalSignalFamily(warnings, "LOCATIONS", "message_location", () => {
+    const columns = columnsFor(inspection, "message_location");
+    const selected = [
+      "message_row_id", "latitude", "longitude", "degrees_latitude", "degrees_longitude", "place_name", "place_address", "name", "address",
+      "url", "place_url", "comment", "caption", "accuracy", "accuracy_in_meters", "speed", "speed_mps", "heading", "heading_degrees",
+      "live_location_share_duration", "live_location_sequence_number", "live_location_final_timestamp", "time_offset", "time_offset_ms", "jpeg_thumbnail", "thumbnail"
+    ].filter((column) => columns.has(column));
+    let skippedMalformedRow = false;
+    for (const row of db.prepare(`SELECT ${selected.map(quoteIdentifier).join(", ")} FROM message_location`).iterate() as Iterable<SqlRow>) {
+      const anchor = anchors.get(Number(row.message_row_id));
+      if (!anchor) {
+        skippedMalformedRow = true;
+        continue;
+      }
+      const latitude = finiteNumberOrNull(row.latitude ?? row.degrees_latitude);
+      const longitude = finiteNumberOrNull(row.longitude ?? row.degrees_longitude);
+      const name = stringOrNull(row.place_name ?? row.name);
+      const address = stringOrNull(row.place_address ?? row.address);
+      // Android msgstore records this duration in seconds (for example 3599
+      // for a one-hour share). The archive contract is milliseconds so backup
+      // and live observations can converge without leaking source-unit quirks
+      // into the UI.
+      const durationSeconds = finiteNumberOrNull(row.live_location_share_duration);
+      const durationMs = durationSeconds == null ? null : Math.round(durationSeconds * 1000);
+      const sequence = finiteNumberOrNull(row.live_location_sequence_number);
+      const finalAtMs = normalizeTimestampMs(row.live_location_final_timestamp);
+      const url = stringOrNull(row.url ?? row.place_url);
+      const comment = stringOrNull(row.comment);
+      const caption = stringOrNull(row.caption);
+      if (latitude == null && longitude == null && !name && !address && !url && !comment && !caption) {
+        skippedMalformedRow = true;
+        continue;
+      }
+      const provenance = signalProvenance(`backup:message_location:${anchor.rowId}`, anchor.observedAtMs);
+      const isLive = durationSeconds != null || sequence != null || finalAtMs != null;
+      batch.locations?.push({
+        sourceMessageKey: anchor.sourceMessageKey,
+        latitude,
+        longitude,
+        name,
+        address,
+        isLive,
+        accuracyMeters: finiteNumberOrNull(row.accuracy ?? row.accuracy_in_meters),
+        url,
+        comment,
+        caption,
+        speedMps: finiteNumberOrNull(row.speed_mps ?? row.speed),
+        headingDegrees: finiteNumberOrNull(row.heading_degrees ?? row.heading),
+        sequenceNumber: sequence,
+        timeOffsetMs: finiteNumberOrNull(row.time_offset_ms ?? row.time_offset),
+        liveShareDurationMs: durationMs,
+        finalAtMs,
+        hasThumbnail: row.jpeg_thumbnail != null || row.thumbnail != null,
+        ...provenance
+      });
+      if (isLive) {
+        batch.locationObservations?.push({
+          observationKey: `backup:location-observation:${anchor.sourceMessageKey}:${sequence ?? anchor.observedAtMs ?? "unknown"}`,
+          sourceMessageKey: anchor.sourceMessageKey,
+          latitude,
+          longitude,
+          accuracyMeters: finiteNumberOrNull(row.accuracy ?? row.accuracy_in_meters),
+          speedMps: finiteNumberOrNull(row.speed_mps ?? row.speed),
+          headingDegrees: finiteNumberOrNull(row.heading_degrees ?? row.heading),
+          sequenceNumber: sequence,
+          timeOffsetMs: finiteNumberOrNull(row.time_offset_ms ?? row.time_offset),
+          finalAtMs,
+          hasThumbnail: row.jpeg_thumbnail != null || row.thumbnail != null,
+          ...provenance
+        });
+      }
+    }
+    if (skippedMalformedRow) {
+      warnings.push({
+        severity: "warning",
+        code: "SIGNAL_LOCATIONS_ROW_SKIPPED",
+        entityType: "message",
+        sourceTable: "message_location",
+        message: "One or more optional location rows could not be safely linked or interpreted."
+      });
+    }
+  });
+}
+
+function readVcards(
+  db: Database.Database,
+  inspection: SQLiteInspection,
+  jidMap: Map<number, string>,
+  anchors: Map<number, SignalMessageAnchor>,
+  warnings: ImportWarning[],
+  batch: ArchiveSignalBatch
+): void {
+  if (!hasColumns(inspection, "message_vcard", ["message_row_id", "vcard"])) return;
+  readOptionalSignalFamily(warnings, "VCARDS", "message_vcard", () => {
+    const jidByVcardRow = new Map<number, string>();
+    if (hasColumns(inspection, "message_vcard_jid", ["vcard_row_id", "vcard_jid_row_id"])) {
+      for (const row of db
+        .prepare("SELECT vcard_row_id, vcard_jid_row_id FROM message_vcard_jid")
+        .iterate() as Iterable<SqlRow>) {
+        const jid = jidMap.get(Number(row.vcard_jid_row_id));
+        if (jid) jidByVcardRow.set(Number(row.vcard_row_id), jid);
+      }
+    }
+    const columns = columnsFor(inspection, "message_vcard");
+    const selected = ["_id", "message_row_id", "vcard"].filter((column) => columns.has(column));
+    const nextIndex = new Map<string, number>();
+    let skippedMalformedRow = false;
+    for (const row of db.prepare(`SELECT ${selected.map(quoteIdentifier).join(", ")} FROM message_vcard ORDER BY ${columns.has("_id") ? "_id" : "message_row_id"} ASC`).iterate() as Iterable<SqlRow>) {
+      const anchor = anchors.get(Number(row.message_row_id));
+      const vcard = typeof row.vcard === "string" && row.vcard.length ? row.vcard : null;
+      if (!anchor || !vcard) {
+        skippedMalformedRow = true;
+        continue;
+      }
+      const cardIndex = nextIndex.get(anchor.sourceMessageKey) ?? 0;
+      nextIndex.set(anchor.sourceMessageKey, cardIndex + 1);
+      batch.vcards?.push({
+        sourceMessageKey: anchor.sourceMessageKey,
+        cardIndex,
+        displayName: displayNameFromVcard(vcard),
+        vcard,
+        resolvedJid: jidByVcardRow.get(Number(row._id)) ?? null,
+        properties: parseVcardProperties(vcard),
+        downloadKind: "source",
+        downloadFileName: vcardFileName(displayNameFromVcard(vcard), cardIndex),
+        ...signalProvenance(`backup:message_vcard:${row._id ?? `${anchor.rowId}:${cardIndex}`}`, anchor.observedAtMs)
+      });
+    }
+    if (skippedMalformedRow) {
+      warnings.push({
+        severity: "warning",
+        code: "SIGNAL_VCARDS_ROW_SKIPPED",
+        entityType: "message",
+        sourceTable: "message_vcard",
+        message: "One or more optional contact-card rows could not be safely linked or interpreted."
+      });
+    }
+  });
+}
+
+function readNumberChanges(
+  db: Database.Database,
+  inspection: SQLiteInspection,
+  jidMap: Map<number, string>,
+  anchors: Map<number, SignalMessageAnchor>,
+  warnings: ImportWarning[],
+  batch: ArchiveSignalBatch
+): void {
+  if (!hasColumns(inspection, "message_system_number_change", ["message_row_id", "old_jid_row_id", "new_jid_row_id"])) return;
+  readOptionalSignalFamily(warnings, "NUMBER_CHANGES", "message_system_number_change", () => {
+    for (const row of db
+      .prepare("SELECT message_row_id, old_jid_row_id, new_jid_row_id FROM message_system_number_change")
+      .iterate() as Iterable<SqlRow>) {
+      const anchor = anchors.get(Number(row.message_row_id));
+      const oldJid = jidMap.get(Number(row.old_jid_row_id));
+      const newJid = jidMap.get(Number(row.new_jid_row_id));
+      if (!anchor || !oldJid || !newJid || oldJid === newJid) continue;
+      batch.numberChanges?.push({
+        eventKey: `backup:number-change:${anchor.sourceMessageKey}`,
+        chatSourceId: anchor.chatSourceId,
+        sourceMessageKey: anchor.sourceMessageKey,
+        oldJid,
+        newJid,
+        // The number-change companion identifies the changed identity, not
+        // necessarily an independent actor. Do not turn the message sender
+        // into a grammatical actor without an explicit source role.
+        actorJid: null,
+        ...signalProvenance(`backup:message_system_number_change:${anchor.rowId}`, anchor.observedAtMs)
+      });
+    }
+  });
+}
+
+function readGroupSignalHistory(
+  db: Database.Database,
+  inspection: SQLiteInspection,
+  jidMap: Map<number, string>,
+  chatRowJidMap: Map<number, string>,
+  anchors: Map<number, SignalMessageAnchor>,
+  warnings: ImportWarning[],
+  batch: ArchiveSignalBatch
+): void {
+  if (hasColumns(inspection, "group_participant_user", ["group_jid_row_id", "user_jid_row_id"])) {
+    readOptionalSignalFamily(warnings, "MEMBERSHIP_PERIODS", "group_participant_user", () => {
+      const columns = columnsFor(inspection, "group_participant_user");
+      const selected = ["group_jid_row_id", "user_jid_row_id", "rank", "add_timestamp"].filter((column) => columns.has(column));
+      for (const row of db.prepare(`SELECT ${selected.map(quoteIdentifier).join(", ")} FROM group_participant_user`).iterate() as Iterable<SqlRow>) {
+        const groupSourceId = jidMap.get(Number(row.group_jid_row_id));
+        const participantJid = jidMap.get(Number(row.user_jid_row_id));
+        if (!groupSourceId || !participantJid) continue;
+        const joinedAtMs = normalizeTimestampMs(row.add_timestamp);
+        batch.membershipPeriods?.push({
+          periodKey: `backup:current-member:${groupSourceId}:${participantJid}`,
+          groupSourceId,
+          participantJid,
+          joinedAtMs,
+          leftAtMs: null,
+          role: stringOrNull(row.rank),
+          ...signalProvenance(`backup:group_participant_user:${groupSourceId}:${participantJid}`, joinedAtMs)
+        });
+      }
+    });
+  }
+  if (hasColumns(inspection, "group_past_participant_user", ["_id", "group_jid_row_id", "user_jid_row_id", "is_leave", "timestamp"])) {
+    readOptionalSignalFamily(warnings, "MEMBERSHIP_HISTORY", "group_past_participant_user", () => {
+      for (const row of db
+        .prepare("SELECT _id, group_jid_row_id, user_jid_row_id, is_leave, timestamp FROM group_past_participant_user ORDER BY _id ASC")
+        .iterate() as Iterable<SqlRow>) {
+        const groupSourceId = jidMap.get(Number(row.group_jid_row_id));
+        const participantJid = jidMap.get(Number(row.user_jid_row_id));
+        const timestampMs = normalizeTimestampMs(row.timestamp);
+        if (!groupSourceId || !participantJid) continue;
+        batch.membershipPeriods?.push({
+          periodKey: `backup:past-member:${row._id}`,
+          groupSourceId,
+          participantJid,
+          joinedAtMs: boolish(row.is_leave) ? null : timestampMs,
+          leftAtMs: boolish(row.is_leave) ? timestampMs : null,
+          role: null,
+          ...signalProvenance(`backup:group_past_participant_user:${row._id}`, timestampMs)
+        });
+      }
+    });
+  }
+  if (hasColumns(inspection, "group_participants_history", ["_id", "timestamp", "gjid", "jid", "action"])) {
+    readOptionalSignalFamily(warnings, "MEMBERSHIP_EVENTS", "group_participants_history", () => {
+      for (const row of db
+        .prepare("SELECT _id, timestamp, gjid, jid, action FROM group_participants_history ORDER BY _id ASC")
+        .iterate() as Iterable<SqlRow>) {
+        const action = verifiedMembershipAction(row.action);
+        const groupSourceId = normalizeJid(row.gjid);
+        const participantJid = normalizeJid(row.jid);
+        if (!action || !groupSourceId || !participantJid) continue;
+        const observedAtMs = normalizeTimestampMs(row.timestamp);
+        batch.membershipEvents?.push({
+          eventKey: `backup:group-participant-history:${row._id}`,
+          groupSourceId,
+          participantJid,
+          action,
+          actorJid: null,
+          sourceMessageKey: null,
+          ...signalProvenance(`backup:group_participants_history:${row._id}`, observedAtMs)
+        });
+      }
+    });
+  }
+  // `message_system_group.is_me_joined` is a local client flag, not a linked
+  // affected participant. It previously manufactured `participantJid: "me"`
+  // and made unrelated group history look like the owner's actions. Keep the
+  // underlying message as an honest generic system event unless another
+  // structurally verified companion supplies the participant/action roles.
+  if (hasColumns(inspection, "message_system_chat_participant", ["message_row_id", "user_jid_row_id"]) && hasColumns(inspection, "message_system", ["message_row_id", "action_type"])) {
+    readOptionalSignalFamily(warnings, "MEMBERSHIP_SYSTEM_ACTIONS", "message_system_chat_participant", () => {
+      for (const row of db
+        .prepare(
+          "SELECT p.message_row_id, p.user_jid_row_id, s.action_type FROM message_system_chat_participant p JOIN message_system s ON s.message_row_id = p.message_row_id"
+        )
+        .iterate() as Iterable<SqlRow>) {
+        const anchor = anchors.get(Number(row.message_row_id));
+        const participantJid = jidMap.get(Number(row.user_jid_row_id));
+        const action = verifiedMembershipAction(row.action_type);
+        if (!anchor || !participantJid || !action) continue;
+        batch.membershipEvents?.push({
+          eventKey: `backup:message-system-participant:${anchor.sourceMessageKey}:${participantJid}`,
+          groupSourceId: anchor.chatSourceId,
+          participantJid,
+          action,
+          // This companion gives an affected participant but no verified
+          // actor column. The message sender is not a safe substitution.
+          actorJid: null,
+          sourceMessageKey: anchor.sourceMessageKey,
+          rawType: String(row.action_type),
+          rawParameters: null,
+          ...signalProvenance(`backup:message_system_chat_participant:${anchor.rowId}`, anchor.observedAtMs)
+        });
+      }
+    });
+  }
+  readChatMetadataHistory(db, inspection, anchors, warnings, batch);
+  // `chatRowJidMap` is intentionally accepted so future aliases that carry a
+  // chat row rather than a group-JID row stay in this one verified mapper.
+  void chatRowJidMap;
+}
+
+function readChatMetadataHistory(
+  db: Database.Database,
+  inspection: SQLiteInspection,
+  anchors: Map<number, SignalMessageAnchor>,
+  warnings: ImportWarning[],
+  batch: ArchiveSignalBatch
+): void {
+  if (hasColumns(inspection, "message_system_with_group_nodes", ["message_row_id", "group_subject"])) {
+    readOptionalSignalFamily(warnings, "CHAT_SUBJECT_HISTORY", "message_system_with_group_nodes", () => {
+      for (const row of db
+        .prepare("SELECT message_row_id, group_subject FROM message_system_with_group_nodes")
+        .iterate() as Iterable<SqlRow>) {
+        const anchor = anchors.get(Number(row.message_row_id));
+        const newValue = stringOrNull(row.group_subject);
+        if (!anchor || !newValue) continue;
+        batch.chatMetadataHistory?.push({
+          eventKey: `backup:group-subject:${anchor.sourceMessageKey}`,
+          chatSourceId: anchor.chatSourceId,
+          field: "subject",
+          sourceMessageKey: anchor.sourceMessageKey,
+          actorJid: null,
+          oldValue: null,
+          newValue,
+          rawType: "group_subject",
+          rawParameters: null,
+          ...signalProvenance(`backup:message_system_with_group_nodes:${anchor.rowId}`, anchor.observedAtMs)
+        });
+      }
+    });
+  }
+  if (hasColumns(inspection, "message_system_photo_change", ["message_row_id", "new_photo_id"])) {
+    readOptionalSignalFamily(warnings, "CHAT_PHOTO_HISTORY", "message_system_photo_change", () => {
+      for (const row of db
+        .prepare("SELECT message_row_id, new_photo_id FROM message_system_photo_change")
+        .iterate() as Iterable<SqlRow>) {
+        const anchor = anchors.get(Number(row.message_row_id));
+        if (!anchor) continue;
+        batch.chatMetadataHistory?.push({
+          eventKey: `backup:group-photo:${anchor.sourceMessageKey}`,
+          chatSourceId: anchor.chatSourceId,
+          field: "photo",
+          sourceMessageKey: anchor.sourceMessageKey,
+          actorJid: null,
+          oldValue: null,
+          // The binary old/new photo fields are deliberately never copied.
+          newValue: stringOrNull(row.new_photo_id),
+          rawType: "photo_change",
+          rawParameters: null,
+          ...signalProvenance(`backup:message_system_photo_change:${anchor.rowId}`, anchor.observedAtMs)
+        });
+      }
+    });
+  }
+}
+
+function readEditAndDeletionSignals(
+  anchors: Map<number, SignalMessageAnchor>,
+  sidecars: InterpretationSidecars,
+  batch: ArchiveSignalBatch
+): void {
+  for (const [rowId, edit] of sidecars.edits) {
+    const anchor = anchors.get(rowId);
+    if (!anchor) continue;
+    batch.editEvents?.push({
+      eventKey: `backup:edit:${anchor.sourceMessageKey}`,
+      sourceMessageKey: anchor.sourceMessageKey,
+      originalSourceMessageId: edit.originalKeyId,
+      observedEditMessageId: anchor.keyId,
+      ...signalProvenance(`backup:message_edit_info:${rowId}`, edit.editedAtMs ?? anchor.observedAtMs)
+    });
+  }
+  for (const [rowId, revoked] of sidecars.revoked) {
+    const anchor = anchors.get(rowId);
+    if (!anchor) continue;
+    batch.deletions?.push({
+      sourceMessageKey: anchor.sourceMessageKey,
+      revokedByJid: revoked.revokedByJid,
+      revokedByAdmin: revoked.revokedByAdmin,
+      deletionKind: revoked.deletionKind,
+      ...signalProvenance(`backup:message_revoked:${rowId}`, revoked.revokedAtMs ?? anchor.observedAtMs)
+    });
+  }
+}
+
+function readMediaInterpretations(
+  db: Database.Database,
+  inspection: SQLiteInspection,
+  anchors: Map<number, SignalMessageAnchor>,
+  sidecars: InterpretationSidecars,
+  warnings: ImportWarning[],
+  batch: ArchiveSignalBatch
+): void {
+  for (const [rowId, media] of sidecars.media) {
+    const anchor = anchors.get(rowId);
+    if (!anchor) continue;
+    if (media.accessibilityLabel) {
+      batch.mediaInterpretations?.push({
+        sourceMessageKey: anchor.sourceMessageKey,
+        kind: "accessibility_label",
+        segmentIndex: 0,
+        text: media.accessibilityLabel,
+        startMs: null,
+        endMs: null,
+        ...signalProvenance(`backup:message_media:accessibility:${rowId}`, anchor.observedAtMs)
+      });
+    }
+    if (media.rawTranscriptionText) {
+      batch.mediaInterpretations?.push({
+        sourceMessageKey: anchor.sourceMessageKey,
+        kind: "transcription",
+        segmentIndex: 0,
+        text: media.rawTranscriptionText,
+        startMs: null,
+        endMs: null,
+        ...signalProvenance(`backup:message_media:transcription:${rowId}`, anchor.observedAtMs)
+      });
+    }
+  }
+  if (!hasColumns(inspection, "transcription_segment", ["message_row_id", "substring_start", "substring_length"])) return;
+  readOptionalSignalFamily(warnings, "TRANSCRIPTION_SEGMENTS", "transcription_segment", () => {
+    const columns = columnsFor(inspection, "transcription_segment");
+    const selected = ["_id", "message_row_id", "substring_start", "substring_length", "timestamp", "duration"].filter((column) => columns.has(column));
+    const indexByMessage = new Map<number, number>();
+    for (const row of db.prepare(`SELECT ${selected.map(quoteIdentifier).join(", ")} FROM transcription_segment ORDER BY ${columns.has("_id") ? "_id" : "message_row_id"} ASC`).iterate() as Iterable<SqlRow>) {
+      const rowId = Number(row.message_row_id);
+      const anchor = anchors.get(rowId);
+      const transcript = sidecars.media.get(rowId)?.rawTranscriptionText;
+      const startIndex = finiteNumberOrNull(row.substring_start);
+      const length = finiteNumberOrNull(row.substring_length);
+      if (!anchor || !transcript || startIndex == null || length == null || startIndex < 0 || length <= 0) continue;
+      const text = transcript.slice(startIndex, startIndex + length);
+      if (!text) continue;
+      const segmentIndex = indexByMessage.get(rowId) ?? 0;
+      indexByMessage.set(rowId, segmentIndex + 1);
+      const startMs = finiteNumberOrNull(row.timestamp);
+      const duration = finiteNumberOrNull(row.duration);
+      batch.mediaInterpretations?.push({
+        sourceMessageKey: anchor.sourceMessageKey,
+        kind: "transcription_segment",
+        segmentIndex,
+        text,
+        startMs,
+        endMs: startMs != null && duration != null ? startMs + duration : null,
+        ...signalProvenance(`backup:transcription_segment:${row._id ?? `${rowId}:${segmentIndex}`}`, anchor.observedAtMs)
+      });
+    }
+  });
+}
+
+function readEngagementAggregates(
+  db: Database.Database,
+  inspection: SQLiteInspection,
+  chatRowJidMap: Map<number, string>,
+  warnings: ImportWarning[],
+  batch: ArchiveSignalBatch
+): void {
+  if (!hasColumns(inspection, "message", ["_id", "chat_row_id", "from_me", "timestamp"])) return;
+  readOptionalSignalFamily(warnings, "ENGAGEMENT_AGGREGATES", "receipt_user", () => {
+    const hasUserReceipts = hasColumns(inspection, "receipt_user", ["message_row_id"]);
+    const hasDeviceReceipts = hasColumns(inspection, "receipt_device", ["message_row_id"]);
+    if (!hasUserReceipts && !hasDeviceReceipts) return;
+    const hasUserDelivery = hasColumns(inspection, "receipt_user", ["message_row_id", "receipt_timestamp"]);
+    const hasUserRead = hasColumns(inspection, "receipt_user", ["message_row_id", "read_timestamp"]);
+    const hasDeviceDelivery = hasColumns(inspection, "receipt_device", ["message_row_id", "receipt_device_timestamp"]);
+    // Aggregate each companion once before joining it to outgoing messages.
+    // Modern backups can have many receipt rows per message and often lack an
+    // index on message_row_id; correlated EXISTS scans turn a full restore into
+    // quadratic work. These compact CTEs retain only boolean receipt evidence.
+    const userReceipts = hasUserReceipts
+      ? `user_receipts AS (
+           SELECT message_row_id,
+                  MAX(CASE WHEN ${hasUserDelivery ? "receipt_timestamp IS NOT NULL" : "0"} THEN 1 ELSE 0 END) AS delivered,
+                  MAX(CASE WHEN ${hasUserRead ? "read_timestamp IS NOT NULL" : "0"} THEN 1 ELSE 0 END) AS read
+           FROM receipt_user
+           GROUP BY message_row_id
+         )`
+      : "user_receipts AS (SELECT NULL AS message_row_id, 0 AS delivered, 0 AS read WHERE 0)";
+    const deviceReceipts = hasDeviceReceipts
+      ? `device_receipts AS (
+           SELECT message_row_id,
+                  MAX(CASE WHEN ${hasDeviceDelivery ? "receipt_device_timestamp IS NOT NULL" : "0"} THEN 1 ELSE 0 END) AS delivered
+           FROM receipt_device
+           GROUP BY message_row_id
+         )`
+      : "device_receipts AS (SELECT NULL AS message_row_id, 0 AS delivered WHERE 0)";
+    const rows = db
+      .prepare(
+        `WITH ${userReceipts}, ${deviceReceipts}
+         SELECT m.chat_row_id AS chat_row_id, COUNT(*) AS eligible_outgoing_count,
+                SUM(CASE WHEN COALESCE(ur.delivered, 0) = 1 OR COALESCE(dr.delivered, 0) = 1 THEN 1 ELSE 0 END) AS delivered_count,
+                SUM(CASE WHEN COALESCE(ur.read, 0) = 1 THEN 1 ELSE 0 END) AS read_count,
+                MIN(m.timestamp) AS window_start_at_ms, MAX(m.timestamp) AS window_end_at_ms
+         FROM message m
+         LEFT JOIN user_receipts ur ON ur.message_row_id = m._id
+         LEFT JOIN device_receipts dr ON dr.message_row_id = m._id
+         WHERE m.from_me = 1 AND m.chat_row_id IS NOT NULL
+         GROUP BY m.chat_row_id`
+      )
+      .iterate() as Iterable<SqlRow>;
+    const aggregates = new Map<
+      number,
+      { eligible: number; delivered: number; read: number; start: number | null; end: number | null; sampleCount: number; medianLatencyMs: number | null }
+    >();
+    for (const row of rows) {
+      const chatRowId = Number(row.chat_row_id);
+      if (!Number.isFinite(chatRowId)) continue;
+      aggregates.set(chatRowId, {
+        eligible: Number(row.eligible_outgoing_count ?? 0),
+        delivered: Number(row.delivered_count ?? 0),
+        read: Number(row.read_count ?? 0),
+        start: normalizeTimestampMs(row.window_start_at_ms),
+        end: normalizeTimestampMs(row.window_end_at_ms),
+        sampleCount: 0,
+        medianLatencyMs: null
+      });
+    }
+    // Compute the exact median in SQLite. This keeps JavaScript memory bounded
+    // even for long histories: an eligible response is an incoming row whose
+    // immediately preceding chronological row was outgoing, matching the
+    // one-response-per-outgoing stream rule without retaining latency samples.
+    const latencyRows = db
+      .prepare(`
+        WITH normalized AS (
+          SELECT chat_row_id, _id, from_me,
+                 CASE WHEN ABS(CAST(timestamp AS REAL)) < 100000000000
+                   THEN CAST(timestamp AS REAL) * 1000
+                   ELSE CAST(timestamp AS REAL)
+                 END AS timestamp_ms
+          FROM message
+          WHERE chat_row_id IS NOT NULL AND timestamp IS NOT NULL
+        ), ordered AS (
+          SELECT chat_row_id, timestamp_ms, from_me,
+                 LAG(from_me) OVER (PARTITION BY chat_row_id ORDER BY timestamp_ms ASC, _id ASC) AS previous_from_me,
+                 LAG(timestamp_ms) OVER (PARTITION BY chat_row_id ORDER BY timestamp_ms ASC, _id ASC) AS previous_timestamp_ms
+          FROM normalized
+        ), samples AS (
+          SELECT chat_row_id, timestamp_ms - previous_timestamp_ms AS latency_ms
+          FROM ordered
+          WHERE from_me = 0 AND previous_from_me = 1 AND timestamp_ms >= previous_timestamp_ms
+        ), ranked AS (
+          SELECT chat_row_id, latency_ms,
+                 ROW_NUMBER() OVER (PARTITION BY chat_row_id ORDER BY latency_ms ASC) AS sample_rank,
+                 COUNT(*) OVER (PARTITION BY chat_row_id) AS sample_count
+          FROM samples
+        )
+        SELECT chat_row_id, MAX(sample_count) AS sample_count,
+               AVG(CASE WHEN sample_rank IN ((sample_count + 1) / 2, (sample_count + 2) / 2) THEN latency_ms END) AS median_latency_ms
+        FROM ranked
+        GROUP BY chat_row_id
+      `)
+      .iterate() as Iterable<SqlRow>;
+    for (const row of latencyRows) {
+      const aggregate = aggregates.get(Number(row.chat_row_id));
+      if (!aggregate) continue;
+      aggregate.sampleCount = Number(row.sample_count ?? 0);
+      aggregate.medianLatencyMs = finiteNumberOrNull(row.median_latency_ms);
+    }
+    for (const [chatRowId, aggregate] of aggregates) {
+      const chatSourceId = chatRowJidMap.get(chatRowId);
+      if (!chatSourceId) continue;
+      batch.engagementAggregates?.push({
+        aggregateKey: `backup:engagement:${chatSourceId}`,
+        chatSourceId,
+        counterpartyJid: inferChatType(chatSourceId) === "group" ? null : chatSourceId,
+        eligibleOutgoingCount: aggregate.eligible,
+        deliveredCount: aggregate.delivered,
+        readCount: aggregate.read,
+        responseLatencySampleCount: aggregate.sampleCount,
+        medianResponseLatencyMs: aggregate.medianLatencyMs,
+        windowStartAtMs: aggregate.start,
+        windowEndAtMs: aggregate.end,
+        algorithmVersion: 1,
+        ...signalProvenance(`backup:engagement:${chatRowId}`, aggregate.end)
+      });
+    }
+  });
+}
+
+function* iterateBackupLinkPreviews(
+  db: Database.Database,
+  inspection: SQLiteInspection,
+  jidMap: Map<number, string>,
+  chatRowJidMap: Map<number, string>,
+  sidecars: InterpretationSidecars,
+  warnings: ImportWarning[],
+  sourceFingerprint: string | null
+): IterableIterator<CapturedLinkPreview> {
+  if (!hasColumns(inspection, "message_text", ["message_row_id"])) return;
+  const previews = readOptionalSignalFamily(warnings, "LINK_PREVIEWS", "message_text", () => {
+    const anchors = buildSignalMessageAnchors(db, inspection, jidMap, chatRowJidMap, sidecars, sourceFingerprint);
+    const columns = columnsFor(inspection, "message_text");
+    const selected = ["message_row_id", "page_title", "description", "url"].filter((column) => columns.has(column));
+    const hasThumbnail = hasColumns(inspection, "message_thumbnail", ["message_row_id", "thumbnail"]);
+    const query = `SELECT ${selected.map((column) => `t.${quoteIdentifier(column)} AS ${quoteIdentifier(column)}`).join(", ")}${
+      hasThumbnail ? ", mt.thumbnail AS thumbnail" : ""
+    } FROM message_text t ${hasThumbnail ? "LEFT JOIN message_thumbnail mt ON mt.message_row_id = t.message_row_id" : ""} ORDER BY t.message_row_id ASC`;
+    const rows: CapturedLinkPreview[] = [];
+    for (const row of db.prepare(query).iterate() as Iterable<SqlRow>) {
+      const anchor = anchors.get(Number(row.message_row_id));
+      const title = stringOrNull(row.page_title);
+      const description = stringOrNull(row.description);
+      const canonicalUrl = stringOrNull(row.url);
+      const thumbnail = row.thumbnail instanceof Buffer && row.thumbnail.length ? row.thumbnail : null;
+      if (!anchor || (!title && !description && !canonicalUrl && !thumbnail)) continue;
+      rows.push({
+        chatSourceId: anchor.chatSourceId,
+        sourceMessageId: anchor.sourceMessageId,
+        title,
+        description,
+        canonicalUrl,
+        thumbnail
+      });
+    }
+    return rows;
+  });
+  for (const preview of previews ?? []) yield preview;
+}
+
+function verifiedMembershipAction(value: unknown): "add" | "remove" | "join" | "leave" | "invite" | "accept" | "promote" | "demote" | null {
+  switch (typeof value === "string" ? value.trim().toLowerCase() : "") {
+    case "add":
+    case "added":
+      return "add";
+    case "remove":
+    case "removed":
+      return "remove";
+    case "join":
+    case "joined":
+      return "join";
+    case "leave":
+    case "left":
+      return "leave";
+    case "invite":
+    case "invited":
+      return "invite";
+    case "accept":
+    case "accepted":
+      return "accept";
+    case "promote":
+    case "promoted":
+      return "promote";
+    case "demote":
+    case "demoted":
+      return "demote";
+    default:
+      return null;
+  }
+}
+
+function displayNameFromVcard(vcard: string): string | null {
+  const line = vcard.split(/\r?\n/).find((candidate) => /^FN(?:;[^:]*)?:/i.test(candidate));
+  return line ? stringOrNull(line.slice(line.indexOf(":") + 1).replace(/\\n/gi, " ").trim()) : null;
+}
+
+// vCard preserves folded source lines and unknown extensions. Parsing is only
+// for local presentation/construction; the original string remains the source
+// of truth and is never used to infer a contact relationship.
+function parseVcardProperties(vcard: string): VCardProperty[] {
+  const unfolded = vcard.replace(/\r?\n[ \t]/g, "").split(/\r?\n/);
+  const properties: VCardProperty[] = [];
+  for (const line of unfolded) {
+    const separator = line.indexOf(":");
+    if (separator <= 0) continue;
+    const left = line.slice(0, separator);
+    const value = line.slice(separator + 1);
+    const [head, ...parameterParts] = left.split(";");
+    const groupSeparator = head.lastIndexOf(".");
+    const group = groupSeparator > 0 ? head.slice(0, groupSeparator) : null;
+    const name = (groupSeparator > 0 ? head.slice(groupSeparator + 1) : head).trim().toUpperCase();
+    if (!name) continue;
+    const parameters = parameterParts.map((part) => {
+      const equals = part.indexOf("=");
+      const parameterName = (equals >= 0 ? part.slice(0, equals) : "TYPE").trim().toUpperCase();
+      const rawValues = equals >= 0 ? part.slice(equals + 1) : part;
+      return { name: parameterName || "TYPE", values: rawValues.split(",").map((item) => item.trim()).filter(Boolean) };
+    });
+    properties.push({ name, group, parameters, value });
+  }
+  return properties;
+}
+
+function vcardFileName(displayName: string | null, cardIndex: number): string {
+  const base = (displayName ?? `contact-${cardIndex + 1}`).replace(/[\\/:*?"<>|\u0000-\u001F]+/g, " ").replace(/\s+/g, " ").trim();
+  return `${base || `contact-${cardIndex + 1}`}.vcf`;
+}
+
+function finiteNumberOrNull(value: unknown): number | null {
+  if (value == null || (typeof value === "string" && value.trim() === "")) return null;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
 function loadMediaSidecarTable(
   db: Database.Database,
   inspection: SQLiteInspection,
@@ -917,7 +1764,8 @@ function loadMediaSidecarTable(
     "file_path", "file_size", "mime_type", "media_name", "file_hash", "width", "height", "media_duration",
     // CDN descriptor columns (present on modern message_media): used to recover
     // media whose phone never saved a local file.
-    "media_key", "enc_file_hash", "direct_path", "message_url", "media_key_timestamp", "file_length"
+    "media_key", "enc_file_hash", "direct_path", "message_url", "media_key_timestamp", "file_length",
+    "accessibility_label", "raw_transcription_text"
   ];
   const selected = ["message_row_id", ...optional.filter((column) => columns.has(column))];
   try {
@@ -944,7 +1792,9 @@ function loadMediaSidecarTable(
         directPath: stringOrNull(row.direct_path) ?? existing?.directPath ?? null,
         url: stringOrNull(row.message_url) ?? existing?.url ?? null,
         mediaKeyTimestamp: row.media_key_timestamp == null ? existing?.mediaKeyTimestamp ?? null : Number(row.media_key_timestamp),
-        fileLength: row.file_length == null ? existing?.fileLength ?? null : Number(row.file_length)
+        fileLength: row.file_length == null ? existing?.fileLength ?? null : Number(row.file_length),
+        accessibilityLabel: stringOrNull(row.accessibility_label) ?? existing?.accessibilityLabel ?? null,
+        rawTranscriptionText: stringOrNull(row.raw_transcription_text) ?? existing?.rawTranscriptionText ?? null
       });
     }
   } catch {
@@ -1495,6 +2345,7 @@ function* iterateModernMessages(
       isDeleted: messageType === "admin_revoked" || messageType === "revoked",
       isForwarded: boolish(row.forwarded),
       isStarred: boolish(row.starred),
+      mentionedJids: sidecars.mentions.get(rowIdNumber) ?? [],
       rawMetadata: {
         adapter: "modern",
         status: row.status ?? null,

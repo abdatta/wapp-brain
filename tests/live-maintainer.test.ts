@@ -12,7 +12,14 @@ import { assertLiveBaselineExists, getLiveBaselineSummary } from "../src/server/
 import { getLiveDependencyStatus, isSafeBaileysVersion } from "../src/server/live/dependency";
 import { LiveMaintainer, liveEventNeedsArchiveSnapshot } from "../src/server/live/maintainer";
 import { messageIdFromKey, messageKey } from "../src/server/identity/keys";
-import { capturedMediaFromBaileysMessage, normalizeBaileysMessage, normalizeBaileysMessagesWithJidResolver } from "../src/server/live/normalize";
+import {
+  capturedMediaFromBaileysMessage,
+  normalizeBaileysGroupParticipantsWithJidResolver,
+  normalizeBaileysGroupUpdatesWithJidResolver,
+  normalizeBaileysMessage,
+  normalizeBaileysMessagesWithJidResolver,
+  updateFromBaileysMessage
+} from "../src/server/live/normalize";
 import { recoverDueGaps } from "../src/server/live/recovery";
 import type {
   LiveConnectionUpdate,
@@ -113,6 +120,23 @@ describe("live WhatsApp maintainer", () => {
     expect(JSON.stringify(message?.rawMetadata)).not.toContain("hello live world");
   });
 
+  it("uses the protocol edit timestamp instead of the original-message envelope time", () => {
+    const update = updateFromBaileysMessage({
+      key: { remoteJid: "15550000001@s.whatsapp.net", id: "EDIT-EVENT", fromMe: false },
+      messageTimestamp: 1_712_000_001,
+      message: {
+        protocolMessage: {
+          type: 14,
+          key: { remoteJid: "15550000001@s.whatsapp.net", id: "ORIGINAL", fromMe: false },
+          timestampMs: 1_712_000_901_234,
+          editedMessage: { conversation: "corrected" }
+        }
+      }
+    });
+
+    expect(update).toMatchObject({ updateType: "edit", occurredAtMs: 1_712_000_901_234 });
+  });
+
   it("canonicalizes live LID chats to phone JIDs when Baileys has a mapping", async () => {
     const event = await normalizeBaileysMessagesWithJidResolver(
       [
@@ -148,6 +172,105 @@ describe("live WhatsApp maintainer", () => {
     expect(event.messages?.[0]?.chatSourceId).toBe("12136968563@s.whatsapp.net");
     expect(event.messages?.[0]?.senderSourceJid).toBe("12136968563@s.whatsapp.net");
     expect(event.messages?.[0]?.sourceMessageKey).toBe("wa|12136968563@s.whatsapp.net|DEVICE123");
+  });
+
+  it("normalizes and persists live source signals across notify and history events without model work", async () => {
+    const repository = new MemoryArchiveRepository();
+    const client = new FakeLiveClient();
+    const maintainer = new LiveMaintainer(repository, client, testOptions());
+    const groupJid = "12036000000000@g.us";
+    const event = await normalizeBaileysMessagesWithJidResolver(
+      [
+        {
+          key: { remoteJid: groupJid, id: "LIVE_LOCATION", fromMe: false, participant: "15550000001@s.whatsapp.net" },
+          messageTimestamp: 1712000001,
+          message: { locationMessage: { degreesLatitude: 37.77, degreesLongitude: -122.42, name: "Live synthetic place", address: "100 Example Ave" } }
+        },
+        {
+          key: { remoteJid: groupJid, id: "LIVE_CARD", fromMe: false, participant: "15550000002@s.whatsapp.net" },
+          messageTimestamp: 1712000002,
+          message: { contactMessage: { displayName: "Live synthetic card", vcard: "BEGIN:VCARD\nFN:Live synthetic card\nEND:VCARD", jid: "15550000003@s.whatsapp.net" } }
+        },
+        {
+          key: { remoteJid: groupJid, id: "LIVE_MEDIA", fromMe: false, participant: "15550000001@s.whatsapp.net" },
+          messageTimestamp: 1712000003,
+          message: { documentMessage: { accessibilityLabel: "Live synthetic label", rawTranscriptionText: "live source transcript" } }
+        },
+        {
+          key: { remoteJid: groupJid, id: "LIVE_PREVIEW", fromMe: false, participant: "15550000001@s.whatsapp.net" },
+          messageTimestamp: 1712000004,
+          message: {
+            extendedTextMessage: {
+              text: "@15550000003 see this",
+              title: "Live preview",
+              description: "Embedded preview",
+              canonicalUrl: "https://example.test/live",
+              jpegThumbnail: new Uint8Array([1, 2]),
+              contextInfo: { mentionedJid: ["15550000003@s.whatsapp.net"] }
+            }
+          }
+        },
+        {
+          key: { remoteJid: groupJid, id: "LIVE_NUMBER", fromMe: false, participant: "15550000001@s.whatsapp.net" },
+          messageTimestamp: 1712000005,
+          messageStubType: "USER_CHANGED_NUMBER",
+          messageStubParameters: ["15550000004", "15550000005"]
+        }
+      ],
+      "wa-web:messages.upsert",
+      (jid) => jid
+    );
+    const history = { ...event, eventKey: "live-signal-history", eventType: "messaging-history.set" as const, mode: "history" as const };
+    const groupUpdate = await normalizeBaileysGroupUpdatesWithJidResolver([{ id: groupJid, subject: "Live signal subject", subjectTime: 1712000006 }], (jid) => jid);
+    const participantUpdate = await normalizeBaileysGroupParticipantsWithJidResolver(
+      { id: groupJid, action: "add", participants: ["15550000005@s.whatsapp.net"] },
+      (jid) => jid,
+      1712000007000
+    );
+
+    await maintainer.start();
+    await client.emit(event);
+    await client.emit(history);
+    await client.emit(groupUpdate);
+    await client.emit(participantUpdate);
+    await client.emit({
+      eventKey: "live-signal-updates",
+      eventType: "messages.update",
+      mode: "update",
+      updates: [
+        { eventKey: "live-edit", chatSourceId: groupJid, sourceMessageKey: event.messages![0].sourceMessageKey, updateType: "edit", occurredAtMs: 1712000008000, metadata: { body: "new live text" } },
+        { eventKey: "live-delete", chatSourceId: groupJid, sourceMessageKey: event.messages![1].sourceMessageKey, updateType: "delete", occurredAtMs: 1712000009000 }
+      ]
+    });
+    await maintainer.stop();
+
+    const group = (await repository.listChats({ limit: 10, offset: 0, includeEventOnly: true })).find((chat) => chat.sourceChatId === groupJid)!;
+    const messages = await repository.listMessages(group.id, { limit: 20, offset: 0 });
+    const location = messages.find((message) => message.sourceMessageId === "LIVE_LOCATION");
+    const card = messages.find((message) => message.sourceMessageId === "LIVE_CARD");
+    const media = messages.find((message) => message.sourceMessageId === "LIVE_MEDIA");
+    const preview = messages.find((message) => message.sourceMessageId === "LIVE_PREVIEW");
+    const numberChange = messages.find((message) => message.sourceMessageId === "LIVE_NUMBER");
+    const timelineEvents = messages.filter((message) => message.sourceMessageId.startsWith("live-system-"));
+
+    expect(location?.structuredSignals?.location).toMatchObject({ name: "Live synthetic place" });
+    expect(card?.structuredSignals?.vcards).toEqual([{ displayName: "Live synthetic card" }]);
+    expect(card?.structuredSignals?.deletion?.revokedAtMs).toBe(1712000009000);
+    expect(location?.structuredSignals?.edit).toMatchObject({ observedAtMs: 1712000008000 });
+    expect(media?.structuredSignals?.mediaInterpretations.map((item) => item.kind)).toEqual(["accessibility_label", "transcription"]);
+    expect(preview?.structuredSignals?.mentionCount).toBe(1);
+    expect(preview?.linkPreview).toMatchObject({ title: "Live preview", canonicalUrl: "https://example.test/live", hasThumbnail: true });
+    expect(numberChange?.systemEvents).toEqual([{ kind: "number_change", summary: "+15550000005 changed their phone number.", captureVersion: 1 }]);
+    expect(timelineEvents.map((message) => message.systemEvents)).toEqual(expect.arrayContaining([
+      [expect.objectContaining({ kind: "chat_metadata", summary: expect.stringContaining("group subject") })],
+      [expect.objectContaining({ kind: "membership", summary: expect.stringContaining("added") })]
+    ])); /* legacy wording assertion retained below for patch context
+      [{ kind: "chat_metadata", summary: "Group subject changed to “Live signal subject”.", captureVersion: 1 }],
+      [{ kind: "membership", summary: "Unknown added +15550000005 to the group.", captureVersion: 1 }]
+    ]); */
+    expect(await repository.listIdentityNumberChanges({ oldJid: "15550000004@s.whatsapp.net" })).toHaveLength(1);
+    expect(await repository.listChatMetadataHistory({ chatSourceId: groupJid })).toHaveLength(1);
+    expect(await repository.listGroupMembershipEvents({ groupSourceId: groupJid })).toHaveLength(1);
   });
 
   it("ingests duplicate live events idempotently through the maintainer", async () => {
@@ -786,6 +909,49 @@ describe("live WhatsApp maintainer", () => {
     expect(stub?.messageType).toBe("system");
     expect(stub?.direction).toBe("system");
     expect(stub?.rawMetadata?.stubType).toBe(27);
+  });
+
+  it("normalizes named and numeric Baileys stubs with explicit actor and participant roles", async () => {
+    const groupJid = "12036000000077@g.us";
+    const actorJid = "15550000001@s.whatsapp.net";
+    const participantJid = "15550000002@s.whatsapp.net";
+    const event = await normalizeBaileysMessagesWithJidResolver(
+      [
+        {
+          key: { remoteJid: groupJid, id: "NUMERIC_ADD", fromMe: false }, messageTimestamp: 1712000101,
+          authorPn: actorJid, messageStubType: 27, messageStubParameters: [JSON.stringify({ phoneNumber: participantJid })]
+        },
+        {
+          key: { remoteJid: groupJid, id: "NAMED_PROMOTE", fromMe: false }, messageTimestamp: 1712000102,
+          author: actorJid, messageStubType: "GROUP_PARTICIPANT_PROMOTE", messageStubParameters: [{ id: participantJid }]
+        },
+        {
+          key: { remoteJid: groupJid, id: "SUBJECT", fromMe: false }, messageTimestamp: 1712000103,
+          authorPn: actorJid, messageStubType: "GROUP_CHANGE_SUBJECT", messageStubParameters: ["A new subject"]
+        },
+        {
+          key: { remoteJid: groupJid, id: "NUMBER", fromMe: false }, messageTimestamp: 1712000104,
+          authorPn: actorJid, messageStubType: 33,
+          messageStubParameters: [{ oldPn: "15550000002", newPn: "15550000003" }]
+        },
+        {
+          key: { remoteJid: groupJid, id: "LIVE_LOCATION_FULL", fromMe: false }, messageTimestamp: 1712000105,
+          message: { liveLocationMessage: { degreesLatitude: 37.7, degreesLongitude: -122.4, accuracyInMeters: 4, speedInMps: 2, degreesClockwiseFromMagneticNorth: 91, sequenceNumber: 7, timeOffset: 3000, liveLocationShareDuration: 60, finalTimestamp: 1712000165000, caption: "on the way", comment: "north entrance", url: "https://example.test/location", jpegThumbnail: new Uint8Array([1]) } }
+        }
+      ],
+      "wa-web:messages.upsert",
+      (jid) => jid
+    );
+
+    const memberships = event.archiveSignals?.membershipEvents ?? [];
+    expect(memberships).toEqual(expect.arrayContaining([
+      expect.objectContaining({ action: "add", actorJid, participantJid, rawType: "GROUP_PARTICIPANT_ADD" }),
+      expect.objectContaining({ action: "promote", actorJid, participantJid, newRole: "admin", rawType: "GROUP_PARTICIPANT_PROMOTE" })
+    ]));
+    expect(event.archiveSignals?.chatMetadataHistory).toEqual([expect.objectContaining({ field: "subject", actorJid, newValue: "A new subject" })]);
+    expect(event.archiveSignals?.numberChanges).toEqual([expect.objectContaining({ oldJid: participantJid, newJid: "15550000003@s.whatsapp.net", actorJid })]);
+    expect(event.archiveSignals?.locations).toEqual([expect.objectContaining({ isLive: true, accuracyMeters: 4, speedMps: 2, headingDegrees: 91, sequenceNumber: 7, timeOffsetMs: 3000, liveShareDurationMs: 60000, finalAtMs: 1712000165000, caption: "on the way", comment: "north entrance", hasThumbnail: true })]);
+    expect(event.archiveSignals?.locationObservations).toEqual([expect.objectContaining({ sequenceNumber: 7, speedMps: 2 })]);
   });
 
   it("escapes the key delimiter so hostile message ids cannot collide", () => {

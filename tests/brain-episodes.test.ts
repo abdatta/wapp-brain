@@ -4,7 +4,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { config } from "../src/server/config";
 import { MemoryArchiveRepository } from "../src/server/db/memoryRepository";
-import { buildEvidencePacks, generateEpisodeForPack } from "../src/server/brain/episodes";
+import { buildEvidencePacks, EXTRACTION_VERSION, generateEpisodeForPack, regenerateEpisode } from "../src/server/brain/episodes";
 import { enableBrainProvider } from "../src/server/brain/provider";
 import { startBrainRun, getBrainRunProgress } from "../src/server/brain/runJob";
 import { messageKey } from "../src/server/identity/keys";
@@ -72,6 +72,31 @@ describe("brain episodes", () => {
       // Obsidian projection landed.
       const files = await readdir(path.join(tempDir, "episodes"));
       expect(files.some((file) => file.endsWith(".md"))).toBe(true);
+    } finally {
+      restore();
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("selects regenerable episodes and transactionally supersedes them without moving covered watermarks", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-brain-ep-regen-"));
+    const restore = configureBrain({ rootDir: tempDir, provider: "extractive" });
+    const repository = new MemoryArchiveRepository();
+    try {
+      await seed(repository);
+      const [pack] = await buildEvidencePacks(repository, { chatSourceId: "ep@g.us", startAtMs: 0, endAtMs: Date.now() });
+      const original = (await generateEpisodeForPack(repository, pack, { generator: "extractive" })).episode;
+      expect((await repository.listRegenerableBrainEpisodes({ currentVersion: EXTRACTION_VERSION, limit: 10 })).map((episode) => episode.id)).toContain(original.id);
+      expect(await repository.getBrainChatBacklog({ limit: 10 })).toHaveLength(0);
+
+      const regenerated = await regenerateEpisode(repository, original, { generator: "extractive" });
+      const old = (await repository.listBrainEpisodes({ episodeId: original.id, limit: 1 }))[0];
+      const replacement = regenerated.results[0]?.episode;
+
+      expect(regenerated.superseded).toBe(true);
+      expect(old?.status).toBe("superseded");
+      expect(replacement).toMatchObject({ status: "current", extractionVersion: EXTRACTION_VERSION });
+      expect(await repository.getBrainChatBacklog({ limit: 10 })).toHaveLength(0);
     } finally {
       restore();
       await rm(tempDir, { recursive: true, force: true });

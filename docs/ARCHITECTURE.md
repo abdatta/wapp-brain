@@ -22,6 +22,7 @@ user files/key
   -> SQLite schema inspection
   -> defensive WhatsApp parser
   -> normalized records
+  -> canonical structured signal batches (optional companions)
   -> ArchiveRepository
   -> local SQLite archive
   -> local API
@@ -37,7 +38,7 @@ server start
   -> local WhatsApp Web protocol client
   -> live/offline/history events + message state updates (edits/deletes/reactions)
   -> live normalizer
-  -> ArchiveRepository upserts (deletes tombstone originals)
+  -> ArchiveRepository upserts (messages, structured signals, and deletes that tombstone originals)
   -> per-chat checkpoints and evidence-based gap windows
   -> periodic bounded recovery loop (closes gaps from ingested evidence)
   -> local API/UI health, grouped uncertainty, and re-pair alerts
@@ -158,6 +159,18 @@ The archive stores:
 - `identity_links`
 - `message_secrets`
 - `retained_encrypted_payloads`
+- `identity_number_changes`
+- `group_membership_periods`
+- `group_membership_events`
+- `chat_metadata_history`
+- `message_locations`
+- `message_location_observations`
+- `message_vcards`
+- `message_edit_events`
+- `message_deletions`
+- `message_media_interpretations`
+- `archive_signal_observations`
+- `engagement_aggregates`
 - `memory_runs`
 - `memory_source_windows`
 - `memory_evidence_packs`
@@ -166,10 +179,15 @@ The archive stores:
 - `memory_citations`
 - `memory_validation_issues`
 - `memory_job_locks`
+- `brain_episode_signal_anchors`
 
 Messages and entities use stable source-derived keys where possible so repeated imports can update existing rows instead of duplicating them.
 
 Live sync is modeled as a separate source feeding the same normalized archive. Import runs remain distinct from live sync runs, while contacts, chats, and messages still converge through stable source-derived keys.
+
+Structured companion facts also converge across backup and live sources. Canonical rows use exact semantic keys, while `archive_signal_observations` retains each source observation and `message_location_observations` retains ordered live-location samples. A backup anchor replaces an equivalent synthetic live system anchor when available; no broad time-window deduplication is used.
+
+The thread page remains a bounded, compact projection. A loopback-only focused message-detail read supplies complete retained owner-local fields on demand for locations, vCards, edit/deletion history, source interpretations, and system-event roles. Per-card vCard downloads are served by a separate local route.
 
 Reply quote snapshots converge through that same message path. Backup and live envelopes monotonically enrich one local snapshot owned by the reply; evidence consumes it as non-citable context and the thread UI uses it for local previews. When an enrichment changes a reply used by a current episode, its exact window is marked stale and queued for replacement without advancing the archive watermark.
 
