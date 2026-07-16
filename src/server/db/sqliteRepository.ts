@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type {
@@ -38,6 +38,7 @@ import type {
   GroupMembershipEventRecord,
   GroupMembershipPeriodRecord,
   IdentityNumberChangeRecord,
+  IdentityRecentMessage,
   IdentityRepairResult,
   ImportRunSummary,
   ImportTotals,
@@ -90,7 +91,24 @@ import type {
   SearchQueryOptions,
   SearchResponse,
   SearchResultItem,
-  StatusSummary
+  StatusSummary,
+  GoogleContactGroupEntry,
+  IdentityActivitySummary,
+  IdentityChatActivity,
+  IdentityProfile,
+  PersonConnectResult,
+  PersonDisconnectResult,
+  PersonLinkEventRecord,
+  PersonLinkSuppressionRecord,
+  PersonLookupResult,
+  PersonMemberRecord,
+  PersonMemberSource,
+  PersonRecord,
+  PersonRedirectRecord,
+  PersonSuggestionInput,
+  PersonSuggestionKind,
+  PersonSuggestionRecord,
+  PersonSuggestionStatus
 } from "../../shared/types";
 import { SEARCH_HIGHLIGHT_END, SEARCH_HIGHLIGHT_START } from "../../shared/types";
 import { config } from "../config";
@@ -101,6 +119,8 @@ import { mergeInteractionMetadata } from "./interactions";
 import { buildMessageEditTimeline, summarizeStructuredSignals, summarizeSystemEvents } from "./signalSummary";
 import { interpretMessage } from "../interpretation/messageInterpretation";
 import { displayPhoneFromJid, isMaskedNumberLabel, normalizeJid, phoneFromJid, resolveDisplayLabel } from "../import/jid";
+import { disambiguateLabels } from "../persons/disambiguate";
+import { personDisplayLabelFromMembers } from "../persons/label";
 import { getMemoryProviderStatus } from "../memory/provider";
 import { PublicError } from "../privacy";
 import type { ArchiveRepository, ArchiveRestorePoint } from "./repository";
@@ -160,10 +180,24 @@ const ARCHIVE_TABLES = [
   "brain_topics",
   "brain_episode_topics",
   "brain_validation_issues",
-  "brain_media_gaps"
+  "brain_media_gaps",
+  "persons",
+  "person_members",
+  "person_link_suppressions",
+  "person_suggestions",
+  "person_link_events",
+  "person_redirects",
+  "google_contact_groups"
 ] as const;
 const DELETE_TABLE_ORDER = [
   "identity_links",
+  "person_members",
+  "persons",
+  "person_link_suppressions",
+  "person_suggestions",
+  "person_link_events",
+  "person_redirects",
+  "google_contact_groups",
   "brain_media_gaps",
   "brain_validation_issues",
   "brain_episode_topics",
@@ -1387,6 +1421,89 @@ const schemaStatements = [
     at_ms INTEGER NOT NULL
   )`,
 
+  // --- Two-level person model ---
+  // Identities (canonical JIDs) are the immutable anchors; a person is an
+  // editable grouping over them. A person row exists only while it has two or
+  // more members, and deliberately has no name column: nothing groups by name.
+  `CREATE TABLE IF NOT EXISTS persons (
+    id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  )`,
+
+  // Membership is the whole person model: connect = insert, disconnect =
+  // delete. An identity belongs to at most one person. `source` is precise
+  // provenance — an accepted suggestion lands as 'user' (the human clicked)
+  // with the suggestion in evidence_json; suggestions are never a source.
+  `CREATE TABLE IF NOT EXISTS person_members (
+    person_id TEXT NOT NULL REFERENCES persons(id) ON DELETE CASCADE,
+    identity_jid TEXT NOT NULL UNIQUE,
+    source TEXT NOT NULL CHECK (source IN ('google','number_change','user')),
+    evidence_json TEXT NULL,
+    linked_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (person_id, identity_jid)
+  )`,
+
+  // Pair-level negative memory (pair normalized by lexicographic order):
+  // a disconnect or a dismissal must never be silently undone by an auto
+  // source. An explicit user connect clears the row.
+  `CREATE TABLE IF NOT EXISTS person_link_suppressions (
+    jid_low TEXT NOT NULL,
+    jid_high TEXT NOT NULL,
+    reason TEXT NOT NULL CHECK (reason IN ('suggestion_rejected','disconnected')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (jid_low, jid_high)
+  ) WITHOUT ROWID`,
+
+  // Detector output: ranked, evidence-attached, and inert — only an explicit
+  // user acceptance turns a suggestion into membership. A 'rejected' row is
+  // the rejection memory: the UNIQUE(pair, kind) slot stays occupied so the
+  // same pair is never re-suggested for the same detector kind.
+  `CREATE TABLE IF NOT EXISTS person_suggestions (
+    id TEXT PRIMARY KEY,
+    jid_low TEXT NOT NULL,
+    jid_high TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('same_name','shared_group','co_citation','succession','shared_vcard','llm')),
+    score REAL NOT NULL,
+    evidence_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','accepted','rejected','superseded')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE (jid_low, jid_high, kind)
+  )`,
+
+  // Append-only audit trail for every person-layer operation.
+  `CREATE TABLE IF NOT EXISTS person_link_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    action TEXT NOT NULL CHECK (action IN ('connect','disconnect','union','dissolve','suggest','accept','reject')),
+    person_id TEXT NULL,
+    identity_jid TEXT NULL,
+    source TEXT NULL,
+    evidence_json TEXT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  )`,
+
+  // Same-contact grouping persisted by the Google sync (resource name +
+  // normalized number only — never raw provider payloads). Mirrors the
+  // provider's current state on every sync; auto-connect keys on one
+  // resource_name matching two or more archived identities. A grouping
+  // disappearing here never disconnects identities it previously connected.
+  `CREATE TABLE IF NOT EXISTS google_contact_groups (
+    resource_name TEXT NOT NULL,
+    phone_e164 TEXT NOT NULL,
+    display_name TEXT NULL,
+    last_seen_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (resource_name, phone_e164)
+  ) WITHOUT ROWID`,
+
+  // Externally-held person ids stay resolvable across dissolution and union.
+  `CREATE TABLE IF NOT EXISTS person_redirects (
+    person_id TEXT PRIMARY KEY,
+    replaced_by_person_id TEXT NULL,
+    surviving_jid TEXT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  )`,
+
   `CREATE INDEX IF NOT EXISTS idx_import_warnings_run ON import_warnings (import_run_id, severity, code)`,
   `CREATE INDEX IF NOT EXISTS idx_contacts_phone ON contacts (phone_number)`,
   `CREATE INDEX IF NOT EXISTS idx_chats_last_message ON chats (last_message_at_ms)`,
@@ -1435,7 +1552,15 @@ const schemaStatements = [
   `CREATE INDEX IF NOT EXISTS idx_brain_issues_episode ON brain_validation_issues (episode_id)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_issues_code ON brain_validation_issues (code, created_at)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_media_gaps_episode ON brain_media_gaps (episode_id)`,
-  `CREATE INDEX IF NOT EXISTS idx_brain_media_gaps_modality ON brain_media_gaps (modality, impact)`
+  `CREATE INDEX IF NOT EXISTS idx_brain_media_gaps_modality ON brain_media_gaps (modality, impact)`,
+  `CREATE INDEX IF NOT EXISTS idx_person_members_person ON person_members (person_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_person_suggestions_status ON person_suggestions (status, score DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_person_suggestions_pair ON person_suggestions (jid_low, jid_high)`,
+  `CREATE INDEX IF NOT EXISTS idx_google_contact_groups_phone ON google_contact_groups (phone_e164)`,
+  // Covering index for the person detectors' activity aggregates: first/last
+  // message per sender (and per sender+chat) resolve as index-only scans, so
+  // the deterministic passes stay cheap at real-archive scale.
+  `CREATE INDEX IF NOT EXISTS idx_messages_sender_activity ON messages (sender_source_jid, timestamp_ms, chat_id)`
 ];
 
 // Full-text search over messages (brain hot tier): a content-storing FTS5
@@ -1804,6 +1929,72 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     return labels;
   }
 
+  // Person keys for a JID batch on the read path (sync): person id when the
+  // identity is a member, else the jid itself — a lone identity is its own
+  // person.
+  private personKeysSync(jids: string[]): Map<string, string> {
+    const result = new Map<string, string>();
+    const unique = [...new Set(jids.filter(Boolean))];
+    for (let index = 0; index < unique.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = unique.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      const rows = this.db
+        .prepare(`SELECT identity_jid AS jid, person_id AS personId FROM person_members WHERE identity_jid IN (${batch.map(() => "?").join(",")})`)
+        .all(...batch) as Array<{ jid: string; personId: string }>;
+      for (const row of rows) {
+        result.set(row.jid, row.personId);
+      }
+    }
+    for (const jid of unique) {
+      if (!result.has(jid)) {
+        result.set(jid, jid);
+      }
+    }
+    return result;
+  }
+
+  // Render-time person disambiguation over one response's label list
+  // (identity-and-naming-integrity): entries sharing a label across DIFFERENT
+  // persons gain a deterministic complete-number suffix; two identities of
+  // one person never disambiguate against each other. Entries with a null
+  // label (or null jid) pass through untouched.
+  private disambiguateEntryLabels(entries: Array<{ label: string | null; jid: string | null }>): Array<string | null> {
+    const keys = this.personKeysSync(entries.map((entry) => entry.jid ?? "").filter(Boolean));
+    return disambiguateLabels(
+      entries.map((entry) => ({
+        label: entry.jid ? entry.label : null,
+        jid: entry.jid,
+        personKey: entry.jid ? keys.get(entry.jid) ?? entry.jid : "no-identity"
+      }))
+    );
+  }
+
+  // Display-level unconfirmed hints for DM counterparties: the best pending
+  // suggestion at or above the configured score. Read path only.
+  private chatHintsSync(jids: string[]): Map<string, string> {
+    const hints = new Map<string, string>();
+    const unique = [...new Set(jids.filter(Boolean))];
+    for (let index = 0; index < unique.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = unique.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      const placeholders = batch.map(() => "?").join(",");
+      const rows = this.db
+        .prepare(
+          `SELECT jid_low AS jidLow, jid_high AS jidHigh, score FROM person_suggestions
+           WHERE status = 'pending' AND score >= ? AND (jid_low IN (${placeholders}) OR jid_high IN (${placeholders}))
+           ORDER BY score DESC`
+        )
+        .all(config.persons.hintScoreThreshold, ...batch, ...batch) as Array<{ jidLow: string; jidHigh: string; score: number }>;
+      for (const row of rows) {
+        for (const jid of batch) {
+          if ((row.jidLow === jid || row.jidHigh === jid) && !hints.has(jid)) {
+            const otherJid = row.jidLow === jid ? row.jidHigh : row.jidLow;
+            hints.set(jid, `possibly the same as ${this.labelForJid(otherJid)} — unconfirmed`);
+          }
+        }
+      }
+    }
+    return hints;
+  }
+
   // The owner's saved name, read synchronously for use inside transactions.
   private readOwnerNameSync(): string | null {
     const row = this.db.prepare(`SELECT value FROM schema_meta WHERE key = 'owner_display_name'`).get() as
@@ -2055,6 +2246,22 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     });
     scored.sort((a, b) => b.score - a.score);
     const results = scored.slice(options.offset, options.offset + options.limit).map((entry) => entry.item);
+    // Same-name persons stay visually distinct within the result page: sender
+    // labels always; chat titles only for identity-addressed (DM) chats.
+    const adjustedSenders = this.disambiguateEntryLabels(results.map((item) => ({ label: item.senderDisplayName, jid: item.senderSourceJid })));
+    const adjustedChats = this.disambiguateEntryLabels(
+      results.map((item) =>
+        item.chatType === "dm" || item.chatType === "unknown" ? { label: item.chatDisplayName, jid: item.chatSourceId } : { label: null, jid: null }
+      )
+    );
+    results.forEach((item, index) => {
+      if (adjustedSenders[index] != null) {
+        item.senderDisplayName = adjustedSenders[index];
+      }
+      if (adjustedChats[index] != null) {
+        item.chatDisplayName = adjustedChats[index];
+      }
+    });
     return { index, totalMatches, results };
   }
 
@@ -3175,9 +3382,12 @@ export class SqliteArchiveRepository implements ArchiveRepository {
              OR EXISTS (SELECT 1 FROM message_deletions WHERE revoked_by_jid = ?)
              OR EXISTS (SELECT 1 FROM engagement_aggregates WHERE chat_source_id = ? OR counterparty_jid = ?)
              OR EXISTS (SELECT 1 FROM live_chat_checkpoints WHERE chat_source_id = ?)
-             OR EXISTS (SELECT 1 FROM live_gap_windows WHERE chat_source_id = ?) AS present`
+             OR EXISTS (SELECT 1 FROM live_gap_windows WHERE chat_source_id = ?)
+             OR EXISTS (SELECT 1 FROM person_members WHERE identity_jid = ?)
+             OR EXISTS (SELECT 1 FROM person_suggestions WHERE jid_low = ? OR jid_high = ?)
+             OR EXISTS (SELECT 1 FROM person_link_suppressions WHERE jid_low = ? OR jid_high = ?) AS present`
       )
-      .get(lid, lid, lid, lid, lid, lid, lid, lid, lid, lid, lid, lid, lid, lid, lid, lid, lid, lid) as { present: number };
+      .get(lid, lid, lid, lid, lid, lid, lid, lid, lid, lid, lid, lid, lid, lid, lid, lid, lid, lid, lid, lid, lid, lid, lid) as { present: number };
     if (!hasPresence.present) {
       return result;
     }
@@ -3268,6 +3478,11 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       this.db.prepare(`UPDATE engagement_aggregates SET chat_source_id = ? WHERE chat_source_id = ?`).run(pn, lid);
       this.db.prepare(`UPDATE engagement_aggregates SET counterparty_jid = ? WHERE counterparty_jid = ?`).run(pn, lid);
 
+      // Person layer follows the canonical identity: memberships rewrite,
+      // pair rows re-normalize (self-referential pairs vanish), and persons
+      // revealed to share an identity union.
+      this.rewritePersonLayerForMergeTx(lid, pn);
+
       // Live bookkeeping follows the merge.
       const pnCheckpoint = this.db.prepare(`SELECT chat_source_id FROM live_chat_checkpoints WHERE chat_source_id = ?`).get(pn);
       if (pnCheckpoint) {
@@ -3325,6 +3540,852 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     await this.repairBrainProseForIdentities(new Set([pn, lid]));
     this.invalidateBrainStatusCache();
     return result;
+  }
+
+  // === Two-level person model =============================================
+  // Identities (canonical JIDs) are immutable anchors; a person is an editable
+  // membership over them. Every method here touches only the person tables —
+  // episodes, claims, citations, and archive rows are structurally out of
+  // reach, which is what makes connect/disconnect metadata-only forever.
+
+  private personPair(jidA: string, jidB: string): [string, string] {
+    return jidA < jidB ? [jidA, jidB] : [jidB, jidA];
+  }
+
+  private recordPersonEventTx(
+    action: "connect" | "disconnect" | "union" | "dissolve" | "suggest" | "accept" | "reject",
+    fields: { personId?: string | null; identityJid?: string | null; source?: string | null; evidence?: Record<string, unknown> | null }
+  ): void {
+    this.db
+      .prepare(`INSERT INTO person_link_events (action, person_id, identity_jid, source, evidence_json, created_at) VALUES (?, ?, ?, ?, ?, ?)`)
+      .run(action, fields.personId ?? null, fields.identityJid ?? null, fields.source ?? null, fields.evidence ? JSON.stringify(fields.evidence) : null, currentIso());
+  }
+
+  private personMembershipTx(jid: string): { personId: string } | undefined {
+    return this.db.prepare(`SELECT person_id AS personId FROM person_members WHERE identity_jid = ?`).get(jid) as { personId: string } | undefined;
+  }
+
+  private supersedePendingSuggestionsTx(jidLow: string, jidHigh: string): void {
+    this.db
+      .prepare(`UPDATE person_suggestions SET status = 'superseded', updated_at = ? WHERE jid_low = ? AND jid_high = ? AND status = 'pending'`)
+      .run(currentIso(), jidLow, jidHigh);
+  }
+
+  // Union two persons revealed to share an identity. Deterministic survivor:
+  // more members, then older created_at, then smaller id. Memberships keep
+  // their original provenance; the dissolved id stays resolvable via redirect.
+  private unionPersonsTx(personIdA: string, personIdB: string, evidence: Record<string, unknown>): string {
+    const stats = this.db
+      .prepare(
+        `SELECT p.id AS id, p.created_at AS createdAt, COUNT(m.identity_jid) AS members
+         FROM persons p LEFT JOIN person_members m ON m.person_id = p.id
+         WHERE p.id IN (?, ?) GROUP BY p.id`
+      )
+      .all(personIdA, personIdB) as Array<{ id: string; createdAt: string; members: number }>;
+    const [survivor, dissolved] = [...stats].sort(
+      (a, b) => b.members - a.members || a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id)
+    );
+    this.db.prepare(`UPDATE person_members SET person_id = ? WHERE person_id = ?`).run(survivor.id, dissolved.id);
+    this.db.prepare(`DELETE FROM persons WHERE id = ?`).run(dissolved.id);
+    this.db
+      .prepare(`INSERT OR REPLACE INTO person_redirects (person_id, replaced_by_person_id, surviving_jid, created_at) VALUES (?, ?, NULL, ?)`)
+      .run(dissolved.id, survivor.id, currentIso());
+    this.db.prepare(`UPDATE persons SET updated_at = ? WHERE id = ?`).run(currentIso(), survivor.id);
+    this.recordPersonEventTx("union", { personId: survivor.id, evidence: { ...evidence, dissolvedPersonId: dissolved.id } });
+    return survivor.id;
+  }
+
+  // Synchronous core shared by the public method, suggestion acceptance, and
+  // the merge-path union. Runs inside the caller's transaction.
+  private connectIdentitiesTx(
+    jidA: string,
+    jidB: string,
+    source: PersonMemberSource,
+    evidence: Record<string, unknown> | null
+  ): PersonConnectResult {
+    const a = this.canonicalJid(jidA);
+    const b = this.canonicalJid(jidB);
+    if (!a || !b) {
+      return { outcome: "invalid", personId: null };
+    }
+    if (a === b) {
+      return { outcome: "self", personId: null };
+    }
+    const [low, high] = this.personPair(a, b);
+    const suppressed = this.db
+      .prepare(`SELECT reason FROM person_link_suppressions WHERE jid_low = ? AND jid_high = ?`)
+      .get(low, high) as { reason: string } | undefined;
+    if (suppressed) {
+      if (source !== "user") {
+        return { outcome: "suppressed", personId: null };
+      }
+      // An explicit human connect outranks past dismissals.
+      this.db.prepare(`DELETE FROM person_link_suppressions WHERE jid_low = ? AND jid_high = ?`).run(low, high);
+    }
+    const memberA = this.personMembershipTx(a);
+    const memberB = this.personMembershipTx(b);
+    const now = currentIso();
+    const insertMember = this.db.prepare(
+      `INSERT INTO person_members (person_id, identity_jid, source, evidence_json, linked_at) VALUES (?, ?, ?, ?, ?)`
+    );
+    const evidenceJson = evidence ? JSON.stringify(evidence) : null;
+    if (memberA && memberB) {
+      if (memberA.personId === memberB.personId) {
+        return { outcome: "already_connected", personId: memberA.personId };
+      }
+      const survivorId = this.unionPersonsTx(memberA.personId, memberB.personId, { viaJids: [a, b], source, ...(evidence ?? {}) });
+      this.supersedePendingSuggestionsTx(low, high);
+      return { outcome: "union", personId: survivorId };
+    }
+    if (memberA || memberB) {
+      const personId = (memberA ?? memberB)!.personId;
+      const newJid = memberA ? b : a;
+      insertMember.run(personId, newJid, source, evidenceJson, now);
+      this.db.prepare(`UPDATE persons SET updated_at = ? WHERE id = ?`).run(now, personId);
+      this.recordPersonEventTx("connect", { personId, identityJid: newJid, source, evidence });
+      this.supersedePendingSuggestionsTx(low, high);
+      return { outcome: "connected", personId };
+    }
+    const personId = `person_${randomUUID()}`;
+    this.db.prepare(`INSERT INTO persons (id, created_at, updated_at) VALUES (?, ?, ?)`).run(personId, now, now);
+    insertMember.run(personId, a, source, evidenceJson, now);
+    insertMember.run(personId, b, source, evidenceJson, now);
+    this.recordPersonEventTx("connect", { personId, identityJid: a, source, evidence });
+    this.recordPersonEventTx("connect", { personId, identityJid: b, source, evidence });
+    this.supersedePendingSuggestionsTx(low, high);
+    return { outcome: "connected", personId };
+  }
+
+  async connectIdentities(
+    jidA: string,
+    jidB: string,
+    source: PersonMemberSource,
+    evidence: Record<string, unknown> | null = null
+  ): Promise<PersonConnectResult> {
+    this.assertWritableIdentityVersion();
+    return this.db.transaction(() => this.connectIdentitiesTx(jidA, jidB, source, evidence))();
+  }
+
+  async disconnectIdentities(identityJid: string): Promise<PersonDisconnectResult> {
+    this.assertWritableIdentityVersion();
+    return this.db.transaction((): PersonDisconnectResult => {
+      const jid = this.canonicalJid(identityJid) ?? identityJid;
+      const membership = this.personMembershipTx(jid);
+      if (!membership) {
+        return { disconnected: false, personId: null, dissolved: false };
+      }
+      const personId = membership.personId;
+      const others = (
+        this.db.prepare(`SELECT identity_jid AS jid FROM person_members WHERE person_id = ? AND identity_jid != ?`).all(personId, jid) as Array<{ jid: string }>
+      ).map((row) => row.jid);
+      const now = currentIso();
+      this.db.prepare(`DELETE FROM person_members WHERE identity_jid = ?`).run(jid);
+      // A severed pair must never be silently re-applied by an auto source.
+      const insertSuppression = this.db.prepare(
+        `INSERT OR REPLACE INTO person_link_suppressions (jid_low, jid_high, reason, created_at) VALUES (?, ?, 'disconnected', ?)`
+      );
+      for (const other of others) {
+        const [low, high] = this.personPair(jid, other);
+        insertSuppression.run(low, high, now);
+      }
+      this.recordPersonEventTx("disconnect", { personId, identityJid: jid });
+      if (others.length < 2) {
+        this.db.prepare(`DELETE FROM person_members WHERE person_id = ?`).run(personId);
+        this.db.prepare(`DELETE FROM persons WHERE id = ?`).run(personId);
+        this.db
+          .prepare(`INSERT OR REPLACE INTO person_redirects (person_id, replaced_by_person_id, surviving_jid, created_at) VALUES (?, NULL, ?, ?)`)
+          .run(personId, others[0] ?? null, now);
+        this.recordPersonEventTx("dissolve", { personId, identityJid: others[0] ?? null });
+        return { disconnected: true, personId, dissolved: true };
+      }
+      this.db.prepare(`UPDATE persons SET updated_at = ? WHERE id = ?`).run(now, personId);
+      return { disconnected: true, personId, dissolved: false };
+    })();
+  }
+
+  // Person-layer reconciliation for the archive-layer LID→PN collapse: rewrite
+  // memberships, re-normalize pair rows (dropping self-referential ones), and
+  // union persons the collapse reveals to share an identity. Runs inside the
+  // mergeIdentity transaction.
+  private rewritePersonLayerForMergeTx(lid: string, pn: string): void {
+    const lidMember = this.personMembershipTx(lid);
+    const pnMember = this.personMembershipTx(pn);
+    if (lidMember && pnMember) {
+      if (lidMember.personId !== pnMember.personId) {
+        this.unionPersonsTx(lidMember.personId, pnMember.personId, { viaJids: [lid, pn], source: "identity_merge" });
+      }
+      // Same WhatsApp identity: the LID membership row is now redundant.
+      this.db.prepare(`DELETE FROM person_members WHERE identity_jid = ?`).run(lid);
+    } else if (lidMember) {
+      this.db.prepare(`UPDATE person_members SET identity_jid = ? WHERE identity_jid = ?`).run(pn, lid);
+    }
+    // Suggestions: substitute the JID, re-normalize pair order, drop rows that
+    // become self-referential, and collapse duplicates onto the strongest
+    // status (a rejection is memory and must survive the merge).
+    const statusRank: Record<string, number> = { rejected: 3, accepted: 2, superseded: 1, pending: 0 };
+    const suggestionRows = this.db
+      .prepare(`SELECT id, jid_low, jid_high, kind, score, status FROM person_suggestions WHERE jid_low = ? OR jid_high = ?`)
+      .all(lid, lid) as Array<{ id: string; jid_low: string; jid_high: string; kind: string; score: number; status: string }>;
+    for (const row of suggestionRows) {
+      const nextA = row.jid_low === lid ? pn : row.jid_low;
+      const nextB = row.jid_high === lid ? pn : row.jid_high;
+      if (nextA === nextB) {
+        this.db.prepare(`DELETE FROM person_suggestions WHERE id = ?`).run(row.id);
+        continue;
+      }
+      const [low, high] = this.personPair(nextA, nextB);
+      const existing = this.db
+        .prepare(`SELECT id, score, status FROM person_suggestions WHERE jid_low = ? AND jid_high = ? AND kind = ? AND id != ?`)
+        .get(low, high, row.kind, row.id) as { id: string; score: number; status: string } | undefined;
+      if (existing) {
+        const keepExisting = (statusRank[existing.status] ?? 0) >= (statusRank[row.status] ?? 0);
+        const survivorId = keepExisting ? existing.id : row.id;
+        const loserId = keepExisting ? row.id : existing.id;
+        this.db.prepare(`DELETE FROM person_suggestions WHERE id = ?`).run(loserId);
+        this.db
+          .prepare(`UPDATE person_suggestions SET jid_low = ?, jid_high = ?, score = MAX(score, ?), updated_at = ? WHERE id = ?`)
+          .run(low, high, Math.max(existing.score, row.score), currentIso(), survivorId);
+      } else {
+        this.db.prepare(`UPDATE person_suggestions SET jid_low = ?, jid_high = ?, updated_at = ? WHERE id = ?`).run(low, high, currentIso(), row.id);
+      }
+    }
+    // Suppressions: same re-normalization; INSERT OR IGNORE collapses duplicates.
+    const suppressionRows = this.db
+      .prepare(`SELECT jid_low, jid_high, reason, created_at FROM person_link_suppressions WHERE jid_low = ? OR jid_high = ?`)
+      .all(lid, lid) as Array<{ jid_low: string; jid_high: string; reason: string; created_at: string }>;
+    for (const row of suppressionRows) {
+      this.db.prepare(`DELETE FROM person_link_suppressions WHERE jid_low = ? AND jid_high = ?`).run(row.jid_low, row.jid_high);
+      const nextA = row.jid_low === lid ? pn : row.jid_low;
+      const nextB = row.jid_high === lid ? pn : row.jid_high;
+      if (nextA === nextB) {
+        continue;
+      }
+      const [low, high] = this.personPair(nextA, nextB);
+      this.db
+        .prepare(`INSERT OR IGNORE INTO person_link_suppressions (jid_low, jid_high, reason, created_at) VALUES (?, ?, ?, ?)`)
+        .run(low, high, row.reason, row.created_at);
+    }
+    this.db.prepare(`UPDATE person_link_events SET identity_jid = ? WHERE identity_jid = ?`).run(pn, lid);
+  }
+
+  private buildPersonRecords(personIds: string[]): PersonRecord[] {
+    if (personIds.length === 0) {
+      return [];
+    }
+    const placeholders = personIds.map(() => "?").join(",");
+    const personRows = this.db
+      .prepare(`SELECT id, created_at AS createdAt, updated_at AS updatedAt FROM persons WHERE id IN (${placeholders})`)
+      .all(...personIds) as Array<{ id: string; createdAt: string; updatedAt: string }>;
+    const memberRows = this.db
+      .prepare(
+        `SELECT m.person_id AS personId, m.identity_jid AS jid, m.source AS source, m.evidence_json AS evidenceJson, m.linked_at AS linkedAt,
+                c.display_name AS displayName, c.push_name AS pushName, c.phone_number AS phoneNumber,
+                (SELECT COUNT(*) FROM messages msg WHERE msg.sender_source_jid = m.identity_jid) AS messageCount
+         FROM person_members m
+         LEFT JOIN contacts c ON c.source_jid = m.identity_jid
+         WHERE m.person_id IN (${placeholders})
+         ORDER BY m.linked_at, m.identity_jid`
+      )
+      .all(...personIds) as Array<{
+      personId: string;
+      jid: string;
+      source: PersonMemberSource;
+      evidenceJson: string | null;
+      linkedAt: string;
+      displayName: string | null;
+      pushName: string | null;
+      phoneNumber: string | null;
+      messageCount: number;
+    }>;
+    const membersByPerson = new Map<string, PersonMemberRecord[]>();
+    for (const row of memberRows) {
+      const hasSavedName = Boolean(
+        row.displayName?.trim() && !isMaskedNumberLabel(row.displayName) && !isIdentityDerivedName(row.displayName, row.jid)
+      );
+      const record: PersonMemberRecord = {
+        identityJid: row.jid,
+        source: row.source,
+        evidence: row.evidenceJson ? (JSON.parse(row.evidenceJson) as Record<string, unknown>) : null,
+        linkedAt: row.linkedAt,
+        displayLabel: resolveDisplayLabel({ displayName: row.displayName, pushName: row.pushName, phoneNumber: row.phoneNumber, jid: row.jid }),
+        phoneNumber: row.phoneNumber ?? phoneFromJid(row.jid),
+        messageCount: Number(row.messageCount ?? 0),
+        hasSavedName
+      };
+      membersByPerson.set(row.personId, [...(membersByPerson.get(row.personId) ?? []), record]);
+    }
+    return personRows.map((person) => {
+      const members = membersByPerson.get(person.id) ?? [];
+      return {
+        id: person.id,
+        displayLabel: personDisplayLabelFromMembers(members),
+        members,
+        unconfirmedHint: this.personUnconfirmedHint(members),
+        createdAt: person.createdAt,
+        updatedAt: person.updatedAt
+      };
+    });
+  }
+
+  // Display-level only: a high-confidence pending suggestion involving any
+  // member surfaces as an annotation. Structurally invisible to evidence
+  // packs, prompts, and search — those paths never read the suggestion table.
+  private personUnconfirmedHint(members: PersonMemberRecord[]): string | null {
+    if (members.length === 0) {
+      return null;
+    }
+    const memberJids = new Set(members.map((member) => member.identityJid));
+    const placeholders = members.map(() => "?").join(",");
+    const row = this.db
+      .prepare(
+        `SELECT jid_low AS jidLow, jid_high AS jidHigh, score FROM person_suggestions
+         WHERE status = 'pending' AND score >= ? AND (jid_low IN (${placeholders}) OR jid_high IN (${placeholders}))
+         ORDER BY score DESC LIMIT 1`
+      )
+      .get(config.persons.hintScoreThreshold, ...members.map((m) => m.identityJid), ...members.map((m) => m.identityJid)) as
+      | { jidLow: string; jidHigh: string; score: number }
+      | undefined;
+    if (!row) {
+      return null;
+    }
+    const otherJid = memberJids.has(row.jidLow) ? row.jidHigh : row.jidLow;
+    return `possibly the same as ${this.labelForJid(otherJid)} — unconfirmed`;
+  }
+
+  private labelForJid(jid: string): string {
+    const contact = this.db
+      .prepare(`SELECT display_name AS displayName, push_name AS pushName, phone_number AS phoneNumber FROM contacts WHERE source_jid = ?`)
+      .get(jid) as { displayName: string | null; pushName: string | null; phoneNumber: string | null } | undefined;
+    return (
+      resolveDisplayLabel({
+        displayName: contact?.displayName ?? null,
+        pushName: contact?.pushName ?? null,
+        phoneNumber: contact?.phoneNumber ?? null,
+        jid
+      }) ?? jid
+    );
+  }
+
+  async resolvePersonForJid(jid: string): Promise<PersonRecord | null> {
+    const canonical = this.canonicalJid(jid) ?? jid;
+    const membership = this.personMembershipTx(canonical);
+    if (!membership) {
+      return null;
+    }
+    return this.buildPersonRecords([membership.personId])[0] ?? null;
+  }
+
+  async listPersons(options: { limit?: number } = {}): Promise<PersonRecord[]> {
+    const limit = Math.max(1, options.limit ?? 200);
+    const ids = (
+      this.db.prepare(`SELECT id FROM persons ORDER BY updated_at DESC, id LIMIT ?`).all(limit) as Array<{ id: string }>
+    ).map((row) => row.id);
+    return this.buildPersonRecords(ids);
+  }
+
+  async getPerson(personId: string): Promise<PersonLookupResult> {
+    const person = this.buildPersonRecords([personId])[0] ?? null;
+    if (person) {
+      return { person, redirect: null };
+    }
+    // Follow redirect chains (union of a union) to the terminal record.
+    let redirect: PersonRedirectRecord | null = null;
+    let cursor = personId;
+    for (let hops = 0; hops < 10; hops += 1) {
+      const row = this.db
+        .prepare(
+          `SELECT person_id AS personId, replaced_by_person_id AS replacedByPersonId, surviving_jid AS survivingJid, created_at AS createdAt
+           FROM person_redirects WHERE person_id = ?`
+        )
+        .get(cursor) as PersonRedirectRecord | undefined;
+      if (!row) {
+        break;
+      }
+      redirect = row;
+      if (!row.replacedByPersonId) {
+        break;
+      }
+      const target = this.buildPersonRecords([row.replacedByPersonId])[0] ?? null;
+      if (target) {
+        return { person: target, redirect: row };
+      }
+      cursor = row.replacedByPersonId;
+    }
+    return { person: null, redirect };
+  }
+
+  async personKeyForJids(jids: string[]): Promise<Map<string, string>> {
+    const result = new Map<string, string>();
+    const canonicalByInput = new Map<string, string>();
+    for (const jid of jids) {
+      if (!jid) {
+        continue;
+      }
+      canonicalByInput.set(jid, this.canonicalJid(jid) ?? jid);
+      result.set(jid, canonicalByInput.get(jid)!);
+    }
+    const canonical = [...new Set(canonicalByInput.values())];
+    for (let index = 0; index < canonical.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = canonical.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      const placeholders = batch.map(() => "?").join(",");
+      const rows = this.db
+        .prepare(`SELECT identity_jid AS jid, person_id AS personId FROM person_members WHERE identity_jid IN (${placeholders})`)
+        .all(...batch) as Array<{ jid: string; personId: string }>;
+      const byJid = new Map(rows.map((row) => [row.jid, row.personId]));
+      for (const [input, canonicalJid] of canonicalByInput) {
+        const personId = byJid.get(canonicalJid);
+        if (personId) {
+          result.set(input, personId);
+        }
+      }
+    }
+    return result;
+  }
+
+  async upsertPersonSuggestions(suggestions: PersonSuggestionInput[]): Promise<{ created: number; updated: number }> {
+    this.assertWritableIdentityVersion();
+    let created = 0;
+    let updated = 0;
+    this.db.transaction(() => {
+      for (const suggestion of suggestions) {
+        const a = this.canonicalJid(suggestion.jidA);
+        const b = this.canonicalJid(suggestion.jidB);
+        if (!a || !b || a === b) {
+          continue;
+        }
+        const [low, high] = this.personPair(a, b);
+        const suppressed = this.db.prepare(`SELECT 1 FROM person_link_suppressions WHERE jid_low = ? AND jid_high = ?`).get(low, high);
+        if (suppressed) {
+          continue;
+        }
+        const memberA = this.personMembershipTx(a);
+        const memberB = this.personMembershipTx(b);
+        if (memberA && memberB && memberA.personId === memberB.personId) {
+          continue;
+        }
+        const existing = this.db
+          .prepare(`SELECT id, score, evidence_json AS evidenceJson, status FROM person_suggestions WHERE jid_low = ? AND jid_high = ? AND kind = ?`)
+          .get(low, high, suggestion.kind) as { id: string; score: number; evidenceJson: string; status: string } | undefined;
+        const evidenceJson = JSON.stringify(suggestion.evidence ?? {});
+        if (existing) {
+          // Rejected is memory and accepted is history: never resurrected by a
+          // detector re-run. Superseded means "no longer applicable at the
+          // time" (pruned low-value pair, a connect's cleanup, a retired
+          // detector) — when a detector produces the pair afresh, the evidence
+          // is current again, so it returns to pending.
+          if (existing.status === "rejected" || existing.status === "accepted") {
+            continue;
+          }
+          if (existing.status === "superseded") {
+            this.db
+              .prepare(`UPDATE person_suggestions SET status = 'pending', score = ?, evidence_json = ?, updated_at = ? WHERE id = ?`)
+              .run(suggestion.score, evidenceJson, currentIso(), existing.id);
+            created += 1;
+            continue;
+          }
+          if (existing.score !== suggestion.score || existing.evidenceJson !== evidenceJson) {
+            this.db
+              .prepare(`UPDATE person_suggestions SET score = ?, evidence_json = ?, updated_at = ? WHERE id = ?`)
+              .run(suggestion.score, evidenceJson, currentIso(), existing.id);
+            updated += 1;
+          }
+          continue;
+        }
+        const id = `psg_${randomUUID()}`;
+        this.db
+          .prepare(
+            `INSERT INTO person_suggestions (id, jid_low, jid_high, kind, score, evidence_json, status, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)`
+          )
+          .run(id, low, high, suggestion.kind, suggestion.score, evidenceJson, currentIso(), currentIso());
+        this.recordPersonEventTx("suggest", { evidence: { suggestionId: id, jidLow: low, jidHigh: high, kind: suggestion.kind, score: suggestion.score } });
+        created += 1;
+      }
+    })();
+    return { created, updated };
+  }
+
+  async listPersonSuggestions(
+    options: { status?: PersonSuggestionStatus; jid?: string; minScore?: number; limit?: number } = {}
+  ): Promise<PersonSuggestionRecord[]> {
+    const clauses: string[] = [];
+    const params: unknown[] = [];
+    if (options.status) {
+      clauses.push(`status = ?`);
+      params.push(options.status);
+    }
+    if (options.jid) {
+      const canonical = this.canonicalJid(options.jid) ?? options.jid;
+      clauses.push(`(jid_low = ? OR jid_high = ?)`);
+      params.push(canonical, canonical);
+    }
+    if (options.minScore != null) {
+      clauses.push(`score >= ?`);
+      params.push(options.minScore);
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    const rows = this.db
+      .prepare(
+        `SELECT id, jid_low AS jidLow, jid_high AS jidHigh, kind, score, evidence_json AS evidenceJson, status,
+                created_at AS createdAt, updated_at AS updatedAt
+         FROM person_suggestions ${where}
+         ORDER BY score DESC, updated_at DESC LIMIT ?`
+      )
+      .all(...params, Math.max(1, options.limit ?? 100)) as Array<{
+      id: string;
+      jidLow: string;
+      jidHigh: string;
+      kind: PersonSuggestionKind;
+      score: number;
+      evidenceJson: string;
+      status: PersonSuggestionStatus;
+      createdAt: string;
+      updatedAt: string;
+    }>;
+    // Decision context, resolved at read time: complete numbers, each
+    // identity's DM chat id (one click to eyeball the conversation), and
+    // display labels for chat/group ids the evidence references.
+    const findPhone = this.db.prepare(`SELECT phone_number AS phone FROM contacts WHERE source_jid = ?`);
+    const findDmChat = this.db.prepare(`SELECT id FROM chats WHERE source_chat_id = ?`);
+    const findChatLabel = this.db.prepare(`SELECT NULLIF(TRIM(COALESCE(display_name, '')), '') AS label FROM chats WHERE source_chat_id = ?`);
+    const countMessages = this.db.prepare(`SELECT COUNT(*) AS count FROM messages WHERE sender_source_jid = ?`);
+    const countMentions = this.db.prepare(`SELECT COUNT(*) AS count FROM message_mentions WHERE mentioned_jid = ?`);
+    const countGroups = this.db.prepare(
+      `SELECT COUNT(*) AS count FROM chat_participants cp JOIN chats c ON c.id = cp.chat_id WHERE cp.source_jid = ? AND c.chat_type = 'group'`
+    );
+    const phoneFor = (jid: string): string | null =>
+      ((findPhone.get(jid) as { phone: string | null } | undefined)?.phone ?? phoneFromJid(jid)) || null;
+    const dmChatIdFor = (jid: string): number | null => {
+      const chat = findDmChat.get(jid) as { id: number } | undefined;
+      return chat ? Number(chat.id) : null;
+    };
+    const cached = (statement: import("better-sqlite3").Statement) => {
+      const cache = new Map<string, number>();
+      return (jid: string): number => {
+        const hit = cache.get(jid);
+        if (hit != null) return hit;
+        const count = Number((statement.get(jid) as { count: number }).count);
+        cache.set(jid, count);
+        return count;
+      };
+    };
+    const messagesFor = cached(countMessages);
+    const mentionsFor = cached(countMentions);
+    const groupsFor = cached(countGroups);
+    return rows.map((row) => {
+      const evidence = JSON.parse(row.evidenceJson) as Record<string, unknown>;
+      const chatLabels: Record<string, string> = {};
+      for (const key of ["sharedChats", "sharedGroups", "membershipHandoffGroups"]) {
+        const ids = evidence[key];
+        if (!Array.isArray(ids)) continue;
+        for (const id of ids) {
+          if (typeof id === "string" && !(id in chatLabels)) {
+            const label = (findChatLabel.get(id) as { label: string | null } | undefined)?.label;
+            if (label) {
+              chatLabels[id] = label;
+            }
+          }
+        }
+      }
+      return {
+        id: row.id,
+        jidLow: row.jidLow,
+        jidHigh: row.jidHigh,
+        kind: row.kind,
+        score: row.score,
+        evidence,
+        status: row.status,
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+        lowLabel: this.labelForJid(row.jidLow),
+        highLabel: this.labelForJid(row.jidHigh),
+        lowPhone: phoneFor(row.jidLow),
+        highPhone: phoneFor(row.jidHigh),
+        lowChatId: dmChatIdFor(row.jidLow),
+        highChatId: dmChatIdFor(row.jidHigh),
+        lowMessageCount: messagesFor(row.jidLow),
+        highMessageCount: messagesFor(row.jidHigh),
+        lowMentionCount: mentionsFor(row.jidLow),
+        highMentionCount: mentionsFor(row.jidHigh),
+        lowGroupCount: groupsFor(row.jidLow),
+        highGroupCount: groupsFor(row.jidHigh),
+        chatLabels
+      };
+    });
+  }
+
+  // A sender's recent visible messages across every chat (groups included):
+  // the compare dialog's activity view for identities without a direct chat.
+  async listRecentMessagesBySender(jid: string, limit = 20): Promise<IdentityRecentMessage[]> {
+    const canonical = this.canonicalJid(jid) ?? jid;
+    const rows = this.db
+      .prepare(
+        `SELECT m.timestamp_ms AS timestampMs, m.direction, m.message_type AS messageType, m.body, m.caption,
+                c.id AS chatId, c.source_chat_id AS chatSourceId, c.chat_type AS chatType,
+                NULLIF(TRIM(COALESCE(c.display_name, '')), '') AS chatLabel
+         FROM messages m JOIN chats c ON c.id = m.chat_id
+         WHERE m.sender_source_jid = ? AND ${visibleExchangePredicate("m")}
+         ORDER BY m.timestamp_ms DESC, m.id DESC LIMIT ?`
+      )
+      .all(canonical, Math.max(1, limit)) as Array<{
+      timestampMs: number | null;
+      direction: string;
+      messageType: string;
+      body: string | null;
+      caption: string | null;
+      chatId: number;
+      chatSourceId: string;
+      chatType: string;
+      chatLabel: string | null;
+    }>;
+    return rows.map((row) => ({
+      chatId: Number(row.chatId),
+      chatSourceId: row.chatSourceId,
+      chatLabel: row.chatLabel && row.chatLabel !== row.chatSourceId ? row.chatLabel : displayPhoneFromJid(row.chatSourceId),
+      chatType: row.chatType as IdentityRecentMessage["chatType"],
+      timestampMs: row.timestampMs == null ? null : Number(row.timestampMs),
+      direction: row.direction as IdentityRecentMessage["direction"],
+      messageType: row.messageType,
+      text: row.body?.trim() || row.caption?.trim() || null
+    }));
+  }
+
+  // Retire a detector kind's pending queue (rejected/accepted history stays).
+  async supersedePersonSuggestionsByKind(kind: PersonSuggestionKind): Promise<number> {
+    const result = this.db
+      .prepare(`UPDATE person_suggestions SET status = 'superseded', updated_at = ? WHERE kind = ? AND status = 'pending'`)
+      .run(currentIso(), kind);
+    return result.changes;
+  }
+
+  // Prune specific pending rows (e.g. pairs whose merge value dropped to
+  // nothing). Superseded rows return to pending if a detector later produces
+  // the pair afresh.
+  async supersedePersonSuggestionsByIds(ids: string[]): Promise<number> {
+    if (ids.length === 0) {
+      return 0;
+    }
+    let changed = 0;
+    const update = this.db.prepare(`UPDATE person_suggestions SET status = 'superseded', updated_at = ? WHERE id = ? AND status = 'pending'`);
+    this.db.transaction(() => {
+      for (const id of ids) {
+        changed += update.run(currentIso(), id).changes;
+      }
+    })();
+    return changed;
+  }
+
+  async acceptPersonSuggestion(suggestionId: string): Promise<PersonConnectResult> {
+    this.assertWritableIdentityVersion();
+    return this.db.transaction((): PersonConnectResult => {
+      const suggestion = this.db
+        .prepare(`SELECT id, jid_low AS jidLow, jid_high AS jidHigh, kind, status FROM person_suggestions WHERE id = ?`)
+        .get(suggestionId) as { id: string; jidLow: string; jidHigh: string; kind: PersonSuggestionKind; status: string } | undefined;
+      if (!suggestion || suggestion.status !== "pending") {
+        throw new PublicError("PERSON_SUGGESTION_STATE", "The suggestion no longer exists or was already resolved.");
+      }
+      // Mark accepted before connecting so the connect's supersede pass (which
+      // only touches pending rows) leaves the acceptance record intact.
+      this.db.prepare(`UPDATE person_suggestions SET status = 'accepted', updated_at = ? WHERE id = ?`).run(currentIso(), suggestion.id);
+      this.recordPersonEventTx("accept", { evidence: { suggestionId: suggestion.id, kind: suggestion.kind } });
+      // The human clicked: membership provenance is 'user', with the accepted
+      // suggestion carried as evidence.
+      return this.connectIdentitiesTx(suggestion.jidLow, suggestion.jidHigh, "user", { suggestionId: suggestion.id, kind: suggestion.kind });
+    })();
+  }
+
+  async rejectPersonSuggestion(suggestionId: string): Promise<boolean> {
+    this.assertWritableIdentityVersion();
+    return this.db.transaction((): boolean => {
+      const suggestion = this.db
+        .prepare(`SELECT id, kind, status FROM person_suggestions WHERE id = ?`)
+        .get(suggestionId) as { id: string; kind: string; status: string } | undefined;
+      if (!suggestion || suggestion.status !== "pending") {
+        return false;
+      }
+      // The rejected row itself is the rejection memory: the UNIQUE(pair, kind)
+      // slot stays occupied, so the detector's upsert can never resurrect it.
+      this.db.prepare(`UPDATE person_suggestions SET status = 'rejected', updated_at = ? WHERE id = ?`).run(currentIso(), suggestion.id);
+      this.recordPersonEventTx("reject", { evidence: { suggestionId: suggestion.id, kind: suggestion.kind } });
+      return true;
+    })();
+  }
+
+  async listPersonLinkSuppressions(limit = 200): Promise<PersonLinkSuppressionRecord[]> {
+    return this.db
+      .prepare(
+        `SELECT jid_low AS jidLow, jid_high AS jidHigh, reason, created_at AS createdAt
+         FROM person_link_suppressions ORDER BY created_at DESC LIMIT ?`
+      )
+      .all(Math.max(1, limit)) as PersonLinkSuppressionRecord[];
+  }
+
+  async listPersonLinkEvents(options: { limit?: number } = {}): Promise<PersonLinkEventRecord[]> {
+    const rows = this.db
+      .prepare(
+        `SELECT id, action, person_id AS personId, identity_jid AS identityJid, source, evidence_json AS evidenceJson, created_at AS createdAt
+         FROM person_link_events ORDER BY id DESC LIMIT ?`
+      )
+      .all(Math.max(1, options.limit ?? 200)) as Array<{
+      id: number;
+      action: PersonLinkEventRecord["action"];
+      personId: string | null;
+      identityJid: string | null;
+      source: string | null;
+      evidenceJson: string | null;
+      createdAt: string;
+    }>;
+    return rows.map((row) => ({
+      id: row.id,
+      action: row.action,
+      personId: row.personId,
+      identityJid: row.identityJid,
+      source: row.source,
+      evidence: row.evidenceJson ? (JSON.parse(row.evidenceJson) as Record<string, unknown>) : null,
+      createdAt: row.createdAt
+    }));
+  }
+
+  async replaceGoogleContactGroups(groups: GoogleContactGroupEntry[]): Promise<{ groups: number; numbers: number }> {
+    this.assertWritableIdentityVersion();
+    const resources = new Set<string>();
+    this.db.transaction(() => {
+      this.db.prepare(`DELETE FROM google_contact_groups`).run();
+      const insert = this.db.prepare(
+        `INSERT OR REPLACE INTO google_contact_groups (resource_name, phone_e164, display_name, last_seen_at) VALUES (?, ?, ?, ?)`
+      );
+      const now = currentIso();
+      for (const group of groups) {
+        if (!group.resourceName || !group.phoneE164) {
+          continue;
+        }
+        insert.run(group.resourceName, group.phoneE164, group.displayName ?? null, now);
+        resources.add(group.resourceName);
+      }
+    })();
+    return { groups: resources.size, numbers: groups.length };
+  }
+
+  async listGoogleContactGroups(): Promise<GoogleContactGroupEntry[]> {
+    return this.db
+      .prepare(`SELECT resource_name AS resourceName, phone_e164 AS phoneE164, display_name AS displayName FROM google_contact_groups ORDER BY resource_name, phone_e164`)
+      .all() as GoogleContactGroupEntry[];
+  }
+
+  async resolveArchivedJidsForPhones(phones: string[]): Promise<Map<string, string[]>> {
+    const result = new Map<string, string[]>();
+    const unique = [...new Set(phones.filter(Boolean))];
+    const find = this.db.prepare(`SELECT source_jid AS jid FROM contacts WHERE phone_number = ? OR source_jid = ?`);
+    for (const phone of unique) {
+      const rows = find.all(phone, `${phone}@s.whatsapp.net`) as Array<{ jid: string }>;
+      if (rows.length > 0) {
+        result.set(phone, [...new Set(rows.map((row) => row.jid))]);
+      }
+    }
+    return result;
+  }
+
+  async listIdentityProfiles(options: { limit?: number } = {}): Promise<IdentityProfile[]> {
+    return this.db
+      .prepare(
+        `SELECT c.source_jid AS jid, c.display_name AS displayName, c.push_name AS pushName, c.phone_number AS phoneNumber,
+                (SELECT COUNT(*) FROM messages m WHERE m.sender_source_jid = c.source_jid) AS messageCount
+         FROM contacts c
+         WHERE c.source_jid LIKE '%@s.whatsapp.net' OR c.source_jid LIKE '%@lid' OR c.source_jid LIKE '%@hosted.lid'
+         ORDER BY c.id LIMIT ?`
+      )
+      .all(Math.max(1, options.limit ?? 10_000)) as IdentityProfile[];
+  }
+
+  async listIdentityActivitySummaries(options: { minMessages?: number; limit?: number } = {}): Promise<IdentityActivitySummary[]> {
+    return this.db
+      .prepare(
+        `SELECT sender_source_jid AS jid, COUNT(*) AS messages, MIN(timestamp_ms) AS firstMs, MAX(timestamp_ms) AS lastMs
+         FROM messages
+         WHERE sender_source_jid IS NOT NULL AND timestamp_ms IS NOT NULL
+           AND (sender_source_jid LIKE '%@s.whatsapp.net' OR sender_source_jid LIKE '%@lid' OR sender_source_jid LIKE '%@hosted.lid')
+         GROUP BY sender_source_jid
+         HAVING COUNT(*) >= ?
+         ORDER BY MAX(timestamp_ms) DESC
+         LIMIT ?`
+      )
+      .all(Math.max(1, options.minMessages ?? 3), Math.max(1, options.limit ?? 2_000)) as IdentityActivitySummary[];
+  }
+
+  async listIdentityChatActivity(jids: string[]): Promise<IdentityChatActivity[]> {
+    const result: IdentityChatActivity[] = [];
+    const unique = [...new Set(jids.filter(Boolean))];
+    for (let index = 0; index < unique.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = unique.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      const placeholders = batch.map(() => "?").join(",");
+      const rows = this.db
+        .prepare(
+          `SELECT m.sender_source_jid AS jid, c.source_chat_id AS chatSourceId, COUNT(*) AS messages,
+                  MIN(m.timestamp_ms) AS firstMs, MAX(m.timestamp_ms) AS lastMs
+           FROM messages m JOIN chats c ON c.id = m.chat_id
+           WHERE m.sender_source_jid IN (${placeholders}) AND m.timestamp_ms IS NOT NULL
+           GROUP BY m.sender_source_jid, c.source_chat_id`
+        )
+        .all(...batch) as IdentityChatActivity[];
+      result.push(...rows);
+    }
+    return result;
+  }
+
+  async listGroupParticipantSets(
+    options: { maxGroupSize?: number; limit?: number } = {}
+  ): Promise<Array<{ groupSourceId: string; participantJids: string[] }>> {
+    const maxGroupSize = Math.max(2, options.maxGroupSize ?? 64);
+    const limit = Math.max(1, options.limit ?? 500);
+    const rows = this.db
+      .prepare(
+        `SELECT c.source_chat_id AS groupSourceId, cp.source_jid AS jid
+         FROM chats c JOIN chat_participants cp ON cp.chat_id = c.id
+         WHERE c.chat_type = 'group'
+         ORDER BY c.id`
+      )
+      .all() as Array<{ groupSourceId: string; jid: string }>;
+    const byGroup = new Map<string, string[]>();
+    for (const row of rows) {
+      byGroup.set(row.groupSourceId, [...(byGroup.get(row.groupSourceId) ?? []), row.jid]);
+    }
+    const sets: Array<{ groupSourceId: string; participantJids: string[] }> = [];
+    for (const [groupSourceId, participantJids] of byGroup) {
+      if (participantJids.length >= 2 && participantJids.length <= maxGroupSize) {
+        sets.push({ groupSourceId, participantJids });
+        if (sets.length >= limit) {
+          break;
+        }
+      }
+    }
+    return sets;
+  }
+
+  async listCoCitedIdentityPairs(
+    options: { minEpisodes?: number; limit?: number } = {}
+  ): Promise<Array<{ jidA: string; jidB: string; episodes: number }>> {
+    return this.db
+      .prepare(
+        `SELECT a.jid AS jidA, b.jid AS jidB, COUNT(DISTINCT cl.episode_id) AS episodes
+         FROM brain_claim_entities a
+         JOIN brain_claim_entities b ON b.claim_id = a.claim_id AND b.jid > a.jid
+         JOIN brain_claims cl ON cl.id = a.claim_id
+         WHERE a.jid IS NOT NULL AND b.jid IS NOT NULL AND a.kind = 'person' AND b.kind = 'person'
+         GROUP BY a.jid, b.jid
+         HAVING COUNT(DISTINCT cl.episode_id) >= ?
+         ORDER BY episodes DESC
+         LIMIT ?`
+      )
+      .all(Math.max(1, options.minEpisodes ?? 2), Math.max(1, options.limit ?? 200)) as Array<{ jidA: string; jidB: string; episodes: number }>;
+  }
+
+  async listResolvedVcardNames(options: { limit?: number } = {}): Promise<Array<{ resolvedJid: string; displayName: string | null }>> {
+    return this.db
+      .prepare(
+        `SELECT DISTINCT resolved_jid AS resolvedJid, display_name AS displayName
+         FROM message_vcards WHERE resolved_jid IS NOT NULL LIMIT ?`
+      )
+      .all(Math.max(1, options.limit ?? 1_000)) as Array<{ resolvedJid: string; displayName: string | null }>;
   }
 
   // Refresh derived search text (`resolved_text` + mentions) for the given
@@ -6145,7 +7206,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
          LIMIT ? OFFSET ?`
       )
       .all(...params) as SqliteChatRow[];
-    return rows.map((row) => ({
+    const items: ChatListItem[] = rows.map((row) => ({
       id: Number(row.id),
       sourceChatId: row.source_chat_id,
       jid: row.jid,
@@ -6157,6 +7218,26 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       participantCount: Number(row.participant_count ?? 0),
       lastMessageAt: row.last_message_at ?? null
     }));
+    // Same-name persons must be visually distinct wherever they co-occur:
+    // disambiguate DM titles across the page (group subjects are not person
+    // labels) and attach display-level unconfirmed hints.
+    const isIdentityChat = (item: ChatListItem): boolean => item.chatType === "dm" || item.chatType === "unknown";
+    const adjusted = this.disambiguateEntryLabels(
+      items.map((item) => (isIdentityChat(item) ? { label: item.displayName, jid: item.sourceChatId } : { label: null, jid: null }))
+    );
+    const hints = this.chatHintsSync(items.filter(isIdentityChat).map((item) => item.sourceChatId));
+    items.forEach((item, index) => {
+      if (isIdentityChat(item)) {
+        if (adjusted[index] != null) {
+          item.displayName = adjusted[index];
+        }
+        const hint = hints.get(item.sourceChatId);
+        if (hint) {
+          item.unconfirmedHint = hint;
+        }
+      }
+    });
+    return items;
   }
 
   async listMessages(
@@ -6232,7 +7313,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
   ): MessageListItem[] {
     const groupSelfSender = chat?.chat_type === "group" ? chat.source_chat_id : null;
     const mentionLabels = this.resolveMentionLabels(rows.flatMap((row) => [row.body, row.caption]));
-    return rows.map((row) => {
+    const items = rows.map((row) => {
       const media = deriveMediaSummary(row, row.message_type);
       const hasHeldContent = Boolean(row.body?.trim() || row.caption?.trim() || media?.availability === "stored");
       return {
@@ -6281,6 +7362,16 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         isStarred: Boolean(row.is_starred)
       };
     });
+    // Same-name persons stay visually distinct within the thread page.
+    const adjustedSenders = this.disambiguateEntryLabels(
+      items.map((item) => ({ label: item.senderDisplayName, jid: item.senderSourceJid }))
+    );
+    items.forEach((item, index) => {
+      if (adjustedSenders[index] != null) {
+        item.senderDisplayName = adjustedSenders[index];
+      }
+    });
+    return items;
   }
 
   private structuredSignalsForMessage(messageId: number, sourceMessageKey: string): MessageStructuredSignals | null {

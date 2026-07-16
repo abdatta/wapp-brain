@@ -22,7 +22,34 @@ describe("Google Contacts phone matching", () => {
       { names: [{ displayName: "Grace" }], phoneNumbers: [{ canonicalForm: "+14155550100" }] },
       { names: [{ displayName: "Lin" }], phoneNumbers: [{ value: "020 1234" }] }
     ]);
-    expect(result).toEqual({ candidates: [], ambiguousNumbers: 1, skippedNumbers: 1 });
+    expect(result).toEqual({ candidates: [], groups: [], ambiguousNumbers: 1, skippedNumbers: 1 });
+  });
+
+  it("captures the same-contact grouping independently of name ambiguity, keeping candidates unchanged", () => {
+    const result = buildCandidates([
+      {
+        resourceName: "people/c1",
+        names: [{ displayName: "Rohit" }],
+        phoneNumbers: [{ canonicalForm: "+14155550100" }, { canonicalForm: "+14155550101" }, { value: "020 1234" }]
+      },
+      // Same number under a different contact with a different name: the name
+      // is ambiguous (skipped for enrichment) but BOTH groupings keep it.
+      { resourceName: "people/c2", names: [{ displayName: "Rohit Old" }], phoneNumbers: [{ canonicalForm: "+14155550100" }] },
+      // No display name at all: never a candidate, still a grouping member.
+      { resourceName: "people/c3", phoneNumbers: [{ canonicalForm: "+14155550102" }] },
+      // Deleted contacts contribute nothing.
+      { resourceName: "people/c4", metadata: { deleted: true }, phoneNumbers: [{ canonicalForm: "+14155550103" }] }
+    ]);
+    expect(result.groups).toEqual([
+      { resourceName: "people/c1", phoneE164: "14155550100", displayName: "Rohit" },
+      { resourceName: "people/c1", phoneE164: "14155550101", displayName: "Rohit" },
+      { resourceName: "people/c2", phoneE164: "14155550100", displayName: "Rohit Old" },
+      { resourceName: "people/c3", phoneE164: "14155550102", displayName: null }
+    ]);
+    // Enrichment candidates are unaffected by grouping capture: 0100 is
+    // name-ambiguous, the unnormalizable and nameless numbers skip.
+    expect(result.candidates).toEqual([{ phoneNumber: "14155550101", displayName: "Rohit" }]);
+    expect(result.ambiguousNumbers).toBe(1);
   });
 });
 
@@ -62,6 +89,77 @@ describe("Google Contacts OAuth", () => {
     expect(tokenCalls).toBe(2);
     expect(peopleCalls).toBe(2);
     expect(result.fetchedPeople).toBe(2);
+  });
+});
+
+describe("Google Contacts grouping sync", () => {
+  function serviceWithPeoplePages(dir: string, pagesByCall: () => unknown[]): GoogleContactsService {
+    const fetcher = async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("oauth2.googleapis.com/token")) {
+        return new Response(JSON.stringify({ access_token: "access", refresh_token: "refresh", expires_in: 3600 }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+      return new Response(JSON.stringify({ connections: pagesByCall() }), { status: 200, headers: { "Content-Type": "application/json" } });
+    };
+    return new GoogleContactsService({
+      clientId: "client",
+      clientSecret: "secret",
+      callbackUrl: "http://127.0.0.1/callback",
+      credentialsPath: path.join(dir, "auth.json"),
+      fetch: fetcher as typeof fetch
+    });
+  }
+
+  it("persists groupings, auto-connects same-contact identities, and a re-sync replaces groupings without disconnecting", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wapp-google-group-")); tempDirs.push(dir);
+    let people: unknown[] = [
+      { resourceName: "people/c9", names: [{ displayName: "Asha" }], phoneNumbers: [{ canonicalForm: "+14155550100" }, { canonicalForm: "+14155550101" }] }
+    ];
+    const service = serviceWithPeoplePages(dir, () => people);
+    const state = new URL(service.createAuthorizationUrl()).searchParams.get("state")!;
+    await service.handleCallback("code", state);
+
+    const repository = new MemoryArchiveRepository();
+    const runId = await repository.startImportRun({ source: "google-group-test" });
+    await repository.upsertContacts(runId, [
+      { sourceJid: "14155550100@s.whatsapp.net", phoneNumber: "14155550100" },
+      { sourceJid: "14155550101@s.whatsapp.net", phoneNumber: "14155550101" }
+    ]);
+
+    const result = await service.sync(repository);
+    expect(result.contactGroups).toBe(1);
+    expect(result.groupedNumbers).toBe(2);
+    expect(result.personsAutoConnected).toBe(1);
+    expect(await repository.listGoogleContactGroups()).toEqual([
+      { resourceName: "people/c9", phoneE164: "14155550100", displayName: "Asha" },
+      { resourceName: "people/c9", phoneE164: "14155550101", displayName: "Asha" }
+    ]);
+    const person = await repository.resolvePersonForJid("14155550100@s.whatsapp.net");
+    expect(person?.members).toHaveLength(2);
+    expect(person?.members.every((member) => member.source === "google")).toBe(true);
+    expect(person?.members[0]?.evidence).toEqual({ resourceName: "people/c9" });
+
+    // The number moves to its own contact: the persisted groupings mirror the
+    // provider's current state, but the connection made earlier persists.
+    people = [
+      { resourceName: "people/c9", names: [{ displayName: "Asha" }], phoneNumbers: [{ canonicalForm: "+14155550100" }] },
+      { resourceName: "people/c77", names: [{ displayName: "Asha New" }], phoneNumbers: [{ canonicalForm: "+14155550101" }] }
+    ];
+    const resync = await service.sync(repository);
+    expect(resync.contactGroups).toBe(2);
+    expect(resync.personsAutoConnected).toBe(0);
+    expect((await repository.listGoogleContactGroups()).map((group) => group.resourceName).sort()).toEqual(["people/c77", "people/c9"]);
+    expect((await repository.resolvePersonForJid("14155550100@s.whatsapp.net"))?.members).toHaveLength(2);
+
+    // Credentials file stores tokens and aggregate counts only — no contact
+    // names, numbers, or raw provider payloads.
+    const stored = JSON.parse(fs.readFileSync(path.join(dir, "auth.json"), "utf8"));
+    expect(JSON.stringify(stored)).not.toContain("Asha");
+    expect(JSON.stringify(stored)).not.toContain("4155550100");
+    expect(stored.lastSync.contactGroups).toBe(2);
   });
 });
 

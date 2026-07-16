@@ -9,6 +9,7 @@ const ChatsPage = lazy(() => import("./pages/chats/ChatsPage").then((m) => ({ de
 const SearchPage = lazy(() => import("./pages/search/SearchPage").then((m) => ({ default: m.SearchPage })));
 const BrainPage = lazy(() => import("./pages/brain/BrainPage").then((m) => ({ default: m.BrainPage })));
 const ContactsPage = lazy(() => import("./pages/contacts/ContactsPage").then((m) => ({ default: m.ContactsPage })));
+const PeoplePage = lazy(() => import("./pages/people/PeoplePage").then((m) => ({ default: m.PeoplePage })));
 const ImportPage = lazy(() => import("./pages/import/ImportPage").then((m) => ({ default: m.ImportPage })));
 const SettingsPage = lazy(() => import("./pages/settings/SettingsPage").then((m) => ({ default: m.SettingsPage })));
 
@@ -32,6 +33,7 @@ export function AppRoutes() {
         <Route path="search" element={<SearchPage />} />
         <Route path="brain" element={<BrainPage />} />
         <Route path="contacts" element={<ContactsPage />} />
+        <Route path="people" element={<PeoplePage />} />
         <Route path="import" element={<ImportPage />} />
         <Route path="import/key" element={<ImportPage />} />
         <Route path="import/mode" element={<ImportPage />} />

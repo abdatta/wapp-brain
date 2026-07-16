@@ -63,7 +63,14 @@ const envSchema = z.object({
   WAPP_MEMORY_MAX_QUERY_MESSAGES: z.coerce.number().int().positive().default(40),
   WAPP_TRACE_NAME: z.string().optional(),
   GOOGLE_CONTACTS_CLIENT_ID: z.string().optional(),
-  GOOGLE_CONTACTS_CLIENT_SECRET: z.string().optional()
+  GOOGLE_CONTACTS_CLIENT_SECRET: z.string().optional(),
+  // Two-level person model: a pending suggestion at or above this score may
+  // surface as a display-level "possibly the same as …" hint. Display only —
+  // hints never reach claims, prompts, or search.
+  WAPP_PERSONS_HINT_THRESHOLD: z.coerce.number().min(0).max(1).default(0.8),
+  // How many recovery ticks between suggestion-detector passes (auto-connect
+  // runs every tick; detectors are heavier and recompute from state).
+  WAPP_PERSONS_DETECTOR_TICK_INTERVAL: z.coerce.number().int().positive().default(10)
 });
 
 const parsed = envSchema.parse(process.env);
@@ -136,6 +143,10 @@ export const config = {
     clientSecret: parsed.GOOGLE_CONTACTS_CLIENT_SECRET?.trim() || null,
     callbackUrl: `http://${parsed.APP_HOST}:${parsed.APP_PORT}/api/google-contacts/oauth/callback`,
     credentialsPath: path.join(workDir, "google-contacts-auth.json")
+  },
+  persons: {
+    hintScoreThreshold: parsed.WAPP_PERSONS_HINT_THRESHOLD,
+    detectorTickInterval: parsed.WAPP_PERSONS_DETECTOR_TICK_INTERVAL
   },
   workDir
 };

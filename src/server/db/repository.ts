@@ -29,6 +29,7 @@ import type {
   GroupMembershipEventRecord,
   GroupMembershipPeriodRecord,
   IdentityNumberChangeRecord,
+  IdentityRecentMessage,
   IdentityRepairResult,
   ImportTotals,
   ImportWarning,
@@ -67,7 +68,22 @@ import type {
   SearchIndexStatus,
   SearchQueryOptions,
   SearchResponse,
-  StatusSummary
+  StatusSummary,
+  GoogleContactGroupEntry,
+  IdentityActivitySummary,
+  IdentityChatActivity,
+  IdentityProfile,
+  PersonConnectResult,
+  PersonDisconnectResult,
+  PersonLinkEventRecord,
+  PersonLinkSuppressionRecord,
+  PersonLookupResult,
+  PersonMemberSource,
+  PersonRecord,
+  PersonSuggestionInput,
+  PersonSuggestionKind,
+  PersonSuggestionRecord,
+  PersonSuggestionStatus
 } from "../../shared/types";
 
 export interface ArchiveRepository {
@@ -334,6 +350,67 @@ export interface ArchiveRepository {
   // dedupe-keyed regeneration task per episode (one transaction). Returns the
   // number of episodes newly marked stale.
   markStaleEpisodesForMessages(sourceMessageKeys: string[]): Promise<number>;
+  // --- Two-level person model: identities (canonical JIDs) stay immutable
+  // anchors; persons are an editable membership. Connect/disconnect touch only
+  // person-layer tables — never episodes, claims, citations, or archive rows.
+  // A `user` connect clears a standing suppression; auto sources are blocked
+  // by it. Both directions are audited in person_link_events.
+  connectIdentities(
+    jidA: string,
+    jidB: string,
+    source: PersonMemberSource,
+    evidence?: Record<string, unknown> | null
+  ): Promise<PersonConnectResult>;
+  // Removes the membership, writes 'disconnected' suppressions against every
+  // former co-member (so no auto source silently reconnects), and dissolves
+  // the person to a redirect when fewer than two members remain.
+  disconnectIdentities(identityJid: string): Promise<PersonDisconnectResult>;
+  resolvePersonForJid(jid: string): Promise<PersonRecord | null>;
+  listPersons(options?: { limit?: number }): Promise<PersonRecord[]>;
+  // Resolves redirects: a dissolved or union-merged person id answers with its
+  // replacement person or surviving identity rather than an error.
+  getPerson(personId: string): Promise<PersonLookupResult>;
+  // Batch person-key map for DTO assembly: jid → person id when the identity
+  // is a member, else the jid itself (a lone identity is its own person).
+  personKeyForJids(jids: string[]): Promise<Map<string, string>>;
+  // Ranked detector output. Never applies membership; skips pairs that are
+  // already co-members or suppressed; a rejected row is never resurrected.
+  upsertPersonSuggestions(suggestions: PersonSuggestionInput[]): Promise<{ created: number; updated: number }>;
+  listPersonSuggestions(options?: {
+    status?: PersonSuggestionStatus;
+    jid?: string;
+    minScore?: number;
+    limit?: number;
+  }): Promise<PersonSuggestionRecord[]>;
+  acceptPersonSuggestion(suggestionId: string): Promise<PersonConnectResult>;
+  rejectPersonSuggestion(suggestionId: string): Promise<boolean>;
+  // Retire a detector kind's pending queue (e.g. a detector removed after
+  // real-data feedback); rejected/accepted history is preserved.
+  supersedePersonSuggestionsByKind(kind: PersonSuggestionKind): Promise<number>;
+  // Prune specific pending rows (e.g. pairs with no unifiable history).
+  // Superseded rows resurrect to pending when a detector produces them afresh;
+  // rejected/accepted never do.
+  supersedePersonSuggestionsByIds(ids: string[]): Promise<number>;
+  // A sender's recent visible messages across every chat (groups included) —
+  // the compare dialog's activity view for identities without a direct chat.
+  listRecentMessagesBySender(jid: string, limit?: number): Promise<IdentityRecentMessage[]>;
+  listPersonLinkSuppressions(limit?: number): Promise<PersonLinkSuppressionRecord[]>;
+  listPersonLinkEvents(options?: { limit?: number }): Promise<PersonLinkEventRecord[]>;
+  // Same-contact grouping persisted by the Google sync: full replace so the
+  // stored groupings always mirror the provider's current state. Replacing
+  // never disconnects members it previously connected.
+  replaceGoogleContactGroups(groups: GoogleContactGroupEntry[]): Promise<{ groups: number; numbers: number }>;
+  listGoogleContactGroups(): Promise<GoogleContactGroupEntry[]>;
+  // Phone → archived canonical JIDs, matched the same way Google enrichment
+  // matches (phone_number column or phone-form JID).
+  resolveArchivedJidsForPhones(phones: string[]): Promise<Map<string, string[]>>;
+  // Bounded deterministic read surfaces for the person detectors.
+  listIdentityProfiles(options?: { limit?: number }): Promise<IdentityProfile[]>;
+  listIdentityActivitySummaries(options?: { minMessages?: number; limit?: number }): Promise<IdentityActivitySummary[]>;
+  listIdentityChatActivity(jids: string[]): Promise<IdentityChatActivity[]>;
+  listGroupParticipantSets(options?: { maxGroupSize?: number; limit?: number }): Promise<Array<{ groupSourceId: string; participantJids: string[] }>>;
+  listCoCitedIdentityPairs(options?: { minEpisodes?: number; limit?: number }): Promise<Array<{ jidA: string; jidB: string; episodes: number }>>;
+  listResolvedVcardNames(options?: { limit?: number }): Promise<Array<{ resolvedJid: string; displayName: string | null }>>;
   close?(): Promise<void>;
 }
 

@@ -17,6 +17,7 @@ import type { ArchiveRepository } from "../db/repository";
 import { configuredTraceRecorder } from "../diagnostics/traceRecorder";
 import { mediaBlobStore } from "../media/blobStore";
 import { PublicError, publicErrorMessage, safeBasename } from "../privacy";
+import { runPersonAutoConnectPass } from "../persons/autoConnect";
 import { runRetainedPayloadDecryptionPass } from "../live/secretsPass";
 import { prepareMsgstore, prepareSidecarDatabase } from "./decrypt";
 import { mediaBackfillWarning, runImportMediaBackfill } from "./mediaBackfill";
@@ -468,6 +469,26 @@ export async function runImport(
 
     options.onProgress?.({ type: "step", step: "finalizing", message: "Refreshing chat statistics." });
     await repository.refreshChatStats();
+    // Person auto-connect over the signals this import just landed (number
+    // changes; Google groupings if a sync already persisted them). Bounded,
+    // idempotent, metadata-only — a failure never fails the import.
+    try {
+      const autoConnect = await runPersonAutoConnectPass(repository);
+      const connected = autoConnect.googleConnected + autoConnect.numberChangeConnected;
+      if (connected > 0) {
+        await configuredTraceRecorder?.record("import.person_auto_connect", { runId, ...autoConnect });
+      }
+    } catch (error) {
+      await repository.addWarnings(runId, [
+        {
+          severity: "warning",
+          code: "PERSON_AUTO_CONNECT_FAILED",
+          message: "Person auto-connect could not complete after the import; the maintenance pass will retry.",
+          context: { message: publicErrorMessage(error) }
+        }
+      ]);
+      warningCount += 1;
+    }
     throwIfAborted(options.signal);
     totals.warnings = warningCount;
     await repository.completeImportRun(runId, totals, warningCount);

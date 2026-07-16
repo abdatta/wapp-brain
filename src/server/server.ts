@@ -101,6 +101,124 @@ app.delete("/api/google-contacts", async (_req, res) => {
   catch (error) { res.status(400).json({ ok: false, error: publicErrorMessage(error) }); }
 });
 
+// --- Two-level person model: identities stay immutable anchors; persons are
+// an editable membership. Every mutation below is metadata-only (episodes,
+// claims, and citations are structurally untouched) and audited.
+
+app.get("/api/persons", async (_req, res) => {
+  try {
+    const { getPersonScanStatus } = await import("./persons/scanStatus");
+    res.json({ persons: await repository.listPersons({ limit: 500 }), scan: getPersonScanStatus() });
+  } catch (error) { res.status(400).json({ error: publicErrorMessage(error) }); }
+});
+
+app.get("/api/persons/suggestions", async (req, res) => {
+  try {
+    const raw = typeof req.query.status === "string" ? req.query.status : "pending";
+    const status = (["pending", "accepted", "rejected", "superseded"] as const).find((value) => value === raw) ?? "pending";
+    res.json({ suggestions: await repository.listPersonSuggestions({ status, limit: 200 }) });
+  } catch (error) { res.status(400).json({ error: publicErrorMessage(error) }); }
+});
+
+app.get("/api/persons/suppressions", async (_req, res) => {
+  try { res.json({ suppressions: await repository.listPersonLinkSuppressions(200) }); }
+  catch (error) { res.status(400).json({ error: publicErrorMessage(error) }); }
+});
+
+// Recent visible activity of one identity across every chat (groups
+// included) — the compare dialog's view for identities without a direct chat.
+app.get("/api/persons/identity-messages", async (req, res) => {
+  try {
+    const jid = typeof req.query.jid === "string" ? req.query.jid.trim() : "";
+    if (!jid) {
+      res.status(400).json({ error: "An identity is required." });
+      return;
+    }
+    const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 20));
+    res.json({ messages: await repository.listRecentMessagesBySender(jid, limit) });
+  } catch (error) { res.status(400).json({ error: publicErrorMessage(error) }); }
+});
+
+app.get("/api/persons/:id", async (req, res) => {
+  try {
+    const lookup = await repository.getPerson(req.params.id);
+    if (!lookup.person && !lookup.redirect) {
+      res.status(404).json({ error: "No person with that id." });
+      return;
+    }
+    res.json(lookup);
+  } catch (error) { res.status(400).json({ error: publicErrorMessage(error) }); }
+});
+
+app.post("/api/persons/connect", async (req, res) => {
+  try {
+    const { jidA, jidB } = (req.body ?? {}) as { jidA?: string; jidB?: string };
+    if (!jidA?.trim() || !jidB?.trim()) {
+      res.status(400).json({ ok: false, error: "Both identities are required." });
+      return;
+    }
+    const result = await repository.connectIdentities(jidA.trim(), jidB.trim(), "user");
+    if (result.outcome === "invalid" || result.outcome === "self") {
+      res.status(400).json({ ok: false, error: "Those identities cannot be connected." });
+      return;
+    }
+    broadcastArchiveChanged({ source: "manual", chatSourceIds: [], messageCount: 0, contactCount: 1 });
+    res.json({ ok: true, result, person: result.personId ? (await repository.getPerson(result.personId)).person : null });
+  } catch (error) { res.status(400).json({ ok: false, error: publicErrorMessage(error) }); }
+});
+
+app.post("/api/persons/disconnect", async (req, res) => {
+  try {
+    const { jid } = (req.body ?? {}) as { jid?: string };
+    if (!jid?.trim()) {
+      res.status(400).json({ ok: false, error: "An identity is required." });
+      return;
+    }
+    const result = await repository.disconnectIdentities(jid.trim());
+    if (!result.disconnected) {
+      res.status(404).json({ ok: false, error: "That identity is not a member of any person." });
+      return;
+    }
+    broadcastArchiveChanged({ source: "manual", chatSourceIds: [], messageCount: 0, contactCount: 1 });
+    res.json({ ok: true, result });
+  } catch (error) { res.status(400).json({ ok: false, error: publicErrorMessage(error) }); }
+});
+
+app.post("/api/persons/suggestions/:id/accept", async (req, res) => {
+  try {
+    const result = await repository.acceptPersonSuggestion(req.params.id);
+    broadcastArchiveChanged({ source: "manual", chatSourceIds: [], messageCount: 0, contactCount: 1 });
+    res.json({ ok: true, result, person: result.personId ? (await repository.getPerson(result.personId)).person : null });
+  } catch (error) { res.status(400).json({ ok: false, error: publicErrorMessage(error) }); }
+});
+
+app.post("/api/persons/suggestions/:id/reject", async (req, res) => {
+  try {
+    const rejected = await repository.rejectPersonSuggestion(req.params.id);
+    if (!rejected) {
+      res.status(404).json({ ok: false, error: "The suggestion no longer exists or was already resolved." });
+      return;
+    }
+    res.json({ ok: true });
+  } catch (error) { res.status(400).json({ ok: false, error: publicErrorMessage(error) }); }
+});
+
+app.post("/api/persons/scan", async (_req, res) => {
+  try {
+    const { runPersonAutoConnectPass } = await import("./persons/autoConnect");
+    const { runPersonSuggestionDetectors } = await import("./persons/suggestions");
+    const autoConnect = await runPersonAutoConnectPass(repository);
+    const detectors = await runPersonSuggestionDetectors(repository);
+    if (autoConnect.googleConnected + autoConnect.numberChangeConnected > 0) {
+      broadcastArchiveChanged({ source: "manual", chatSourceIds: [], messageCount: 0, contactCount: autoConnect.googleConnected + autoConnect.numberChangeConnected });
+    }
+    res.json({ ok: true, autoConnect, detectors });
+  } catch (error) {
+    console.error(`[persons] scan failed: ${publicErrorMessage(error)}`);
+    res.status(400).json({ ok: false, error: publicErrorMessage(error) });
+  }
+});
+
 app.get("/api/live/status", async (_req, res) => {
   try {
     res.json(await repository.getLiveStatus());

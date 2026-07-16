@@ -31,6 +31,7 @@ import type {
   ChatSyncStateRecord,
   ContactRecord,
   EngagementAggregateRecord,
+  IdentityRecentMessage,
   IdentityRepairResult,
   GroupMembershipEventRecord,
   GroupMembershipPeriodRecord,
@@ -79,9 +80,26 @@ import type {
   SearchQueryOptions,
   SearchResponse,
   SearchResultItem,
-  StatusSummary
+  StatusSummary,
+  GoogleContactGroupEntry,
+  IdentityActivitySummary,
+  IdentityChatActivity,
+  IdentityProfile,
+  PersonConnectResult,
+  PersonDisconnectResult,
+  PersonLinkEventRecord,
+  PersonLinkSuppressionRecord,
+  PersonLookupResult,
+  PersonMemberRecord,
+  PersonMemberSource,
+  PersonRecord,
+  PersonRedirectRecord,
+  PersonSuggestionInput,
+  PersonSuggestionKind,
+  PersonSuggestionRecord,
+  PersonSuggestionStatus
 } from "../../shared/types";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { SEARCH_HIGHLIGHT_END, SEARCH_HIGHLIGHT_START } from "../../shared/types";
 import { config } from "../config";
 import { baselineFromStatus } from "../live/baseline";
@@ -91,7 +109,10 @@ import { mergeInteractionMetadata } from "./interactions";
 import { buildMessageEditTimeline, summarizeStructuredSignals, summarizeSystemEvents } from "./signalSummary";
 import { interpretMessage } from "../interpretation/messageInterpretation";
 import { isMaskedNumberLabel, normalizeJid, phoneFromJid, resolveDisplayLabel } from "../import/jid";
+import { disambiguateLabels } from "../persons/disambiguate";
+import { personDisplayLabelFromMembers } from "../persons/label";
 import { getMemoryProviderStatus } from "../memory/provider";
+import { PublicError } from "../privacy";
 
 function stableSignalFactKey(family: string, parts: Array<string | number | null | undefined>): string {
   return `${family}:${createHash("sha256").update(JSON.stringify(parts)).digest("hex")}`;
@@ -99,6 +120,12 @@ function stableSignalFactKey(family: string, parts: Array<string | number | null
 
 function isSyntheticSystemAnchor(sourceMessageKey: string | null | undefined): boolean {
   return Boolean(sourceMessageKey && sourceMessageKey.includes("live-system-"));
+}
+
+// Person-model detectors only reason over identity-addressed JIDs (phone or
+// LID servers) — groups, broadcasts, and synthetic senders are never people.
+function isIdentityServerJid(jid: string): boolean {
+  return jid.endsWith("@s.whatsapp.net") || jid.endsWith("@lid") || jid.endsWith("@hosted.lid");
 }
 
 function safeVcardFileName(candidate: string | null, cardIndex: number): string {
@@ -178,6 +205,18 @@ export class MemoryArchiveRepository implements ArchiveRepository {
   private nextMessageId = 1;
   private nextLiveGapId = 1;
   private identityLinks = new Map<string, string>();
+  // Two-level person model (mirror of the SQLite tables).
+  private persons = new Map<string, { id: string; createdAt: string; updatedAt: string }>();
+  private personMembers = new Map<string, { personId: string; source: PersonMemberSource; evidence: Record<string, unknown> | null; linkedAt: string }>();
+  private personSuppressions = new Map<string, PersonLinkSuppressionRecord>();
+  private personSuggestions = new Map<
+    string,
+    { id: string; jidLow: string; jidHigh: string; kind: PersonSuggestionKind; score: number; evidence: Record<string, unknown>; status: PersonSuggestionStatus; createdAt: string; updatedAt: string }
+  >();
+  private personEvents: PersonLinkEventRecord[] = [];
+  private personRedirects = new Map<string, PersonRedirectRecord>();
+  private googleContactGroups = new Map<string, GoogleContactGroupEntry & { lastSeenAt: string }>();
+  private nextPersonEventId = 1;
 
   private canonicalJid(jid: string | null | undefined): string | null {
     const normalized = normalizeJid(jid);
@@ -563,6 +602,10 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       }
     }
 
+    // Person layer follows the canonical identity (memberships, suggestions,
+    // suppressions, audit), unioning persons revealed to share an identity.
+    this.rewritePersonLayerForMerge(lid, pn);
+
     await this.refreshChatStats([pn]);
     // Deterministic brain-prose repair: substitute the merged identity's baked
     // `lid:` token in old episodes with the now-known number or name. The stamp
@@ -943,6 +986,747 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       await this.repairIdentityResolution(improvedJids);
     }
     return { matchedIdentities, improvedNames };
+  }
+
+  // === Two-level person model (mirror of the SQLite adapter) ===============
+
+  private personPair(jidA: string, jidB: string): [string, string] {
+    return jidA < jidB ? [jidA, jidB] : [jidB, jidA];
+  }
+
+  private personPairKey(jidA: string, jidB: string): string {
+    const [low, high] = this.personPair(jidA, jidB);
+    return `${low}\u0000${high}`;
+  }
+
+  private recordPersonEvent(
+    action: PersonLinkEventRecord["action"],
+    fields: { personId?: string | null; identityJid?: string | null; source?: string | null; evidence?: Record<string, unknown> | null }
+  ): void {
+    this.personEvents.push({
+      id: this.nextPersonEventId++,
+      action,
+      personId: fields.personId ?? null,
+      identityJid: fields.identityJid ?? null,
+      source: fields.source ?? null,
+      evidence: fields.evidence ?? null,
+      createdAt: new Date().toISOString()
+    });
+  }
+
+  private supersedePendingSuggestions(jidLow: string, jidHigh: string): void {
+    for (const suggestion of this.personSuggestions.values()) {
+      if (suggestion.jidLow === jidLow && suggestion.jidHigh === jidHigh && suggestion.status === "pending") {
+        suggestion.status = "superseded";
+        suggestion.updatedAt = new Date().toISOString();
+      }
+    }
+  }
+
+  private personMemberJids(personId: string): string[] {
+    return [...this.personMembers.entries()].filter(([, member]) => member.personId === personId).map(([jid]) => jid);
+  }
+
+  private unionPersons(personIdA: string, personIdB: string, evidence: Record<string, unknown>): string {
+    const stats = [personIdA, personIdB].map((id) => ({
+      id,
+      createdAt: this.persons.get(id)?.createdAt ?? "",
+      members: this.personMemberJids(id).length
+    }));
+    const [survivor, dissolved] = stats.sort(
+      (a, b) => b.members - a.members || a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id)
+    );
+    for (const jid of this.personMemberJids(dissolved.id)) {
+      this.personMembers.get(jid)!.personId = survivor.id;
+    }
+    this.persons.delete(dissolved.id);
+    this.personRedirects.set(dissolved.id, {
+      personId: dissolved.id,
+      replacedByPersonId: survivor.id,
+      survivingJid: null,
+      createdAt: new Date().toISOString()
+    });
+    const survivorRow = this.persons.get(survivor.id);
+    if (survivorRow) {
+      survivorRow.updatedAt = new Date().toISOString();
+    }
+    this.recordPersonEvent("union", { personId: survivor.id, evidence: { ...evidence, dissolvedPersonId: dissolved.id } });
+    return survivor.id;
+  }
+
+  private connectIdentitiesInternal(
+    jidA: string,
+    jidB: string,
+    source: PersonMemberSource,
+    evidence: Record<string, unknown> | null
+  ): PersonConnectResult {
+    const a = this.canonicalJid(jidA);
+    const b = this.canonicalJid(jidB);
+    if (!a || !b) {
+      return { outcome: "invalid", personId: null };
+    }
+    if (a === b) {
+      return { outcome: "self", personId: null };
+    }
+    const [low, high] = this.personPair(a, b);
+    const pairKey = this.personPairKey(a, b);
+    if (this.personSuppressions.has(pairKey)) {
+      if (source !== "user") {
+        return { outcome: "suppressed", personId: null };
+      }
+      this.personSuppressions.delete(pairKey);
+    }
+    const memberA = this.personMembers.get(a);
+    const memberB = this.personMembers.get(b);
+    const now = new Date().toISOString();
+    if (memberA && memberB) {
+      if (memberA.personId === memberB.personId) {
+        return { outcome: "already_connected", personId: memberA.personId };
+      }
+      const survivorId = this.unionPersons(memberA.personId, memberB.personId, { viaJids: [a, b], source, ...(evidence ?? {}) });
+      this.supersedePendingSuggestions(low, high);
+      return { outcome: "union", personId: survivorId };
+    }
+    if (memberA || memberB) {
+      const personId = (memberA ?? memberB)!.personId;
+      const newJid = memberA ? b : a;
+      this.personMembers.set(newJid, { personId, source, evidence, linkedAt: now });
+      const person = this.persons.get(personId);
+      if (person) {
+        person.updatedAt = now;
+      }
+      this.recordPersonEvent("connect", { personId, identityJid: newJid, source, evidence });
+      this.supersedePendingSuggestions(low, high);
+      return { outcome: "connected", personId };
+    }
+    const personId = `person_${randomUUID()}`;
+    this.persons.set(personId, { id: personId, createdAt: now, updatedAt: now });
+    this.personMembers.set(a, { personId, source, evidence, linkedAt: now });
+    this.personMembers.set(b, { personId, source, evidence, linkedAt: now });
+    this.recordPersonEvent("connect", { personId, identityJid: a, source, evidence });
+    this.recordPersonEvent("connect", { personId, identityJid: b, source, evidence });
+    this.supersedePendingSuggestions(low, high);
+    return { outcome: "connected", personId };
+  }
+
+  async connectIdentities(
+    jidA: string,
+    jidB: string,
+    source: PersonMemberSource,
+    evidence: Record<string, unknown> | null = null
+  ): Promise<PersonConnectResult> {
+    return this.connectIdentitiesInternal(jidA, jidB, source, evidence);
+  }
+
+  async disconnectIdentities(identityJid: string): Promise<PersonDisconnectResult> {
+    const jid = this.canonicalJid(identityJid) ?? identityJid;
+    const membership = this.personMembers.get(jid);
+    if (!membership) {
+      return { disconnected: false, personId: null, dissolved: false };
+    }
+    const personId = membership.personId;
+    const others = this.personMemberJids(personId).filter((member) => member !== jid);
+    const now = new Date().toISOString();
+    this.personMembers.delete(jid);
+    for (const other of others) {
+      const [low, high] = this.personPair(jid, other);
+      this.personSuppressions.set(this.personPairKey(jid, other), { jidLow: low, jidHigh: high, reason: "disconnected", createdAt: now });
+    }
+    this.recordPersonEvent("disconnect", { personId, identityJid: jid });
+    if (others.length < 2) {
+      for (const other of others) {
+        this.personMembers.delete(other);
+      }
+      this.persons.delete(personId);
+      this.personRedirects.set(personId, { personId, replacedByPersonId: null, survivingJid: others[0] ?? null, createdAt: now });
+      this.recordPersonEvent("dissolve", { personId, identityJid: others[0] ?? null });
+      return { disconnected: true, personId, dissolved: true };
+    }
+    const person = this.persons.get(personId);
+    if (person) {
+      person.updatedAt = now;
+    }
+    return { disconnected: true, personId, dissolved: false };
+  }
+
+  private buildPersonRecord(personId: string): PersonRecord | null {
+    const person = this.persons.get(personId);
+    if (!person) {
+      return null;
+    }
+    const members: PersonMemberRecord[] = this.personMemberJids(personId).map((jid) => {
+      const membership = this.personMembers.get(jid)!;
+      const contact = this.contacts.get(jid);
+      const displayName = contact?.displayName ?? null;
+      const hasSavedName = Boolean(displayName?.trim() && !isMaskedNumberLabel(displayName) && !isIdentityDerivedName(displayName, jid));
+      let messageCount = 0;
+      for (const message of this.messages.values()) {
+        if (message.senderSourceJid === jid) {
+          messageCount += 1;
+        }
+      }
+      return {
+        identityJid: jid,
+        source: membership.source,
+        evidence: membership.evidence,
+        linkedAt: membership.linkedAt,
+        displayLabel: resolveDisplayLabel({
+          displayName,
+          pushName: contact?.pushName ?? null,
+          phoneNumber: contact?.phoneNumber ?? null,
+          jid
+        }),
+        phoneNumber: contact?.phoneNumber ?? phoneFromJid(jid),
+        messageCount,
+        hasSavedName
+      };
+    });
+    members.sort((a, b) => a.linkedAt.localeCompare(b.linkedAt) || a.identityJid.localeCompare(b.identityJid));
+    return {
+      id: person.id,
+      displayLabel: personDisplayLabelFromMembers(members),
+      members,
+      unconfirmedHint: this.personUnconfirmedHint(members),
+      createdAt: person.createdAt,
+      updatedAt: person.updatedAt
+    };
+  }
+
+  private personUnconfirmedHint(members: PersonMemberRecord[]): string | null {
+    const memberJids = new Set(members.map((member) => member.identityJid));
+    let best: { otherJid: string; score: number } | null = null;
+    for (const suggestion of this.personSuggestions.values()) {
+      if (suggestion.status !== "pending" || suggestion.score < config.persons.hintScoreThreshold) {
+        continue;
+      }
+      const lowIn = memberJids.has(suggestion.jidLow);
+      const highIn = memberJids.has(suggestion.jidHigh);
+      if (lowIn === highIn) {
+        continue;
+      }
+      const otherJid = lowIn ? suggestion.jidHigh : suggestion.jidLow;
+      if (!best || suggestion.score > best.score) {
+        best = { otherJid, score: suggestion.score };
+      }
+    }
+    if (!best) {
+      return null;
+    }
+    return `possibly the same as ${this.resolveCurrentLabelForJid(best.otherJid) ?? best.otherJid} — unconfirmed`;
+  }
+
+  async resolvePersonForJid(jid: string): Promise<PersonRecord | null> {
+    const canonical = this.canonicalJid(jid) ?? jid;
+    const membership = this.personMembers.get(canonical);
+    return membership ? this.buildPersonRecord(membership.personId) : null;
+  }
+
+  async listPersons(options: { limit?: number } = {}): Promise<PersonRecord[]> {
+    const limit = Math.max(1, options.limit ?? 200);
+    return [...this.persons.values()]
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.id.localeCompare(b.id))
+      .slice(0, limit)
+      .map((person) => this.buildPersonRecord(person.id)!)
+      .filter(Boolean);
+  }
+
+  async getPerson(personId: string): Promise<PersonLookupResult> {
+    const person = this.buildPersonRecord(personId);
+    if (person) {
+      return { person, redirect: null };
+    }
+    let redirect: PersonRedirectRecord | null = null;
+    let cursor = personId;
+    for (let hops = 0; hops < 10; hops += 1) {
+      const row = this.personRedirects.get(cursor);
+      if (!row) {
+        break;
+      }
+      redirect = row;
+      if (!row.replacedByPersonId) {
+        break;
+      }
+      const target = this.buildPersonRecord(row.replacedByPersonId);
+      if (target) {
+        return { person: target, redirect: row };
+      }
+      cursor = row.replacedByPersonId;
+    }
+    return { person: null, redirect };
+  }
+
+  async personKeyForJids(jids: string[]): Promise<Map<string, string>> {
+    const result = new Map<string, string>();
+    for (const jid of jids) {
+      if (!jid) {
+        continue;
+      }
+      const canonical = this.canonicalJid(jid) ?? jid;
+      result.set(jid, this.personMembers.get(canonical)?.personId ?? canonical);
+    }
+    return result;
+  }
+
+  async upsertPersonSuggestions(suggestions: PersonSuggestionInput[]): Promise<{ created: number; updated: number }> {
+    let created = 0;
+    let updated = 0;
+    for (const suggestion of suggestions) {
+      const a = this.canonicalJid(suggestion.jidA);
+      const b = this.canonicalJid(suggestion.jidB);
+      if (!a || !b || a === b) {
+        continue;
+      }
+      const [low, high] = this.personPair(a, b);
+      if (this.personSuppressions.has(this.personPairKey(a, b))) {
+        continue;
+      }
+      const memberA = this.personMembers.get(a);
+      const memberB = this.personMembers.get(b);
+      if (memberA && memberB && memberA.personId === memberB.personId) {
+        continue;
+      }
+      const key = `${low}\u0000${high}\u0000${suggestion.kind}`;
+      const existing = this.personSuggestions.get(key);
+      const now = new Date().toISOString();
+      if (existing) {
+        // Rejected is memory, accepted is history — never resurrected.
+        // Superseded returns to pending when a detector produces it afresh.
+        if (existing.status === "rejected" || existing.status === "accepted") {
+          continue;
+        }
+        if (existing.status === "superseded") {
+          existing.status = "pending";
+          existing.score = suggestion.score;
+          existing.evidence = suggestion.evidence ?? {};
+          existing.updatedAt = now;
+          created += 1;
+          continue;
+        }
+        const evidenceJson = JSON.stringify(suggestion.evidence ?? {});
+        if (existing.score !== suggestion.score || JSON.stringify(existing.evidence) !== evidenceJson) {
+          existing.score = suggestion.score;
+          existing.evidence = suggestion.evidence ?? {};
+          existing.updatedAt = now;
+          updated += 1;
+        }
+        continue;
+      }
+      const id = `psg_${randomUUID()}`;
+      this.personSuggestions.set(key, {
+        id,
+        jidLow: low,
+        jidHigh: high,
+        kind: suggestion.kind,
+        score: suggestion.score,
+        evidence: suggestion.evidence ?? {},
+        status: "pending",
+        createdAt: now,
+        updatedAt: now
+      });
+      this.recordPersonEvent("suggest", { evidence: { suggestionId: id, jidLow: low, jidHigh: high, kind: suggestion.kind, score: suggestion.score } });
+      created += 1;
+    }
+    return { created, updated };
+  }
+
+  async listPersonSuggestions(
+    options: { status?: PersonSuggestionStatus; jid?: string; minScore?: number; limit?: number } = {}
+  ): Promise<PersonSuggestionRecord[]> {
+    const canonical = options.jid ? this.canonicalJid(options.jid) ?? options.jid : null;
+    const phoneFor = (jid: string): string | null => (this.contacts.get(jid)?.phoneNumber ?? phoneFromJid(jid)) || null;
+    const dmChatIdFor = (jid: string): number | null => this.chats.get(jid)?.id ?? null;
+    const cachedCount = (compute: (jid: string) => number) => {
+      const cache = new Map<string, number>();
+      return (jid: string): number => {
+        const hit = cache.get(jid);
+        if (hit != null) return hit;
+        const count = compute(jid);
+        cache.set(jid, count);
+        return count;
+      };
+    };
+    const messagesFor = cachedCount((jid) => {
+      let count = 0;
+      for (const message of this.messages.values()) {
+        if (message.senderSourceJid === jid) count += 1;
+      }
+      return count;
+    });
+    const mentionsFor = cachedCount((jid) => {
+      let count = 0;
+      for (const message of this.messages.values()) {
+        if (message.mentionedJids?.includes(jid)) count += 1;
+      }
+      return count;
+    });
+    const groupsFor = cachedCount((jid) => {
+      let count = 0;
+      for (const participant of this.participants.values()) {
+        if (participant.sourceJid === jid && this.chats.get(participant.chatSourceId)?.chatType === "group") count += 1;
+      }
+      return count;
+    });
+    return [...this.personSuggestions.values()]
+      .filter((suggestion) => !options.status || suggestion.status === options.status)
+      .filter((suggestion) => !canonical || suggestion.jidLow === canonical || suggestion.jidHigh === canonical)
+      .filter((suggestion) => options.minScore == null || suggestion.score >= options.minScore)
+      .sort((a, b) => b.score - a.score || b.updatedAt.localeCompare(a.updatedAt))
+      .slice(0, Math.max(1, options.limit ?? 100))
+      .map((suggestion) => {
+        const chatLabels: Record<string, string> = {};
+        for (const key of ["sharedChats", "sharedGroups", "membershipHandoffGroups"]) {
+          const ids = suggestion.evidence[key];
+          if (!Array.isArray(ids)) continue;
+          for (const id of ids) {
+            if (typeof id === "string" && !(id in chatLabels)) {
+              const label = this.chats.get(id)?.displayName?.trim();
+              if (label) {
+                chatLabels[id] = label;
+              }
+            }
+          }
+        }
+        return {
+          ...suggestion,
+          evidence: { ...suggestion.evidence },
+          lowLabel: this.resolveCurrentLabelForJid(suggestion.jidLow) ?? suggestion.jidLow,
+          highLabel: this.resolveCurrentLabelForJid(suggestion.jidHigh) ?? suggestion.jidHigh,
+          lowPhone: phoneFor(suggestion.jidLow),
+          highPhone: phoneFor(suggestion.jidHigh),
+          lowChatId: dmChatIdFor(suggestion.jidLow),
+          highChatId: dmChatIdFor(suggestion.jidHigh),
+          lowMessageCount: messagesFor(suggestion.jidLow),
+          highMessageCount: messagesFor(suggestion.jidHigh),
+          lowMentionCount: mentionsFor(suggestion.jidLow),
+          highMentionCount: mentionsFor(suggestion.jidHigh),
+          lowGroupCount: groupsFor(suggestion.jidLow),
+          highGroupCount: groupsFor(suggestion.jidHigh),
+          chatLabels
+        };
+      });
+  }
+
+  // A sender's recent visible messages across every chat (mirror of SQLite).
+  async listRecentMessagesBySender(jid: string, limit = 20): Promise<IdentityRecentMessage[]> {
+    const canonical = this.canonicalJid(jid) ?? jid;
+    return [...this.messages.values()]
+      .filter((message) => message.senderSourceJid === canonical && isVisibleExchangeMessage(message))
+      .sort((a, b) => (b.timestampMs ?? 0) - (a.timestampMs ?? 0) || b.id - a.id)
+      .slice(0, Math.max(1, limit))
+      .map((message) => {
+        const chat = this.chats.get(message.chatSourceId);
+        const label = chat?.displayName?.trim();
+        return {
+          chatId: chat?.id ?? 0,
+          chatSourceId: message.chatSourceId,
+          chatLabel: label && label !== message.chatSourceId ? label : displayPhoneFromJid(message.chatSourceId),
+          chatType: chat?.chatType ?? "unknown",
+          timestampMs: message.timestampMs ?? null,
+          direction: message.direction,
+          messageType: message.messageType,
+          text: message.body?.trim() || message.caption?.trim() || null
+        };
+      });
+  }
+
+  // Retire a detector kind's pending queue (rejected/accepted history stays).
+  async supersedePersonSuggestionsByKind(kind: PersonSuggestionKind): Promise<number> {
+    let changed = 0;
+    for (const suggestion of this.personSuggestions.values()) {
+      if (suggestion.kind === kind && suggestion.status === "pending") {
+        suggestion.status = "superseded";
+        suggestion.updatedAt = new Date().toISOString();
+        changed += 1;
+      }
+    }
+    return changed;
+  }
+
+  // Prune specific pending rows (e.g. pairs whose merge value dropped to
+  // nothing); they return to pending if a detector produces them afresh.
+  async supersedePersonSuggestionsByIds(ids: string[]): Promise<number> {
+    const wanted = new Set(ids);
+    let changed = 0;
+    for (const suggestion of this.personSuggestions.values()) {
+      if (wanted.has(suggestion.id) && suggestion.status === "pending") {
+        suggestion.status = "superseded";
+        suggestion.updatedAt = new Date().toISOString();
+        changed += 1;
+      }
+    }
+    return changed;
+  }
+
+  async acceptPersonSuggestion(suggestionId: string): Promise<PersonConnectResult> {
+    const suggestion = [...this.personSuggestions.values()].find((row) => row.id === suggestionId);
+    if (!suggestion || suggestion.status !== "pending") {
+      throw new PublicError("PERSON_SUGGESTION_STATE", "The suggestion no longer exists or was already resolved.");
+    }
+    suggestion.status = "accepted";
+    suggestion.updatedAt = new Date().toISOString();
+    this.recordPersonEvent("accept", { evidence: { suggestionId: suggestion.id, kind: suggestion.kind } });
+    return this.connectIdentitiesInternal(suggestion.jidLow, suggestion.jidHigh, "user", { suggestionId: suggestion.id, kind: suggestion.kind });
+  }
+
+  async rejectPersonSuggestion(suggestionId: string): Promise<boolean> {
+    const suggestion = [...this.personSuggestions.values()].find((row) => row.id === suggestionId);
+    if (!suggestion || suggestion.status !== "pending") {
+      return false;
+    }
+    suggestion.status = "rejected";
+    suggestion.updatedAt = new Date().toISOString();
+    this.recordPersonEvent("reject", { evidence: { suggestionId: suggestion.id, kind: suggestion.kind } });
+    return true;
+  }
+
+  async listPersonLinkSuppressions(limit = 200): Promise<PersonLinkSuppressionRecord[]> {
+    return [...this.personSuppressions.values()]
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .slice(0, Math.max(1, limit))
+      .map((row) => ({ ...row }));
+  }
+
+  async listPersonLinkEvents(options: { limit?: number } = {}): Promise<PersonLinkEventRecord[]> {
+    return [...this.personEvents]
+      .sort((a, b) => b.id - a.id)
+      .slice(0, Math.max(1, options.limit ?? 200))
+      .map((row) => ({ ...row, evidence: row.evidence ? { ...row.evidence } : null }));
+  }
+
+  async replaceGoogleContactGroups(groups: GoogleContactGroupEntry[]): Promise<{ groups: number; numbers: number }> {
+    this.googleContactGroups.clear();
+    const now = new Date().toISOString();
+    const resources = new Set<string>();
+    let numbers = 0;
+    for (const group of groups) {
+      if (!group.resourceName || !group.phoneE164) {
+        continue;
+      }
+      this.googleContactGroups.set(`${group.resourceName}\u0000${group.phoneE164}`, { ...group, lastSeenAt: now });
+      resources.add(group.resourceName);
+      numbers += 1;
+    }
+    return { groups: resources.size, numbers };
+  }
+
+  async listGoogleContactGroups(): Promise<GoogleContactGroupEntry[]> {
+    return [...this.googleContactGroups.values()]
+      .map(({ resourceName, phoneE164, displayName }) => ({ resourceName, phoneE164, displayName }))
+      .sort((a, b) => a.resourceName.localeCompare(b.resourceName) || a.phoneE164.localeCompare(b.phoneE164));
+  }
+
+  async resolveArchivedJidsForPhones(phones: string[]): Promise<Map<string, string[]>> {
+    const result = new Map<string, string[]>();
+    for (const phone of new Set(phones.filter(Boolean))) {
+      const jids = new Set<string>();
+      const direct = this.contacts.get(`${phone}@s.whatsapp.net`);
+      if (direct) {
+        jids.add(direct.sourceJid);
+      }
+      for (const contact of this.contacts.values()) {
+        if (contact.phoneNumber === phone) {
+          jids.add(contact.sourceJid);
+        }
+      }
+      if (jids.size > 0) {
+        result.set(phone, [...jids]);
+      }
+    }
+    return result;
+  }
+
+  async listIdentityProfiles(options: { limit?: number } = {}): Promise<IdentityProfile[]> {
+    const profiles: IdentityProfile[] = [];
+    const counts = new Map<string, number>();
+    for (const message of this.messages.values()) {
+      if (message.senderSourceJid) {
+        counts.set(message.senderSourceJid, (counts.get(message.senderSourceJid) ?? 0) + 1);
+      }
+    }
+    for (const contact of this.contacts.values()) {
+      if (!isIdentityServerJid(contact.sourceJid)) {
+        continue;
+      }
+      profiles.push({
+        jid: contact.sourceJid,
+        displayName: contact.displayName ?? null,
+        pushName: contact.pushName ?? null,
+        phoneNumber: contact.phoneNumber ?? null,
+        messageCount: counts.get(contact.sourceJid) ?? 0
+      });
+      if (profiles.length >= Math.max(1, options.limit ?? 10_000)) {
+        break;
+      }
+    }
+    return profiles;
+  }
+
+  async listIdentityActivitySummaries(options: { minMessages?: number; limit?: number } = {}): Promise<IdentityActivitySummary[]> {
+    const byJid = new Map<string, { messages: number; firstMs: number | null; lastMs: number | null }>();
+    for (const message of this.messages.values()) {
+      const jid = message.senderSourceJid;
+      if (!jid || !isIdentityServerJid(jid) || message.timestampMs == null) {
+        continue;
+      }
+      const entry = byJid.get(jid) ?? { messages: 0, firstMs: null, lastMs: null };
+      entry.messages += 1;
+      entry.firstMs = entry.firstMs == null ? message.timestampMs : Math.min(entry.firstMs, message.timestampMs);
+      entry.lastMs = entry.lastMs == null ? message.timestampMs : Math.max(entry.lastMs, message.timestampMs);
+      byJid.set(jid, entry);
+    }
+    return [...byJid.entries()]
+      .filter(([, entry]) => entry.messages >= Math.max(1, options.minMessages ?? 3))
+      .map(([jid, entry]) => ({ jid, ...entry }))
+      .sort((a, b) => (b.lastMs ?? 0) - (a.lastMs ?? 0))
+      .slice(0, Math.max(1, options.limit ?? 2_000));
+  }
+
+  async listIdentityChatActivity(jids: string[]): Promise<IdentityChatActivity[]> {
+    const wanted = new Set(jids.filter(Boolean));
+    const byKey = new Map<string, IdentityChatActivity>();
+    for (const message of this.messages.values()) {
+      const jid = message.senderSourceJid;
+      if (!jid || !wanted.has(jid) || message.timestampMs == null) {
+        continue;
+      }
+      const key = `${jid}\u0000${message.chatSourceId}`;
+      const entry = byKey.get(key) ?? { jid, chatSourceId: message.chatSourceId, messages: 0, firstMs: null, lastMs: null };
+      entry.messages += 1;
+      entry.firstMs = entry.firstMs == null ? message.timestampMs : Math.min(entry.firstMs, message.timestampMs);
+      entry.lastMs = entry.lastMs == null ? message.timestampMs : Math.max(entry.lastMs, message.timestampMs);
+      byKey.set(key, entry);
+    }
+    return [...byKey.values()];
+  }
+
+  async listGroupParticipantSets(
+    options: { maxGroupSize?: number; limit?: number } = {}
+  ): Promise<Array<{ groupSourceId: string; participantJids: string[] }>> {
+    const maxGroupSize = Math.max(2, options.maxGroupSize ?? 64);
+    const limit = Math.max(1, options.limit ?? 500);
+    const byGroup = new Map<string, string[]>();
+    for (const participant of this.participants.values()) {
+      const chat = this.chats.get(participant.chatSourceId);
+      if (chat?.chatType !== "group") {
+        continue;
+      }
+      byGroup.set(participant.chatSourceId, [...(byGroup.get(participant.chatSourceId) ?? []), participant.sourceJid]);
+    }
+    const sets: Array<{ groupSourceId: string; participantJids: string[] }> = [];
+    for (const [groupSourceId, participantJids] of byGroup) {
+      if (participantJids.length >= 2 && participantJids.length <= maxGroupSize) {
+        sets.push({ groupSourceId, participantJids });
+        if (sets.length >= limit) {
+          break;
+        }
+      }
+    }
+    return sets;
+  }
+
+  async listCoCitedIdentityPairs(
+    options: { minEpisodes?: number; limit?: number } = {}
+  ): Promise<Array<{ jidA: string; jidB: string; episodes: number }>> {
+    const episodesByPair = new Map<string, Set<string>>();
+    for (const episode of this.brainEpisodes.values()) {
+      for (const claim of episode.claims) {
+        const jids = [...new Set(claim.entities.filter((entity) => entity.kind === "person" && entity.jid).map((entity) => entity.jid!))].sort();
+        for (let i = 0; i < jids.length; i += 1) {
+          for (let j = i + 1; j < jids.length; j += 1) {
+            const key = `${jids[i]}\u0000${jids[j]}`;
+            episodesByPair.set(key, (episodesByPair.get(key) ?? new Set()).add(episode.id));
+          }
+        }
+      }
+    }
+    return [...episodesByPair.entries()]
+      .map(([key, episodes]) => {
+        const [jidA, jidB] = key.split("\u0000");
+        return { jidA, jidB, episodes: episodes.size };
+      })
+      .filter((pair) => pair.episodes >= Math.max(1, options.minEpisodes ?? 2))
+      .sort((a, b) => b.episodes - a.episodes)
+      .slice(0, Math.max(1, options.limit ?? 200));
+  }
+
+  async listResolvedVcardNames(options: { limit?: number } = {}): Promise<Array<{ resolvedJid: string; displayName: string | null }>> {
+    const seen = new Map<string, string | null>();
+    for (const vcard of this.vcards.values()) {
+      if (vcard.resolvedJid && !seen.has(`${vcard.resolvedJid}\u0000${vcard.displayName ?? ""}`)) {
+        seen.set(`${vcard.resolvedJid}\u0000${vcard.displayName ?? ""}`, vcard.displayName ?? null);
+      }
+    }
+    return [...seen.entries()]
+      .map(([key, displayName]) => ({ resolvedJid: key.split("\u0000")[0], displayName }))
+      .slice(0, Math.max(1, options.limit ?? 1_000));
+  }
+
+  // Person-layer reconciliation for the archive-layer LID→PN collapse (mirror
+  // of the SQLite rewrite): memberships follow the canonical JID, pair rows
+  // re-normalize, self-referential pairs vanish, and persons revealed to share
+  // an identity union.
+  private rewritePersonLayerForMerge(lid: string, pn: string): void {
+    const lidMember = this.personMembers.get(lid);
+    const pnMember = this.personMembers.get(pn);
+    if (lidMember && pnMember) {
+      if (lidMember.personId !== pnMember.personId) {
+        this.unionPersons(lidMember.personId, pnMember.personId, { viaJids: [lid, pn], source: "identity_merge" });
+      }
+      this.personMembers.delete(lid);
+    } else if (lidMember) {
+      this.personMembers.delete(lid);
+      this.personMembers.set(pn, lidMember);
+    }
+    const statusRank: Record<PersonSuggestionStatus, number> = { rejected: 3, accepted: 2, superseded: 1, pending: 0 };
+    for (const [key, suggestion] of [...this.personSuggestions]) {
+      if (suggestion.jidLow !== lid && suggestion.jidHigh !== lid) {
+        continue;
+      }
+      this.personSuggestions.delete(key);
+      const nextA = suggestion.jidLow === lid ? pn : suggestion.jidLow;
+      const nextB = suggestion.jidHigh === lid ? pn : suggestion.jidHigh;
+      if (nextA === nextB) {
+        continue;
+      }
+      const [low, high] = this.personPair(nextA, nextB);
+      const nextKey = `${low}\u0000${high}\u0000${suggestion.kind}`;
+      const existing = this.personSuggestions.get(nextKey);
+      if (existing) {
+        const keepExisting = statusRank[existing.status] >= statusRank[suggestion.status];
+        const survivor = keepExisting ? existing : suggestion;
+        survivor.jidLow = low;
+        survivor.jidHigh = high;
+        survivor.score = Math.max(existing.score, suggestion.score);
+        survivor.updatedAt = new Date().toISOString();
+        this.personSuggestions.set(nextKey, survivor);
+      } else {
+        suggestion.jidLow = low;
+        suggestion.jidHigh = high;
+        suggestion.updatedAt = new Date().toISOString();
+        this.personSuggestions.set(nextKey, suggestion);
+      }
+    }
+    for (const [key, suppression] of [...this.personSuppressions]) {
+      if (suppression.jidLow !== lid && suppression.jidHigh !== lid) {
+        continue;
+      }
+      this.personSuppressions.delete(key);
+      const nextA = suppression.jidLow === lid ? pn : suppression.jidLow;
+      const nextB = suppression.jidHigh === lid ? pn : suppression.jidHigh;
+      if (nextA === nextB) {
+        continue;
+      }
+      const [low, high] = this.personPair(nextA, nextB);
+      const nextKey = this.personPairKey(nextA, nextB);
+      if (!this.personSuppressions.has(nextKey)) {
+        this.personSuppressions.set(nextKey, { ...suppression, jidLow: low, jidHigh: high });
+      }
+    }
+    for (const event of this.personEvents) {
+      if (event.identityJid === lid) {
+        event.identityJid = pn;
+      }
+    }
   }
 
   async upsertChats(_runId: string, chats: ChatRecord[]): Promise<Map<string, number>> {
@@ -1356,6 +2140,16 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     this.messageSecrets.clear();
     this.retainedPayloads.clear();
     this.nextRetainedPayloadId = 1;
+    // Person layer references identities, so it clears with the archive
+    // (mirror of DELETE_TABLE_ORDER in the SQLite adapter).
+    this.persons.clear();
+    this.personMembers.clear();
+    this.personSuppressions.clear();
+    this.personSuggestions.clear();
+    this.personEvents = [];
+    this.personRedirects.clear();
+    this.googleContactGroups.clear();
+    this.nextPersonEventId = 1;
   }
 
   async getStatus(): Promise<StatusSummary> {
@@ -2064,10 +2858,42 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     return latest ?? null;
   }
 
+  // Render-time person disambiguation over one response's label list (mirror
+  // of the SQLite adapter): same label across DIFFERENT persons gains a
+  // deterministic complete-number suffix; one person's identities never
+  // disambiguate against each other.
+  private disambiguateEntryLabels(entries: Array<{ label: string | null; jid: string | null }>): Array<string | null> {
+    return disambiguateLabels(
+      entries.map((entry) => ({
+        label: entry.jid ? entry.label : null,
+        jid: entry.jid,
+        personKey: entry.jid ? this.personMembers.get(entry.jid)?.personId ?? entry.jid : "no-identity"
+      }))
+    );
+  }
+
+  // Display-level unconfirmed hints for DM counterparties (mirror of SQLite).
+  private chatHintFor(jid: string): string | null {
+    let best: { otherJid: string; score: number } | null = null;
+    for (const suggestion of this.personSuggestions.values()) {
+      if (suggestion.status !== "pending" || suggestion.score < config.persons.hintScoreThreshold) {
+        continue;
+      }
+      if (suggestion.jidLow !== jid && suggestion.jidHigh !== jid) {
+        continue;
+      }
+      const otherJid = suggestion.jidLow === jid ? suggestion.jidHigh : suggestion.jidLow;
+      if (!best || suggestion.score > best.score) {
+        best = { otherJid, score: suggestion.score };
+      }
+    }
+    return best ? `possibly the same as ${this.resolveCurrentLabelForJid(best.otherJid) ?? best.otherJid} — unconfirmed` : null;
+  }
+
   async listChats(options: ChatListOptions): Promise<ChatListItem[]> {
     const search = options.search?.toLowerCase();
     const searchDigits = search ? search.replace(/\D/g, "") : "";
-    return [...this.chats.values()]
+    const items: ChatListItem[] = [...this.chats.values()]
       .filter(
         (chat) =>
           !search ||
@@ -2089,6 +2915,22 @@ export class MemoryArchiveRepository implements ArchiveRepository {
         participantCount: chat.participantCount,
         lastMessageAt: chat.lastMessageAt
       }));
+    const isIdentityChat = (item: ChatListItem): boolean => item.chatType === "dm" || item.chatType === "unknown";
+    const adjusted = this.disambiguateEntryLabels(
+      items.map((item) => (isIdentityChat(item) ? { label: item.displayName, jid: item.sourceChatId } : { label: null, jid: null }))
+    );
+    items.forEach((item, index) => {
+      if (isIdentityChat(item)) {
+        if (adjusted[index] != null) {
+          item.displayName = adjusted[index];
+        }
+        const hint = this.chatHintFor(item.sourceChatId);
+        if (hint) {
+          item.unconfirmedHint = hint;
+        }
+      }
+    });
+    return items;
   }
 
   async listMessages(
@@ -2100,7 +2942,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       return [];
     }
     const query = options.query?.toLowerCase();
-    return [...this.messages.values()]
+    const items = [...this.messages.values()]
       .filter((message) => message.chatSourceId === chat.sourceChatId)
       .filter((message) => !options.sender || message.senderSourceJid === options.sender)
       .filter((message) => !query || message.body?.toLowerCase().includes(query) || message.caption?.toLowerCase().includes(query))
@@ -2160,6 +3002,16 @@ export class MemoryArchiveRepository implements ArchiveRepository {
           isStarred: message.isStarred
         };
       });
+    // Same-name persons stay visually distinct within the thread page.
+    const adjustedSenders = this.disambiguateEntryLabels(
+      items.map((item) => ({ label: item.senderDisplayName, jid: item.senderSourceJid }))
+    );
+    items.forEach((item, index) => {
+      if (adjustedSenders[index] != null) {
+        item.senderDisplayName = adjustedSenders[index];
+      }
+    });
+    return items;
   }
 
   async listMessagesAround(chatId: number, messageId: number, radius: number): Promise<MessageContextWindow | null> {
@@ -2297,10 +3149,27 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       });
     }
     scored.sort((a, b) => b.score - a.score || (b.item.timestampMs ?? 0) - (a.item.timestampMs ?? 0));
+    const results = scored.slice(options.offset, options.offset + options.limit).map((entry) => entry.item);
+    // Same-name persons stay visually distinct within the result page: sender
+    // labels always; chat titles only for identity-addressed (DM) chats.
+    const adjustedSenders = this.disambiguateEntryLabels(results.map((item) => ({ label: item.senderDisplayName, jid: item.senderSourceJid })));
+    const adjustedChats = this.disambiguateEntryLabels(
+      results.map((item) =>
+        item.chatType === "dm" || item.chatType === "unknown" ? { label: item.chatDisplayName, jid: item.chatSourceId } : { label: null, jid: null }
+      )
+    );
+    results.forEach((item, index) => {
+      if (adjustedSenders[index] != null) {
+        item.senderDisplayName = adjustedSenders[index];
+      }
+      if (adjustedChats[index] != null) {
+        item.chatDisplayName = adjustedChats[index];
+      }
+    });
     return {
       index,
       totalMatches: scored.length,
-      results: scored.slice(options.offset, options.offset + options.limit).map((entry) => entry.item)
+      results
     };
   }
 

@@ -586,6 +586,16 @@ export interface GoogleContactCandidate {
   displayName: string;
 }
 
+// Person-level grouping captured from the provider: which normalized numbers
+// belong to one Google contact. Grouping capture is independent of name
+// ambiguity (a contested name never removes a number from its contact's
+// grouping) and exists to drive same-contact person auto-connect.
+export interface GoogleContactGroupEntry {
+  resourceName: string;
+  phoneE164: string;
+  displayName: string | null;
+}
+
 export interface GoogleContactsSyncResult {
   fetchedPeople: number;
   usableNumbers: number;
@@ -593,7 +603,188 @@ export interface GoogleContactsSyncResult {
   improvedNames: number;
   ambiguousNumbers: number;
   skippedNumbers: number;
+  // Same-contact grouping totals (absent on syncs persisted before the
+  // two-level person model shipped).
+  contactGroups?: number;
+  groupedNumbers?: number;
+  personsAutoConnected?: number;
   syncedAt: string;
+}
+
+// --- Two-level person model ---
+// Identities (canonical JIDs) are immutable anchors; persons are an editable
+// grouping over identities via a membership table. Connect inserts a row,
+// disconnect deletes it; nothing durable ever keys on a person id.
+
+export type PersonMemberSource = "google" | "number_change" | "user";
+export type PersonSuggestionKind = "same_name" | "shared_group" | "co_citation" | "succession" | "shared_vcard" | "llm";
+export type PersonSuggestionStatus = "pending" | "accepted" | "rejected" | "superseded";
+
+export interface PersonMemberRecord {
+  identityJid: string;
+  source: PersonMemberSource;
+  evidence: Record<string, unknown> | null;
+  linkedAt: string;
+  // Read-time context so provenance and the primary-member rule are visible
+  // where membership is presented; never stored.
+  displayLabel: string | null;
+  phoneNumber: string | null;
+  messageCount: number;
+  hasSavedName: boolean;
+}
+
+export interface PersonRecord {
+  id: string;
+  // Derived at read time from the primary member (saved-name member with the
+  // highest message count, else highest message count). Never stored: nothing
+  // in the system groups by name.
+  displayLabel: string | null;
+  members: PersonMemberRecord[];
+  unconfirmedHint: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PersonRedirectRecord {
+  personId: string;
+  replacedByPersonId: string | null;
+  survivingJid: string | null;
+  createdAt: string;
+}
+
+export interface PersonLookupResult {
+  person: PersonRecord | null;
+  redirect: PersonRedirectRecord | null;
+}
+
+export type PersonConnectOutcome = "connected" | "already_connected" | "union" | "suppressed" | "self" | "invalid";
+
+export interface PersonConnectResult {
+  outcome: PersonConnectOutcome;
+  personId: string | null;
+}
+
+export interface PersonDisconnectResult {
+  disconnected: boolean;
+  // The person the identity was removed from (null when it was not a member).
+  personId: string | null;
+  // Set when the removal left fewer than two members and the person dissolved.
+  dissolved: boolean;
+}
+
+export interface PersonSuggestionInput {
+  jidA: string;
+  jidB: string;
+  kind: PersonSuggestionKind;
+  score: number;
+  evidence: Record<string, unknown>;
+}
+
+export interface PersonSuggestionRecord {
+  id: string;
+  jidLow: string;
+  jidHigh: string;
+  kind: PersonSuggestionKind;
+  score: number;
+  evidence: Record<string, unknown>;
+  status: PersonSuggestionStatus;
+  createdAt: string;
+  updatedAt: string;
+  // Read-time labels for the two identities, display-rule resolved.
+  lowLabel: string | null;
+  highLabel: string | null;
+  // Read-time context so a human can actually decide: complete numbers, each
+  // identity's DM chat id (for one-click chat exploration), message volume
+  // per side (drives value-aware sorting), and display labels for any
+  // chat/group source ids referenced by the evidence.
+  lowPhone: string | null;
+  highPhone: string | null;
+  lowChatId: number | null;
+  highChatId: number | null;
+  lowMessageCount: number;
+  highMessageCount: number;
+  // The rest of the merge's value proposition, resolved at read time: how
+  // often each identity is @mentioned and how many groups each is in.
+  lowMentionCount: number;
+  highMentionCount: number;
+  lowGroupCount: number;
+  highGroupCount: number;
+  chatLabels: Record<string, string>;
+}
+
+// A sender's recent activity across every chat (groups included) — the
+// compare dialog's answer for identities with no direct chat.
+export interface IdentityRecentMessage {
+  chatId: number;
+  chatSourceId: string;
+  chatLabel: string | null;
+  chatType: ChatType;
+  timestampMs: number | null;
+  direction: "incoming" | "outgoing" | "system" | "unknown";
+  messageType: string;
+  text: string | null;
+}
+
+// Freshness surface for the People page: when the deterministic passes last
+// ran in this server process (in-memory — a restart honestly reads "not yet").
+export interface PersonScanStatus {
+  lastAutoConnectAtMs: number | null;
+  lastAutoConnect: PersonAutoConnectSummary | null;
+  lastDetectorAtMs: number | null;
+  lastDetectors: { created: number; updated: number } | null;
+}
+
+export interface PersonLinkSuppressionRecord {
+  jidLow: string;
+  jidHigh: string;
+  reason: "suggestion_rejected" | "disconnected";
+  createdAt: string;
+}
+
+export interface PersonLinkEventRecord {
+  id: number;
+  action: "connect" | "disconnect" | "union" | "dissolve" | "suggest" | "accept" | "reject";
+  personId: string | null;
+  identityJid: string | null;
+  source: string | null;
+  evidence: Record<string, unknown> | null;
+  createdAt: string;
+}
+
+export interface PersonAutoConnectSummary {
+  googleConnected: number;
+  numberChangeConnected: number;
+  unions: number;
+  skippedSuppressed: number;
+}
+
+export interface PersonScanSummary extends PersonAutoConnectSummary {
+  suggestionsCreated: number;
+  suggestionsUpdated: number;
+}
+
+// Bounded read surfaces the deterministic person passes are built on.
+export interface IdentityActivitySummary {
+  jid: string;
+  messages: number;
+  firstMs: number | null;
+  lastMs: number | null;
+}
+
+export interface IdentityChatActivity {
+  jid: string;
+  chatSourceId: string;
+  messages: number;
+  firstMs: number | null;
+  lastMs: number | null;
+}
+
+export interface IdentityProfile {
+  jid: string;
+  displayName: string | null;
+  pushName: string | null;
+  phoneNumber: string | null;
+  messageCount: number;
 }
 
 export interface GoogleContactsStatus {
@@ -745,12 +936,18 @@ export interface ChatListItem {
   sourceChatId: string;
   jid: string;
   // Name or phone number; NULL means unresolved and the UI renders an explicit
-  // state instead of a raw identifier.
+  // state instead of a raw identifier. When the same label would render for a
+  // different person elsewhere in the response, it arrives disambiguated with
+  // a deterministic suffix (complete +E.164).
   displayName: string | null;
   chatType: ChatType;
   messageCount: number;
   participantCount: number;
   lastMessageAt: string | null;
+  // Display-level annotation from a high-confidence pending person suggestion
+  // ("possibly the same as … — unconfirmed"). Never influences claims,
+  // evidence, or search — those paths do not read suggestions.
+  unconfirmedHint?: string | null;
 }
 
 export interface ChatListOptions {

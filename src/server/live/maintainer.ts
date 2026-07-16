@@ -5,6 +5,8 @@ import { configuredTraceRecorder } from "../diagnostics/traceRecorder";
 import { messageKey } from "../identity/keys";
 import { normalizeJid } from "../import/jid";
 import { mediaBlobStore } from "../media/blobStore";
+import { runPersonAutoConnectPass } from "../persons/autoConnect";
+import { runPersonSuggestionDetectors } from "../persons/suggestions";
 import { assertLiveDependencySafe } from "./dependency";
 import { auditChatGaps, auditMessageEventCheckpoint, GAP_TOLERANCE_MS } from "./auditor";
 import { recoverDueGaps } from "./recovery";
@@ -201,6 +203,7 @@ export class LiveMaintainer {
         await configuredTraceRecorder?.record("live.recovery_tick", { runId: this.runId, ...summary });
       }
       await this.sweepUnmergedIdentities();
+      await this.runPersonPass();
       await this.runGroupNamingPass();
       await this.runSecretsPass();
       // Media runs last on the tick so gap recovery and secrets never wait.
@@ -350,6 +353,36 @@ export class LiveMaintainer {
     for (const { lid, pn } of unmerged) {
       const merged = await this.repository.mergeIdentity(lid, pn);
       await configuredTraceRecorder?.record("live.identity_merged", { runId: this.runId, lid, source: "sweep", ...merged });
+    }
+  }
+
+  private personTickCount = 0;
+
+  // Two-level person model maintenance: certainty-grade auto-connect (google
+  // groupings + number-change events) every tick — cheap, idempotent scans —
+  // and the heavier deterministic suggestion detectors every Nth tick. Person
+  // work is metadata-only by construction; its errors never inflate live-sync
+  // warnings.
+  private async runPersonPass(): Promise<void> {
+    this.personTickCount += 1;
+    try {
+      const summary = await runPersonAutoConnectPass(this.repository);
+      const connected = summary.googleConnected + summary.numberChangeConnected;
+      if (connected > 0) {
+        console.log(
+          `[persons] auto-connect: ${summary.googleConnected} via google, ${summary.numberChangeConnected} via number change, ${summary.unions} union(s)`
+        );
+        await configuredTraceRecorder?.record("live.person_auto_connect", { runId: this.runId, ...summary });
+      }
+      if (this.personTickCount % Math.max(1, config.persons.detectorTickInterval) === 0) {
+        const detected = await runPersonSuggestionDetectors(this.repository);
+        if (detected.created > 0 || detected.updated > 0) {
+          console.log(`[persons] suggestion detectors: ${detected.created} new, ${detected.updated} updated`);
+          await configuredTraceRecorder?.record("live.person_suggestions", { runId: this.runId, ...detected });
+        }
+      }
+    } catch (error) {
+      console.error(`[persons] pass failed: ${error instanceof Error ? error.message.slice(0, 200) : "unknown error"}`);
     }
   }
 

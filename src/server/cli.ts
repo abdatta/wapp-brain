@@ -396,6 +396,49 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Two-level person model: run the deterministic person pass on demand —
+  // certainty-grade auto-connect (google groupings + number-change events)
+  // and, unless --connect-only, the suggestion detectors. Metadata-only by
+  // construction (episodes/claims/citations are never touched). Run with the
+  // server STOPPED — SQLite is single-writer.
+  if (command === "persons-scan") {
+    const repository = createArchiveRepository();
+    try {
+      const { runPersonAutoConnectPass } = await import("./persons/autoConnect");
+      const autoConnect = await runPersonAutoConnectPass(repository);
+      console.log(
+        `Auto-connect: ${autoConnect.googleConnected} via google grouping, ${autoConnect.numberChangeConnected} via number change, ` +
+          `${autoConnect.unions} union(s), ${autoConnect.skippedSuppressed} suppressed pair(s) skipped.`
+      );
+      if (!args["connect-only"]) {
+        const { runPersonSuggestionDetectors } = await import("./persons/suggestions");
+        const detected = await runPersonSuggestionDetectors(repository);
+        console.log(`Suggestions: ${detected.created} new, ${detected.updated} updated.`);
+        for (const [kind, count] of Object.entries(detected.byDetector)) {
+          if (count > 0) {
+            console.log(`  ${kind}: ${count}`);
+          }
+        }
+      }
+      const persons = await repository.listPersons({ limit: 200 });
+      console.log(`Persons: ${persons.length}`);
+      for (const person of persons.slice(0, 20)) {
+        const members = person.members
+          .map((member) => `${member.displayLabel ?? member.identityJid} [${member.source}]`)
+          .join(" + ");
+        console.log(`  ${person.displayLabel ?? person.id}: ${members}`);
+      }
+      const pending = await repository.listPersonSuggestions({ status: "pending", limit: 20 });
+      console.log(`Pending suggestions: ${pending.length}`);
+      for (const suggestion of pending) {
+        console.log(`  [${suggestion.kind} ${suggestion.score.toFixed(2)}] ${suggestion.lowLabel} ↔ ${suggestion.highLabel}`);
+      }
+    } finally {
+      await repository.close?.();
+    }
+    return;
+  }
+
   if (command === "search-reindex") {
     const repository = createArchiveRepository();
     try {
@@ -884,6 +927,7 @@ function printHelp(): void {
   tsx src/server/cli.ts live-retry-gap --id <gap-id>
   tsx src/server/cli.ts live-unlink
   tsx src/server/cli.ts set-contact-name --jid <sourceJid> --name "<display name>"
+  tsx src/server/cli.ts persons-scan [--connect-only]
   tsx src/server/cli.ts memory-status
   tsx src/server/cli.ts memory-provider [status|enable-codex|login|disable]
   tsx src/server/cli.ts memory-rem [--dry-run] [--force]

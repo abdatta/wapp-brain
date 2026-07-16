@@ -2,7 +2,8 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { ArchiveRepository } from "./db/repository";
-import type { GoogleContactCandidate, GoogleContactsStatus, GoogleContactsSyncResult } from "../shared/types";
+import type { GoogleContactCandidate, GoogleContactGroupEntry, GoogleContactsStatus, GoogleContactsSyncResult } from "../shared/types";
+import { runPersonAutoConnectPass } from "./persons/autoConnect";
 import { PublicError } from "./privacy";
 
 const CONTACTS_SCOPE = "https://www.googleapis.com/auth/contacts.readonly";
@@ -29,6 +30,10 @@ interface StoredAuth {
 }
 
 interface GooglePerson {
+  // Stable per-contact identifier (people/cXXXX) — present on every Person in
+  // every response. It is the person-level grouping signal: numbers sharing a
+  // resourceName belong to one saved Google contact.
+  resourceName?: string;
   metadata?: { deleted?: boolean };
   names?: Array<{ displayName?: string }>;
   phoneNumbers?: Array<{ value?: string; canonicalForm?: string }>;
@@ -110,10 +115,18 @@ export class GoogleContactsService {
 
     const normalized = buildCandidates(people);
     const enrichment = await repository.enrichContactsFromGoogle(normalized.candidates);
+    // Persist the person-level grouping the provider already returned (which
+    // numbers share one Google contact), then run same-contact auto-connect.
+    // Groupings mirror the provider's current state; replacing them never
+    // disconnects identities a previous grouping connected.
+    const grouping = await repository.replaceGoogleContactGroups(normalized.groups);
+    const autoConnect = await runPersonAutoConnectPass(repository, { sources: ["google"] });
     const result: GoogleContactsSyncResult = {
       fetchedPeople: people.length, usableNumbers: normalized.candidates.length,
       matchedIdentities: enrichment.matchedIdentities, improvedNames: enrichment.improvedNames,
       ambiguousNumbers: normalized.ambiguousNumbers, skippedNumbers: normalized.skippedNumbers,
+      contactGroups: grouping.groups, groupedNumbers: grouping.numbers,
+      personsAutoConnected: autoConnect.googleConnected + autoConnect.numberChangeConnected,
       syncedAt: new Date(this.now()).toISOString()
     };
     await this.writeAuth({ ...auth, lastSync: result });
@@ -169,14 +182,32 @@ export function normalizeGooglePhone(phone: { value?: string; canonicalForm?: st
   return /^[1-9]\d{7,14}$/.test(digits) ? digits : null;
 }
 
-export function buildCandidates(people: GooglePerson[]): { candidates: GoogleContactCandidate[]; ambiguousNumbers: number; skippedNumbers: number } {
+export function buildCandidates(people: GooglePerson[]): {
+  candidates: GoogleContactCandidate[];
+  groups: GoogleContactGroupEntry[];
+  ambiguousNumbers: number;
+  skippedNumbers: number;
+} {
   const namesByPhone = new Map<string, Set<string>>();
+  const groups: GoogleContactGroupEntry[] = [];
+  const seenGroupKeys = new Set<string>();
   let skippedNumbers = 0;
   for (const person of people) {
     if (person.metadata?.deleted) continue;
     const name = person.names?.map((item) => item.displayName?.trim()).find(Boolean);
     for (const phone of person.phoneNumbers ?? []) {
       const normalized = normalizeGooglePhone(phone);
+      // Grouping capture is independent of name handling: a contested or
+      // missing name never removes a normalizable number from its contact's
+      // grouping — only an unnormalizable number stays out (it could never
+      // match an archive identity anyway).
+      if (normalized && person.resourceName) {
+        const key = `${person.resourceName} ${normalized}`;
+        if (!seenGroupKeys.has(key)) {
+          seenGroupKeys.add(key);
+          groups.push({ resourceName: person.resourceName, phoneE164: normalized, displayName: name ?? null });
+        }
+      }
       if (!name || !normalized) { skippedNumbers += 1; continue; }
       const names = namesByPhone.get(normalized) ?? new Set<string>(); names.add(name); namesByPhone.set(normalized, names);
     }
@@ -187,7 +218,7 @@ export function buildCandidates(people: GooglePerson[]): { candidates: GoogleCon
     if (names.size !== 1) { ambiguousNumbers += 1; continue; }
     candidates.push({ phoneNumber, displayName: [...names][0] });
   }
-  return { candidates, ambiguousNumbers, skippedNumbers };
+  return { candidates, groups, ambiguousNumbers, skippedNumbers };
 }
 
 function safeEqual(left: string, right: string): boolean { const a = Buffer.from(left); const b = Buffer.from(right); return a.length === b.length && crypto.timingSafeEqual(a, b); }

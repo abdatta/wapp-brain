@@ -309,7 +309,7 @@ function GoogleContactsPanel({ status, busy, onSync, onDisconnect }: {
       ) : (
         <>
           <p className="muted">Connected{status.accountLabel ? ` as ${status.accountLabel}` : " with read-only contact access"}.</p>
-          {last && <p className="muted">Last sync: {last.fetchedPeople.toLocaleString()} people, {last.matchedIdentities.toLocaleString()} matched, {last.improvedNames.toLocaleString()} improved, {last.ambiguousNumbers.toLocaleString()} ambiguous, {last.skippedNumbers.toLocaleString()} skipped.</p>}
+          {last && <p className="muted">Last sync: {last.fetchedPeople.toLocaleString()} people, {last.matchedIdentities.toLocaleString()} matched, {last.improvedNames.toLocaleString()} improved, {last.ambiguousNumbers.toLocaleString()} ambiguous, {last.skippedNumbers.toLocaleString()} skipped{last.contactGroups != null ? `, ${last.contactGroups.toLocaleString()} contact groupings (${(last.groupedNumbers ?? 0).toLocaleString()} numbers)` : ""}{last.personsAutoConnected ? `, ${last.personsAutoConnected.toLocaleString()} auto-connected` : ""}.</p>}
           <div className="buttonRow">
             <button className="primaryButton" disabled={busy} onClick={onSync}>{busy ? <Loader2 className="spin" size={16} /> : <RefreshCcw size={16} />} Sync contacts</button>
             <button className="secondaryButton" disabled={busy} onClick={onDisconnect}><Unlink size={16} /> Disconnect</button>

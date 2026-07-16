@@ -34,7 +34,16 @@ import type {
   BackupDetectionManifest,
   WaContactsSummary,
   GoogleContactsStatus,
-  GoogleContactsSyncResult
+  GoogleContactsSyncResult,
+  IdentityRecentMessage,
+  PersonAutoConnectSummary,
+  PersonConnectResult,
+  PersonDisconnectResult,
+  PersonLookupResult,
+  PersonRecord,
+  PersonScanStatus,
+  PersonSuggestionRecord,
+  PersonSuggestionStatus
 } from "../shared/types";
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
@@ -48,6 +57,11 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const payload = await response.json().catch(() => null);
   if (!response.ok) {
     throw new Error(payload?.error ?? "Local request failed.");
+  }
+  // A 200 with a non-JSON body is the SPA fallback answering for an API route
+  // the running server doesn't know — a stale server behind a newer client.
+  if (payload === null) {
+    throw new Error("The local server doesn't recognize this endpoint — it's likely running an older build. Restart the server and retry.");
   }
   return payload as T;
 }
@@ -74,6 +88,44 @@ export function syncGoogleContacts(): Promise<{ ok: boolean; result: GoogleConta
 
 export function disconnectGoogleContacts(): Promise<{ ok: boolean; revoked: boolean; status: GoogleContactsStatus }> {
   return request("/api/google-contacts", { method: "DELETE", body: "{}" });
+}
+
+// --- Two-level person model ---
+
+export function listPersons(): Promise<{ persons: PersonRecord[]; scan?: PersonScanStatus | null }> {
+  return request("/api/persons");
+}
+
+export function getPerson(personId: string): Promise<PersonLookupResult> {
+  return request(`/api/persons/${encodeURIComponent(personId)}`);
+}
+
+export function listPersonSuggestions(status: PersonSuggestionStatus = "pending"): Promise<{ suggestions: PersonSuggestionRecord[] }> {
+  return request(`/api/persons/suggestions?status=${encodeURIComponent(status)}`);
+}
+
+export function connectPersonIdentities(jidA: string, jidB: string): Promise<{ ok: boolean; result: PersonConnectResult; person: PersonRecord | null }> {
+  return request("/api/persons/connect", { method: "POST", body: JSON.stringify({ jidA, jidB }) });
+}
+
+export function disconnectPersonIdentity(jid: string): Promise<{ ok: boolean; result: PersonDisconnectResult }> {
+  return request("/api/persons/disconnect", { method: "POST", body: JSON.stringify({ jid }) });
+}
+
+export function acceptPersonSuggestion(id: string): Promise<{ ok: boolean; result: PersonConnectResult; person: PersonRecord | null }> {
+  return request(`/api/persons/suggestions/${encodeURIComponent(id)}/accept`, { method: "POST", body: "{}" });
+}
+
+export function rejectPersonSuggestion(id: string): Promise<{ ok: boolean }> {
+  return request(`/api/persons/suggestions/${encodeURIComponent(id)}/reject`, { method: "POST", body: "{}" });
+}
+
+export function runPersonScan(): Promise<{ ok: boolean; autoConnect: PersonAutoConnectSummary; detectors: { created: number; updated: number } }> {
+  return request("/api/persons/scan", { method: "POST", body: "{}" });
+}
+
+export function listIdentityRecentMessages(jid: string, limit = 20): Promise<{ messages: IdentityRecentMessage[] }> {
+  return request(`/api/persons/identity-messages?jid=${encodeURIComponent(jid)}&limit=${limit}`);
 }
 
 export function initDatabase(): Promise<{ ok: boolean; status: StatusSummary }> {

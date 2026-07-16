@@ -1,4 +1,4 @@
-import { Brain, MessageCircle, Search, Signal, SlidersHorizontal, Upload, Users } from "lucide-react";
+import { Brain, MessageCircle, Search, Signal, SlidersHorizontal, Upload, UserRound, Users } from "lucide-react";
 import type { ReactNode } from "react";
 import { NavLink } from "react-router-dom";
 import { useStatus } from "../state/StatusContext";
@@ -8,6 +8,7 @@ const NAV_ITEMS: { to: string; label: string; icon: ReactNode }[] = [
   { to: "/search", label: "Search", icon: <Search size={18} /> },
   { to: "/brain", label: "Brain", icon: <Brain size={18} /> },
   { to: "/contacts", label: "Contacts", icon: <Users size={18} /> },
+  { to: "/people", label: "People", icon: <UserRound size={18} /> },
   { to: "/import", label: "Import", icon: <Upload size={18} /> },
   { to: "/settings", label: "Settings", icon: <SlidersHorizontal size={18} /> }
 ];

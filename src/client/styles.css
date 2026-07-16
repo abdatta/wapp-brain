@@ -3676,3 +3676,452 @@ button.fileButton:disabled {
   white-space: pre-wrap;
   max-width: 640px;
 }
+
+/* --- People (two-level person model) management surface --- */
+
+.peoplePage {
+  max-width: 820px;
+  margin: 0 auto;
+  padding: 20px 16px 48px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.peoplePage > .panel {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  background: rgba(17, 19, 22, 0.6);
+  padding: 16px;
+}
+
+.peoplePage .toolHeader button {
+  align-self: flex-start;
+}
+
+.peoplePage h3 {
+  margin: 0 0 10px;
+  font-size: 0.95rem;
+}
+
+.personSuggestionList,
+.personList,
+.personMembers {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.personSuggestion,
+.personCard {
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 10px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.personSuggestion .badge,
+.personMember .badge {
+  margin-left: 8px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(125, 224, 178, 0.4);
+  color: #7de0b2;
+  font-size: 0.72rem;
+  white-space: nowrap;
+}
+
+.personEvidence {
+  font-size: 0.8rem;
+  overflow-wrap: anywhere;
+}
+
+.personActions {
+  display: flex;
+  gap: 8px;
+}
+
+.personActions button,
+.personMember button {
+  font: inherit;
+  font-size: 0.8rem;
+  padding: 4px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(125, 224, 178, 0.5);
+  background: rgba(125, 224, 178, 0.12);
+  color: #d9efe5;
+  cursor: pointer;
+}
+
+.personActions button.secondary,
+.personMember button.secondary {
+  border-color: rgba(255, 255, 255, 0.18);
+  background: transparent;
+  color: #9ea9a6;
+}
+
+.personActions button:disabled,
+.personMember button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.personCardHeader {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.personHint {
+  font-size: 0.78rem;
+  font-style: italic;
+}
+
+.personMember {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 0.88rem;
+}
+
+.personMember button {
+  margin-left: auto;
+}
+
+/* People page: tabs, filters, decision context, tooltips */
+
+.personScanLine {
+  font-size: 0.82rem;
+  max-width: 640px;
+}
+
+.personTabs {
+  display: flex;
+  gap: 8px;
+}
+
+.personTabs button {
+  font: inherit;
+  font-size: 0.86rem;
+  padding: 6px 14px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: transparent;
+  color: #9ea9a6;
+  cursor: pointer;
+}
+
+.personTabs button.active {
+  border-color: rgba(125, 224, 178, 0.55);
+  background: rgba(125, 224, 178, 0.12);
+  color: #d9efe5;
+}
+
+.personFilters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.personFilters button {
+  font: inherit;
+  font-size: 0.76rem;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: transparent;
+  color: #9ea9a6;
+  cursor: pointer;
+}
+
+.personFilters button.active {
+  border-color: rgba(125, 224, 178, 0.5);
+  color: #d9efe5;
+}
+
+.personPair {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.personIdentity {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.personPhone {
+  font-size: 0.78rem;
+}
+
+.personChatLink {
+  font-size: 0.74rem;
+  color: #7de0b2;
+  text-decoration: none;
+  border-bottom: 1px dotted rgba(125, 224, 178, 0.5);
+}
+
+.personEvidenceLines {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 0.82rem;
+}
+
+.personRawEvidence summary {
+  font-size: 0.74rem;
+  cursor: pointer;
+}
+
+.personRawEvidence pre {
+  font-size: 0.72rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: rgba(0, 0, 0, 0.25);
+  border-radius: 8px;
+  padding: 8px;
+  margin: 6px 0 0;
+}
+
+.personSuggestion.dismissed {
+  opacity: 0.75;
+}
+
+/* Lightweight custom tooltip for explainer chips (hover or keyboard focus). */
+.tipChip {
+  position: relative;
+  cursor: help;
+}
+
+.tipChip:hover::after,
+.tipChip:focus-visible::after {
+  content: attr(data-tip);
+  position: absolute;
+  left: 0;
+  top: calc(100% + 6px);
+  z-index: 30;
+  width: max-content;
+  max-width: 300px;
+  white-space: normal;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: #14171a;
+  color: #d9efe5;
+  font-size: 0.74rem;
+  line-height: 1.35;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+}
+
+/* People page: header row, sort control, compare dialog */
+
+.personLinkButton {
+  font: inherit;
+  background: none;
+  border: none;
+  padding: 0;
+  color: #7de0b2;
+  cursor: pointer;
+  border-bottom: 1px dotted rgba(125, 224, 178, 0.5);
+}
+
+.personIntro {
+  max-width: 640px;
+  font-size: 0.84rem;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.personScanRow {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.personScanRow .primaryButton {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.personScanRow .muted {
+  font-size: 0.8rem;
+}
+
+.personListControls {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.personSort {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.8rem;
+}
+
+.personSort select {
+  font: inherit;
+  font-size: 0.8rem;
+  padding: 4px 8px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: #14171a;
+  color: #d9efe5;
+}
+
+.personSuggestion.clickable {
+  cursor: pointer;
+}
+
+.personSuggestion.clickable:hover {
+  border-color: rgba(125, 224, 178, 0.35);
+}
+
+.personCompareBackdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(2px);
+  padding: 24px;
+}
+
+.personCompareDialog {
+  width: min(980px, 100%);
+  max-height: 90vh;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 14px;
+  background: #101315;
+  padding: 16px;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.55);
+}
+
+.personCompareHeader {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.personCompareHeader button {
+  font: inherit;
+  font-size: 0.8rem;
+  padding: 4px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: transparent;
+  color: #9ea9a6;
+  cursor: pointer;
+}
+
+.personCompareColumns {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+@media (max-width: 760px) {
+  .personCompareColumns {
+    grid-template-columns: 1fr;
+  }
+}
+
+.personCompareColumn {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.personCompareColumnHeader {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.personCompareThread {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 44vh;
+  overflow-y: auto;
+  font-size: 0.84rem;
+}
+
+.personCompareMessage {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  overflow-wrap: anywhere;
+}
+
+.personCompareMessage.outgoing {
+  background: rgba(125, 224, 178, 0.08);
+}
+
+.personCompareWhen {
+  font-size: 0.7rem;
+}
+
+.personCompareActions {
+  justify-content: flex-end;
+}
+
+/* Combined-signal chip on pair cards */
+.personCombined {
+  border-color: rgba(125, 224, 178, 0.7);
+  background: rgba(125, 224, 178, 0.14);
+  font-weight: 600;
+}
+
+.personCardStats {
+  font-size: 0.78rem;
+}
+
+/* Merge value proposition + compare-dialog section labels */
+
+.personValueLine {
+  margin: 0;
+  font-size: 0.8rem;
+  color: #7de0b2;
+  align-self: flex-start;
+}
+
+.personCompareSection {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-top: 4px;
+}
