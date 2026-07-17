@@ -1,4 +1,11 @@
 import type {
+  BrainClaimGradeRecord,
+  BrainClaimGradeValue,
+  BrainEvalGateVerdict,
+  BrainEvalRunRecord,
+  BrainGoldenSetInfo,
+  BrainGradingSample,
+  BrainModelQualityAggregate,
   BrainOverview,
   BrainProviderName,
   BrainProviderStatus,
@@ -457,4 +464,66 @@ export function brainProviderAction(body: {
     method: "POST",
     body: JSON.stringify(body)
   });
+}
+
+// --- Brain eval harness ---
+
+export function getBrainEvalGolden(): Promise<{
+  ok: boolean;
+  path: string;
+  exists: boolean;
+  info: BrainGoldenSetInfo | null;
+  error?: string;
+}> {
+  return request("/api/brain/eval/golden");
+}
+
+export function scaffoldBrainEvalGolden(): Promise<{ ok: boolean; info: BrainGoldenSetInfo }> {
+  return request("/api/brain/eval/golden/scaffold", { method: "POST", body: "{}" });
+}
+
+export function runBrainEval(body?: { notes?: string | null; baselineId?: string | null }): Promise<{
+  ok: boolean;
+  run: BrainEvalRunRecord;
+  baseline: BrainEvalRunRecord | null;
+  gate: BrainEvalGateVerdict;
+}> {
+  return request("/api/brain/eval/runs", { method: "POST", body: JSON.stringify(body ?? {}) });
+}
+
+export function listBrainEvalRuns(options?: { goldenHash?: string; limit?: number }): Promise<BrainEvalRunRecord[]> {
+  const params = new URLSearchParams();
+  if (options?.goldenHash) params.set("goldenHash", options.goldenHash);
+  if (options?.limit) params.set("limit", String(options.limit));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return request(`/api/brain/eval/runs${suffix}`);
+}
+
+export function getBrainEvalGate(options?: { runId?: string; baselineId?: string }): Promise<{
+  ok: boolean;
+  run: BrainEvalRunRecord;
+  baseline: BrainEvalRunRecord | null;
+  gate: BrainEvalGateVerdict;
+}> {
+  const params = new URLSearchParams();
+  if (options?.runId) params.set("runId", options.runId);
+  if (options?.baselineId) params.set("baselineId", options.baselineId);
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return request(`/api/brain/eval/gate${suffix}`);
+}
+
+export function getBrainGradingSample(options?: { perModel?: number; includeGraded?: boolean }): Promise<BrainGradingSample> {
+  const params = new URLSearchParams();
+  if (options?.perModel) params.set("perModel", String(options.perModel));
+  if (options?.includeGraded) params.set("includeGraded", "1");
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return request(`/api/brain/eval/grading-sample${suffix}`);
+}
+
+export function gradeBrainClaim(claimId: string, grade: BrainClaimGradeValue): Promise<{ ok: boolean; grade: BrainClaimGradeRecord }> {
+  return request("/api/brain/eval/grades", { method: "POST", body: JSON.stringify({ claimId, grade }) });
+}
+
+export function getBrainModelQuality(): Promise<BrainModelQualityAggregate[]> {
+  return request("/api/brain/eval/aggregates");
 }

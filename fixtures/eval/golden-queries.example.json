@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "readme": "SYNTHETIC example of the brain eval golden set (real sets live at <WAPP_WORK_DIR>/eval/golden-queries.json and never enter git). Each query: stable id, class (canonical: paraphrase / person / commitment / temporal / code-mixed — open vocabulary), the query text as you'd type it into search, and expect: source message keys (wa|<chatSourceId>|<sourceMessageId>) the search should surface. Bump version on edit; every eval run records a content hash so runs are only compared within identical golden content.",
+  "queries": [
+    {
+      "id": "para-flat-viewing",
+      "class": "paraphrase",
+      "query": "apartment visit schedule",
+      "expect": ["wa|12345000001@s.whatsapp.net|3EB0F1A2B3C4D5E6F701"],
+      "note": "Original message says 'let's see the flat on Saturday' — no keyword overlap with 'apartment visit'."
+    },
+    {
+      "id": "person-priya-invoice",
+      "class": "person",
+      "query": "Priya invoice",
+      "expect": ["wa|9876500002-1601020304@g.us|3EB0A1B2C3D4E5F60702"],
+      "note": "Sender resolution: the message stores only a raw JID; resolved_text carries the display name."
+    },
+    {
+      "id": "commit-rent-transfer",
+      "class": "commitment",
+      "query": "transfer the rent by first",
+      "expect": [
+        "wa|12345000001@s.whatsapp.net|3EB0B2C3D4E5F6070803",
+        "wa|12345000001@s.whatsapp.net|3EB0C3D4E5F607080904"
+      ],
+      "note": "Two messages: the promise and its confirmation."
+    },
+    {
+      "id": "temporal-diwali-plan",
+      "class": "temporal",
+      "query": "Diwali travel plan October",
+      "expect": ["wa|9876500002-1601020304@g.us|3EB0D4E5F60708091005"]
+    },
+    {
+      "id": "codemix-nahi-aa-raha",
+      "class": "code-mixed",
+      "query": "kal nahi aa raha",
+      "expect": ["wa|12345000001@s.whatsapp.net|3EB0E5F6070809101106"],
+      "note": "Romanized Hindi; recall gates must exercise transliteration variance ('nhi' vs 'nahi')."
+    }
+  ]
+}

@@ -37,6 +37,14 @@ tsx src/server/cli.ts memory-provider enable-codex
 tsx src/server/cli.ts memory-provider login
 ```
 
+Brain eval (zero model calls; delegates to a running server, opens the DB directly otherwise):
+
+```powershell
+npm run brain:eval -- --init        # scaffold the golden set
+npm run brain:eval                  # run + report vs the latest same-hash baseline
+npm run brain:eval -- --gate        # exit non-zero on recall regression
+```
+
 ## Current Test Coverage
 
 The test suite covers:
@@ -75,6 +83,17 @@ The test suite covers:
 - stale citation marking after archive replacement
 - structured signal capture across legacy, modern, iOS-shaped, malformed, and large receipt/history fixtures
 - backup/live canonical parity, signal-anchor staleness, regeneration, and public-DTO privacy canaries for vCards, coordinates, transcripts, and receipt data
+- brain eval harness: golden-set validation and hashing, recall math with invalid-expectation quarantine on both backends, gate verdicts, deterministic grading samples, denormalized grades surviving reset/rebuild, per-model aggregates with fallback attribution, and the eval API routes end-to-end
+
+## Brain Eval Methodology
+
+The eval harness (`brain-eval-harness`) makes brain quality measurable before any archive-scale spend. Two instruments:
+
+**Golden-set retrieval recall.** `<WAPP_WORK_DIR>/eval/golden-queries.json` holds real queries — each with a stable id, a class (`paraphrase` / `person` / `commitment` / `temporal` / `code-mixed`; open vocabulary), the query text, and `expect`: the source message keys (`wa|<chatSourceId>|<sourceMessageId>`) search should surface. The file quotes real archive content, so it never enters git (see Fixture Policy); include `eval/` in whatever backup covers `archive.sqlite`. `npm run brain:eval` (or the `/brain/eval` page) executes every query through the real `searchMessages` path and records recall@k per class (k = 5/10/20; per-query recall = fraction of expected keys in the top k) into `brain_eval_runs`, stamped with the golden set's version + content hash. Expected keys that no longer resolve are quarantined as invalid expectations — a stale golden entry is never a retrieval miss. Zero model calls.
+
+**Gate criterion.** Retrieval-affecting changes are judged by "golden-set recall@k per class meets or exceeds the recorded baseline" — not by anecdotal spot queries. The baseline is the most recent prior run with the same golden hash (or an explicit `--baseline <runId>`); `npm run brain:eval -- --gate` exits non-zero on regression, naming the regressed classes and offending queries. Cross-hash comparisons are labelled, never silently mixed. This is also the data producer for the embedding-rerank follow-up decision.
+
+**Claim-citation grading.** The `/brain/eval` grading strip renders deterministically sampled claims (current model episodes only, stratified per model, ungraded first, claim-UUID order) beside their cited messages' full text. Grades: `supported` (citations establish the claim), `partial` (grounded but imprecise or overstated), `unsupported`, `unclear` (can't judge — excluded from precision). Strict precision = supported / (supported + partial + unsupported). Grades denormalize the episode's model/extraction-version stamps at grade time, so they survive regeneration, supersession, and brain resets — eval runs and grades are user-authored ground truth, not derived data. Per-model tables (precision, fallback rate via `attempted_model`, validation/anchoring rates — each with its denominator) drive the backfill model choice.
 
 ## Fixture Policy
 

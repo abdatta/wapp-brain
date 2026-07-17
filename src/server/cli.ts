@@ -181,6 +181,73 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Golden-set retrieval eval (design E3). When the local server is up the CLI
+  // delegates over HTTP so the single writer stays inside the server process;
+  // otherwise it opens the repository directly and runs the identical module.
+  // Zero model calls either way. --init scaffolds the golden set; --gate exits
+  // non-zero on regression; --baseline <runId> pins the comparison; --notes
+  // annotates the run; --json prints the raw payload.
+  if (command === "brain-eval") {
+    const { computeEvalGate, localServerListening, renderEvalReportLines, resolveEvalBaseline, runBrainEval, scaffoldGoldenSet } =
+      await import("./brain/eval");
+    if (args.init) {
+      const info = scaffoldGoldenSet();
+      console.log(`Golden set scaffolded at ${displayPath(info.path)} — replace the example with real queries (readme inside).`);
+      return;
+    }
+    const baselineId = stringArg(args.baseline) ?? null;
+    const notes = stringArg(args.notes) ?? null;
+    const serverBase = `http://${config.app.host}:${config.app.port}`;
+    let run: import("../shared/types").BrainEvalRunRecord;
+    let baseline: import("../shared/types").BrainEvalRunRecord | null;
+    let gate: import("../shared/types").BrainEvalGateVerdict;
+    if (await localServerListening(serverBase)) {
+      console.log(`Server detected at ${serverBase} — delegating the run (the single writer stays in the server process).`);
+      const response = await fetch(`${serverBase}/api/brain/eval/runs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ notes, baselineId })
+      });
+      const payload = (await response.json().catch(() => null)) as
+        | { run: typeof run; baseline: typeof baseline; gate: typeof gate; error?: string }
+        | null;
+      if (!response.ok || !payload?.run) {
+        throw new Error(payload?.error ?? `The server rejected the eval request (${response.status}).`);
+      }
+      ({ run, baseline, gate } = payload);
+    } else {
+      const repository = createArchiveRepository();
+      try {
+        run = await runBrainEval(repository, { notes });
+        baseline = await resolveEvalBaseline(repository, run, baselineId);
+        gate = computeEvalGate(run, baseline);
+      } finally {
+        await repository.close?.();
+      }
+    }
+    if (args.json) {
+      console.log(JSON.stringify({ run, baseline, gate }, null, 2));
+    } else {
+      for (const line of renderEvalReportLines(run, baseline)) {
+        console.log(line);
+      }
+    }
+    if (gate.verdict === "fail") {
+      for (const regression of gate.regressions) {
+        console.log(
+          `  REGRESSION ${regression.class} r@${regression.k}: ${(regression.run * 100).toFixed(1)}% vs baseline ${(regression.baseline * 100).toFixed(1)}% — queries: ${regression.offendingQueryIds.join(", ")}`
+        );
+      }
+      if (args.gate) {
+        console.log("GATE FAILED — recall regressed below the baseline.");
+        process.exitCode = 1;
+      }
+    } else if (args.gate) {
+      console.log(gate.verdict === "pass" ? "GATE PASSED — every class meets or exceeds the baseline." : "GATE: no baseline yet — this run becomes the baseline.");
+    }
+    return;
+  }
+
   // Drive a brain run from the terminal (best run with the server stopped —
   // SQLite is single-writer). --provider/--model set the persisted selection
   // before running; --extractive forces the no-model path; --max-chats caps how
@@ -926,6 +993,7 @@ function printHelp(): void {
   tsx src/server/cli.ts live-gaps
   tsx src/server/cli.ts live-retry-gap --id <gap-id>
   tsx src/server/cli.ts live-unlink
+  tsx src/server/cli.ts brain-eval [--init] [--gate] [--baseline <runId>] [--notes <text>] [--json]
   tsx src/server/cli.ts set-contact-name --jid <sourceJid> --name "<display name>"
   tsx src/server/cli.ts persons-scan [--connect-only]
   tsx src/server/cli.ts memory-status

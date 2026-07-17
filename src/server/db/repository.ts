@@ -3,9 +3,14 @@ import type {
   ChatMetadataHistoryRecord,
   EngagementAggregateRecord,
   BrainChatBacklogItem,
+  BrainClaimGradeRecord,
+  BrainClaimGradeValue,
   BrainEpisodeGenerator,
   BrainEpisodeInput,
   BrainEpisodeRecord,
+  BrainEvalRunRecord,
+  BrainGradingSample,
+  BrainModelQualityAggregate,
   BrainLlmUsageSummary,
   BrainMediaGapImpact,
   BrainMediaGapSummary,
@@ -332,6 +337,23 @@ export interface ArchiveRepository {
   }): Promise<BrainEpisodeRecord[]>;
   // Cheap count for status surfaces (no record materialization).
   countRegenerableBrainEpisodes(currentVersion: number): Promise<number>;
+  // --- Brain evaluation (eval harness) ---
+  // Eval runs and manual claim grades are user-authored ground truth, not
+  // derived data: they survive resetBrainDerivedData, regeneration, and the
+  // contract-shape rebuild by construction (no FKs into brain tables).
+  insertBrainEvalRun(run: BrainEvalRunRecord): Promise<void>;
+  listBrainEvalRuns(options?: { goldenHash?: string; limit?: number }): Promise<BrainEvalRunRecord[]>;
+  getBrainEvalRun(id: string): Promise<BrainEvalRunRecord | null>;
+  // Invalid-expectation quarantine: which golden keys still resolve to rows.
+  filterExistingMessageKeys(keys: string[]): Promise<Set<string>>;
+  // Deterministic stratified grading sample: current model episodes only,
+  // per model stamp, ungraded first, claim-UUID order.
+  listClaimsForGrading(options: { perModel: number; includeGraded?: boolean }): Promise<BrainGradingSample>;
+  // One grade per claim, regrade overwrites; stamps denormalized server-side.
+  upsertBrainClaimGrade(claimId: string, grade: BrainClaimGradeValue): Promise<BrainClaimGradeRecord>;
+  // Per-(model, extraction_version) quality rollup, every rate with its
+  // denominator; fallbacks attribute via attempted_model ('unknown' legacy).
+  getBrainModelQualityAggregates(): Promise<BrainModelQualityAggregate[]>;
   // D13 media-gap demand signal: the modality/impact aggregate (the demand
   // stat) and the materiality-aware selector a future media-interpretation
   // change regenerates first.

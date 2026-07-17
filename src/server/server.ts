@@ -893,7 +893,10 @@ app.get("/api/brain/status", async (_req, res) => {
       mediaGaps: await repository.getBrainMediaGapSummary(),
       // Identity late-resolution debt: episodes still referring to people by
       // number, ranked so the highest-value contact saves surface first.
-      resolutionDebt: await repository.getBrainResolutionDebt({ limit: 8 })
+      resolutionDebt: await repository.getBrainResolutionDebt({ limit: 8 }),
+      // Eval harness free interim signal: per-model fallback/precision rollup
+      // (cheap GROUP BYs over small brain tables).
+      modelQuality: await repository.getBrainModelQualityAggregates()
     });
   } catch (error) {
     res.status(400).json({ error: publicErrorMessage(error) });
@@ -1084,6 +1087,133 @@ app.post("/api/brain/provider", async (req, res) => {
     } else {
       res.status(400).json({ error: "Unknown provider action." });
     }
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+// --- Brain eval harness (design E3): eval executes inside the server process
+// so the single-writer constraint is honored by construction; the CLI
+// delegates here whenever the server is up. Zero model calls throughout. ---
+
+// Golden set identity (or its absence, with the scaffold hint).
+app.get("/api/brain/eval/golden", async (_req, res) => {
+  try {
+    const { goldenSetExists, goldenSetPath, loadGoldenSetInfo } = await import("./brain/eval");
+    const filePath = goldenSetPath();
+    try {
+      res.json({ ok: true, path: filePath, exists: goldenSetExists(), info: loadGoldenSetInfo() });
+    } catch (error) {
+      // The file exists but doesn't validate — surface why instead of a 500.
+      res.json({ ok: false, path: filePath, exists: goldenSetExists(), info: null, error: publicErrorMessage(error) });
+    }
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+app.post("/api/brain/eval/golden/scaffold", async (_req, res) => {
+  try {
+    const { scaffoldGoldenSet } = await import("./brain/eval");
+    res.json({ ok: true, info: scaffoldGoldenSet() });
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+// Run the golden set synchronously (~pure-SQL queries; the UI shows a busy
+// state) and answer with the run, its resolved baseline, and the gate verdict.
+app.post("/api/brain/eval/runs", async (req, res) => {
+  try {
+    const { computeEvalGate, resolveEvalBaseline, runBrainEval } = await import("./brain/eval");
+    const notes = typeof req.body?.notes === "string" && req.body.notes.trim() ? req.body.notes.trim() : null;
+    const baselineId = typeof req.body?.baselineId === "string" && req.body.baselineId.trim() ? req.body.baselineId.trim() : null;
+    const run = await runBrainEval(repository, { notes });
+    const baseline = await resolveEvalBaseline(repository, run, baselineId);
+    res.json({ ok: true, run, baseline, gate: computeEvalGate(run, baseline) });
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+app.get("/api/brain/eval/runs", async (req, res) => {
+  try {
+    res.json(
+      await repository.listBrainEvalRuns({
+        goldenHash: stringQuery(req.query.goldenHash) ?? undefined,
+        limit: clampNumber(req.query.limit, 1, 100, 20)
+      })
+    );
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+app.get("/api/brain/eval/runs/:id", async (req, res) => {
+  try {
+    const run = await repository.getBrainEvalRun(req.params.id);
+    if (!run) {
+      res.status(404).json({ error: "No eval run with that id." });
+      return;
+    }
+    res.json(run);
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+// Gate verdict for an existing run (default: the latest) vs a baseline
+// (default: the most recent prior run with the same golden hash).
+app.get("/api/brain/eval/gate", async (req, res) => {
+  try {
+    const { computeEvalGate, resolveEvalBaseline } = await import("./brain/eval");
+    const runId = stringQuery(req.query.runId);
+    const run = runId ? await repository.getBrainEvalRun(runId) : (await repository.listBrainEvalRuns({ limit: 1 }))[0] ?? null;
+    if (!run) {
+      res.status(404).json({ error: runId ? "No eval run with that id." : "No eval runs yet." });
+      return;
+    }
+    const baseline = await resolveEvalBaseline(repository, run, stringQuery(req.query.baselineId));
+    res.json({ ok: true, run, baseline, gate: computeEvalGate(run, baseline) });
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+// Deterministic stratified grading sample with cited message text resolved
+// server-side (tombstones for deleted originals).
+app.get("/api/brain/eval/grading-sample", async (req, res) => {
+  try {
+    res.json(
+      await repository.listClaimsForGrading({
+        perModel: clampNumber(req.query.perModel, 1, 200, 20),
+        includeGraded: booleanQuery(req.query.includeGraded)
+      })
+    );
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+// One-click grade; the client sends only {claimId, grade} — every stamp is
+// denormalized server-side from the claim's episode.
+app.post("/api/brain/eval/grades", async (req, res) => {
+  try {
+    const claimId = typeof req.body?.claimId === "string" ? req.body.claimId.trim() : "";
+    const grade = req.body?.grade;
+    if (!claimId || (grade !== "supported" && grade !== "partial" && grade !== "unsupported" && grade !== "unclear")) {
+      res.status(400).json({ error: "A claimId and a grade of supported|partial|unsupported|unclear are required." });
+      return;
+    }
+    res.json({ ok: true, grade: await repository.upsertBrainClaimGrade(claimId, grade) });
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+app.get("/api/brain/eval/aggregates", async (_req, res) => {
+  try {
+    res.json(await repository.getBrainModelQualityAggregates());
   } catch (error) {
     res.status(400).json({ error: publicErrorMessage(error) });
   }

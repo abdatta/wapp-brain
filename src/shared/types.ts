@@ -1476,6 +1476,9 @@ export interface BrainOverview extends BrainStatusSummary {
   // Identity late-resolution debt: episodes whose participants are still
   // labelled by a number, ranked so the highest-value contact saves surface.
   resolutionDebt?: BrainResolutionDebtSummary;
+  // Eval harness free interim signal: per-(model, extraction_version) quality
+  // rollup — fallback rates render even before any manual grades exist.
+  modelQuality?: BrainModelQualityAggregate[];
 }
 
 // One unresolved identity in the resolution-debt surface: how much brain content
@@ -1579,6 +1582,10 @@ export interface BrainEpisodeInput {
   uninterpretedMediaCount?: number;
   quotedReplyAnchors?: QuotedReplyAnchor[];
   archiveSignalAnchors?: ArchiveSignalAnchor[];
+  // When a model attempt fell back to extractive, the model that was attempted
+  // — the truthful join for per-model fallback rates (eval harness). NULL on
+  // model episodes and on no-provider extractive rows.
+  attemptedModel?: string | null;
   // Regeneration commits pass false: the watermark already covers the window.
   advanceWatermark?: boolean;
   // Regeneration: mark this episode 'superseded' in the same transaction as
@@ -1604,6 +1611,7 @@ export interface BrainEpisodeRecord {
   model: string | null;
   status: "current" | "superseded" | "stale" | "compressed";
   fallbackReason: string | null;
+  attemptedModel: string | null;
   extractionVersion: number;
   topics: string[];
   unresolvedParticipants: string[];
@@ -1680,6 +1688,181 @@ export interface BrainValidationIssueSummary {
   error: number;
   warning: number;
   info: number;
+}
+
+// --- Brain evaluation (eval harness) ---
+// Measurement is user-authored ground truth, not derived data: golden queries
+// live in a local file outside git, and eval runs + claim grades survive every
+// brain wipe/regeneration by design.
+
+// One golden retrieval query. `expect` holds stable source message keys
+// (`wa|<chat>|<msgId>`), the same key space search results and citations use.
+export interface BrainGoldenQuery {
+  id: string;
+  // Open vocabulary; the canonical five are paraphrase / person / commitment /
+  // temporal / code-mixed. New classes are data, not schema.
+  class: string;
+  query: string;
+  expect: string[];
+  note?: string | null;
+}
+
+export interface BrainGoldenSet {
+  version: number;
+  readme?: string;
+  queries: BrainGoldenQuery[];
+}
+
+// Identity of a loaded golden set: runs record version+hash so results are
+// comparable only within the same golden content.
+export interface BrainGoldenSetInfo {
+  path: string;
+  version: number;
+  hash: string;
+  queryCount: number;
+  classes: string[];
+}
+
+// Per-query eval detail, persisted with the run for inspection.
+export interface BrainEvalQueryResult {
+  queryId: string;
+  class: string;
+  query: string;
+  // Expected keys that resolve to archived messages (scored) and those that
+  // don't (quarantined — a stale golden entry, never a retrieval miss).
+  validExpected: string[];
+  invalidExpected: string[];
+  // 1-based rank within the ranked results for each valid expected key; null
+  // when not found within the largest K.
+  ranks: Record<string, number | null>;
+  recallAtK: Record<string, number>;
+}
+
+export interface BrainEvalClassStat {
+  class: string;
+  queries: number;
+  recallAtK: Record<string, number>;
+}
+
+export interface BrainEvalRunRecord {
+  id: string;
+  ranAtMs: number;
+  // Retrieval target; 'archive-search' today, extensible to future brain
+  // retrieval modes.
+  target: string;
+  goldenVersion: number;
+  goldenHash: string;
+  kValues: number[];
+  queryCount: number;
+  // Queries skipped entirely because no expected key resolved.
+  skippedQueryIds: string[];
+  perClass: BrainEvalClassStat[];
+  perQuery: BrainEvalQueryResult[];
+  totals: { queries: number; recallAtK: Record<string, number>; zeroHitQueries: number };
+  notes: string | null;
+}
+
+// Gate verdict: a run vs a baseline run, per class at every K.
+export interface BrainEvalGateRegression {
+  class: string;
+  k: number;
+  run: number;
+  baseline: number;
+  offendingQueryIds: string[];
+}
+
+export interface BrainEvalGateVerdict {
+  verdict: "pass" | "fail" | "no-baseline";
+  runId: string;
+  baselineRunId: string | null;
+  // False when run and baseline carry different golden hashes — labelled
+  // cross-version, never silently mixed.
+  sameGolden: boolean;
+  regressions: BrainEvalGateRegression[];
+}
+
+// Manual claim-citation grades. Stamps are denormalized at grade time so a
+// grade outlives its claim's supersession or deletion.
+export type BrainClaimGradeValue = "supported" | "partial" | "unsupported" | "unclear";
+
+export interface BrainClaimGradeRecord {
+  claimId: string;
+  grade: BrainClaimGradeValue;
+  gradedAtMs: number;
+  episodeId: string;
+  chatSourceId: string;
+  generator: BrainEpisodeGenerator;
+  model: string | null;
+  extractionVersion: number;
+  claimKind: BrainClaimKind;
+  claimConfidence: BrainClaimConfidence;
+  claimText: string;
+  citationKeys: string[];
+}
+
+// One claim in the grading sample, with its cited messages' full text resolved
+// server-side (deleted originals arrive as tombstones).
+export interface BrainGradingCitation {
+  sourceMessageKey: string;
+  timestampMs: number | null;
+  senderSourceJid: string | null;
+  text: string | null;
+  deleted: boolean;
+  // False when the cited message no longer exists in the archive at all.
+  present: boolean;
+}
+
+export interface BrainGradingSampleClaim {
+  claimId: string;
+  episodeId: string;
+  chatSourceId: string;
+  chatDisplayName: string | null;
+  model: string | null;
+  extractionVersion: number;
+  kind: BrainClaimKind;
+  confidence: BrainClaimConfidence;
+  text: string;
+  eventAtMs: number | null;
+  grade: BrainClaimGradeValue | null;
+  citations: BrainGradingCitation[];
+}
+
+// Deterministic stratified sample: per model stamp, ungraded first, claim-UUID
+// order (stable unbiased shuffle — same archive state, same sample).
+export interface BrainGradingSampleModel {
+  model: string;
+  eligibleClaims: number;
+  gradedClaims: number;
+  claims: BrainGradingSampleClaim[];
+}
+
+export interface BrainGradingSample {
+  perModel: number;
+  models: BrainGradingSampleModel[];
+}
+
+// Per-(model, extraction_version) quality aggregate. Every rate ships with its
+// denominator — thin data must look thin. `model` is 'unknown' for historical
+// fallback rows that predate attempted-model stamping.
+export interface BrainModelQualityAggregate {
+  model: string;
+  extractionVersion: number;
+  // generator='model' episodes committed under this stamp (all statuses —
+  // superseded rows still evidence generation quality).
+  modelEpisodes: number;
+  // Model attempts that fell back to extractive (fallback_reason set),
+  // attributed via attempted_model.
+  fallbackEpisodes: number;
+  attempted: number;
+  fallbackRate: number | null;
+  claims: number;
+  unanchoredWarnings: number;
+  validationErrors: number;
+  grades: Record<BrainClaimGradeValue, number>;
+  gradedTotal: number;
+  // supported / (supported + partial + unsupported); 'unclear' is excluded
+  // from the denominator. Null until at least one gradable grade exists.
+  strictPrecision: number | null;
 }
 
 // In-memory progress of a manual/scheduled brain run (job + polling model).

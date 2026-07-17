@@ -22,6 +22,7 @@
     "brain:run": "tsx src/server/cli.ts brain-run",
     "brain:pass": "tsx src/server/cli.ts brain-pass",
     "brain:reset": "tsx src/server/cli.ts brain-reset",
+    "brain:eval": "tsx src/server/cli.ts brain-eval",
     "persons:scan": "tsx src/server/cli.ts persons-scan",
     "live:proof": "tsx src/server/cli.ts live-proof",
     "live:start": "tsx src/server/cli.ts live-start",

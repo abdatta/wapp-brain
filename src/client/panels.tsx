@@ -37,6 +37,7 @@ import {
 } from "lucide-react";
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { MouseEvent as ReactMouseEvent, ReactNode, RefObject } from "react";
+import { Link } from "react-router-dom";
 import { parseInlineSegments, parseWhatsAppBlocks, type InlineSegment } from "./whatsappFormat";
 import type {
   ArchiveChangeEvent,
@@ -592,6 +593,24 @@ function BrainPanel({
                 .map((identity) => `${identity.label} (${identity.messageCount.toLocaleString()})`)
                 .join(", ")}
               .
+            </div>
+          )}
+          {(overview?.modelQuality?.some((aggregate) => aggregate.attempted > 0) ?? false) && (
+            <div className="brainHint">
+              Model quality:{" "}
+              {overview!.modelQuality!
+                .filter((aggregate) => aggregate.attempted > 0)
+                .map(
+                  (aggregate) =>
+                    `${aggregate.model} v${aggregate.extractionVersion} — ${aggregate.fallbackEpisodes}/${aggregate.attempted} fell back` +
+                    (aggregate.strictPrecision != null
+                      ? `, precision ${(aggregate.strictPrecision * 100).toFixed(0)}% (${
+                          aggregate.grades.supported + aggregate.grades.partial + aggregate.grades.unsupported
+                        } graded)`
+                      : "")
+                )
+                .join(" · ")}{" "}
+              — <Link to="/brain/eval">Eval &amp; grading</Link>
             </div>
           )}
           {runDue && !running && (

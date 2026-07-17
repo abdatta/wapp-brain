@@ -4270,3 +4270,280 @@ button.fileButton:disabled {
   gap: 8px;
   margin-bottom: 12px;
 }
+
+/* --- Brain eval & grading surface (brain-eval-harness) --- */
+
+.evalPage {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 20px 16px 48px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.evalHeader h2 {
+  margin: 6px 0 2px;
+}
+
+.evalBackLink {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: #7de0b2;
+  text-decoration: none;
+}
+
+.evalBackLink:hover {
+  text-decoration: underline;
+}
+
+.evalCard {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.02);
+  padding: 14px 16px;
+}
+
+.evalCard h3 {
+  margin: 0 0 8px;
+  font-size: 14px;
+}
+
+.evalCardHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.evalCardActions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.evalButton {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 7px;
+  border: 1px solid rgba(125, 224, 178, 0.4);
+  background: rgba(125, 224, 178, 0.1);
+  color: #d9f4e6;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.evalButton:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.evalToggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: #aab5b1;
+}
+
+.evalGoldenLine {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  font-size: 12.5px;
+  color: #c8d2ce;
+  margin: 6px 0;
+}
+
+.evalHash {
+  font-family: ui-monospace, monospace;
+  font-size: 11.5px;
+  color: #9aa4b2;
+}
+
+.evalVerdict {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: #c8d2ce;
+}
+
+.evalVerdict.pass {
+  border-color: rgba(125, 224, 178, 0.5);
+  background: rgba(125, 224, 178, 0.1);
+  color: #a9ecc9;
+}
+
+.evalVerdict.fail {
+  border-color: rgba(230, 164, 164, 0.5);
+  background: rgba(230, 164, 164, 0.1);
+  color: #e6a4a4;
+}
+
+.evalTableWrap {
+  overflow-x: auto;
+  margin: 8px 0;
+}
+
+.evalTable {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 12.5px;
+}
+
+.evalTable th,
+.evalTable td {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  white-space: nowrap;
+}
+
+.evalTable th {
+  color: #9aa4b2;
+  font-weight: 500;
+  font-size: 11.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.evalTotalsRow td {
+  font-weight: 600;
+  border-top: 1px solid rgba(255, 255, 255, 0.14);
+}
+
+.evalDelta.up {
+  color: #a9ecc9;
+  font-size: 11px;
+}
+
+.evalDelta.down {
+  color: #e6a4a4;
+  font-size: 11px;
+}
+
+.evalHistory td,
+.evalHistory th {
+  font-size: 11.5px;
+}
+
+.evalModelProgress {
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  font-size: 11.5px;
+}
+
+.evalGradeCard {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin-top: 8px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.evalChip {
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  font-size: 11px;
+  color: #aab5b1;
+}
+
+.evalChip.graded {
+  border-color: rgba(255, 200, 90, 0.45);
+  color: #f4e8c8;
+}
+
+.evalClaimText {
+  font-size: 14px;
+  line-height: 1.5;
+  margin: 10px 0;
+}
+
+.evalCitations {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 10px 0;
+  border-left: 2px solid rgba(125, 224, 178, 0.35);
+  padding-left: 12px;
+}
+
+.evalCitation {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.evalCitationMeta {
+  font-size: 11px;
+  color: #9aa4b2;
+}
+
+.evalCitationDeleted {
+  font-style: italic;
+  color: #9aa4b2;
+}
+
+.evalGradeButtons {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.evalGradeButton {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  padding: 8px 10px;
+  border-radius: 7px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.03);
+  color: #edf4f1;
+  font-size: 12.5px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.evalGradeButton small {
+  font-size: 10.5px;
+  color: #9aa4b2;
+  line-height: 1.3;
+  white-space: normal;
+}
+
+.evalGradeButton:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.evalGradeButton.supported:hover {
+  border-color: rgba(125, 224, 178, 0.5);
+}
+
+.evalGradeButton.partial:hover {
+  border-color: rgba(255, 200, 90, 0.5);
+}
+
+.evalGradeButton.unsupported:hover {
+  border-color: rgba(230, 164, 164, 0.5);
+}
+
+.evalGradeButton.unclear:hover {
+  border-color: rgba(154, 164, 178, 0.5);
+}

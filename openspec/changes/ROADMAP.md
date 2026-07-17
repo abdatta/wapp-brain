@@ -17,7 +17,7 @@
 | ✅ | 4 | `identity-late-resolution` | Opus | **archived 2026-07-14** | #3, #20 | save a contact → old episodes + search repair with zero model calls |
 | ✅ | 5 | `two-level-person-model` | **Fable** | **archived 2026-07-16** | #3 | same-name stays separate; Google same-contact auto-connects; disconnect re-derives, zero episode changes |
 | ✅ | 6 | `people-management-ui` | Sonnet | **archived 2026-07-16** | #4, #5, #19 | ranked hygiene queue; dismissed pair stays dismissed |
-|  | 7 | `brain-eval-harness` | Opus | seeded | #3 | recall table + per-model precision/fallback tables on the real archive |
+| ✅ | 7 | `brain-eval-harness` | Opus | **archived 2026-07-17** | #3 | recall table + per-model precision/fallback tables on the real archive |
 |  | 8 | `retrieval-hardening` | Opus | seeded | — (#7 soft, to measure delta; #4 shipped the shared rename hook — only the rename-trigger gap remains) | typo'd query returns labelled relaxed results; "nhi" finds "nahi"; renamed contact searchable |
 |  | 9 | `knowledge-graph-foundation` | Opus | seeded | #3, #5 | nodes/edges from claim entities; open commitment survives salience recompute |
 |  | 10 | `commitment-lifecycle` | **Fable** | seeded | #2, #3, #9 | promise → reaction-acknowledged → cited closure; overdue flagged |

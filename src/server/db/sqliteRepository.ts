@@ -8,9 +8,16 @@ import type {
   ArchiveSignalAnchor,
   BrainChatBacklogItem,
   BrainClaimEntityRecord,
+  BrainClaimGradeRecord,
+  BrainClaimGradeValue,
   BrainEpisodeGenerator,
   BrainEpisodeInput,
   BrainEpisodeRecord,
+  BrainEvalRunRecord,
+  BrainGradingCitation,
+  BrainGradingSample,
+  BrainGradingSampleClaim,
+  BrainModelQualityAggregate,
   BrainLlmUsageSummary,
   BrainRunSummary,
   BrainStatusSummary,
@@ -1306,6 +1313,7 @@ const schemaStatements = [
     status TEXT NOT NULL DEFAULT 'current' CHECK (status IN ('current','superseded','stale','compressed')),
     run_id TEXT NULL,
     fallback_reason TEXT NULL,
+    attempted_model TEXT NULL,
     extraction_version INTEGER NOT NULL,
     unresolved_participants_json TEXT NULL,
     push_name_participants_json TEXT NULL,
@@ -1421,6 +1429,45 @@ const schemaStatements = [
     estimated INTEGER NOT NULL DEFAULT 0,
     at_ms INTEGER NOT NULL
   )`,
+
+  // --- Brain evaluation (eval harness) ---
+  // Eval runs and claim grades are user-authored ground truth, NOT derived
+  // data: they are deliberately excluded from resetBrainDerivedData and from
+  // the contract-shape rebuild guard, and carry no foreign keys into brain
+  // tables so they outlive supersession, regeneration, and full wipes.
+  `CREATE TABLE IF NOT EXISTS brain_eval_runs (
+    id TEXT PRIMARY KEY,
+    ran_at_ms INTEGER NOT NULL,
+    target TEXT NOT NULL,
+    golden_version INTEGER NOT NULL,
+    golden_hash TEXT NOT NULL,
+    k_values_json TEXT NOT NULL,
+    query_count INTEGER NOT NULL,
+    skipped_query_ids_json TEXT NOT NULL DEFAULT '[]',
+    per_class_json TEXT NOT NULL,
+    per_query_json TEXT NOT NULL,
+    totals_json TEXT NOT NULL,
+    notes TEXT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_brain_eval_runs_hash_time ON brain_eval_runs (golden_hash, ran_at_ms)`,
+
+  // One grade per claim (regrade overwrites). Stamps are denormalized at grade
+  // time — server-read from the claim's episode, never client-supplied.
+  `CREATE TABLE IF NOT EXISTS brain_claim_grades (
+    claim_id TEXT PRIMARY KEY,
+    grade TEXT NOT NULL CHECK (grade IN ('supported','partial','unsupported','unclear')),
+    graded_at_ms INTEGER NOT NULL,
+    episode_id TEXT NOT NULL,
+    chat_source_id TEXT NOT NULL,
+    generator TEXT NOT NULL,
+    model TEXT NULL,
+    extraction_version INTEGER NOT NULL,
+    claim_kind TEXT NOT NULL,
+    claim_confidence TEXT NOT NULL,
+    claim_text TEXT NOT NULL,
+    citation_keys_json TEXT NOT NULL DEFAULT '[]'
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_brain_claim_grades_model ON brain_claim_grades (model, extraction_version)`,
 
   // --- Two-level person model ---
   // Identities (canonical JIDs) are the immutable anchors; a person is an
@@ -2704,9 +2751,9 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     const chatSourceId = this.canonicalJid(episode.chatSourceId) ?? episode.chatSourceId;
     const insertEpisode = this.db.prepare(
       `INSERT INTO brain_episodes
-       (id, chat_source_id, start_at_ms, end_at_ms, message_count, participants_json, summary, markdown, generator, model, run_id, fallback_reason,
+       (id, chat_source_id, start_at_ms, end_at_ms, message_count, participants_json, summary, markdown, generator, model, run_id, fallback_reason, attempted_model,
         extraction_version, unresolved_participants_json, push_name_participants_json, uninterpreted_media_count, quoted_reply_anchors_json, archive_signal_anchors_json)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     const insertClaim = this.db.prepare(
       `INSERT INTO brain_claims (id, episode_id, sequence, kind, text, event_at_ms, valid_until_ms, confidence) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
@@ -2749,6 +2796,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         episode.model,
         episode.runId,
         episode.fallbackReason ?? null,
+        episode.attemptedModel ?? null,
         episode.extractionVersion,
         stringifyJson(episode.unresolvedParticipants ?? []),
         stringifyJson(episode.pushNameParticipants ?? []),
@@ -2891,6 +2939,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       model: (row.model as string | null) ?? null,
       status: row.status as BrainEpisodeRecord["status"],
       fallbackReason: (row.fallback_reason as string | null) ?? null,
+      attemptedModel: (row.attempted_model as string | null) ?? null,
       extractionVersion: Number(row.extraction_version ?? 0),
       topics: (topicsStmt.all(row.id) as Array<{ title: string }>).map((topic) => String(topic.title)),
       unresolvedParticipants: (parseJson(row.unresolved_participants_json as string | null) as string[] | null) ?? [],
@@ -2975,6 +3024,334 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       )
       .get(currentVersion) as { n: number };
     return Number(row.n);
+  }
+
+  // --- Brain evaluation (eval harness) ---
+  // Runs and grades are user-authored ground truth: no FK into brain tables,
+  // untouched by resetBrainDerivedData and the contract-shape rebuild guard.
+
+  async insertBrainEvalRun(run: BrainEvalRunRecord): Promise<void> {
+    this.db
+      .prepare(
+        `INSERT INTO brain_eval_runs
+         (id, ran_at_ms, target, golden_version, golden_hash, k_values_json, query_count, skipped_query_ids_json, per_class_json, per_query_json, totals_json, notes)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        run.id,
+        run.ranAtMs,
+        run.target,
+        run.goldenVersion,
+        run.goldenHash,
+        stringifyJson(run.kValues),
+        run.queryCount,
+        stringifyJson(run.skippedQueryIds),
+        stringifyJson(run.perClass),
+        stringifyJson(run.perQuery),
+        stringifyJson(run.totals),
+        run.notes
+      );
+  }
+
+  async listBrainEvalRuns(options?: { goldenHash?: string; limit?: number }): Promise<BrainEvalRunRecord[]> {
+    const clauses: string[] = [];
+    const params: unknown[] = [];
+    if (options?.goldenHash) {
+      clauses.push("golden_hash = ?");
+      params.push(options.goldenHash);
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    params.push(options?.limit ?? 50);
+    const rows = this.db
+      .prepare(`SELECT * FROM brain_eval_runs ${where} ORDER BY ran_at_ms DESC, id DESC LIMIT ?`)
+      .all(...params) as Array<Record<string, unknown>>;
+    return rows.map((row) => this.rowToBrainEvalRun(row));
+  }
+
+  async getBrainEvalRun(id: string): Promise<BrainEvalRunRecord | null> {
+    const row = this.db.prepare(`SELECT * FROM brain_eval_runs WHERE id = ?`).get(id) as Record<string, unknown> | undefined;
+    return row ? this.rowToBrainEvalRun(row) : null;
+  }
+
+  private rowToBrainEvalRun(row: Record<string, unknown>): BrainEvalRunRecord {
+    return {
+      id: String(row.id),
+      ranAtMs: Number(row.ran_at_ms),
+      target: String(row.target),
+      goldenVersion: Number(row.golden_version),
+      goldenHash: String(row.golden_hash),
+      kValues: (parseJson(row.k_values_json as string | null) as number[] | null) ?? [],
+      queryCount: Number(row.query_count),
+      skippedQueryIds: (parseJson(row.skipped_query_ids_json as string | null) as string[] | null) ?? [],
+      perClass: (parseJson(row.per_class_json as string | null) as BrainEvalRunRecord["perClass"] | null) ?? [],
+      perQuery: (parseJson(row.per_query_json as string | null) as BrainEvalRunRecord["perQuery"] | null) ?? [],
+      totals:
+        (parseJson(row.totals_json as string | null) as BrainEvalRunRecord["totals"] | null) ??
+        ({ queries: 0, recallAtK: {}, zeroHitQueries: 0 } as BrainEvalRunRecord["totals"]),
+      notes: (row.notes as string | null) ?? null
+    };
+  }
+
+  // Which of these source message keys still resolve to archived messages —
+  // the eval runner's invalid-expectation quarantine.
+  async filterExistingMessageKeys(keys: string[]): Promise<Set<string>> {
+    const existing = new Set<string>();
+    for (let index = 0; index < keys.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = keys.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      const placeholders = batch.map(() => "?").join(",");
+      const rows = this.db
+        .prepare(`SELECT source_message_key FROM messages WHERE source_message_key IN (${placeholders})`)
+        .all(...batch) as Array<{ source_message_key: string }>;
+      for (const row of rows) {
+        existing.add(row.source_message_key);
+      }
+    }
+    return existing;
+  }
+
+  // Deterministic stratified grading sample (design E5): current model-episode
+  // claims only, per model stamp, ungraded first, claim-UUID order (a stable
+  // unbiased shuffle — UUIDs are already uniform-random).
+  async listClaimsForGrading(options: { perModel: number; includeGraded?: boolean }): Promise<BrainGradingSample> {
+    const perModel = Math.max(1, Math.floor(options.perModel));
+    const totals = this.db
+      .prepare(
+        `SELECT e.model AS model,
+                COUNT(*) AS eligible,
+                SUM(CASE WHEN g.claim_id IS NULL THEN 0 ELSE 1 END) AS graded
+         FROM brain_claims c
+         JOIN brain_episodes e ON e.id = c.episode_id AND e.status = 'current' AND e.generator = 'model'
+         LEFT JOIN brain_claim_grades g ON g.claim_id = c.id
+         GROUP BY e.model
+         ORDER BY e.model`
+      )
+      .all() as Array<{ model: string | null; eligible: number; graded: number }>;
+    const rows = this.db
+      .prepare(
+        `SELECT c.id AS claim_id, c.kind, c.text, c.confidence, c.event_at_ms,
+                e.id AS episode_id, e.chat_source_id, e.model, e.extraction_version,
+                g.grade AS grade,
+                COALESCE(NULLIF(TRIM(COALESCE(ch.display_name, '')), ''), NULL) AS chat_display_name
+         FROM brain_claims c
+         JOIN brain_episodes e ON e.id = c.episode_id AND e.status = 'current' AND e.generator = 'model'
+         LEFT JOIN brain_claim_grades g ON g.claim_id = c.id
+         LEFT JOIN chats ch ON ch.source_chat_id = e.chat_source_id
+         ORDER BY e.model ASC, CASE WHEN g.claim_id IS NULL THEN 0 ELSE 1 END ASC, c.id ASC`
+      )
+      .all() as Array<Record<string, unknown>>;
+    const byModel = new Map<string, BrainGradingSampleClaim[]>();
+    for (const row of rows) {
+      const model = String(row.model ?? "unknown");
+      const graded = row.grade != null;
+      if (graded && !options.includeGraded) {
+        continue;
+      }
+      const bucket = byModel.get(model) ?? [];
+      if (bucket.length >= perModel) {
+        continue;
+      }
+      bucket.push({
+        claimId: String(row.claim_id),
+        episodeId: String(row.episode_id),
+        chatSourceId: String(row.chat_source_id),
+        chatDisplayName: (row.chat_display_name as string | null) ?? null,
+        model: (row.model as string | null) ?? null,
+        extractionVersion: Number(row.extraction_version ?? 0),
+        kind: row.kind as BrainGradingSampleClaim["kind"],
+        confidence: row.confidence as BrainGradingSampleClaim["confidence"],
+        text: String(row.text),
+        eventAtMs: row.event_at_ms == null ? null : Number(row.event_at_ms),
+        grade: (row.grade as BrainClaimGradeValue | null) ?? null,
+        citations: []
+      });
+      byModel.set(model, bucket);
+    }
+    // Resolve cited message text server-side; deleted or missing originals
+    // arrive as tombstones, never silent absences.
+    const citationStmt = this.db.prepare(
+      `SELECT ct.source_message_key, ct.timestamp_ms, ct.sender_source_jid,
+              m.id AS message_row, m.is_deleted,
+              COALESCE(NULLIF(m.body, ''), NULLIF(m.caption, ''), CASE WHEN m.id IS NULL THEN NULL ELSE '[' || m.message_type || ']' END) AS text
+       FROM brain_citations ct
+       LEFT JOIN messages m ON m.source_message_key = ct.source_message_key
+       WHERE ct.claim_id = ?
+       ORDER BY ct.timestamp_ms ASC, ct.id ASC`
+    );
+    for (const claims of byModel.values()) {
+      for (const claim of claims) {
+        claim.citations = (citationStmt.all(claim.claimId) as Array<Record<string, unknown>>).map(
+          (citation): BrainGradingCitation => ({
+            sourceMessageKey: String(citation.source_message_key),
+            timestampMs: citation.timestamp_ms == null ? null : Number(citation.timestamp_ms),
+            senderSourceJid: (citation.sender_source_jid as string | null) ?? null,
+            text: (citation.text as string | null) ?? null,
+            deleted: Boolean(citation.is_deleted),
+            present: citation.message_row != null
+          })
+        );
+      }
+    }
+    return {
+      perModel,
+      models: totals.map((total) => ({
+        model: String(total.model ?? "unknown"),
+        eligibleClaims: Number(total.eligible ?? 0),
+        gradedClaims: Number(total.graded ?? 0),
+        claims: byModel.get(String(total.model ?? "unknown")) ?? []
+      }))
+    };
+  }
+
+  // One grade per claim; regrade overwrites. Stamps are read server-side from
+  // the claim's episode at grade time — the client supplies only {claimId, grade}.
+  async upsertBrainClaimGrade(claimId: string, grade: BrainClaimGradeValue): Promise<BrainClaimGradeRecord> {
+    const row = this.db
+      .prepare(
+        `SELECT c.id AS claim_id, c.kind, c.confidence, c.text,
+                e.id AS episode_id, e.chat_source_id, e.generator, e.model, e.extraction_version
+         FROM brain_claims c
+         JOIN brain_episodes e ON e.id = c.episode_id
+         WHERE c.id = ?`
+      )
+      .get(claimId) as Record<string, unknown> | undefined;
+    if (!row) {
+      throw new PublicError("BRAIN_EVAL_CLAIM_MISSING", "No claim with that id — it may have been superseded and wiped; refresh the grading sample.");
+    }
+    const citationKeys = (
+      this.db.prepare(`SELECT source_message_key FROM brain_citations WHERE claim_id = ? ORDER BY id`).all(claimId) as Array<{
+        source_message_key: string;
+      }>
+    ).map((citation) => citation.source_message_key);
+    const record: BrainClaimGradeRecord = {
+      claimId,
+      grade,
+      gradedAtMs: Date.now(),
+      episodeId: String(row.episode_id),
+      chatSourceId: String(row.chat_source_id),
+      generator: row.generator as BrainClaimGradeRecord["generator"],
+      model: (row.model as string | null) ?? null,
+      extractionVersion: Number(row.extraction_version ?? 0),
+      claimKind: row.kind as BrainClaimGradeRecord["claimKind"],
+      claimConfidence: row.confidence as BrainClaimGradeRecord["claimConfidence"],
+      claimText: String(row.text),
+      citationKeys
+    };
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO brain_claim_grades
+         (claim_id, grade, graded_at_ms, episode_id, chat_source_id, generator, model, extraction_version, claim_kind, claim_confidence, claim_text, citation_keys_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        record.claimId,
+        record.grade,
+        record.gradedAtMs,
+        record.episodeId,
+        record.chatSourceId,
+        record.generator,
+        record.model,
+        record.extractionVersion,
+        record.claimKind,
+        record.claimConfidence,
+        record.claimText,
+        stringifyJson(record.citationKeys)
+      );
+    return record;
+  }
+
+  // Per-(model, extraction_version) quality: grade distribution + strict
+  // precision, fallback rate via attempted_model ('unknown' buckets the
+  // historical rows that predate the stamp), and issue rates. All statuses
+  // count — superseded episodes still evidence generation quality.
+  async getBrainModelQualityAggregates(): Promise<BrainModelQualityAggregate[]> {
+    const buckets = new Map<string, BrainModelQualityAggregate>();
+    const bucket = (model: string, extractionVersion: number): BrainModelQualityAggregate => {
+      const key = `${model}|${extractionVersion}`;
+      let entry = buckets.get(key);
+      if (!entry) {
+        entry = {
+          model,
+          extractionVersion,
+          modelEpisodes: 0,
+          fallbackEpisodes: 0,
+          attempted: 0,
+          fallbackRate: null,
+          claims: 0,
+          unanchoredWarnings: 0,
+          validationErrors: 0,
+          grades: { supported: 0, partial: 0, unsupported: 0, unclear: 0 },
+          gradedTotal: 0,
+          strictPrecision: null
+        };
+        buckets.set(key, entry);
+      }
+      return entry;
+    };
+    const modelRows = this.db
+      .prepare(
+        `SELECT model, extraction_version AS v, COUNT(*) AS n FROM brain_episodes
+         WHERE generator = 'model' AND model IS NOT NULL GROUP BY model, extraction_version`
+      )
+      .all() as Array<{ model: string; v: number; n: number }>;
+    for (const row of modelRows) {
+      bucket(row.model, Number(row.v)).modelEpisodes += Number(row.n);
+    }
+    const fallbackRows = this.db
+      .prepare(
+        `SELECT COALESCE(attempted_model, 'unknown') AS model, extraction_version AS v, COUNT(*) AS n FROM brain_episodes
+         WHERE generator = 'extractive' AND fallback_reason IS NOT NULL GROUP BY COALESCE(attempted_model, 'unknown'), extraction_version`
+      )
+      .all() as Array<{ model: string; v: number; n: number }>;
+    for (const row of fallbackRows) {
+      bucket(row.model, Number(row.v)).fallbackEpisodes += Number(row.n);
+    }
+    const claimRows = this.db
+      .prepare(
+        `SELECT e.model AS model, e.extraction_version AS v, COUNT(*) AS n
+         FROM brain_claims c JOIN brain_episodes e ON e.id = c.episode_id
+         WHERE e.generator = 'model' AND e.model IS NOT NULL GROUP BY e.model, e.extraction_version`
+      )
+      .all() as Array<{ model: string; v: number; n: number }>;
+    for (const row of claimRows) {
+      bucket(row.model, Number(row.v)).claims += Number(row.n);
+    }
+    const issueRows = this.db
+      .prepare(
+        `SELECT CASE WHEN e.generator = 'model' THEN e.model ELSE COALESCE(e.attempted_model, 'unknown') END AS model,
+                e.extraction_version AS v,
+                SUM(CASE WHEN i.code = 'unanchored' THEN 1 ELSE 0 END) AS unanchored,
+                SUM(CASE WHEN i.severity = 'error' THEN 1 ELSE 0 END) AS errors
+         FROM brain_validation_issues i
+         JOIN brain_episodes e ON e.id = i.episode_id
+         WHERE (e.generator = 'model' AND e.model IS NOT NULL) OR (e.generator = 'extractive' AND e.fallback_reason IS NOT NULL)
+         GROUP BY 1, 2`
+      )
+      .all() as Array<{ model: string; v: number; unanchored: number; errors: number }>;
+    for (const row of issueRows) {
+      const entry = bucket(row.model, Number(row.v));
+      entry.unanchoredWarnings += Number(row.unanchored ?? 0);
+      entry.validationErrors += Number(row.errors ?? 0);
+    }
+    const gradeRows = this.db
+      .prepare(
+        `SELECT COALESCE(model, 'unknown') AS model, extraction_version AS v, grade, COUNT(*) AS n
+         FROM brain_claim_grades GROUP BY COALESCE(model, 'unknown'), extraction_version, grade`
+      )
+      .all() as Array<{ model: string; v: number; grade: BrainClaimGradeValue; n: number }>;
+    for (const row of gradeRows) {
+      const entry = bucket(row.model, Number(row.v));
+      entry.grades[row.grade] += Number(row.n);
+    }
+    for (const entry of buckets.values()) {
+      entry.attempted = entry.modelEpisodes + entry.fallbackEpisodes;
+      entry.fallbackRate = entry.attempted > 0 ? entry.fallbackEpisodes / entry.attempted : null;
+      entry.gradedTotal = entry.grades.supported + entry.grades.partial + entry.grades.unsupported + entry.grades.unclear;
+      const gradable = entry.grades.supported + entry.grades.partial + entry.grades.unsupported;
+      entry.strictPrecision = gradable > 0 ? entry.grades.supported / gradable : null;
+    }
+    return [...buckets.values()].sort(
+      (a, b) => b.extractionVersion - a.extractionVersion || b.attempted - a.attempted || a.model.localeCompare(b.model)
+    );
   }
 
   // The D13 demand stat: gap counts by modality and impact over current episodes.
@@ -8389,6 +8766,9 @@ function migrateAdditiveColumns(db: Database.Database): void {
     { table: "brain_llm_ledger", column: "estimated", ddl: "ALTER TABLE brain_llm_ledger ADD COLUMN estimated INTEGER NOT NULL DEFAULT 0" },
     { table: "brain_episodes", column: "quoted_reply_anchors_json", ddl: "ALTER TABLE brain_episodes ADD COLUMN quoted_reply_anchors_json TEXT NULL" },
     { table: "brain_episodes", column: "archive_signal_anchors_json", ddl: "ALTER TABLE brain_episodes ADD COLUMN archive_signal_anchors_json TEXT NULL" },
+    // Eval harness: the model a fallback episode *attempted* — the truthful
+    // join for per-model fallback rates (the fallback commit nulls `model`).
+    { table: "brain_episodes", column: "attempted_model", ddl: "ALTER TABLE brain_episodes ADD COLUMN attempted_model TEXT NULL" },
     { table: "message_mentions", column: "source_mask", ddl: "ALTER TABLE message_mentions ADD COLUMN source_mask INTEGER NOT NULL DEFAULT 0" }
   ];
   for (const addition of additions) {

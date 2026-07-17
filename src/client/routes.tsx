@@ -8,6 +8,7 @@ import { AppShell } from "./shell/AppShell";
 const ChatsPage = lazy(() => import("./pages/chats/ChatsPage").then((m) => ({ default: m.ChatsPage })));
 const SearchPage = lazy(() => import("./pages/search/SearchPage").then((m) => ({ default: m.SearchPage })));
 const BrainPage = lazy(() => import("./pages/brain/BrainPage").then((m) => ({ default: m.BrainPage })));
+const BrainEvalPage = lazy(() => import("./pages/brain/BrainEvalPage").then((m) => ({ default: m.BrainEvalPage })));
 const ContactsPage = lazy(() => import("./pages/contacts/ContactsPage").then((m) => ({ default: m.ContactsPage })));
 const PeoplePage = lazy(() => import("./pages/people/PeoplePage").then((m) => ({ default: m.PeoplePage })));
 const ImportPage = lazy(() => import("./pages/import/ImportPage").then((m) => ({ default: m.ImportPage })));
@@ -32,6 +33,7 @@ export function AppRoutes() {
         <Route path="chats/:id" element={<ChatsPage />} />
         <Route path="search" element={<SearchPage />} />
         <Route path="brain" element={<BrainPage />} />
+        <Route path="brain/eval" element={<BrainEvalPage />} />
         <Route path="contacts" element={<ContactsPage />} />
         <Route path="people" element={<PeoplePage />} />
         <Route path="import" element={<ImportPage />} />

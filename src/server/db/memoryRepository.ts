@@ -6,9 +6,16 @@ import type {
   ArchiveSignalBatch,
   ArchiveSignalObservation,
   BrainChatBacklogItem,
+  BrainClaimGradeRecord,
+  BrainClaimGradeValue,
   BrainEpisodeGenerator,
   BrainEpisodeInput,
   BrainEpisodeRecord,
+  BrainEvalRunRecord,
+  BrainGradingCitation,
+  BrainGradingSample,
+  BrainGradingSampleClaim,
+  BrainModelQualityAggregate,
   BrainLlmUsageSummary,
   BrainMediaGapImpact,
   BrainMediaGapSummary,
@@ -185,6 +192,10 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     day: string;
   }> = [];
   private brainEpisodes = new Map<string, BrainEpisodeRecord>();
+  // Eval harness ground truth: deliberately NOT cleared by
+  // resetBrainDerivedData — runs and grades outlive every brain wipe.
+  private brainEvalRuns = new Map<string, BrainEvalRunRecord>();
+  private brainClaimGrades = new Map<string, BrainClaimGradeRecord>();
   private brainLockRunId: string | null = null;
   // Contract v2: validation issues and the case-insensitive topic vocabulary
   // (lowercased key → first-seen canonical title), mirroring the SQLite tables.
@@ -3593,6 +3604,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       model: episode.model,
       status: "current",
       fallbackReason: episode.fallbackReason ?? null,
+      attemptedModel: episode.attemptedModel ?? null,
       extractionVersion: episode.extractionVersion,
       topics,
       unresolvedParticipants: episode.unresolvedParticipants ?? [],
@@ -3668,6 +3680,221 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     return [...this.brainEpisodes.values()].filter(
       (episode) => episode.status === "current" && (episode.generator === "extractive" || episode.extractionVersion < currentVersion)
     ).length;
+  }
+
+  // --- Brain evaluation (eval harness) — mirrors the SQLite semantics ---
+
+  async insertBrainEvalRun(run: BrainEvalRunRecord): Promise<void> {
+    this.brainEvalRuns.set(run.id, structuredClone(run));
+  }
+
+  async listBrainEvalRuns(options?: { goldenHash?: string; limit?: number }): Promise<BrainEvalRunRecord[]> {
+    return structuredClone(
+      [...this.brainEvalRuns.values()]
+        .filter((run) => !options?.goldenHash || run.goldenHash === options.goldenHash)
+        .sort((a, b) => b.ranAtMs - a.ranAtMs || b.id.localeCompare(a.id))
+        .slice(0, options?.limit ?? 50)
+    );
+  }
+
+  async getBrainEvalRun(id: string): Promise<BrainEvalRunRecord | null> {
+    const run = this.brainEvalRuns.get(id);
+    return run ? structuredClone(run) : null;
+  }
+
+  async filterExistingMessageKeys(keys: string[]): Promise<Set<string>> {
+    const wanted = new Set(keys);
+    const existing = new Set<string>();
+    for (const message of this.messages.values()) {
+      if (wanted.has(message.sourceMessageKey)) {
+        existing.add(message.sourceMessageKey);
+      }
+    }
+    return existing;
+  }
+
+  async listClaimsForGrading(options: { perModel: number; includeGraded?: boolean }): Promise<BrainGradingSample> {
+    const perModel = Math.max(1, Math.floor(options.perModel));
+    type Eligible = { episode: BrainEpisodeRecord; claim: BrainEpisodeRecord["claims"][number] };
+    const eligible: Eligible[] = [];
+    for (const episode of this.brainEpisodes.values()) {
+      if (episode.status !== "current" || episode.generator !== "model") {
+        continue;
+      }
+      for (const claim of episode.claims) {
+        eligible.push({ episode, claim });
+      }
+    }
+    // Ungraded first, then claim-UUID order — same stable shuffle as SQLite.
+    eligible.sort((a, b) => {
+      const modelOrder = (a.episode.model ?? "unknown").localeCompare(b.episode.model ?? "unknown");
+      if (modelOrder !== 0) return modelOrder;
+      const aGraded = this.brainClaimGrades.has(a.claim.id) ? 1 : 0;
+      const bGraded = this.brainClaimGrades.has(b.claim.id) ? 1 : 0;
+      if (aGraded !== bGraded) return aGraded - bGraded;
+      return a.claim.id.localeCompare(b.claim.id);
+    });
+    const totals = new Map<string, { eligible: number; graded: number }>();
+    for (const entry of eligible) {
+      const model = entry.episode.model ?? "unknown";
+      const total = totals.get(model) ?? { eligible: 0, graded: 0 };
+      total.eligible += 1;
+      if (this.brainClaimGrades.has(entry.claim.id)) {
+        total.graded += 1;
+      }
+      totals.set(model, total);
+    }
+    const byModel = new Map<string, BrainGradingSampleClaim[]>();
+    for (const entry of eligible) {
+      const model = entry.episode.model ?? "unknown";
+      const graded = this.brainClaimGrades.has(entry.claim.id);
+      if (graded && !options.includeGraded) {
+        continue;
+      }
+      const bucket = byModel.get(model) ?? [];
+      if (bucket.length >= perModel) {
+        continue;
+      }
+      bucket.push({
+        claimId: entry.claim.id,
+        episodeId: entry.episode.id,
+        chatSourceId: entry.episode.chatSourceId,
+        chatDisplayName: entry.episode.chatDisplayName ?? null,
+        model: entry.episode.model,
+        extractionVersion: entry.episode.extractionVersion,
+        kind: entry.claim.kind,
+        confidence: entry.claim.confidence,
+        text: entry.claim.text,
+        eventAtMs: entry.claim.eventAtMs,
+        grade: this.brainClaimGrades.get(entry.claim.id)?.grade ?? null,
+        citations: entry.claim.citations.map((citation): BrainGradingCitation => {
+          const message = [...this.messages.values()].find((candidate) => candidate.sourceMessageKey === citation.sourceMessageKey);
+          const text = message ? message.body?.trim() || message.caption?.trim() || `[${message.messageType}]` : null;
+          return {
+            sourceMessageKey: citation.sourceMessageKey,
+            timestampMs: citation.timestampMs,
+            senderSourceJid: citation.senderSourceJid,
+            text,
+            deleted: Boolean(message?.isDeleted),
+            present: Boolean(message)
+          };
+        })
+      });
+      byModel.set(model, bucket);
+    }
+    return {
+      perModel,
+      models: [...totals.entries()]
+        .sort((a, b) => a[0].localeCompare(b[0]))
+        .map(([model, total]) => ({
+          model,
+          eligibleClaims: total.eligible,
+          gradedClaims: total.graded,
+          claims: byModel.get(model) ?? []
+        }))
+    };
+  }
+
+  async upsertBrainClaimGrade(claimId: string, grade: BrainClaimGradeValue): Promise<BrainClaimGradeRecord> {
+    for (const episode of this.brainEpisodes.values()) {
+      const claim = episode.claims.find((candidate) => candidate.id === claimId);
+      if (!claim) {
+        continue;
+      }
+      const record: BrainClaimGradeRecord = {
+        claimId,
+        grade,
+        gradedAtMs: Date.now(),
+        episodeId: episode.id,
+        chatSourceId: episode.chatSourceId,
+        generator: episode.generator,
+        model: episode.model,
+        extractionVersion: episode.extractionVersion,
+        claimKind: claim.kind,
+        claimConfidence: claim.confidence,
+        claimText: claim.text,
+        citationKeys: claim.citations.map((citation) => citation.sourceMessageKey)
+      };
+      this.brainClaimGrades.set(claimId, record);
+      return structuredClone(record);
+    }
+    throw new Error("No claim with that id — it may have been superseded and wiped; refresh the grading sample.");
+  }
+
+  async getBrainModelQualityAggregates(): Promise<BrainModelQualityAggregate[]> {
+    const buckets = new Map<string, BrainModelQualityAggregate>();
+    const bucket = (model: string, extractionVersion: number): BrainModelQualityAggregate => {
+      const key = `${model}|${extractionVersion}`;
+      let entry = buckets.get(key);
+      if (!entry) {
+        entry = {
+          model,
+          extractionVersion,
+          modelEpisodes: 0,
+          fallbackEpisodes: 0,
+          attempted: 0,
+          fallbackRate: null,
+          claims: 0,
+          unanchoredWarnings: 0,
+          validationErrors: 0,
+          grades: { supported: 0, partial: 0, unsupported: 0, unclear: 0 },
+          gradedTotal: 0,
+          strictPrecision: null
+        };
+        buckets.set(key, entry);
+      }
+      return entry;
+    };
+    const episodeBucket = (episode: BrainEpisodeRecord): BrainModelQualityAggregate | null => {
+      if (episode.generator === "model" && episode.model) {
+        return bucket(episode.model, episode.extractionVersion);
+      }
+      if (episode.generator === "extractive" && episode.fallbackReason != null) {
+        return bucket(episode.attemptedModel ?? "unknown", episode.extractionVersion);
+      }
+      return null;
+    };
+    for (const episode of this.brainEpisodes.values()) {
+      const entry = episodeBucket(episode);
+      if (!entry) {
+        continue;
+      }
+      if (episode.generator === "model") {
+        entry.modelEpisodes += 1;
+        entry.claims += episode.claims.length;
+      } else {
+        entry.fallbackEpisodes += 1;
+      }
+    }
+    for (const issue of this.brainIssues) {
+      const episode = issue.episodeId ? this.brainEpisodes.get(issue.episodeId) : undefined;
+      if (!episode) {
+        continue;
+      }
+      const entry = episodeBucket(episode);
+      if (!entry) {
+        continue;
+      }
+      if (issue.code === "unanchored") {
+        entry.unanchoredWarnings += 1;
+      }
+      if (issue.severity === "error") {
+        entry.validationErrors += 1;
+      }
+    }
+    for (const grade of this.brainClaimGrades.values()) {
+      bucket(grade.model ?? "unknown", grade.extractionVersion).grades[grade.grade] += 1;
+    }
+    for (const entry of buckets.values()) {
+      entry.attempted = entry.modelEpisodes + entry.fallbackEpisodes;
+      entry.fallbackRate = entry.attempted > 0 ? entry.fallbackEpisodes / entry.attempted : null;
+      entry.gradedTotal = entry.grades.supported + entry.grades.partial + entry.grades.unsupported + entry.grades.unclear;
+      const gradable = entry.grades.supported + entry.grades.partial + entry.grades.unsupported;
+      entry.strictPrecision = gradable > 0 ? entry.grades.supported / gradable : null;
+    }
+    return [...buckets.values()].sort(
+      (a, b) => b.extractionVersion - a.extractionVersion || b.attempted - a.attempted || a.model.localeCompare(b.model)
+    );
   }
 
   async getBrainMediaGapSummary(): Promise<BrainMediaGapSummary[]> {

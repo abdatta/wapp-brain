@@ -27,7 +27,7 @@ import type {
 import { config } from "../config";
 import type { ArchiveRepository } from "../db/repository";
 import { PublicError, publicErrorMessage } from "../privacy";
-import { generateStructured, type BrainTokenUsage } from "./provider";
+import { generateStructured, getBrainProviderStatus, type BrainTokenUsage } from "./provider";
 
 // Contract version stamped on every committed episode (model AND extractive).
 // BUMP on any change to: the prompt text below, the JSON contract shape,
@@ -1304,6 +1304,10 @@ export async function generateEpisodeForPack(
     model: generator === "model" ? options.model ?? null : null,
     runId: options.runId ?? null,
     fallbackReason: fellBack ? fallbackReason : null,
+    // Eval harness: a fallback records which model was attempted — an explicit
+    // override when given, else the provider's effective selection — so
+    // per-model fallback rates have a truthful join (design E7).
+    attemptedModel: fellBack ? options.model ?? getBrainProviderStatus().model : null,
     extractionVersion: EXTRACTION_VERSION,
     topics: validated.topics,
     unresolvedParticipants: stamps.unresolvedParticipants,
