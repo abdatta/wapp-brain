@@ -1281,8 +1281,27 @@ export interface SearchQueryOptions {
   direction?: "incoming" | "outgoing" | null;
   // Default false: only visible-exchange (conversation) rows are returned.
   includeNoise?: boolean;
+  // Relaxation acceptance threshold: looser ladder tiers run only while the
+  // result count is below this (default 1 — i.e. only on zero hits). Internal
+  // consumers (the future brain fast path) may demand more.
+  minHits?: number | null;
   limit: number;
   offset: number;
+}
+
+// How strictly the returned results matched the query. "exact" = every term
+// as typed (alias variants of a term still count as that term); "relaxed" =
+// every term still required but prefix-loosened; "partial" = some terms were
+// dropped (or only a subset is required) — degraded precision is always
+// labelled, never silently blended.
+export type SearchMatchTier = "exact" | "relaxed" | "partial";
+
+export interface SearchRelaxationInfo {
+  // Ladder tier that produced the results (1 prefix, 2 term-drop, 3 best-half, 4 ranked OR).
+  tier: 1 | 2 | 3 | 4;
+  droppedTerms: string[];
+  totalTerms: number;
+  requiredTerms: number;
 }
 
 // Snippet highlight markers: private-use codepoints that cannot occur in real
@@ -1311,19 +1330,29 @@ export interface SearchResultItem {
   // Match locality with highlight markers around matched terms; mention tokens
   // arrive resolved where the index carried resolved text.
   snippet: string;
-  // Relevance after recency decay; higher is better, comparable only within
-  // one result set.
+  // Relevance after recency decay (plus any mention boost); higher is better,
+  // comparable only within one result set.
   score: number;
   hasMedia: boolean;
   isDeleted: boolean;
+  // Present on partial-tier responses: how many of the query's terms this row
+  // covers ("matched m of n"). Display-grade, not a ranking input.
+  termCoverage?: { matched: number; total: number };
+  // True when the hit matched only through the sender's display identity —
+  // a sent-by hit, not an about-hit.
+  senderOnlyMatch?: boolean;
 }
 
 export interface SearchResponse {
   index: SearchIndexStatus;
   // Exact number of messages matching the query and filters across the whole
-  // archive; results carries only the requested page of the ranked top pool.
+  // archive — always computed from the tier that produced `results`, so the
+  // count describes what is actually shown.
   totalMatches: number;
   results: SearchResultItem[];
+  // Precision honesty: which tier answered, and what was loosened to get it.
+  matchTier: SearchMatchTier;
+  relaxation?: SearchRelaxationInfo | null;
 }
 
 // Window of a chat's thread centered on one message, for search deep links.

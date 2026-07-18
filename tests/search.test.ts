@@ -217,8 +217,13 @@ describe("archive full-text search", () => {
           body: "bring the projector tomorrow"
         })
       ]);
+      // Pre-merge, the name term resolves to nothing. The relaxation ladder
+      // (retrieval-hardening) now recovers the other term instead of returning
+      // an empty set — but only labelled as a partial match that dropped the
+      // unresolvable name, never as an exact hit.
       const before = await repository.searchMessages({ query: "priya projector", limit: 10, offset: 0 });
-      expect(before.results).toHaveLength(0);
+      expect(before.matchTier).toBe("partial");
+      expect(before.relaxation?.droppedTerms).toContain("priya");
 
       // The LID collapses onto a phone identity whose contact has a name.
       await repository.upsertContacts(runId, [

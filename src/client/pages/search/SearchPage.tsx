@@ -1,7 +1,7 @@
 import { Search, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import type { SearchResultItem, SearchTypeFilter } from "../../../shared/types";
+import type { SearchMatchTier, SearchRelaxationInfo, SearchResultItem, SearchTypeFilter } from "../../../shared/types";
 import { getSearchStatus, searchArchive, startSearchReindex } from "../../api";
 import { buildChatDeepLink } from "../../lib/deepLinks";
 import { GlobalSearchResults } from "../../panels";
@@ -19,6 +19,8 @@ export function SearchPage() {
   const [globalQuery, setGlobalQuery] = useState("");
   const [globalResults, setGlobalResults] = useState<SearchResultItem[]>([]);
   const [globalTotalMatches, setGlobalTotalMatches] = useState(0);
+  const [globalMatchTier, setGlobalMatchTier] = useState<SearchMatchTier>("exact");
+  const [globalRelaxation, setGlobalRelaxation] = useState<SearchRelaxationInfo | null>(null);
   const [globalSearching, setGlobalSearching] = useState(false);
   const [globalSearchError, setGlobalSearchError] = useState<string | null>(null);
   const [searchSender, setSearchSender] = useState("");
@@ -55,6 +57,8 @@ export function SearchPage() {
           // servers may answer without newer fields.
           setGlobalResults(response.results ?? []);
           setGlobalTotalMatches(response.totalMatches ?? response.results?.length ?? 0);
+          setGlobalMatchTier(response.matchTier ?? "exact");
+          setGlobalRelaxation(response.relaxation ?? null);
           setSearchIndex(response.index ?? null);
           setGlobalSearchError(null);
         })
@@ -62,6 +66,8 @@ export function SearchPage() {
           if (cancelled) return;
           setGlobalResults([]);
           setGlobalTotalMatches(0);
+          setGlobalMatchTier("exact");
+          setGlobalRelaxation(null);
           setGlobalSearchError(err instanceof Error ? err.message : "Search failed.");
           getSearchStatus()
             .then((status) => {
@@ -118,6 +124,8 @@ export function SearchPage() {
           error={globalSearchError}
           index={searchIndex}
           reindex={reindexProgress}
+          matchTier={globalMatchTier}
+          relaxation={globalRelaxation}
           sender={searchSender}
           type={searchType}
           direction={searchDirection}

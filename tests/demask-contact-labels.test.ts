@@ -313,12 +313,14 @@ describe("demask-contact-labels · SQLite adapter", () => {
       repo = new SqliteArchiveRepository(dbPath);
 
       const raw = new Database(dbPath, { readonly: true });
-      const resolved = (raw.prepare(`SELECT resolved_text FROM messages WHERE source_message_id = ?`).get("m1") as {
-        resolved_text: string | null;
-      }).resolved_text;
+      const derived = raw
+        .prepare(`SELECT resolved_text, resolved_sender FROM messages WHERE source_message_id = ?`)
+        .get("m1") as { resolved_text: string | null; resolved_sender: string | null };
       raw.close();
-      expect(resolved).toContain("+919051167186");
-      expect(resolved).not.toContain("∙");
+      // retrieval-hardening split the sender label into its own derived
+      // column; the demasked full number must land there, mask-free.
+      expect(derived.resolved_sender).toContain("+919051167186");
+      expect(`${derived.resolved_text}\n${derived.resolved_sender}`).not.toContain("∙");
 
       const byNumber = await repo.searchMessages({ query: "919051167186", limit: 10, offset: 0 });
       expect(byNumber.results.some((result) => result.sourceMessageId === "m1")).toBe(true);

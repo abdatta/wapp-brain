@@ -1428,7 +1428,30 @@ app.listen(config.app.port, config.app.host, () => {
   void autoResumeLiveSync();
   void probeBrainProviderOnStartup();
   void backfillIdentityResolutionOnStartup();
+  void autoStartSearchReindexOnStartup();
 });
+
+// A schema migration (or an interrupted build) can leave the search index
+// marked needs_rebuild on an archive that already holds messages. Kick off the
+// existing background reindex job automatically — same progress surface,
+// console mirror, and failure reporting as the manual button — so search
+// comes back without waiting for a user action. No-op on healthy archives.
+async function autoStartSearchReindexOnStartup(): Promise<void> {
+  try {
+    const status = await repository.getSearchIndexStatus();
+    if (status.state !== "needs_rebuild" || status.totalMessages === 0) {
+      return;
+    }
+    console.log(
+      `[search] index needs a rebuild (${status.totalMessages.toLocaleString()} messages) — starting the background build automatically`
+    );
+    startSearchReindex(repository, () => {
+      broadcastArchiveChanged({ source: "manual", chatSourceIds: [], messageCount: 0, contactCount: 0 });
+    });
+  } catch (error) {
+    console.warn(`Automatic search reindex start failed: ${publicErrorMessage(error)}`);
+  }
+}
 
 // Episodes written before the identity-repair machinery existed may still refer
 // to participants by number even though their contacts were saved since. Run the

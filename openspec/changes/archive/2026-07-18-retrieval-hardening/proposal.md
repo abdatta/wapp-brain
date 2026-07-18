@@ -22,7 +22,8 @@ The shipped hot-tier search has recall dead-ends that no later tier can compensa
 
 ### Modified Capabilities
 
-- `archive-full-text-search`: gains the relaxation ladder with match-tier labelling, dual-pool candidate guarantee, sender-column separation with entity boost, rename-triggered derived-text maintenance, and the term-alias expansion layer.
+- `archive-full-text-search`: gains the relaxation ladder with match-tier labelling, dual-pool candidate guarantee, sender-column separation with entity boost, contextual (orphan-quote + link-preview) indexing, the term-alias expansion layer, and automatic index rebuild on schema migration.
+- `identity-and-naming-integrity`: the Identity Improvement Repair Trigger's sources extend to genuine renames (name → different name), closing the rename-trigger gap through the existing entry point.
 
 ## Impact
 

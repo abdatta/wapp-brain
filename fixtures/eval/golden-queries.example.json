@@ -38,6 +38,13 @@
       "query": "kal nahi aa raha",
       "expect": ["wa|12345000001@s.whatsapp.net|3EB0E5F6070809101106"],
       "note": "Romanized Hindi; recall gates must exercise transliteration variance ('nhi' vs 'nahi')."
+    },
+    {
+      "id": "codemix-nhi-variant-typed",
+      "class": "code-mixed",
+      "query": "kal nhi aa raha",
+      "expect": ["wa|12345000001@s.whatsapp.net|3EB0E5F6070809101106"],
+      "note": "Same target message as codemix-nahi-aa-raha but queried with the shorthand variant ('nhi'); recovered by the term-alias layer at the exact tier, no model call."
     }
   ]
 }

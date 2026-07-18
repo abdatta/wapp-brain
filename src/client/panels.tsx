@@ -59,7 +59,9 @@ import type {
   MessageListItem,
   PickKind,
   SearchIndexStatus,
+  SearchMatchTier,
   SearchReindexProgress,
+  SearchRelaxationInfo,
   SearchResultItem,
   SearchTypeFilter,
   StatusSummary,
@@ -123,6 +125,8 @@ function GlobalSearchResults({
   error,
   index,
   reindex,
+  matchTier,
+  relaxation,
   sender,
   type,
   direction,
@@ -142,6 +146,8 @@ function GlobalSearchResults({
   error: string | null;
   index: SearchIndexStatus | null;
   reindex: SearchReindexProgress | null;
+  matchTier?: SearchMatchTier;
+  relaxation?: SearchRelaxationInfo | null;
   sender: string;
   type: "all" | SearchTypeFilter;
   direction: "all" | "incoming" | "outgoing";
@@ -159,6 +165,22 @@ function GlobalSearchResults({
   const reindexRunning = reindex?.state === "running" || reindex?.state === "finalizing";
   const [filtersOpen, setFiltersOpen] = useState(false);
   const activeFilterCount = [sender.trim(), type !== "all", direction !== "all", after, before].filter(Boolean).length;
+  // Precision honesty: relaxed/partial tiers are labelled, never silently
+  // blended with exact results (they only appear when strict found nothing).
+  const effectiveTier: SearchMatchTier = matchTier ?? "exact";
+  const showRelaxationBanner = !searching && !needsRebuild && !error && effectiveTier !== "exact" && results.length > 0;
+  const relaxationSummary = (() => {
+    if (effectiveTier === "relaxed") {
+      return "No exact matches — loosened word endings (prefix match) to find these.";
+    }
+    if (relaxation && relaxation.droppedTerms.length > 0) {
+      return `No exact matches — matched ${relaxation.requiredTerms} of ${relaxation.totalTerms} terms; ignored: ${relaxation.droppedTerms.join(", ")}.`;
+    }
+    if (relaxation && relaxation.tier === 4) {
+      return "No exact matches — showing the best results matching any of your terms.";
+    }
+    return "No exact matches — showing looser results.";
+  })();
   return (
     <div className="searchResultsPanel">
       <div className="searchResultsHeader">
@@ -235,6 +257,11 @@ function GlobalSearchResults({
           )}
         </div>
       )}
+      {showRelaxationBanner && (
+        <div className="relaxedBanner" role="status">
+          <p>{relaxationSummary}</p>
+        </div>
+      )}
       <div className="searchResults chatList" aria-live="polite">
         {searching && <SkeletonRows />}
         {!searching && error && !needsRebuild && <div className="searchError">{error}</div>}
@@ -254,6 +281,12 @@ function GlobalSearchResults({
                 {hit.direction === "outgoing" ? "You" : hit.senderDisplayName ?? "Unknown sender"}
                 {hit.interpretation ? ` · ${hit.interpretation.label}` : ""}
                 {hit.isDeleted ? " · deleted" : ""}
+                {hit.senderOnlyMatch && <span className="hitBadge">sender match</span>}
+                {hit.termCoverage && hit.termCoverage.matched < hit.termCoverage.total && (
+                  <span className="hitBadge">
+                    {hit.termCoverage.matched}/{hit.termCoverage.total} terms
+                  </span>
+                )}
               </span>
               <span className="searchHitSnippet">{renderSearchSnippet(hit.snippet)}</span>
             </button>

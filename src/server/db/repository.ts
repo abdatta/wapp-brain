@@ -225,8 +225,14 @@ export interface ArchiveRepository {
   listMessagesAround(chatId: number, messageId: number, radius: number): Promise<MessageContextWindow | null>;
   // Indexed full-text search across all chats (brain hot tier). Refuses with a
   // PublicError while the index needs a rebuild — never a linear-scan fallback.
+  // Zero-hit queries walk the relaxation ladder; responses carry the match
+  // tier so degraded precision is always labelled.
   searchMessages(options: SearchQueryOptions): Promise<SearchResponse>;
   getSearchIndexStatus(): Promise<SearchIndexStatus>;
+  // Persist term-alias variants (bidirectional groups, OR-ed into queries at
+  // zero model cost). Seeded statically at boot; the deep retrieval path may
+  // add learned rows so the asset compounds. Returns rows actually added.
+  addTermAliases(entries: Array<{ term: string; variant: string; source?: string; weight?: number }>): Promise<number>;
   // Chunked recompute of derived resolved text + full FTS rebuild; yields to
   // the event loop between chunks and reports progress.
   rebuildSearchIndex(onProgress?: (processedMessages: number, totalMessages: number) => void): Promise<{ indexedMessages: number }>;

@@ -121,6 +121,27 @@ import { disambiguateLabels } from "../persons/disambiguate";
 import { personDisplayLabelFromMembers } from "../persons/label";
 import { getMemoryProviderStatus } from "../memory/provider";
 import { PublicError } from "../privacy";
+import { termAliasSeedRows } from "../search/aliasSeed";
+import {
+  attachAliasVariants,
+  buildBasePlans,
+  buildDroppedPlans,
+  countTermCoverage,
+  dfProbesForToken,
+  groupMatchesWords,
+  normalizeTerm,
+  normalizedWords,
+  planMatchesWords,
+  tokenizeSearchQuery,
+  tokenLenientlyMatchesWords,
+  type PlanGroup,
+  type QueryToken,
+  type TierPlan
+} from "../search/relaxation";
+
+// Additive rerank lift for transport-authoritative mentions whose resolved
+// label matches a query term (mirror of SEARCH_MENTION_BOOST).
+const MEMORY_SEARCH_MENTION_BOOST = 1.0;
 
 function stableSignalFactKey(family: string, parts: Array<string | number | null | undefined>): string {
   return `${family}:${createHash("sha256").update(JSON.stringify(parts)).digest("hex")}`;
@@ -166,6 +187,9 @@ export class MemoryArchiveRepository implements ArchiveRepository {
   private mediaQueue = new Map<string, MediaDownloadQueueRecord & { id: number }>();
   private mediaAssets = new Map<number, MediaAssetRecord & { id: number }>();
   private linkPreviews = new Map<string, CapturedLinkPreview>();
+  // Term-alias layer (mirror of brain_term_aliases), pre-seeded statically.
+  private termAliasRows: Array<{ term: string; variant: string }> = termAliasSeedRows();
+  private termAliasCache: Map<string, string[]> | null = null;
   private numberChanges = new Map<string, IdentityNumberChangeRecord>();
   private membershipPeriods = new Map<string, GroupMembershipPeriodRecord>();
   private membershipEvents = new Map<string, GroupMembershipEventRecord>();
@@ -681,14 +705,16 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     return displayPhoneFromJid(canonical);
   }
 
-  private genuinelyNamedJids(jids: string[]): Set<string> {
-    const result = new Set<string>();
+  // Mirror of the SQLite adapter: genuine labels keyed by canonical JID, so
+  // the post-write diff catches both unnamed→named and genuine renames.
+  private genuinelyNamedLabels(jids: string[]): Map<string, string> {
+    const result = new Map<string, string>();
     for (const jid of jids) {
       const canonical = this.canonicalJid(jid) ?? jid;
       const contact = this.contacts.get(canonical);
       const name = contact?.displayName?.trim() || contact?.pushName?.trim() || "";
       if (name && !isMaskedNumberLabel(name) && !isIdentityDerivedName(name, canonical)) {
-        result.add(canonical);
+        result.set(canonical, name);
       }
     }
     return result;
@@ -948,7 +974,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       });
     }
     const batchJids = [...unique.keys()];
-    const namedBefore = this.genuinelyNamedJids(batchJids);
+    const labelsBefore = this.genuinelyNamedLabels(batchJids);
     for (const contact of unique.values()) {
       const existing = this.contacts.get(contact.sourceJid);
       // A user-set name is the strongest source: only another user write may
@@ -977,9 +1003,10 @@ export class MemoryArchiveRepository implements ArchiveRepository {
         chat.displayName = pushName;
       }
     }
-    // Identity late-resolution: repair episodes for identities that just gained a
-    // genuine name (mirror of the SQLite path).
-    const transitioned = [...this.genuinelyNamedJids(batchJids)].filter((jid) => !namedBefore.has(jid));
+    // Identity late-resolution: repair episodes for identities whose genuine
+    // resolution changed — gained OR renamed (mirror of the SQLite path).
+    const labelsAfter = this.genuinelyNamedLabels(batchJids);
+    const transitioned = [...labelsAfter].filter(([jid, name]) => labelsBefore.get(jid) !== name).map(([jid]) => jid);
     if (transitioned.length > 0) {
       await this.repairIdentityResolution(transitioned);
     }
@@ -3148,109 +3175,246 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     return { indexedMessages: this.messages.size };
   }
 
-  async searchMessages(options: SearchQueryOptions): Promise<SearchResponse> {
-    const index = await this.getSearchIndexStatus();
-    const tokens = (options.query.match(/"[^"]*"|\S+/g) ?? [])
-      .map((token) => token.replace(/^"|"$/g, "").trim().toLowerCase())
-      .filter(Boolean);
-    if (tokens.length === 0) {
-      return { index, totalMatches: 0, results: [] };
+  // Search strata for one message, mirroring the SQLite derived columns:
+  // content (mention-resolved body/caption, raw body/caption, media name),
+  // sender label, and context (orphan-quote + link-preview text). The scan
+  // recomputes these live, so quote-orphan convergence is automatic here.
+  private searchStrataForMessage(message: MessageRecord & { id: number }): {
+    haystackFields: Array<string | null>;
+    contextText: string | null;
+    contentWords: string[];
+    contextWords: string[];
+  } {
+    const mentionLabels = this.resolveMentionLabels([message.body ?? null, message.caption ?? null]);
+    const haystackFields = [
+      applyMentionLabels(message.body ?? null, mentionLabels),
+      applyMentionLabels(message.caption ?? null, mentionLabels),
+      message.body ?? null,
+      message.caption ?? null,
+      message.mediaName ?? null
+    ];
+    const parts: string[] = [];
+    const snapshot = message.quotedSnapshot;
+    if (snapshot && (snapshot.body?.trim() || snapshot.caption?.trim())) {
+      const sourceChat = snapshot.quotedSourceChatId ?? message.chatSourceId;
+      const original = snapshot.quotedSourceMessageId ? this.messages.get(messageKey(sourceChat, snapshot.quotedSourceMessageId)) : undefined;
+      if (!original || original.isDeleted) {
+        if (snapshot.body?.trim()) {
+          parts.push(snapshot.body.trim());
+        }
+        if (snapshot.caption?.trim()) {
+          parts.push(snapshot.caption.trim());
+        }
+      }
     }
-    const chatBysourceId = new Map([...this.chats.values()].map((chat) => [chat.sourceChatId, chat]));
-    const scored: Array<{ item: SearchResultItem; score: number }> = [];
-    const nowMs = Date.now();
+    const preview = this.linkPreviews.get(message.sourceMessageKey);
+    if (preview?.title?.trim()) {
+      parts.push(preview.title.trim());
+    }
+    if (preview?.description?.trim()) {
+      parts.push(preview.description.trim());
+    }
+    if (preview?.canonicalUrl?.trim()) {
+      parts.push(preview.canonicalUrl.trim());
+    }
+    const contextText = parts.length > 0 ? parts.join("\n") : null;
+    return {
+      haystackFields,
+      contextText,
+      contentWords: normalizedWords(haystackFields.filter(Boolean).join("\n")),
+      contextWords: normalizedWords(contextText)
+    };
+  }
+
+  // Corpus-wide effective document frequency for a token at tier-1 looseness
+  // (mirror of the fts5vocab measurement — unscoped by query filters).
+  private memoryTokenDf(token: QueryToken): number {
+    const probeGroup: PlanGroup = { alternatives: dfProbesForToken(token), sourceText: token.text, quoted: token.quoted };
+    let df = 0;
     for (const message of this.messages.values()) {
-      const chat = chatBysourceId.get(message.chatSourceId);
-      if (!chat) {
-        continue;
-      }
-      if (options.chatId != null && chat.id !== options.chatId) {
-        continue;
-      }
-      if (options.afterMs != null && (message.timestampMs ?? 0) < options.afterMs) {
-        continue;
-      }
-      if (options.beforeMs != null && (message.timestampMs ?? Number.MAX_SAFE_INTEGER) > options.beforeMs) {
-        continue;
-      }
-      if (options.direction && message.direction !== options.direction) {
-        continue;
-      }
-      const isMediaLike =
-        message.hasMedia || ["image", "video", "audio", "document", "sticker", "view_once", "ptv"].includes(message.messageType);
-      if (options.type === "text" && (message.hasMedia || message.messageType === "call")) {
-        continue;
-      }
-      if (options.type === "media" && !isMediaLike) {
-        continue;
-      }
-      if (options.type === "call" && message.messageType !== "call") {
-        continue;
-      }
-      if (!options.includeNoise && !isVisibleExchangeMessage(message)) {
-        continue;
-      }
+      const strata = this.searchStrataForMessage(message);
       const sender = message.senderSourceJid ? this.contacts.get(message.senderSourceJid) : null;
       const senderLabel =
         sender?.displayName?.trim() || sender?.pushName?.trim() || sender?.phoneNumber || displayPhoneFromJid(message.senderSourceJid) || null;
-      if (options.sender) {
-        const wanted = options.sender.trim().toLowerCase();
-        const senderMatches = wanted.includes("@")
-          ? message.senderSourceJid === options.sender.trim()
-          : Boolean(senderLabel && senderLabel.toLowerCase().includes(wanted));
-        if (!senderMatches) {
+      const words = [...strata.contentWords, ...normalizedWords(senderLabel), ...strata.contextWords];
+      if (groupMatchesWords(probeGroup, words)) {
+        df += 1;
+      }
+    }
+    return df;
+  }
+
+  async searchMessages(options: SearchQueryOptions): Promise<SearchResponse> {
+    const index = await this.getSearchIndexStatus();
+    const tokens = attachAliasVariants(tokenizeSearchQuery(options.query), (norm) => this.lookupTermAliases(norm));
+    if (tokens.length === 0) {
+      return { index, totalMatches: 0, results: [], matchTier: "exact", relaxation: null };
+    }
+    const chatBysourceId = new Map([...this.chats.values()].map((chat) => [chat.sourceChatId, chat]));
+    const nowMs = Date.now();
+    const evaluatePlan = (plan: TierPlan): Array<{ item: SearchResultItem; score: number }> => {
+      const scored: Array<{ item: SearchResultItem; score: number }> = [];
+      for (const message of this.messages.values()) {
+        const chat = chatBysourceId.get(message.chatSourceId);
+        if (!chat) {
           continue;
         }
-      }
-      const mentionLabels = this.resolveMentionLabels([message.body ?? null, message.caption ?? null]);
-      const haystackFields = [
-        applyMentionLabels(message.body ?? null, mentionLabels),
-        applyMentionLabels(message.caption ?? null, mentionLabels),
-        message.body ?? null,
-        message.caption ?? null,
-        message.mediaName ?? null,
-        senderLabel
-      ];
-      const haystack = haystackFields.filter(Boolean).join("\n").toLowerCase();
-      if (!tokens.every((token) => haystack.includes(token))) {
-        continue;
-      }
-      const ageDays = message.timestampMs != null ? Math.max(0, (nowMs - message.timestampMs) / 86_400_000) : 365;
-      const recency = 0.2 + 0.8 * Math.pow(0.5, ageDays / 90);
-      const score = tokens.length * recency;
-      const snippetSource =
-        haystackFields.find((field) => field && field.toLowerCase().includes(tokens[0])) ?? haystackFields.find(Boolean) ?? "";
-      scored.push({
-        score,
-        item: {
-          layer: "message",
-          messageId: message.id,
-          sourceMessageKey: message.sourceMessageKey,
-          sourceMessageId: message.sourceMessageId,
-          chatId: chat.id,
-          chatSourceId: chat.sourceChatId,
-          chatDisplayName: chat.displayName?.trim() && chat.displayName !== chat.jid ? chat.displayName : displayPhoneFromJid(chat.jid),
-          chatType: chat.chatType,
-          senderDisplayName: senderLabel,
-          senderSourceJid: message.senderSourceJid ?? null,
-          timestampMs: message.timestampMs ?? null,
-          sentAt: message.timestampMs ? new Date(message.timestampMs).toISOString() : null,
-          direction: message.direction,
-          messageType: message.messageType,
-          interpretation: interpretMessage({
-            messageType: message.messageType,
-            isDeleted: message.isDeleted,
-            hasHeldContent: Boolean(message.body?.trim() || message.caption?.trim() || message.hasMedia),
-            mediaAvailability: null
-          }),
-          snippet: buildMemorySnippet(snippetSource ?? "", tokens[0]),
-          score,
-          hasMedia: message.hasMedia,
-          isDeleted: message.isDeleted
+        if (options.chatId != null && chat.id !== options.chatId) {
+          continue;
         }
-      });
+        if (options.afterMs != null && (message.timestampMs ?? 0) < options.afterMs) {
+          continue;
+        }
+        if (options.beforeMs != null && (message.timestampMs ?? Number.MAX_SAFE_INTEGER) > options.beforeMs) {
+          continue;
+        }
+        if (options.direction && message.direction !== options.direction) {
+          continue;
+        }
+        const isMediaLike =
+          message.hasMedia || ["image", "video", "audio", "document", "sticker", "view_once", "ptv"].includes(message.messageType);
+        if (options.type === "text" && (message.hasMedia || message.messageType === "call")) {
+          continue;
+        }
+        if (options.type === "media" && !isMediaLike) {
+          continue;
+        }
+        if (options.type === "call" && message.messageType !== "call") {
+          continue;
+        }
+        if (!options.includeNoise && !isVisibleExchangeMessage(message)) {
+          continue;
+        }
+        const sender = message.senderSourceJid ? this.contacts.get(message.senderSourceJid) : null;
+        const senderLabel =
+          sender?.displayName?.trim() || sender?.pushName?.trim() || sender?.phoneNumber || displayPhoneFromJid(message.senderSourceJid) || null;
+        if (options.sender) {
+          const wanted = options.sender.trim().toLowerCase();
+          const senderMatches = wanted.includes("@")
+            ? message.senderSourceJid === options.sender.trim()
+            : Boolean(senderLabel && senderLabel.toLowerCase().includes(wanted));
+          if (!senderMatches) {
+            continue;
+          }
+        }
+        const strata = this.searchStrataForMessage(message);
+        const senderWords = normalizedWords(senderLabel);
+        const allWords = [...strata.contentWords, ...senderWords, ...strata.contextWords];
+        if (!planMatchesWords(plan, allWords)) {
+          continue;
+        }
+        const matchedGroups = plan.groups.filter((group) => groupMatchesWords(group, allWords)).length;
+        const ageDays = message.timestampMs != null ? Math.max(0, (nowMs - message.timestampMs) / 86_400_000) : 365;
+        const recency = 0.2 + 0.8 * Math.pow(0.5, ageDays / 90);
+        // Entity boost mirror: transport-authoritative mentions whose resolved
+        // label matches a query term.
+        const mentionWords = (message.mentionedJids ?? []).map((jid) => normalizedWords(this.resolveCurrentLabelForJid(jid)));
+        const boosted = mentionWords.some(
+          (words) => words.length > 0 && tokens.some((token) => tokenLenientlyMatchesWords(token, words))
+        );
+        const score = matchedGroups * recency + (boosted ? MEMORY_SEARCH_MENTION_BOOST : 0);
+        const contentAndContextWords = [...strata.contentWords, ...strata.contextWords];
+        const contentMatched = plan.groups.some((group) => groupMatchesWords(group, contentAndContextWords));
+        const senderMatched = senderWords.length > 0 && tokens.some((token) => tokenLenientlyMatchesWords(token, senderWords));
+        const senderOnlyMatch = senderMatched && !contentMatched ? true : undefined;
+        const termCoverage = plan.matchTier === "partial" ? countTermCoverage(tokens, allWords) : undefined;
+        const snippetFields = [...strata.haystackFields, strata.contextText];
+        const snippetSource =
+          snippetFields.find((field) => field && plan.groups.some((group) => groupMatchesWords(group, normalizedWords(field)))) ??
+          snippetFields.find(Boolean) ??
+          "";
+        const normalizedSource = normalizeTerm(snippetSource ?? "");
+        const snippetToken =
+          tokens
+            .flatMap((token) => [token.norm, ...token.variants])
+            .find((text) => text && normalizedSource.includes(text)) ??
+          tokens[0]?.norm ??
+          "";
+        scored.push({
+          score,
+          item: {
+            layer: "message",
+            messageId: message.id,
+            sourceMessageKey: message.sourceMessageKey,
+            sourceMessageId: message.sourceMessageId,
+            chatId: chat.id,
+            chatSourceId: chat.sourceChatId,
+            chatDisplayName: chat.displayName?.trim() && chat.displayName !== chat.jid ? chat.displayName : displayPhoneFromJid(chat.jid),
+            chatType: chat.chatType,
+            senderDisplayName: senderLabel,
+            senderSourceJid: message.senderSourceJid ?? null,
+            timestampMs: message.timestampMs ?? null,
+            sentAt: message.timestampMs ? new Date(message.timestampMs).toISOString() : null,
+            direction: message.direction,
+            messageType: message.messageType,
+            interpretation: interpretMessage({
+              messageType: message.messageType,
+              isDeleted: message.isDeleted,
+              hasHeldContent: Boolean(message.body?.trim() || message.caption?.trim() || message.hasMedia),
+              mediaAvailability: null
+            }),
+            snippet: buildMemorySnippet(snippetSource ?? "", snippetToken),
+            score,
+            hasMedia: message.hasMedia,
+            isDeleted: message.isDeleted,
+            ...(senderOnlyMatch ? { senderOnlyMatch } : {}),
+            ...(termCoverage ? { termCoverage } : {})
+          }
+        });
+      }
+      return scored;
+    };
+    // Relaxation ladder (mirror of the SQLite executor): strict first, looser
+    // tiers only while below the acceptance threshold.
+    const minHits = Math.max(1, Math.floor(options.minHits ?? 1));
+    let winner: TierPlan | null = null;
+    let winnerScored: Array<{ item: SearchResultItem; score: number }> = [];
+    let fallback: { plan: TierPlan; scored: Array<{ item: SearchResultItem; score: number }> } | null = null;
+    const tryPlans = (plans: TierPlan[]): boolean => {
+      for (const plan of plans) {
+        const scored = evaluatePlan(plan);
+        if (scored.length >= minHits) {
+          winner = plan;
+          winnerScored = scored;
+          return true;
+        }
+        if (scored.length > 0 && !fallback) {
+          fallback = { plan, scored };
+        }
+      }
+      return false;
+    };
+    const basePlans = buildBasePlans(tokens);
+    if (!tryPlans(basePlans)) {
+      const dfByNorm = new Map<string, number>();
+      for (const token of tokens) {
+        if (!token.quoted) {
+          dfByNorm.set(token.norm, this.memoryTokenDf(token));
+        }
+      }
+      tryPlans(buildDroppedPlans(tokens, dfByNorm, new Set(basePlans.map((plan) => plan.match))));
     }
-    scored.sort((a, b) => b.score - a.score || (b.item.timestampMs ?? 0) - (a.item.timestampMs ?? 0));
+    if (!winner && fallback) {
+      const best = fallback as { plan: TierPlan; scored: Array<{ item: SearchResultItem; score: number }> };
+      winner = best.plan;
+      winnerScored = best.scored;
+    }
+    if (!winner) {
+      return { index, totalMatches: 0, results: [], matchTier: "exact", relaxation: null };
+    }
+    const winningPlan: TierPlan = winner;
+    const scored = winnerScored;
+    // Ranked-OR mirror: term coverage outranks any single-term score spike.
+    if (winningPlan.requireAll) {
+      scored.sort((a, b) => b.score - a.score || (b.item.timestampMs ?? 0) - (a.item.timestampMs ?? 0));
+    } else {
+      scored.sort(
+        (a, b) =>
+          (b.item.termCoverage?.matched ?? 0) - (a.item.termCoverage?.matched ?? 0) ||
+          b.score - a.score ||
+          (b.item.timestampMs ?? 0) - (a.item.timestampMs ?? 0)
+      );
+    }
     const results = scored.slice(options.offset, options.offset + options.limit).map((entry) => entry.item);
     // Same-name persons stay visually distinct within the result page: sender
     // labels always; chat titles only for identity-addressed (DM) chats.
@@ -3271,8 +3435,75 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     return {
       index,
       totalMatches: scored.length,
-      results
+      results,
+      matchTier: winningPlan.matchTier,
+      relaxation:
+        winningPlan.tier === 0
+          ? null
+          : {
+              tier: winningPlan.tier as 1 | 2 | 3 | 4,
+              droppedTerms: winningPlan.droppedTerms,
+              totalTerms: winningPlan.totalTerms,
+              requiredTerms: winningPlan.requiredTerms
+            }
     };
+  }
+
+  // Bidirectional alias groups (mirror of the SQLite cache), seeded from the
+  // same static list so "nhi" finds "nahi" identically in both adapters.
+  private lookupTermAliases(norm: string): string[] {
+    if (!this.termAliasCache) {
+      const cache = new Map<string, string[]>();
+      const groups = new Map<string, Set<string>>();
+      for (const row of this.termAliasRows) {
+        const term = normalizeTerm(row.term);
+        const variant = normalizeTerm(row.variant);
+        if (!term || !variant || term === variant) {
+          continue;
+        }
+        const group = groups.get(term) ?? new Set<string>();
+        group.add(variant);
+        groups.set(term, group);
+      }
+      for (const [term, variants] of groups) {
+        const members = [term, ...variants];
+        for (const member of members) {
+          const others = members.filter((candidate) => candidate !== member);
+          const existing = cache.get(member);
+          if (existing) {
+            for (const other of others) {
+              if (!existing.includes(other)) {
+                existing.push(other);
+              }
+            }
+          } else {
+            cache.set(member, [...others]);
+          }
+        }
+      }
+      this.termAliasCache = cache;
+    }
+    return this.termAliasCache.get(norm) ?? [];
+  }
+
+  async addTermAliases(entries: Array<{ term: string; variant: string; source?: string; weight?: number }>): Promise<number> {
+    let added = 0;
+    for (const entry of entries) {
+      const term = normalizeTerm(entry.term ?? "").trim();
+      const variant = normalizeTerm(entry.variant ?? "").trim();
+      if (!term || !variant || term === variant) {
+        continue;
+      }
+      const exists = this.termAliasRows.some((row) => normalizeTerm(row.term) === term && normalizeTerm(row.variant) === variant);
+      if (!exists) {
+        this.termAliasRows.push({ term, variant });
+        added += 1;
+      }
+    }
+    if (added > 0) {
+      this.termAliasCache = null;
+    }
+    return added;
   }
 
   // --- Brain substrate (mirrors the SQLite adapter's semantics) ---

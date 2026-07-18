@@ -3164,6 +3164,33 @@ button.fileButton:disabled {
   font-size: 12px;
 }
 
+/* Relaxed-search honesty: banner above looser-than-typed result sets, and
+   per-hit chips for term coverage / sender-only matches. */
+.relaxedBanner {
+  margin: 0 14px 10px;
+  padding: 8px 12px;
+  border: 1px solid rgba(120, 180, 255, 0.35);
+  border-radius: 8px;
+  background: rgba(120, 180, 255, 0.08);
+  font-size: 13px;
+  color: #c9daf0;
+}
+
+.relaxedBanner p {
+  margin: 0;
+}
+
+.hitBadge {
+  background: rgba(120, 180, 255, 0.22);
+  color: #d7e6f8;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 1;
+  padding: 2px 6px;
+  margin-left: 6px;
+  white-space: nowrap;
+}
+
 .searchHitSnippet {
   color: #c8d2ce;
   font-size: 13px;

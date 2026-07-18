@@ -131,6 +131,21 @@ import { disambiguateLabels } from "../persons/disambiguate";
 import { personDisplayLabelFromMembers } from "../persons/label";
 import { getMemoryProviderStatus } from "../memory/provider";
 import { PublicError } from "../privacy";
+import { termAliasSeedRows } from "../search/aliasSeed";
+import {
+  attachAliasVariants,
+  buildBasePlans,
+  buildDroppedPlans,
+  countTermCoverage,
+  dfProbesForToken,
+  normalizeTerm,
+  normalizedWords,
+  tokenizeSearchQuery,
+  tokenLenientlyMatchesWords,
+  type PlanAlternative,
+  type QueryToken,
+  type TierPlan
+} from "../search/relaxation";
 import type { ArchiveRepository, ArchiveRestorePoint } from "./repository";
 
 const TOOL_VERSION = "0.1.0";
@@ -729,9 +744,14 @@ const schemaStatements = [
     is_starred INTEGER NOT NULL DEFAULT 0,
     raw_metadata_json TEXT NULL,
     -- Derived search text: body/caption with mentions swapped for display
-    -- names, plus media file name and sender label. Recomputed by write paths
-    -- and the reindex job; stored raw content is never touched.
+    -- names, plus media file name. Recomputed by write paths and the reindex
+    -- job; stored raw content is never touched. The sender label lives in
+    -- resolved_sender (its own low-weight FTS column) so sent-by matches are
+    -- identifiable; resolved_context carries searchable secondary text
+    -- (orphaned quoted-snapshot text, link-preview title/description/URL).
     resolved_text TEXT NULL,
+    resolved_sender TEXT NULL,
+    resolved_context TEXT NULL,
     imported_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE,
     FOREIGN KEY (sender_contact_id) REFERENCES contacts(id) ON DELETE SET NULL
@@ -746,6 +766,18 @@ const schemaStatements = [
     source_mask INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (message_id, mentioned_jid),
     FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
+  ) WITHOUT ROWID`,
+
+  // Query-time term-alias expansion (retrieval-hardening): spelling variants
+  // of the same word (romanized Hindi seeds now; the deep retrieval path
+  // may persist model-learned variants later) OR-ed into FTS queries at zero
+  // model cost. Tokenizer-normalized text on both sides.
+  `CREATE TABLE IF NOT EXISTS brain_term_aliases (
+    term TEXT NOT NULL,
+    variant TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'seed',
+    weight REAL NOT NULL DEFAULT 1.0,
+    PRIMARY KEY (term, variant)
   ) WITHOUT ROWID`,
 
   // Signal capture is additive archive state. Every row has a stable natural
@@ -1584,6 +1616,10 @@ const schemaStatements = [
   `CREATE INDEX IF NOT EXISTS idx_signal_observations_fact ON archive_signal_observations (fact_key, family, observed_at_ms)`,
   `CREATE INDEX IF NOT EXISTS idx_engagement_chat_identity ON engagement_aggregates (chat_source_id, counterparty_jid)`,
   `CREATE INDEX IF NOT EXISTS idx_quoted_snapshots_referent ON message_quoted_snapshots (quoted_source_chat_id, quoted_source_message_id)`,
+  // retrieval-hardening: converge late-arriving quoted originals (lookup by
+  // source id alone) and point-look-up originals for the orphan-quote check.
+  `CREATE INDEX IF NOT EXISTS idx_quoted_snapshots_source ON message_quoted_snapshots (quoted_source_message_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_messages_source_id ON messages (source_message_id)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_tasks_due ON brain_tasks (status, next_attempt_at_ms, priority, id)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_ledger_day ON brain_llm_ledger (day, purpose)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_runs_status ON brain_runs (status, started_at)`,
@@ -1624,22 +1660,26 @@ const schemaStatements = [
 // migration because the triggers reference messages.resolved_text.
 const searchSchemaStatements = [
   `CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-    resolved_text, body, caption,
+    resolved_text, body, caption, sender, context,
     tokenize='unicode61 remove_diacritics 2', prefix='2 3'
   )`,
   `CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
     DELETE FROM messages_fts WHERE rowid = new.id;
-    INSERT INTO messages_fts(rowid, resolved_text, body, caption)
-    VALUES (new.id, new.resolved_text, new.body, new.caption);
+    INSERT INTO messages_fts(rowid, resolved_text, body, caption, sender, context)
+    VALUES (new.id, new.resolved_text, new.body, new.caption, new.resolved_sender, new.resolved_context);
   END`,
   `CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
     DELETE FROM messages_fts WHERE rowid = old.id;
   END`,
-  `CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE OF resolved_text, body, caption ON messages BEGIN
+  `CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE OF resolved_text, body, caption, resolved_sender, resolved_context ON messages BEGIN
     DELETE FROM messages_fts WHERE rowid = new.id;
-    INSERT INTO messages_fts(rowid, resolved_text, body, caption)
-    VALUES (new.id, new.resolved_text, new.body, new.caption);
-  END`
+    INSERT INTO messages_fts(rowid, resolved_text, body, caption, sender, context)
+    VALUES (new.id, new.resolved_text, new.body, new.caption, new.resolved_sender, new.resolved_context);
+  END`,
+  // Zero-maintenance vocabulary view over the FTS index: per-term document
+  // frequencies for the relaxation ladder's drop decisions. Never on the
+  // strict query path.
+  `CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_vocab USING fts5vocab('messages_fts', 'row')`
 ];
 
 export function initializeSqliteArchive(dbPath = config.archive.sqlitePath): void {
@@ -1677,6 +1717,8 @@ export class SqliteArchiveRepository implements ArchiveRepository {
   private legacyArchive = false;
   private readonly identityLinks = new Map<string, string>();
   private cachedFtsState: SearchIndexState | null = null;
+  // Bidirectional alias-group cache; invalidated whenever the table changes.
+  private termAliasCache: Map<string, string[]> | null = null;
   // brain-correctness-debts D7: bound the cost of the coverage scan, which the
   // client refetches on every archive-updated SSE. A short TTL collapses a
   // burst of history-sync refreshes into at most one scan per interval;
@@ -2051,22 +2093,27 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     return row?.value?.trim() || null;
   }
 
-  // Recompute derived search state (resolved_text + message_mentions) for a
-  // set of messages from their FINAL stored content. Runs inside the caller's
-  // transaction; FTS follows via the update trigger. Rows whose derived state
-  // is already correct are left untouched (no index churn).
+  // Recompute derived search state (resolved_text + resolved_sender +
+  // resolved_context + message_mentions) for a set of messages from their
+  // FINAL stored content. Runs inside the caller's transaction; FTS follows
+  // via the update trigger. Rows whose derived state is already correct are
+  // left untouched (no index churn).
   private syncMessageDerivedState(messageIds: number[], explicitMentionsById?: Map<number, string[]>): void {
     if (messageIds.length === 0) {
       return;
     }
     const rows: Array<{
       id: number;
+      source_message_key: string;
       body: string | null;
       caption: string | null;
       media_name: string | null;
       sender_source_jid: string | null;
       from_me: number | null;
       resolved_text: string | null;
+      resolved_sender: string | null;
+      resolved_context: string | null;
+      chat_source_id: string;
     }> = [];
     const unique = [...new Set(messageIds)];
     for (let index = 0; index < unique.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
@@ -2074,8 +2121,10 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       rows.push(
         ...(this.db
           .prepare(
-            `SELECT id, body, caption, media_name, sender_source_jid, from_me, resolved_text
-             FROM messages WHERE id IN (${batch.map(() => "?").join(",")})`
+            `SELECT m.id, m.source_message_key, m.body, m.caption, m.media_name, m.sender_source_jid, m.from_me,
+                    m.resolved_text, m.resolved_sender, m.resolved_context, ch.source_chat_id AS chat_source_id
+             FROM messages m JOIN chats ch ON ch.id = m.chat_id
+             WHERE m.id IN (${batch.map(() => "?").join(",")})`
           )
           .all(...batch) as typeof rows)
       );
@@ -2087,7 +2136,46 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     const senderLabels = this.resolveContactLabels(
       rows.map((row) => row.sender_source_jid).filter((jid): jid is string => Boolean(jid))
     );
-    const updateResolved = this.db.prepare(`UPDATE messages SET resolved_text = ? WHERE id = ?`);
+    // Context inputs: link previews and quoted snapshots for these rows, plus
+    // a point probe for each quoted original ("is it archived and live?").
+    const keys = rows.map((row) => row.source_message_key);
+    const previews = new Map<string, { title: string | null; description: string | null; canonical_url: string | null }>();
+    const snapshots = new Map<
+      string,
+      { quoted_source_message_id: string | null; quoted_source_chat_id: string | null; body: string | null; caption: string | null }
+    >();
+    for (let index = 0; index < keys.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = keys.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      const placeholders = batch.map(() => "?").join(",");
+      const previewRows = this.db
+        .prepare(`SELECT message_key, title, description, canonical_url FROM message_link_previews WHERE message_key IN (${placeholders})`)
+        .all(...batch) as Array<{ message_key: string; title: string | null; description: string | null; canonical_url: string | null }>;
+      for (const preview of previewRows) {
+        previews.set(preview.message_key, preview);
+      }
+      const snapshotRows = this.db
+        .prepare(
+          `SELECT reply_message_key, quoted_source_message_id, quoted_source_chat_id, body, caption
+           FROM message_quoted_snapshots WHERE reply_message_key IN (${placeholders})`
+        )
+        .all(...batch) as Array<{
+        reply_message_key: string;
+        quoted_source_message_id: string | null;
+        quoted_source_chat_id: string | null;
+        body: string | null;
+        caption: string | null;
+      }>;
+      for (const snapshot of snapshotRows) {
+        snapshots.set(snapshot.reply_message_key, snapshot);
+      }
+    }
+    const originalProbe = this.db.prepare(
+      `SELECT m2.is_deleted FROM messages m2 JOIN chats ch2 ON ch2.id = m2.chat_id
+       WHERE m2.source_message_id = ? AND ch2.source_chat_id = ? LIMIT 1`
+    );
+    const updateResolved = this.db.prepare(
+      `UPDATE messages SET resolved_text = ?, resolved_sender = ?, resolved_context = ? WHERE id = ?`
+    );
     const selectMentions = this.db.prepare(`SELECT mentioned_jid, source_mask FROM message_mentions WHERE message_id = ?`);
     const deleteMentions = this.db.prepare(`DELETE FROM message_mentions WHERE message_id = ?`);
     const insertMention = this.db.prepare(`INSERT OR REPLACE INTO message_mentions (message_id, mentioned_jid, source_mask) VALUES (?, ?, ?)`);
@@ -2100,9 +2188,32 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         : row.sender_source_jid
           ? senderLabels.get(row.sender_source_jid) ?? displayPhoneFromJid(row.sender_source_jid)
           : null;
-      const resolved = composeResolvedText(row.body, row.caption, row.media_name, senderLabel, mentionLabels);
-      if ((resolved ?? null) !== (row.resolved_text ?? null)) {
-        updateResolved.run(resolved, row.id);
+      const resolved = composeResolvedText(row.body, row.caption, row.media_name, mentionLabels);
+      // Sender is indexed only for rows with visible content (same guard as
+      // the old co-mingled form): system noise must not match name queries.
+      const resolvedSender = resolved != null ? senderLabel?.trim() || null : null;
+      const snapshot = snapshots.get(row.source_message_key) ?? null;
+      let orphanQuote: { body: string | null; caption: string | null } | null = null;
+      if (snapshot && (snapshot.body?.trim() || snapshot.caption?.trim())) {
+        const sourceChat = snapshot.quoted_source_chat_id ?? row.chat_source_id;
+        const original = snapshot.quoted_source_message_id
+          ? (originalProbe.get(snapshot.quoted_source_message_id, sourceChat) as { is_deleted: number } | undefined)
+          : undefined;
+        if (!original || Boolean(original.is_deleted)) {
+          orphanQuote = { body: snapshot.body, caption: snapshot.caption };
+        }
+      }
+      const preview = previews.get(row.source_message_key);
+      const resolvedContext = composeResolvedContext(
+        orphanQuote,
+        preview ? { title: preview.title, description: preview.description, canonicalUrl: preview.canonical_url } : null
+      );
+      if (
+        (resolved ?? null) !== (row.resolved_text ?? null) ||
+        (resolvedSender ?? null) !== (row.resolved_sender ?? null) ||
+        (resolvedContext ?? null) !== (row.resolved_context ?? null)
+      ) {
+        updateResolved.run(resolved, resolvedSender, resolvedContext, row.id);
       }
       const desired = new Map<string, number>();
       for (const jid of explicitMentionsById?.get(row.id) ?? []) {
@@ -2165,12 +2276,14 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         "The search index has not been built for this archive yet. Run the search reindex to enable global search."
       );
     }
-    const match = buildFtsMatchQuery(options.query);
-    if (!match) {
-      return { index, totalMatches: 0, results: [] };
+    const tokens = attachAliasVariants(tokenizeSearchQuery(options.query), (norm) => this.lookupTermAliases(norm));
+    if (tokens.length === 0) {
+      return { index, totalMatches: 0, results: [], matchTier: "exact", relaxation: null };
     }
+    // First WHERE clause is the per-plan MATCH placeholder; `params` holds
+    // only the filter bindings (the match string is bound per ladder tier).
     const where = ["messages_fts MATCH ?"];
-    const params: unknown[] = [match];
+    const params: unknown[] = [];
     if (options.chatId != null) {
       where.push("m.chat_id = ?");
       params.push(options.chatId);
@@ -2207,58 +2320,139 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     if (!options.includeNoise) {
       where.push(visibleExchangePredicate("m"));
     }
-    // Exact archive-wide match count (same predicate, no ranking work).
-    const totalMatches = Number(
-      (
-        this.db
-          .prepare(
-            `SELECT COUNT(*) AS count
-             FROM messages_fts
-             JOIN messages m ON m.id = messages_fts.rowid
-             JOIN chats ch ON ch.id = m.chat_id
-             LEFT JOIN contacts c ON c.source_jid = m.sender_source_jid
-             WHERE ${where.join(" AND ")}`
-          )
-          .get(...params) as { count: number }
-      ).count ?? 0
+    const whereSql = where.join(" AND ");
+    // Exact archive-wide match count per attempted tier (same predicate, no
+    // ranking work). Counts always describe the tier that produced results.
+    const countStmt = this.db.prepare(
+      `SELECT COUNT(*) AS count
+       FROM messages_fts
+       JOIN messages m ON m.id = messages_fts.rowid
+       JOIN chats ch ON ch.id = m.chat_id
+       LEFT JOIN contacts c ON c.source_jid = m.sender_source_jid
+       WHERE ${whereSql}`
     );
-    // Candidate pool: top matches by BM25, reranked in JS with recency decay.
-    // Deterministic paging inside the pool; offsets beyond it return empty.
-    const rows = this.db
-      .prepare(
-        `SELECT m.id, m.source_message_key, m.source_message_id, m.chat_id, m.sender_source_jid,
-                m.timestamp_ms, m.sent_at, m.direction, m.message_type, m.is_deleted, m.has_media, m.body,
+    const countForMatch = (match: string): number => Number((countStmt.get(match, ...params) as { count: number }).count ?? 0);
+    // Relaxation ladder: strict first; looser tiers run only while results
+    // are below the acceptance threshold (default: only on zero hits).
+    const minHits = Math.max(1, Math.floor(options.minHits ?? 1));
+    let winner: TierPlan | null = null;
+    let winnerCount = 0;
+    let fallback: { plan: TierPlan; count: number } | null = null;
+    const tryPlans = (plans: TierPlan[]): boolean => {
+      for (const plan of plans) {
+        const count = countForMatch(plan.match);
+        if (count >= minHits) {
+          winner = plan;
+          winnerCount = count;
+          return true;
+        }
+        if (count > 0 && !fallback) {
+          fallback = { plan, count };
+        }
+      }
+      return false;
+    };
+    const basePlans = buildBasePlans(tokens);
+    if (!tryPlans(basePlans)) {
+      const dfByNorm = new Map<string, number>();
+      for (const token of tokens) {
+        if (!token.quoted) {
+          dfByNorm.set(token.norm, this.effectiveTokenDf(token));
+        }
+      }
+      tryPlans(buildDroppedPlans(tokens, dfByNorm, new Set(basePlans.map((plan) => plan.match))));
+    }
+    if (!winner && fallback) {
+      const best = fallback as { plan: TierPlan; count: number };
+      winner = best.plan;
+      winnerCount = best.count;
+    }
+    if (!winner) {
+      return { index, totalMatches: 0, results: [], matchTier: "exact", relaxation: null };
+    }
+    const winningPlan: TierPlan = winner;
+    const totalMatches = winnerCount;
+    // Dual candidate pool (retrieval-hardening): the top pool by BM25 union
+    // the most-recent matches, deduped by rowid — "best-matching AND most-
+    // recent are always considered" is an explicit guarantee, not a hope.
+    // Reranked in JS with recency decay; deterministic paging inside the
+    // union; offsets beyond it return empty.
+    const selectSql = `SELECT m.id, m.source_message_key, m.source_message_id, m.chat_id, m.sender_source_jid,
+                m.timestamp_ms, m.sent_at, m.direction, m.message_type, m.is_deleted, m.has_media, m.body, m.caption,
+                m.resolved_text, m.resolved_sender, m.resolved_context,
                 ch.source_chat_id AS chat_source_id, ch.display_name AS chat_display_name, ch.chat_type,
                 ${contactLabelSql("c.")} AS sender_display_name,
-                bm25(messages_fts, 3.0, 2.0, 1.0) AS rank,
+                bm25(messages_fts, 3.0, 2.0, 1.0, 0.5, 1.0) AS rank,
                 snippet(messages_fts, 0, ?, ?, '…', 14) AS snip_resolved,
                 snippet(messages_fts, 1, ?, ?, '…', 14) AS snip_body,
-                snippet(messages_fts, 2, ?, ?, '…', 14) AS snip_caption
+                snippet(messages_fts, 2, ?, ?, '…', 14) AS snip_caption,
+                snippet(messages_fts, 4, ?, ?, '…', 14) AS snip_context
          FROM messages_fts
          JOIN messages m ON m.id = messages_fts.rowid
          JOIN chats ch ON ch.id = m.chat_id
          LEFT JOIN contacts c ON c.source_jid = m.sender_source_jid
-         WHERE ${where.join(" AND ")}
-         ORDER BY rank
-         LIMIT ${SEARCH_CANDIDATE_POOL}`
-      )
-      .all(
-        SEARCH_HIGHLIGHT_START,
-        SEARCH_HIGHLIGHT_END,
-        SEARCH_HIGHLIGHT_START,
-        SEARCH_HIGHLIGHT_END,
-        SEARCH_HIGHLIGHT_START,
-        SEARCH_HIGHLIGHT_END,
-        ...params
-      ) as SqliteSearchRow[];
+         WHERE ${whereSql}`;
+    const snippetParams = [
+      SEARCH_HIGHLIGHT_START,
+      SEARCH_HIGHLIGHT_END,
+      SEARCH_HIGHLIGHT_START,
+      SEARCH_HIGHLIGHT_END,
+      SEARCH_HIGHLIGHT_START,
+      SEARCH_HIGHLIGHT_END,
+      SEARCH_HIGHLIGHT_START,
+      SEARCH_HIGHLIGHT_END
+    ];
+    const relevanceRows = this.db
+      .prepare(`${selectSql} ORDER BY rank LIMIT ${SEARCH_CANDIDATE_POOL}`)
+      .all(...snippetParams, winningPlan.match, ...params) as SqliteSearchRow[];
+    // The recency pass is skipped when the relevance pool already saw every
+    // match — the union would be a no-op.
+    const recencyRows =
+      totalMatches > SEARCH_CANDIDATE_POOL
+        ? (this.db
+            .prepare(`${selectSql} ORDER BY (m.timestamp_ms IS NULL), m.timestamp_ms DESC, m.id DESC LIMIT ${SEARCH_RECENCY_POOL}`)
+            .all(...snippetParams, winningPlan.match, ...params) as SqliteSearchRow[])
+        : [];
+    const byId = new Map<number, SqliteSearchRow>();
+    for (const row of [...relevanceRows, ...recencyRows]) {
+      if (!byId.has(Number(row.id))) {
+        byId.set(Number(row.id), row);
+      }
+    }
+    const rows = [...byId.values()];
+    // Entity boost: authoritative structured mentions (source_mask bit 2)
+    // whose resolved label matches a query term lift the row at rerank.
+    const mentionBoosted = this.mentionBoostedMessageIds(rows.map((row) => Number(row.id)), tokens);
     const nowMs = Date.now();
     const mentionLabels = this.resolveMentionLabels(rows.map((row) => row.body));
+    const partialTier = winningPlan.matchTier === "partial";
     const scored = rows.map((row) => {
       // FTS5 bm25() is negative for matches; smaller = better.
       const relevance = Math.max(0, -Number(row.rank));
       const ageDays = row.timestamp_ms != null ? Math.max(0, (nowMs - Number(row.timestamp_ms)) / 86_400_000) : 365;
       const recency = 0.2 + 0.8 * Math.pow(0.5, ageDays / 90);
+      const boost = mentionBoosted.has(Number(row.id)) ? SEARCH_MENTION_BOOST : 0;
+      const score = relevance * recency + boost;
       const snippetRaw = pickSnippet(row);
+      // Display-grade match anatomy: which strata carried highlights, whether
+      // the sender label alone matched, and (on partial tiers) how many of
+      // the query's terms this row actually covers.
+      const contentMatched = [row.snip_resolved, row.snip_body, row.snip_caption, row.snip_context].some((snip) =>
+        Boolean(snip && snip.includes(SEARCH_HIGHLIGHT_START))
+      );
+      const senderWords = normalizedWords(`${row.resolved_sender ?? ""} ${row.sender_display_name ?? ""}`);
+      const senderMatched = senderWords.length > 0 && tokens.some((token) => tokenLenientlyMatchesWords(token, senderWords));
+      const senderOnlyMatch = senderMatched && !contentMatched ? true : undefined;
+      const termCoverage = partialTier
+        ? countTermCoverage(
+            tokens,
+            normalizedWords(
+              [row.resolved_text, row.body, row.caption, row.resolved_sender, row.sender_display_name, row.resolved_context]
+                .filter(Boolean)
+                .join("\n")
+            )
+          )
+        : undefined;
       return {
         item: {
           layer: "message" as const,
@@ -2285,14 +2479,24 @@ export class SqliteArchiveRepository implements ArchiveRepository {
             mediaAvailability: null
           }),
           snippet: applyMentionLabels(snippetRaw, mentionLabels) ?? snippetRaw,
-          score: relevance * recency,
+          score,
           hasMedia: Boolean(row.has_media),
-          isDeleted: Boolean(row.is_deleted)
+          isDeleted: Boolean(row.is_deleted),
+          ...(senderOnlyMatch ? { senderOnlyMatch } : {}),
+          ...(termCoverage ? { termCoverage } : {})
         },
-        score: relevance * recency
+        score,
+        coverage: termCoverage?.matched ?? 0
       };
     });
-    scored.sort((a, b) => b.score - a.score);
+    // On the ranked-OR tier, rows covering more of the query's terms outrank
+    // any single-term hit regardless of its BM25 rarity spike — the "multi-
+    // token rows surface first" guarantee, made explicit.
+    if (winningPlan.requireAll) {
+      scored.sort((a, b) => b.score - a.score);
+    } else {
+      scored.sort((a, b) => b.coverage - a.coverage || b.score - a.score);
+    }
     const results = scored.slice(options.offset, options.offset + options.limit).map((entry) => entry.item);
     // Same-name persons stay visually distinct within the result page: sender
     // labels always; chat titles only for identity-addressed (DM) chats.
@@ -2310,7 +2514,152 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         item.chatDisplayName = adjustedChats[index];
       }
     });
-    return { index, totalMatches, results };
+    return {
+      index,
+      totalMatches,
+      results,
+      matchTier: winningPlan.matchTier,
+      relaxation:
+        winningPlan.tier === 0
+          ? null
+          : {
+              tier: winningPlan.tier as 1 | 2 | 3 | 4,
+              droppedTerms: winningPlan.droppedTerms,
+              totalTerms: winningPlan.totalTerms,
+              requiredTerms: winningPlan.requiredTerms
+            }
+    };
+  }
+
+  // Of the given pool ids, those carrying an authoritative structured mention
+  // (source_mask bit 2) whose resolved display label matches a query term.
+  private mentionBoostedMessageIds(messageIds: number[], tokens: QueryToken[]): Set<number> {
+    const boosted = new Set<number>();
+    if (messageIds.length === 0 || tokens.length === 0) {
+      return boosted;
+    }
+    const mentionRows: Array<{ message_id: number; mentioned_jid: string }> = [];
+    for (let index = 0; index < messageIds.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = messageIds.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      mentionRows.push(
+        ...(this.db
+          .prepare(
+            `SELECT message_id, mentioned_jid FROM message_mentions
+             WHERE (source_mask & 2) != 0 AND message_id IN (${batch.map(() => "?").join(",")})`
+          )
+          .all(...batch) as Array<{ message_id: number; mentioned_jid: string }>)
+      );
+    }
+    if (mentionRows.length === 0) {
+      return boosted;
+    }
+    const labels = this.resolveContactLabels([...new Set(mentionRows.map((row) => row.mentioned_jid))]);
+    const wordsByJid = new Map<string, string[]>();
+    for (const [jid, label] of labels) {
+      wordsByJid.set(jid, normalizedWords(label));
+    }
+    for (const mention of mentionRows) {
+      const words = wordsByJid.get(mention.mentioned_jid) ?? [];
+      if (words.length > 0 && tokens.some((token) => tokenLenientlyMatchesWords(token, words))) {
+        boosted.add(Number(mention.message_id));
+      }
+    }
+    return boosted;
+  }
+
+  // Effective document frequency for one query token at tier-1 looseness: its
+  // starred form plus alias variants, straight from the fts5vocab view. Zero
+  // means "cannot match anything" (the typo case). Vocab failures degrade to
+  // "assume matchable" so the ladder still works without df smarts.
+  private effectiveTokenDf(token: QueryToken): number {
+    let total = 0;
+    for (const alternative of dfProbesForToken(token)) {
+      total += this.searchAlternativeDf(alternative);
+      if (total > 0 && total >= Number.MAX_SAFE_INTEGER / 2) {
+        break;
+      }
+    }
+    return total;
+  }
+
+  private searchAlternativeDf(alternative: PlanAlternative): number {
+    try {
+      if (alternative.prefix) {
+        const row = this.db
+          .prepare(`SELECT COALESCE(SUM(doc), 0) AS df FROM messages_fts_vocab WHERE term >= ? AND term < ?`)
+          .get(alternative.text, `${alternative.text}\uffff`) as { df: number };
+        return Number(row?.df ?? 0);
+      }
+      const row = this.db.prepare(`SELECT doc AS df FROM messages_fts_vocab WHERE term = ?`).get(alternative.text) as
+        | { df: number }
+        | undefined;
+      return Number(row?.df ?? 0);
+    } catch {
+      return Number.MAX_SAFE_INTEGER / 4;
+    }
+  }
+
+  // Bidirectional alias groups, cached until the table changes: every member
+  // of a (term ∪ variants) group expands to the other members.
+  private lookupTermAliases(norm: string): string[] {
+    if (!this.termAliasCache) {
+      const cache = new Map<string, string[]>();
+      const groups = new Map<string, Set<string>>();
+      const rows = this.db
+        .prepare(`SELECT term, variant FROM brain_term_aliases ORDER BY weight DESC, term, variant`)
+        .all() as Array<{ term: string; variant: string }>;
+      for (const row of rows) {
+        const term = normalizeTerm(row.term);
+        const variant = normalizeTerm(row.variant);
+        if (!term || !variant || term === variant) {
+          continue;
+        }
+        const group = groups.get(term) ?? new Set<string>();
+        group.add(variant);
+        groups.set(term, group);
+      }
+      for (const [term, variants] of groups) {
+        const members = [term, ...variants];
+        for (const member of members) {
+          const others = members.filter((candidate) => candidate !== member);
+          const existing = cache.get(member);
+          if (existing) {
+            for (const other of others) {
+              if (!existing.includes(other)) {
+                existing.push(other);
+              }
+            }
+          } else {
+            cache.set(member, [...others]);
+          }
+        }
+      }
+      this.termAliasCache = cache;
+    }
+    return this.termAliasCache.get(norm) ?? [];
+  }
+
+  async addTermAliases(entries: Array<{ term: string; variant: string; source?: string; weight?: number }>): Promise<number> {
+    const insert = this.db.prepare(`INSERT OR IGNORE INTO brain_term_aliases (term, variant, source, weight) VALUES (?, ?, ?, ?)`);
+    let added = 0;
+    const apply = this.db.transaction(() => {
+      for (const entry of entries) {
+        const term = normalizeTerm(entry.term ?? "").trim();
+        const variant = normalizeTerm(entry.variant ?? "").trim();
+        if (!term || !variant || term === variant) {
+          continue;
+        }
+        const result = insert.run(term, variant, entry.source?.trim() || "manual", entry.weight ?? 1.0);
+        if (result.changes > 0) {
+          added += 1;
+        }
+      }
+    });
+    apply();
+    if (added > 0) {
+      this.termAliasCache = null;
+    }
+    return added;
   }
 
   async rebuildSearchIndex(onProgress?: (processedMessages: number, totalMessages: number) => void): Promise<{ indexedMessages: number }> {
@@ -2344,8 +2693,8 @@ export class SqliteArchiveRepository implements ArchiveRepository {
           this.db.prepare(`DELETE FROM messages_fts WHERE rowid IN (${placeholders})`).run(...batch);
           this.db
             .prepare(
-              `INSERT INTO messages_fts(rowid, resolved_text, body, caption)
-               SELECT id, resolved_text, body, caption FROM messages WHERE id IN (${placeholders})`
+              `INSERT INTO messages_fts(rowid, resolved_text, body, caption, sender, context)
+               SELECT id, resolved_text, body, caption, resolved_sender, resolved_context FROM messages WHERE id IN (${placeholders})`
             )
             .run(...batch);
         }
@@ -4957,12 +5306,14 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     return displayPhoneFromJid(canonical);
   }
 
-  // Of the given JIDs, those that currently resolve to a genuine saved/push name
-  // (not a masked placeholder, and not an identity-derived restatement of the
-  // number). Used to detect a name transition worth repairing after a contact
-  // write, so bulk imports of already-named or number-only contacts don't churn.
-  private genuinelyNamedJids(jids: string[]): Set<string> {
-    const result = new Set<string>();
+  // Of the given JIDs, those that currently resolve to a genuine saved/push
+  // name (not a masked placeholder, and not an identity-derived restatement of
+  // the number), mapped to that name. Used to detect name transitions worth
+  // repairing after a contact write — both unnamed→named and genuine renames
+  // (name → different name) — so bulk imports that merely restate existing
+  // names don't churn.
+  private genuinelyNamedLabels(jids: string[]): Map<string, string> {
+    const result = new Map<string, string>();
     const unique = [...new Set(jids.map((jid) => this.canonicalJid(jid) ?? jid).filter(Boolean))];
     for (let index = 0; index < unique.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
       const batch = unique.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
@@ -4973,7 +5324,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       for (const row of rows) {
         const name = row.display_name?.trim() || row.push_name?.trim() || "";
         if (name && !isMaskedNumberLabel(name) && !isIdentityDerivedName(name, row.source_jid)) {
-          result.add(row.source_jid);
+          result.set(row.source_jid, name);
         }
       }
     }
@@ -5430,11 +5781,11 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       return new Map();
     }
 
-    // Snapshot which identities already resolved to a genuine name, so after the
-    // write we can repair episodes only for those that just transitioned — not
-    // every contact in a bulk import.
+    // Snapshot the genuine labels identities already resolved to, so after the
+    // write we can repair episodes only for those whose resolution actually
+    // changed — a gained name or a rename — not every contact in a bulk import.
     const batchJids = [...unique.keys()];
-    const namedBefore = this.genuinelyNamedJids(batchJids);
+    const labelsBefore = this.genuinelyNamedLabels(batchJids);
 
     const upsert = this.db.prepare(
       `INSERT INTO contacts
@@ -5497,10 +5848,14 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       [...unique.values()].map((contact) => ({ ...contact, displayName: storedNames.get(contact.sourceJid) ?? contact.displayName ?? null }))
     );
 
-    // Identity late-resolution: any identity that just gained a genuine name is
-    // routed through the one repair entry point (search text + brain prose), so
-    // saving a contact retroactively improves old episodes with no model call.
-    const transitioned = [...this.genuinelyNamedJids(batchJids)].filter((jid) => !namedBefore.has(jid));
+    // Identity late-resolution: any identity whose genuine resolution changed —
+    // gained a name (unnamed→named) or was renamed to a DIFFERENT genuine name
+    // — routes through the one repair entry point (search text + brain prose),
+    // so contact saves and renames retroactively improve old messages and
+    // episodes with no model call. Restated names change nothing and fire
+    // nothing (bulk-import safe).
+    const labelsAfter = this.genuinelyNamedLabels(batchJids);
+    const transitioned = [...labelsAfter].filter(([jid, name]) => labelsBefore.get(jid) !== name).map(([jid]) => jid);
     if (transitioned.length > 0) {
       await this.repairIdentityResolution(transitioned);
     }
@@ -5742,24 +6097,16 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       ...new Set(canonical.map((message) => message.senderSourceJid).filter((jid): jid is string => Boolean(jid)))
     ]);
     // Derived search text for the insert path, computed from the incoming
-    // values; conflict-merged rows are recomputed from final state below.
+    // values; conflict-merged rows are recomputed from final state below —
+    // that same in-transaction recompute also fills resolved_sender and
+    // resolved_context, so the insert only carries the content stratum.
     const incomingMentionLabels = this.resolveMentionLabels(canonical.flatMap((message) => [message.body ?? null, message.caption ?? null]));
-    const incomingSenderLabels = this.resolveContactLabels(
-      canonical.map((message) => message.senderSourceJid).filter((jid): jid is string => Boolean(jid))
-    );
-    const ownerName = this.readOwnerNameSync();
     const rows = canonical
       .map((message) => {
         const chatId = chatIds.get(message.chatSourceId);
         if (!chatId) {
           return null;
         }
-        const senderLabel =
-          message.senderSourceJid === "me" || message.fromMe
-            ? ownerName
-            : message.senderSourceJid
-              ? incomingSenderLabels.get(message.senderSourceJid) ?? displayPhoneFromJid(message.senderSourceJid)
-              : null;
         return {
           sourceMessageKey: message.sourceMessageKey,
           sourceMessageId: message.sourceMessageId,
@@ -5784,13 +6131,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
           isForwarded: Number(message.isForwarded),
           isStarred: Number(message.isStarred),
           rawMetadata: stringifyJson(message.rawMetadata ?? null),
-          resolvedText: composeResolvedText(
-            message.body ?? null,
-            message.caption ?? null,
-            message.mediaName ?? null,
-            senderLabel,
-            incomingMentionLabels
-          ),
+          resolvedText: composeResolvedText(message.body ?? null, message.caption ?? null, message.mediaName ?? null, incomingMentionLabels),
           mentionedJids: [
             ...new Set((message.mentionedJids ?? []).map((jid) => this.canonicalJid(jid)).filter((jid): jid is string => Boolean(jid)))
           ],
@@ -5965,12 +6306,71 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         }
       }
       this.syncMessageDerivedState([...idsByKey.values()], explicitMentionsById);
+      // Convergence for late-arriving quoted originals (retrieval-hardening):
+      // replies indexed while one of these messages was absent carry its
+      // snapshot text in resolved_context; re-derive them now so the
+      // duplicate context converges away (and tombstoned originals re-orphan).
+      const replyIds = this.findReplyIdsQuotingMessages(
+        canonical.map((message) => ({ chatSourceId: message.chatSourceId, sourceMessageId: message.sourceMessageId })),
+        new Set(idsByKey.values())
+      );
+      if (replyIds.length > 0) {
+        this.syncMessageDerivedState(replyIds);
+      }
     });
     transaction();
     if (enrichedQuoteKeys.length > 0) {
       await this.markStaleEpisodesForQuotedReplies(enrichedQuoteKeys);
     }
     return rows.length;
+  }
+
+  // Replies (anywhere in the archive) whose quoted snapshot points at one of
+  // the given messages. Scoping mirrors the orphan probe: an explicit
+  // quoted_source_chat_id must equal the message's chat; a snapshot without
+  // one is same-chat by construction, so the reply's own chat must match.
+  private findReplyIdsQuotingMessages(
+    messages: Array<{ chatSourceId: string; sourceMessageId: string | null | undefined }>,
+    excludeIds: Set<number>
+  ): number[] {
+    const wanted = new Map<string, Set<string>>();
+    for (const message of messages) {
+      const sourceId = message.sourceMessageId?.trim();
+      if (!sourceId) {
+        continue;
+      }
+      const chats = wanted.get(sourceId) ?? new Set<string>();
+      chats.add(message.chatSourceId);
+      wanted.set(sourceId, chats);
+    }
+    if (wanted.size === 0) {
+      return [];
+    }
+    const replyIds = new Set<number>();
+    const sourceIds = [...wanted.keys()];
+    for (let index = 0; index < sourceIds.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = sourceIds.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      const rows = this.db
+        .prepare(
+          `SELECT m.id, q.quoted_source_message_id AS source_id, q.quoted_source_chat_id AS quoted_chat, ch.source_chat_id AS reply_chat
+           FROM message_quoted_snapshots q
+           JOIN messages m ON m.source_message_key = q.reply_message_key
+           JOIN chats ch ON ch.id = m.chat_id
+           WHERE q.quoted_source_message_id IN (${batch.map(() => "?").join(",")})`
+        )
+        .all(...batch) as Array<{ id: number; source_id: string; quoted_chat: string | null; reply_chat: string }>;
+      for (const row of rows) {
+        const chats = wanted.get(row.source_id);
+        if (!chats) {
+          continue;
+        }
+        const sourceChat = row.quoted_chat ?? row.reply_chat;
+        if (chats.has(sourceChat) && !excludeIds.has(Number(row.id))) {
+          replyIds.add(Number(row.id));
+        }
+      }
+    }
+    return [...replyIds];
   }
 
   async upsertArchiveSignals(batch: ArchiveSignalBatch): Promise<{ changedMessageKeys: string[]; skippedUnanchoredRecords: number }> {
@@ -7343,6 +7743,20 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     });
     transaction();
     if (changedMessageKeys.size > 0) {
+      // Preview text feeds the low-weight context FTS column; previews can
+      // arrive after their message was indexed, so re-derive those rows now.
+      const keys = [...changedMessageKeys];
+      const ids: number[] = [];
+      for (let index = 0; index < keys.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+        const batch = keys.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+        const rows = this.db
+          .prepare(`SELECT id FROM messages WHERE source_message_key IN (${batch.map(() => "?").join(",")})`)
+          .all(...batch) as Array<{ id: number }>;
+        ids.push(...rows.map((row) => Number(row.id)));
+      }
+      if (ids.length > 0) {
+        this.db.transaction(() => this.syncMessageDerivedState(ids))();
+      }
       await this.markStaleEpisodesForMessages([...changedMessageKeys]);
     }
     return recorded;
@@ -8769,7 +9183,11 @@ function migrateAdditiveColumns(db: Database.Database): void {
     // Eval harness: the model a fallback episode *attempted* — the truthful
     // join for per-model fallback rates (the fallback commit nulls `model`).
     { table: "brain_episodes", column: "attempted_model", ddl: "ALTER TABLE brain_episodes ADD COLUMN attempted_model TEXT NULL" },
-    { table: "message_mentions", column: "source_mask", ddl: "ALTER TABLE message_mentions ADD COLUMN source_mask INTEGER NOT NULL DEFAULT 0" }
+    { table: "message_mentions", column: "source_mask", ddl: "ALTER TABLE message_mentions ADD COLUMN source_mask INTEGER NOT NULL DEFAULT 0" },
+    // retrieval-hardening: sender label split out of resolved_text, plus the
+    // low-weight context stratum (orphaned quote snapshots, link previews).
+    { table: "messages", column: "resolved_sender", ddl: "ALTER TABLE messages ADD COLUMN resolved_sender TEXT NULL" },
+    { table: "messages", column: "resolved_context", ddl: "ALTER TABLE messages ADD COLUMN resolved_context TEXT NULL" }
   ];
   for (const addition of additions) {
     const columns = db.prepare(`SELECT name FROM pragma_table_info(?)`).all(addition.table) as Array<{ name: string }>;
@@ -8949,7 +9367,11 @@ function ensureSearchSchema(db: Database.Database): void {
     .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts'`)
     .get() as { sql: string } | undefined;
   const legacyExternalContent = Boolean(existingFts?.sql && existingFts.sql.includes("content="));
-  if (legacyExternalContent) {
+  // Structural column-set migration (retrieval-hardening): an index without
+  // the sender/context columns predates the 5-column design. The trigger DDL
+  // changed with it, so triggers are recreated alongside the table.
+  const legacyColumnSet = Boolean(existingFts?.sql && !legacyExternalContent && !existingFts.sql.includes("sender"));
+  if (legacyExternalContent || legacyColumnSet) {
     db.exec(
       `DROP TRIGGER IF EXISTS messages_fts_ai;
        DROP TRIGGER IF EXISTS messages_fts_ad;
@@ -8959,13 +9381,29 @@ function ensureSearchSchema(db: Database.Database): void {
   }
   db.exec(searchSchemaStatements.join(";\n"));
   const stamped = db.prepare(`SELECT value FROM schema_meta WHERE key = 'fts_state'`).get() as { value: string } | undefined;
-  if (!stamped || legacyExternalContent) {
+  if (!stamped || legacyExternalContent || legacyColumnSet) {
     const messageCount = (db.prepare(`SELECT COUNT(*) AS count FROM messages`).get() as { count: number }).count;
     db.prepare(
       `INSERT INTO schema_meta (key, value, updated_at) VALUES ('fts_state', ?, ?)
        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
     ).run(messageCount > 0 ? "needs_rebuild" : "ready", new Date().toISOString());
   }
+  seedTermAliases(db);
+}
+
+// Idempotent alias seeding: INSERT OR IGNORE never overwrites rows learned or
+// tuned later (same primary key), so re-boots are free and the seed acts as a
+// floor, not an owner, of the alias table.
+function seedTermAliases(db: Database.Database): void {
+  const insert = db.prepare(
+    `INSERT OR IGNORE INTO brain_term_aliases (term, variant, source, weight) VALUES (?, ?, 'seed', 1.0)`
+  );
+  const apply = db.transaction(() => {
+    for (const row of termAliasSeedRows()) {
+      insert.run(normalizeTerm(row.term), normalizeTerm(row.variant));
+    }
+  });
+  apply();
 }
 
 // SQLite cannot alter CHECK constraints in place; rebuild live_sessions when an
@@ -9343,10 +9781,12 @@ function emptyStatus(initialized: boolean, error?: string): StatusSummary {
   };
 }
 
-// Search tuning: candidate pool reranked in JS (BM25 × recency decay) and the
-// reindex chunk size (rows recomputed per transaction between event-loop
-// yields).
+// Search tuning: dual candidate pool reranked in JS (BM25 × recency decay,
+// plus the additive mention boost) and the reindex chunk size (rows recomputed
+// per transaction between event-loop yields).
 const SEARCH_CANDIDATE_POOL = 240;
+const SEARCH_RECENCY_POOL = 120;
+const SEARCH_MENTION_BOOST = 1.0;
 const SEARCH_REINDEX_CHUNK = 2000;
 
 interface SqliteSearchRow {
@@ -9362,6 +9802,10 @@ interface SqliteSearchRow {
   is_deleted: number;
   has_media: number;
   body: string | null;
+  caption: string | null;
+  resolved_text: string | null;
+  resolved_sender: string | null;
+  resolved_context: string | null;
   chat_source_id: string;
   chat_display_name: string | null;
   chat_type: string;
@@ -9370,36 +9814,15 @@ interface SqliteSearchRow {
   snip_resolved: string | null;
   snip_body: string | null;
   snip_caption: string | null;
-}
-
-// User text → FTS5 MATCH expression. Every token becomes a quoted phrase so
-// FTS operators in user input are inert; the final unquoted token gets prefix
-// matching so search-as-you-type works. Returns null for queries with no
-// searchable tokens.
-function buildFtsMatchQuery(raw: string): string | null {
-  const tokens = raw.match(/"[^"]*"|\S+/g) ?? [];
-  const parts: string[] = [];
-  tokens.forEach((token, index) => {
-    let phrase = token;
-    let quoted = false;
-    if (phrase.length >= 2 && phrase.startsWith('"') && phrase.endsWith('"')) {
-      quoted = true;
-      phrase = phrase.slice(1, -1);
-    }
-    const cleaned = phrase.replace(/"/g, " ").trim();
-    if (!cleaned) {
-      return;
-    }
-    const prefix = !quoted && index === tokens.length - 1 && /[\p{L}\p{N}]{2,}$/u.test(cleaned);
-    parts.push(`"${cleaned}"${prefix ? "*" : ""}`);
-  });
-  return parts.length > 0 ? parts.join(" ") : null;
+  snip_context: string | null;
 }
 
 // Prefer the snippet closest to what the user sees (body, then caption), then
-// the resolved-text snippet (which may have matched a name or file name).
+// the resolved-text snippet (which may have matched a name or file name),
+// then the context snippet (quoted-orphan or link-preview text). Sender-only
+// matches fall through to a plain body excerpt — no fabricated highlight.
 function pickSnippet(row: SqliteSearchRow): string {
-  for (const candidate of [row.snip_body, row.snip_caption, row.snip_resolved]) {
+  for (const candidate of [row.snip_body, row.snip_caption, row.snip_resolved, row.snip_context]) {
     if (candidate && candidate.includes(SEARCH_HIGHLIGHT_START)) {
       return candidate;
     }
@@ -9408,13 +9831,13 @@ function pickSnippet(row: SqliteSearchRow): string {
 }
 
 // Derived search text for one message: resolved body/caption (mentions as
-// names), media file name, and the sender label. Content-less rows stay null
-// so system noise never matches person-name queries.
+// names) and the media file name. Content-less rows stay null so system noise
+// never matches content queries. The sender label lives in resolved_sender
+// (its own low-weight FTS column, retrieval-hardening) — not co-mingled here.
 function composeResolvedText(
   body: string | null,
   caption: string | null,
   mediaName: string | null,
-  senderLabel: string | null,
   mentionLabels: Map<string, string>
 ): string | null {
   const parts: string[] = [];
@@ -9429,13 +9852,34 @@ function composeResolvedText(
   if (mediaName?.trim()) {
     parts.push(mediaName.trim());
   }
-  if (parts.length === 0) {
-    return null;
+  return parts.length > 0 ? parts.join("\n") : null;
+}
+
+// Secondary searchable text (the low-weight `context` FTS column): link
+// preview title/description/URL (content that exists nowhere else), and a
+// reply's quoted-snapshot text ONLY when the original is absent from the
+// archive — in-chat quotes of live originals would double-hit otherwise.
+function composeResolvedContext(
+  orphanQuote: { body: string | null; caption: string | null } | null,
+  preview: { title: string | null; description: string | null; canonicalUrl: string | null } | null
+): string | null {
+  const parts: string[] = [];
+  if (orphanQuote?.body?.trim()) {
+    parts.push(orphanQuote.body.trim());
   }
-  if (senderLabel?.trim()) {
-    parts.push(senderLabel.trim());
+  if (orphanQuote?.caption?.trim()) {
+    parts.push(orphanQuote.caption.trim());
   }
-  return parts.join("\n");
+  if (preview?.title?.trim()) {
+    parts.push(preview.title.trim());
+  }
+  if (preview?.description?.trim()) {
+    parts.push(preview.description.trim());
+  }
+  if (preview?.canonicalUrl?.trim()) {
+    parts.push(preview.canonicalUrl.trim());
+  }
+  return parts.length > 0 ? parts.join("\n") : null;
 }
 
 // A "visible exchange" is a message a user would recognize as conversation:
