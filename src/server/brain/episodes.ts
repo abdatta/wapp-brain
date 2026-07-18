@@ -36,7 +36,9 @@ import { generateStructured, getBrainProviderStatus, type BrainTokenUsage } from
 // Do NOT bump for provider/model choice (the `model` column records that) or
 // topic-vocabulary offers (non-stamping input). `extraction_version <
 // EXTRACTION_VERSION` is the staleness predicate `brain regenerate` selects on.
-export const EXTRACTION_VERSION = 4;
+// v5: owner self-identities — configured self numbers render with the owner
+// label (absolute precedence over saved names), changing evidence rendering.
+export const EXTRACTION_VERSION = 5;
 
 const SILENCE_GAP_MS = 90 * 60_000;
 const MIN_SEGMENT_FOR_SPLIT = 10;
@@ -62,6 +64,14 @@ function isEvidenceMessage(message: MemoryEvidenceMessage): boolean {
 // never surface that as a person's name).
 function isSelfMessage(message: MemoryEvidenceMessage): boolean {
   return message.direction === "outgoing" || message.senderSourceJid === "me";
+}
+
+const EMPTY_SELF_JIDS: ReadonlySet<string> = new Set();
+
+// Owner self-identities as a canonical-JID set, fetched once per pack build or
+// generation (the labeler is pure; callers supply the set).
+export async function ownerSelfJidSet(repository: ArchiveRepository): Promise<Set<string>> {
+  return new Set((await repository.getArchiveOwnerSelfIdentities()).map((identity) => identity.jid));
 }
 
 // Deterministic short hash for JID-based fallback labels (no crypto needed —
@@ -180,9 +190,17 @@ export interface PackLabeler {
 // identities that resolve to the SAME label are disambiguated with a
 // deterministic number-derived suffix (extended until unique); a participant
 // sharing the owner's short name is suffixed too (the owner keeps "(me)").
-export function buildPackLabeler(messages: MemoryEvidenceMessage[], ownerName: string): PackLabeler {
+export function buildPackLabeler(
+  messages: MemoryEvidenceMessage[],
+  ownerName: string,
+  selfJids: ReadonlySet<string> = EMPTY_SELF_JIDS
+): PackLabeler {
   const ownerProseName = shortOwnerName(ownerName);
   const ownerLabel = `${ownerProseName} (me)`;
+  // Owner self-identities (brain-run-console): a configured self JID is the
+  // owner with ABSOLUTE precedence — the check runs before any display-name
+  // lookup, so a saved contact name can never win.
+  const isSelfJid = (jid: string | null | undefined): boolean => Boolean(jid && (jid === "me" || selfJids.has(jid)));
   // Distinct non-self sender identities and their base labels.
   const baseByJid = new Map<string, ParticipantBase>();
   const digitsByJid = new Map<string, string>();
@@ -203,11 +221,16 @@ export function buildPackLabeler(messages: MemoryEvidenceMessage[], ownerName: s
     digitsByJid.set(jid, (jid.split("@")[0]?.split(":")[0] ?? "").replace(/\D/g, ""));
   };
   for (const message of messages) {
-    addParticipant(message.senderSourceJid, message.senderDisplayName, message.senderNameIsPushName, isSelfMessage(message));
+    addParticipant(
+      message.senderSourceJid,
+      message.senderDisplayName,
+      message.senderNameIsPushName,
+      isSelfMessage(message) || isSelfJid(message.senderSourceJid)
+    );
     for (const mentionedJid of message.structuredSignals?.mentionedJids ?? []) {
       // Structured mention JIDs belong to the owning message's evidence; they
       // participate in pack-local labelling but never cause a global lookup.
-      addParticipant(mentionedJid, null, false, mentionedJid === "me");
+      addParticipant(mentionedJid, null, false, isSelfJid(mentionedJid));
     }
     const quote = message.quotedSnapshot;
     if (quote) {
@@ -215,7 +238,7 @@ export function buildPackLabeler(messages: MemoryEvidenceMessage[], ownerName: s
         quote.quotedSenderSourceJid,
         quote.quotedSenderDisplayName,
         quote.quotedSenderNameIsPushName,
-        quote.quotedFromMe === true || quote.quotedSenderSourceJid === "me"
+        quote.quotedFromMe === true || isSelfJid(quote.quotedSenderSourceJid)
       );
     }
   }
@@ -268,7 +291,7 @@ export function buildPackLabeler(messages: MemoryEvidenceMessage[], ownerName: s
   }
   return {
     sender: (message) => {
-      if (isSelfMessage(message)) {
+      if (isSelfMessage(message) || isSelfJid(message.senderSourceJid)) {
         return ownerLabel;
       }
       const jid = message.senderSourceJid;
@@ -277,12 +300,12 @@ export function buildPackLabeler(messages: MemoryEvidenceMessage[], ownerName: s
     quotedSender: (message) => {
       const quote = message.quotedSnapshot;
       if (!quote) return "someone";
-      if (quote.quotedFromMe || quote.quotedSenderSourceJid === "me") return ownerLabel;
+      if (quote.quotedFromMe || isSelfJid(quote.quotedSenderSourceJid)) return ownerLabel;
       const jid = quote.quotedSenderSourceJid;
       return (jid && labelByJid.get(jid)) || baseParticipant(jid, quote.quotedSenderDisplayName, quote.quotedSenderNameIsPushName).label;
     },
     reactor: (reaction) => {
-      if (reaction.reactorJid === "me") {
+      if (isSelfJid(reaction.reactorJid)) {
         return ownerProseName;
       }
       return (
@@ -291,7 +314,7 @@ export function buildPackLabeler(messages: MemoryEvidenceMessage[], ownerName: s
       );
     },
     identity: (jid) => {
-      if (jid === "me") return ownerLabel;
+      if (isSelfJid(jid)) return ownerLabel;
       return labelByJid.get(jid) ?? baseParticipant(jid, null, false).label;
     },
     ownerLabel,
@@ -369,8 +392,9 @@ export async function buildEvidencePacks(
     }
   }
   const ownerName = (await repository.getArchiveOwnerName()) ?? "the archive owner";
+  const selfJids = await ownerSelfJidSet(repository);
   return merged.map((messages) => {
-    const labeler = buildPackLabeler(messages, ownerName);
+    const labeler = buildPackLabeler(messages, ownerName, selfJids);
     return {
       chatSourceId: options.chatSourceId,
       chatDisplayName: messages[0]?.chatDisplayName ?? null,
@@ -540,8 +564,12 @@ function quotedSnapshotContext(snapshot: NonNullable<MemoryEvidenceMessage["quot
 
 // Testable deterministic surface used by both the model prompt and extractive
 // generation. No caller receives thumbnail bytes or raw vCard text here.
-export function renderEvidenceLines(pack: BrainEvidencePack, ownerName = "the archive owner"): string[] {
-  const labeler = buildPackLabeler(pack.messages, ownerName);
+export function renderEvidenceLines(
+  pack: BrainEvidencePack,
+  ownerName = "the archive owner",
+  selfJids: ReadonlySet<string> = EMPTY_SELF_JIDS
+): string[] {
+  const labeler = buildPackLabeler(pack.messages, ownerName, selfJids);
   return packPromptLines(pack, labeler, new Map()).lines;
 }
 
@@ -1179,7 +1207,7 @@ export async function generateEpisodeForPack(
   }
 ): Promise<EpisodeGenerationResult> {
   const ownerName = (await repository.getArchiveOwnerName()) ?? "the archive owner";
-  const labeler = buildPackLabeler(pack.messages, ownerName);
+  const labeler = buildPackLabeler(pack.messages, ownerName, await ownerSelfJidSet(repository));
   const stamps = computePackStamps(pack, labeler);
   const claimCap = claimCapForPack(pack.messages.length);
   let validated: ValidatedEpisode | null = null;

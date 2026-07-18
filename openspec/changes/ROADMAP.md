@@ -19,7 +19,7 @@
 | ✅ | 6 | `people-management-ui` | Sonnet | **archived 2026-07-16** | #4, #5, #19 | ranked hygiene queue; dismissed pair stays dismissed |
 | ✅ | 7 | `brain-eval-harness` | Opus | **archived 2026-07-17** | #3 | recall table + per-model precision/fallback tables on the real archive |
 | ✅ | 8 | `retrieval-hardening` | Opus | **archived 2026-07-18** | — (#7 soft, to measure delta; #4 shipped the shared rename hook — only the rename-trigger gap remains) | typo'd query returns labelled relaxed results; "nhi" finds "nahi"; renamed contact searchable |
-|  | 9 | `knowledge-graph-foundation` | Opus | seeded | #3, #5 | nodes/edges from claim entities; open commitment survives salience recompute |
+| ✅ | 9 | `knowledge-graph-foundation` | Opus | **archived 2026-07-18** | #3, #5 | nodes/edges from claim entities; open commitment survives salience recompute |
 |  | 10 | `commitment-lifecycle` | **Fable** | seeded | #2, #3, #9 | promise → reaction-acknowledged → cited closure; overdue flagged |
 |  | 11 | `semantic-rollups` | **Fable** | seeded | #9, #10 (adjacent) | coherent cited entity pages; undeclared claim-drop refused; mechanical rollback |
 |  | 12 | `brain-retrieval-pipeline` | **Fable** | seeded | #8, #9, #11, #19 (query-panel UI) | zero-keyword paraphrase recovered in deep mode; coverage verdict + gap sentences; one-call week summary |

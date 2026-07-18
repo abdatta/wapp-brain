@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "server",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["tsx", "src/server/server.ts"],
+      "port": 3600
+    },
+    {
+      "name": "client",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev:client"],
+      "port": 5900
+    }
+  ]
+}

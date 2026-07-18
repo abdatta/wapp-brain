@@ -583,8 +583,6 @@ h1 {
 
 .miniButton {
   flex: 0 0 auto;
-  width: 30px;
-  height: 30px;
   border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: 8px;
   background: #242931;
@@ -3925,6 +3923,378 @@ button.fileButton:disabled {
 
 .personSuggestion.dismissed {
   opacity: 0.75;
+}
+
+/* ------------------------------------------------------------------ *
+ * Brain run console (brain-run-console): the panel's summary row and the
+ * configuration modal — identity, mode, provider, budgets — with the
+ * disabled-with-reason validation treatment.
+ * ------------------------------------------------------------------ */
+
+.brainConsoleRow {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: 12px 0 4px;
+}
+
+/* Reset is a destructive archive-level control: on the panel row, pushed away
+ * from the primary action, never inside the run dialog. */
+.brainResetButton {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+/* Loading values: real numbers or a shimmer — never a placeholder 0 that
+ * reads as data. */
+.metricSkeleton {
+  display: inline-block;
+  width: 64px;
+  height: 20px;
+  border-radius: 6px;
+  background: linear-gradient(90deg, #171b20, #222830, #171b20);
+  background-size: 220% 100%;
+  animation: shimmer 1.2s linear infinite;
+}
+
+.lineSkeleton {
+  width: 220px;
+  height: 13px;
+}
+
+.lineSkeleton.short {
+  width: 140px;
+}
+
+.brainConsoleRow .primaryButton {
+  flex-shrink: 0;
+}
+
+.runConsoleModal {
+  width: min(680px, 100%);
+  max-height: min(860px, 94vh);
+  overflow: auto;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  background:
+    linear-gradient(150deg, rgba(42, 69, 66, 0.55), rgba(20, 23, 29, 0.94) 38%),
+    #12161b;
+  box-shadow: 0 34px 90px rgba(0, 0, 0, 0.46);
+}
+
+.runConsoleHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px 20px 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  position: sticky;
+  top: 0;
+  background: rgba(18, 22, 27, 0.94);
+  backdrop-filter: blur(8px);
+  z-index: 1;
+}
+
+.runConsoleHeader h2 {
+  margin: 0;
+  font-size: 19px;
+}
+
+.runConsoleHeader p {
+  margin: 4px 0 0;
+  font-size: 12.5px;
+  color: #93a29d;
+}
+
+.runConsoleSection {
+  padding: 16px 20px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.runConsoleSection h3 {
+  margin: 0 0 10px;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #7ea89b;
+}
+
+.runConsoleField {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 12px;
+  color: #aab5b1;
+  min-width: 0;
+}
+
+.runConsoleField > span {
+  font-weight: 600;
+}
+
+.runConsoleField input,
+.runConsoleField select {
+  background: #1a2225;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 7px;
+  color: #edf4f1;
+  font-size: 13px;
+  padding: 8px 10px;
+  transition: border-color 120ms ease;
+}
+
+.runConsoleField input:focus,
+.runConsoleField select:focus {
+  outline: none;
+  border-color: rgba(126, 168, 155, 0.65);
+}
+
+.runConsoleField input:disabled,
+.runConsoleField select:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.fieldDisabled > span {
+  opacity: 0.55;
+}
+
+.requiredMark {
+  color: #e6a4a4;
+  font-style: normal;
+}
+
+.fieldError {
+  color: #e6a4a4;
+  font-size: 11.5px;
+}
+
+.fieldNote {
+  color: #8a968f;
+  font-size: 11.5px;
+}
+
+.runConsoleGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+  align-items: start;
+}
+
+.probeButton {
+  align-self: end;
+  height: 34px;
+}
+
+.runModeRow {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.runModeRow label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 13px;
+  color: #dbe6e1;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.runModeRow label input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.runModeRow label small {
+  color: #8a968f;
+  font-size: 11.5px;
+}
+
+.runModeRow .runModeActive {
+  border-color: rgba(126, 168, 155, 0.75);
+  background: rgba(126, 168, 155, 0.12);
+}
+
+.runModeRow .runModeDisabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.selfChips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.selfChips:empty {
+  display: none;
+}
+
+.selfChip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(126, 168, 155, 0.45);
+  background: rgba(126, 168, 155, 0.12);
+  font-size: 12px;
+  color: #dbe6e1;
+}
+
+.selfChipWarn {
+  border-color: rgba(230, 190, 120, 0.55);
+  background: rgba(230, 190, 120, 0.1);
+}
+
+.selfChipNote {
+  color: #e0c084;
+  font-size: 11px;
+}
+
+.selfChipCount {
+  color: #8a968f;
+  font-size: 11px;
+}
+
+.selfChip button {
+  display: inline-flex;
+  align-items: center;
+  border: none;
+  background: none;
+  color: #aab5b1;
+  cursor: pointer;
+  padding: 0;
+}
+
+.selfChip button:hover {
+  color: #e6a4a4;
+}
+
+.selfSuggestWrap {
+  position: relative;
+}
+
+.selfSuggestWrap input {
+  width: 100%;
+  background: #1a2225;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 7px;
+  color: #edf4f1;
+  font-size: 13px;
+  padding: 8px 10px;
+}
+
+.selfSuggestList {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 5;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  background: #161c21;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.5);
+  max-height: 240px;
+  overflow: auto;
+}
+
+.selfSuggestList button {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 10px;
+  align-items: baseline;
+  width: 100%;
+  text-align: left;
+  border: none;
+  background: none;
+  color: #dbe6e1;
+  font-size: 12.5px;
+  padding: 7px 9px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.selfSuggestList button:hover:not(:disabled) {
+  background: rgba(126, 168, 155, 0.14);
+}
+
+.selfSuggestList button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.selfSuggestName {
+  color: #e0c084;
+}
+
+.selfSuggestMuted {
+  color: #8a968f;
+}
+
+.selfSuggestMeta {
+  color: #7f8b86;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.runConsoleFooter {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 14px 20px;
+  position: sticky;
+  bottom: 0;
+  background: rgba(18, 22, 27, 0.95);
+  backdrop-filter: blur(8px);
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.runConsoleFooterReason {
+  font-size: 12px;
+  color: #e0c084;
+  min-height: 1em;
+}
+
+.runConsoleFooterActions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.dangerZone {
+  padding: 10px 20px 16px;
+}
+
+.dangerZone summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: #b08b8b;
+}
+
+.dangerZoneRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 10px;
+  font-size: 12px;
+  color: #aab5b1;
 }
 
 /* Lightweight custom tooltip for explainer chips (hover or keyboard focus). */

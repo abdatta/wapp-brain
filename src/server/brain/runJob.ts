@@ -21,6 +21,7 @@ const progress: BrainRunProgress = {
   processedChats: 0,
   totalChats: 0,
   currentChat: null,
+  tokensUsed: 0,
   episodesCommitted: 0,
   extractiveEpisodes: 0,
   claimsCommitted: 0,
@@ -62,6 +63,10 @@ export interface BrainRunRequest {
   // extraction version, enqueue durable 'regenerate' tasks, and drain those.
   // Model mode only — regenerating a model episode extractively would downgrade it.
   regenerate?: boolean;
+  // Per-run token budget (assimilation runs): once accumulated input+output
+  // tokens reach this, no further model call is made and the run ends as a
+  // NAMED budget_exceeded — the token sibling of maxModelCalls.
+  maxTokens?: number | null;
 }
 
 export function startBrainRun(
@@ -102,6 +107,7 @@ export function startBrainRun(
   progress.processedChats = 0;
   progress.totalChats = 0;
   progress.currentChat = null;
+  progress.tokensUsed = 0;
   progress.episodesCommitted = 0;
   progress.extractiveEpisodes = 0;
   progress.claimsCommitted = 0;
@@ -110,7 +116,23 @@ export function startBrainRun(
   progress.finishedAt = null;
   progress.error = null;
   void executeRun(repository, request, beforeAssimilation)
-    .then((outcome) => {
+    .then(async (outcome) => {
+      // Graph maintenance after every terminal run that committed episodes:
+      // idempotent signal sync (so a post-reset graph regains its membership/
+      // vCard/number-change edges without waiting for a manual rebuild), then
+      // the salience recompute. Pure SQL, no model calls, and a failure here
+      // never masks the run's own outcome (it logs and moves on).
+      if (progress.episodesCommitted > 0) {
+        try {
+          const sync = await repository.syncBrainGraphSignals();
+          const recompute = await repository.recomputeBrainGraphSalience();
+          console.log(
+            `[brain] graph maintained after run: +${sync.participationEdges + sync.vcardMentionEdges} signal edge(s); salience over ${recompute.nodes} node(s), ${recompute.dormant} newly dormant, ${recompute.revived} revived`
+          );
+        } catch (error) {
+          console.warn(`[brain] post-run graph maintenance failed: ${publicErrorMessage(error)}`);
+        }
+      }
       progress.state = outcome;
       progress.finishedAt = new Date().toISOString();
       console.log(
@@ -151,6 +173,8 @@ async function executeRun(
       : await repository.getBrainChatBacklog({ limit: request.maxChats ?? 10 });
     progress.totalChats = backlog.length;
     let budgetExhausted = false;
+    // Which budget stopped the run — the stop is always NAMED, never generic.
+    let budgetStopMessage = "Model-call budget for this run was reached; remaining backlog stays pending.";
     let cancelled = false;
     // Chats that actually produced an episode vs. windows merely visited — the
     // honest chat count, so "12 chats for 3 episodes" can't happen.
@@ -177,6 +201,13 @@ async function executeRun(
             budgetExhausted = true;
             break;
           }
+          // Token budget: checked BEFORE the next call so the stop is
+          // conservative — the budget is a ceiling, not a target.
+          if (request.maxTokens != null && request.maxTokens > 0 && progress.tokensUsed >= request.maxTokens) {
+            budgetExhausted = true;
+            budgetStopMessage = `Token budget for this run (${request.maxTokens.toLocaleString()} tokens) was reached; remaining backlog stays pending.`;
+            break;
+          }
         }
         const result = await generateEpisodeForPack(repository, pack, {
           generator: progress.mode,
@@ -191,6 +222,7 @@ async function executeRun(
         progress.claimsCommitted += result.episode.claims.length;
         if (result.usage) {
           progress.modelCalls += 1;
+          progress.tokensUsed += result.usage.inputTokens + result.usage.outputTokens;
           await repository.recordBrainLlmUsage({
             purpose: "episode",
             provider: `${progress.provider}/${progress.model ?? "default"}`,
@@ -217,6 +249,7 @@ async function executeRun(
       chats: chatsProduced,
       chatsVisited,
       modelCalls: progress.modelCalls,
+      tokens: progress.tokensUsed,
       // Chats still holding pending backlog that this run never attempted.
       skippedForBudget: budgetExhausted ? Math.max(0, backlog.length - chatsVisited) : 0
     };
@@ -230,12 +263,7 @@ async function executeRun(
       return "interrupted";
     }
     if (budgetExhausted) {
-      await repository.failBrainRun(
-        runId,
-        "budget_exceeded",
-        "Model-call budget for this run was reached; remaining backlog stays pending.",
-        totals
-      );
+      await repository.failBrainRun(runId, "budget_exceeded", budgetStopMessage, totals);
       return "budget_exceeded";
     }
     await repository.completeBrainRun(runId, totals);

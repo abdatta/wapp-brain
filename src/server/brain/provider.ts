@@ -158,6 +158,10 @@ export function getBrainProviderStatus(): BrainProviderStatus {
     model: modelBacked ? selectedModel(state, provider as Exclude<BrainProviderName, "extractive">) : null,
     reasoningEffort: provider === "codex" ? DEFAULT_CODEX_REASONING_EFFORT : null,
     models: BRAIN_PROVIDER_MODELS,
+    // Token-usage accuracy for budget surfaces: the claude CLI envelope carries
+    // a real usage object; codex falls back to character estimates when the
+    // stream surfaces none. Extractive makes no calls at all.
+    tokenUsage: !modelBacked ? "none" : provider === "claude-cli" ? "exact" : "may-estimate",
     health,
     message
   };

@@ -10,6 +10,12 @@ import type {
   BrainEpisodeRecord,
   BrainEvalRunRecord,
   BrainGradingSample,
+  BrainGraphEntityView,
+  BrainGraphRebuildResult,
+  BrainGraphRecomputeResult,
+  BrainGraphStats,
+  BrainGraphSyncResult,
+  BrainGraphUnresolvedEntity,
   BrainModelQualityAggregate,
   BrainLlmUsageSummary,
   BrainMediaGapImpact,
@@ -67,6 +73,8 @@ import type {
   MessageListItem,
   MessageRecord,
   MessageSecretRecord,
+  OwnerIdentitySuggestion,
+  OwnerSelfIdentity,
   ParticipantRecord,
   RetainedPayloadRecord,
   ChatListOptions,
@@ -289,6 +297,17 @@ export interface ArchiveRepository {
   // Archive owner identity: who "me" is in evidence, episodes, and search.
   getArchiveOwnerName(): Promise<string | null>;
   setArchiveOwnerName(displayName: string | null): Promise<void>;
+  // Additional self numbers (run console): canonical identity JIDs the evidence
+  // labeler treats as the owner with ABSOLUTE precedence over saved names.
+  getArchiveOwnerSelfIdentities(): Promise<OwnerSelfIdentity[]>;
+  // Replaces the stored list. Accepts digits or identity JIDs; normalizes,
+  // canonicalizes through identity links, dedupes; rejects non-phone-shaped
+  // input with a PublicError naming the offending value.
+  setArchiveOwnerSelfJids(inputs: string[]): Promise<OwnerSelfIdentity[]>;
+  // Plain substring autocomplete over archived identities (numbers and names,
+  // no inference) — every row carries the number's CURRENT resolved label so
+  // picking the wrong person is visible before saving.
+  listOwnerIdentitySuggestions(query: string, limit?: number): Promise<OwnerIdentitySuggestion[]>;
   // Startup sweep: a run left 'running' by a dead process becomes an honest
   // 'interrupted' (watermarks make interruption free; the row must not lie).
   reconcileBrainRuns(): Promise<number>;
@@ -379,6 +398,27 @@ export interface ArchiveRepository {
   // dedupe-keyed regeneration task per episode (one transaction). Returns the
   // number of episodes newly marked stale.
   markStaleEpisodesForMessages(sourceMessageKeys: string[]): Promise<number>;
+  // --- Knowledge graph (knowledge-graph-foundation) ---
+  // Derived-of-derived: nodes/edges rebuild from committed episodes + captured
+  // signals with zero model calls. Commit-time upserts live inside
+  // commitBrainEpisode's transaction; these are the maintenance jobs and reads.
+  // Idempotent chunked signal sync: membership periods → participates_in,
+  // resolved vCards → mentions, number-changes → alias evidence, engagement
+  // aggregates → bounded person salience factor.
+  syncBrainGraphSignals(): Promise<BrainGraphSyncResult>;
+  // Wipe graph tables and replay every current model episode + signal sync +
+  // salience recompute. Deterministic: converges to the incremental state.
+  rebuildBrainGraph(): Promise<BrainGraphRebuildResult>;
+  // Evidence-derived salience with kind-aware dormancy (open commitment/
+  // question nodes never go dormant; due-soon nodes boost). Pure SQL/TS math.
+  recomputeBrainGraphSalience(): Promise<BrainGraphRecomputeResult>;
+  getBrainGraphStats(): Promise<BrainGraphStats>;
+  // Entity view resolved by node id (redirect-following), canonical JID, or
+  // name — person-aggregated at read time through person_members.
+  getBrainGraphEntity(query: { nodeId?: string; jid?: string; name?: string }): Promise<BrainGraphEntityView | null>;
+  // Chat-scoped unresolved person entities ranked by salience — deterministic
+  // backpressure for the person layer's suggestion producers, never a join key.
+  listUnresolvedBrainGraphEntities(options?: { limit?: number }): Promise<BrainGraphUnresolvedEntity[]>;
   // --- Two-level person model: identities (canonical JIDs) stay immutable
   // anchors; persons are an editable membership. Connect/disconnect touch only
   // person-layer tables — never episodes, claims, citations, or archive rows.

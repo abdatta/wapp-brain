@@ -908,6 +908,10 @@ app.get("/api/brain/status", async (_req, res) => {
 // dryRun reports the queue size without spending anything.
 app.post("/api/brain/regenerate", async (req, res) => {
   try {
+    if (!req.body?.dryRun && !(await repository.getArchiveOwnerName())) {
+      res.status(400).json({ error: "Set your name first — episodes label your messages with it (Run console → Identity)." });
+      return;
+    }
     const { EXTRACTION_VERSION } = await import("./brain/episodes");
     const chatSourceId = typeof req.body?.chatSourceId === "string" ? req.body.chatSourceId : null;
     if (req.body?.dryRun) {
@@ -943,10 +947,17 @@ app.post("/api/brain/regenerate", async (req, res) => {
 });
 
 // Manual brain runs: start with an explicit generator/model, poll progress.
+// User-triggered runs REQUIRE an owner name (episodes label the user's own
+// messages with it); the automatic scheduler keeps its fallback and is exempt.
 app.post("/api/brain/runs", async (req, res) => {
   try {
+    if (!(await repository.getArchiveOwnerName())) {
+      res.status(400).json({ error: "Set your name first — episodes label your messages with it (Run console → Identity)." });
+      return;
+    }
     const { startBrainRun } = await import("./brain/runJob");
     const mode = req.body?.mode === "model" || req.body?.mode === "extractive" ? req.body.mode : "model";
+    const maxTokens = clampNumber(req.body?.maxTokens, 1000, 100_000_000, 0);
     const result = startBrainRun(
       repository,
       {
@@ -954,7 +965,9 @@ app.post("/api/brain/runs", async (req, res) => {
         model: typeof req.body?.model === "string" ? req.body.model : null,
         chatSourceId: typeof req.body?.chatSourceId === "string" ? req.body.chatSourceId : null,
         maxChats: clampNumber(req.body?.maxChats, 1, 5000, 10),
-        maxModelCalls: clampNumber(req.body?.maxModelCalls, 1, 1000, config.brain.maxCallsPerHour)
+        maxModelCalls: clampNumber(req.body?.maxModelCalls, 1, 1000, config.brain.maxCallsPerHour),
+        // 0 = no token budget (clampNumber's default when the field is absent).
+        maxTokens: mode === "model" && maxTokens > 0 ? maxTokens : null
       },
       () => {
         broadcastArchiveChanged({ source: "manual", chatSourceIds: [], messageCount: 0, contactCount: 0 });
@@ -1054,13 +1067,112 @@ app.post("/api/brain/reset", async (req, res) => {
   }
 });
 
+// --- Knowledge graph (knowledge-graph-foundation) ---
+// Read surfaces + the two deterministic maintenance jobs. Zero model calls on
+// every path here; rebuild/recompute are chunked and yield, so the server
+// stays responsive while they run.
+app.get("/api/brain/graph/stats", async (_req, res) => {
+  try {
+    res.json(await repository.getBrainGraphStats());
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+// Entity view: person-aggregated at read time through person membership, so a
+// connect/disconnect changes the NEXT read with zero graph writes.
+app.get("/api/brain/graph/entity", async (req, res) => {
+  try {
+    const nodeId = stringQuery(req.query.nodeId);
+    const jid = stringQuery(req.query.jid);
+    const name = stringQuery(req.query.name);
+    if (!nodeId && !jid && !name) {
+      res.status(400).json({ error: "Provide nodeId, jid, or name." });
+      return;
+    }
+    const view = await repository.getBrainGraphEntity({
+      nodeId: nodeId ?? undefined,
+      jid: jid ?? undefined,
+      name: name ?? undefined
+    });
+    if (!view) {
+      res.status(404).json({ error: "No graph node matches that query." });
+      return;
+    }
+    res.json(view);
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+// Chat-scoped unresolved person entities ranked by salience — deterministic
+// backpressure for the person layer, never a resolution join.
+app.get("/api/brain/graph/unresolved", async (req, res) => {
+  try {
+    res.json(await repository.listUnresolvedBrainGraphEntities({ limit: clampNumber(req.query.limit, 1, 200, 50) }));
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+// Wipe + deterministic replay over current model episodes + signal sync +
+// salience recompute. This is also how episodes committed before the graph
+// existed gain coverage — no model spend, no episode writes.
+app.post("/api/brain/graph/rebuild", async (_req, res) => {
+  try {
+    const { getBrainRunProgress } = await import("./brain/runJob");
+    if (getBrainRunProgress().state === "running") {
+      res.status(409).json({ error: "A brain run is in progress; wait for it to finish before rebuilding the graph." });
+      return;
+    }
+    const result = await repository.rebuildBrainGraph();
+    console.log(
+      `[brain] graph rebuilt: ${result.nodes} node(s), ${result.edges} edge(s), ${result.evidence} evidence row(s) from ${result.episodesReplayed} episode(s) in ${result.durationMs}ms`
+    );
+    res.json({ ok: true, ...result });
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+app.post("/api/brain/graph/recompute", async (_req, res) => {
+  try {
+    const result = await repository.recomputeBrainGraphSalience();
+    console.log(
+      `[brain] graph salience recomputed: ${result.nodes} node(s), ${result.dormant} newly dormant, ${result.revived} revived, ${result.exemptOpenLifecycle} open lifecycle exempt (${result.durationMs}ms)`
+    );
+    res.json({ ok: true, ...result });
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
 // Who "me" is: evidence, episodes, and new search indexing label the owner's
 // messages with this name. Historical search rows update on the next reindex.
+// `selfJids` (run console): additional numbers labelled as the owner with
+// absolute precedence — omitted = unchanged, [] = cleared.
 app.post("/api/brain/owner", async (req, res) => {
   try {
     const displayName = typeof req.body?.displayName === "string" ? req.body.displayName : null;
     await repository.setArchiveOwnerName(displayName);
-    res.json({ ok: true, ownerName: await repository.getArchiveOwnerName() });
+    let selfIdentities = await repository.getArchiveOwnerSelfIdentities();
+    if (Array.isArray(req.body?.selfJids)) {
+      const inputs = (req.body.selfJids as unknown[]).filter((entry): entry is string => typeof entry === "string");
+      selfIdentities = await repository.setArchiveOwnerSelfJids(inputs);
+    }
+    res.json({ ok: true, ownerName: await repository.getArchiveOwnerName(), selfIdentities });
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+// Self-number autocomplete (run console): plain substring matching over
+// archived identities — every row carries the number's CURRENT resolved name
+// so picking the wrong person is visible before saving. No inference.
+app.get("/api/brain/owner/identity-suggestions", async (req, res) => {
+  try {
+    const query = stringQuery(req.query.q) ?? "";
+    res.json(await repository.listOwnerIdentitySuggestions(query, clampNumber(req.query.limit, 1, 25, 12)));
   } catch (error) {
     res.status(400).json({ error: publicErrorMessage(error) });
   }

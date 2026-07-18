@@ -15,6 +15,18 @@ import type {
   BrainGradingCitation,
   BrainGradingSample,
   BrainGradingSampleClaim,
+  BrainGraphEdgeKind,
+  BrainGraphEdgeView,
+  BrainGraphEntityClaim,
+  BrainGraphEntityView,
+  BrainGraphNodeKind,
+  BrainGraphNodeRecord,
+  BrainGraphNodeStatus,
+  BrainGraphRebuildResult,
+  BrainGraphRecomputeResult,
+  BrainGraphStats,
+  BrainGraphSyncResult,
+  BrainGraphUnresolvedEntity,
   BrainModelQualityAggregate,
   BrainLlmUsageSummary,
   BrainMediaGapImpact,
@@ -79,6 +91,8 @@ import type {
   MessageListItem,
   MessageRecord,
   MessageSecretRecord,
+  OwnerIdentitySuggestion,
+  OwnerSelfIdentity,
   QuotedMessageSnapshot,
   QuotedMessageSnapshotSummary,
   ParticipantRecord,
@@ -116,7 +130,22 @@ import { applyMentionLabels, appliedMentionLabels, extractMentionDigits, mention
 import { mergeInteractionMetadata } from "./interactions";
 import { buildMessageEditTimeline, summarizeStructuredSignals, summarizeSystemEvents } from "./signalSummary";
 import { interpretMessage } from "../interpretation/messageInterpretation";
+import {
+  chatNaturalKey,
+  computeGraphSalience,
+  deriveEpisodeGraph,
+  engagementFactorFromAggregates,
+  graphDormancyThreshold,
+  personJidNaturalKey,
+  slugForGraphNode,
+  type EpisodeGraphContext,
+  type GraphEpisodeSource,
+  type GraphEvidenceSpec,
+  type GraphMutations,
+  type GraphNodeSpec
+} from "../brain/graph";
 import { isMaskedNumberLabel, normalizeJid, phoneFromJid, resolveDisplayLabel } from "../import/jid";
+import { normalizeOwnerSelfInput } from "../identity/ownerSelf";
 import { disambiguateLabels } from "../persons/disambiguate";
 import { personDisplayLabelFromMembers } from "../persons/label";
 import { getMemoryProviderStatus } from "../memory/provider";
@@ -166,6 +195,39 @@ function safeVcardFileName(candidate: string | null, cardIndex: number): string 
 function constructMinimalVcard(displayName: string, phone: string): string {
   const escape = (value: string) => value.replace(/\\/g, "\\\\").replace(/\n/g, "\\n").replace(/;/g, "\\;").replace(/,/g, "\\,");
   return `BEGIN:VCARD\r\nVERSION:3.0\r\nFN:${escape(displayName)}\r\nTEL;TYPE=CELL:+${phone}\r\nEND:VCARD\r\n`;
+}
+
+// In-memory knowledge-graph rows (mirror of the SQLite tables).
+interface MemGraphNode {
+  id: string;
+  kind: BrainGraphNodeKind;
+  naturalKey: string;
+  slug: string;
+  title: string | null;
+  jid: string | null;
+  chatScope: string | null;
+  payload: Record<string, unknown> | null;
+  status: BrainGraphNodeStatus;
+  mergedInto: string | null;
+  salience: number;
+  citationCount: number;
+  evidenceDays: number;
+  engagementFactor: number;
+  firstSeenAtMs: number | null;
+  lastSeenAtMs: number | null;
+}
+
+interface MemGraphEdge {
+  id: number;
+  srcNodeId: string;
+  dstNodeId: string;
+  kind: BrainGraphEdgeKind;
+  firstSeenAtMs: number | null;
+  lastSeenAtMs: number | null;
+  evidence: Map<
+    string,
+    { claimId: string | null; sourceMessageKey: string | null; sourceRef: string | null; observedAtMs: number | null }
+  >;
 }
 
 export class MemoryArchiveRepository implements ArchiveRepository {
@@ -225,6 +287,17 @@ export class MemoryArchiveRepository implements ArchiveRepository {
   // (lowercased key → first-seen canonical title), mirroring the SQLite tables.
   private brainIssues: BrainValidationIssueRecord[] = [];
   private brainTopics = new Map<string, string>();
+  // Knowledge graph (mirror): keyed exactly like the SQLite tables so the
+  // shared derivation in brain/graph.ts produces identical state.
+  private graphNodes = new Map<string, MemGraphNode>();
+  private graphNodeIdByKey = new Map<string, string>();
+  private graphSlugs = new Set<string>();
+  private graphEdges = new Map<string, MemGraphEdge>();
+  private graphEdgesById = new Map<number, MemGraphEdge>();
+  private graphEdgeSeq = 1;
+  private graphNodeClaims = new Map<string, Set<string>>();
+  private graphAliases = new Map<string, Map<string, { alias: string; source: string }>>();
+  private graphLastRecomputeAt: string | null = null;
   private editRevisions = new Map<string, MessageEditRevisionRecord[]>();
   private nextMediaQueueId = 1;
   private nextMediaAssetId = 1;
@@ -641,6 +714,10 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     // Person layer follows the canonical identity (memberships, suggestions,
     // suppressions, audit), unioning persons revealed to share an identity.
     this.rewritePersonLayerForMerge(lid, pn);
+
+    // Graph rekey mirror: person/chat nodes follow the canonical JID with a
+    // 'merged' redirect stub; chat-scoped natural keys rewrite.
+    this.memRekeyGraphForIdentityMerge(lid, pn);
 
     await this.refreshChatStats([pn]);
     // Deterministic brain-prose repair: substitute the merged identity's baked
@@ -3657,6 +3734,105 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     this.ownerDisplayName = displayName?.trim() || null;
   }
 
+  // --- Owner self-identities (mirror of the SQLite semantics) --------------
+
+  private ownerSelfJids: string[] = [];
+
+  private memOwnerSelfIdentityRecord(jid: string): OwnerSelfIdentity {
+    const canonical = this.canonicalJid(jid) ?? jid;
+    const contact = this.contacts.get(canonical);
+    const number = `+${(canonical.split("@")[0] ?? "").replace(/\D/g, "")}`;
+    const label = contact
+      ? resolveDisplayLabel({
+          displayName: contact.displayName,
+          pushName: contact.pushName,
+          phoneNumber: contact.phoneNumber,
+          jid: canonical
+        })
+      : null;
+    const currentLabel = label && label !== number && !/^\+?\d[\d\s]*$/.test(label) ? label : null;
+    let messageCount = 0;
+    for (const message of this.messages.values()) {
+      if (message.senderSourceJid === canonical) {
+        messageCount += 1;
+      }
+    }
+    return { jid: canonical, number, currentLabel, messageCount };
+  }
+
+  async getArchiveOwnerSelfIdentities(): Promise<OwnerSelfIdentity[]> {
+    const seen = new Set<string>();
+    const out: OwnerSelfIdentity[] = [];
+    for (const jid of this.ownerSelfJids) {
+      const canonical = this.canonicalJid(jid) ?? jid;
+      if (seen.has(canonical)) {
+        continue;
+      }
+      seen.add(canonical);
+      out.push(this.memOwnerSelfIdentityRecord(canonical));
+    }
+    return out;
+  }
+
+  async setArchiveOwnerSelfJids(inputs: string[]): Promise<OwnerSelfIdentity[]> {
+    const jids: string[] = [];
+    for (const raw of inputs) {
+      const normalized = normalizeOwnerSelfInput(raw);
+      if ("error" in normalized) {
+        throw new PublicError("invalid_self_number", normalized.error);
+      }
+      const canonical = this.canonicalJid(normalized.jid) ?? normalized.jid;
+      if (!jids.includes(canonical)) {
+        jids.push(canonical);
+      }
+    }
+    this.ownerSelfJids = jids;
+    return jids.map((jid) => this.memOwnerSelfIdentityRecord(jid));
+  }
+
+  async listOwnerIdentitySuggestions(query: string, limit = 12): Promise<OwnerIdentitySuggestion[]> {
+    const q = query.trim();
+    if (q.length < 2) {
+      return [];
+    }
+    const digits = q.replace(/\D/g, "");
+    const lower = q.toLowerCase();
+    const selfJids = new Set((await this.getArchiveOwnerSelfIdentities()).map((identity) => identity.jid));
+    const matches: OwnerIdentitySuggestion[] = [];
+    for (const contact of this.contacts.values()) {
+      const jid = contact.sourceJid;
+      if (!isIdentityServerJid(jid)) {
+        continue;
+      }
+      const jidDigits = (jid.split("@")[0] ?? "").replace(/\D/g, "");
+      const nameMatch =
+        (contact.displayName ?? "").toLowerCase().includes(lower) || (contact.pushName ?? "").toLowerCase().includes(lower);
+      const digitMatch = digits.length >= 2 && jidDigits.includes(digits);
+      if (!nameMatch && !digitMatch) {
+        continue;
+      }
+      let messageCount = 0;
+      for (const message of this.messages.values()) {
+        if (message.senderSourceJid === jid) {
+          messageCount += 1;
+        }
+      }
+      matches.push({
+        jid,
+        number: `+${jidDigits}`,
+        label: resolveDisplayLabel({
+          displayName: contact.displayName,
+          pushName: contact.pushName,
+          phoneNumber: contact.phoneNumber,
+          jid
+        }),
+        messageCount,
+        isSelf: selfJids.has(this.canonicalJid(jid) ?? jid)
+      });
+    }
+    return matches.sort((a, b) => b.messageCount - a.messageCount || a.jid.localeCompare(b.jid)).slice(0, Math.max(1, Math.min(25, limit)));
+  }
+
   async reconcileBrainRuns(): Promise<number> {
     let reconciled = 0;
     for (const run of this.brainRuns.values()) {
@@ -3760,6 +3936,8 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     const runs = [...this.brainRuns.values()].sort((a, b) => b.startedAt.localeCompare(a.startedAt));
     return {
       ownerName: this.ownerDisplayName,
+      selfIdentities: await this.getArchiveOwnerSelfIdentities(),
+      limits: { maxCallsPerHour: config.brain.maxCallsPerHour, maxCallsPerDay: config.brain.maxCallsPerDay },
       totalVisibleMessages: visible.length,
       assimilatedVisibleMessages: assimilated.length,
       coveragePercent: visible.length > 0 ? Math.round((assimilated.length / visible.length) * 1000) / 10 : 100,
@@ -3777,6 +3955,22 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     const episodeIds = [...this.brainEpisodes.values()]
       .filter((episode) => !chat || episode.chatSourceId === chat)
       .map((episode) => episode.id);
+    // Graph first (it reads claims that are about to be deleted): full reset
+    // wipes the derived-of-derived state outright; a scoped reset removes
+    // exactly the affected episodes' contributions.
+    if (!chat) {
+      this.graphNodes.clear();
+      this.graphNodeIdByKey.clear();
+      this.graphSlugs.clear();
+      this.graphEdges.clear();
+      this.graphEdgesById.clear();
+      this.graphNodeClaims.clear();
+      this.graphAliases.clear();
+    } else {
+      for (const id of episodeIds) {
+        this.memRemoveGraphContributionForEpisode(id);
+      }
+    }
     for (const id of episodeIds) {
       this.brainEpisodes.delete(id);
     }
@@ -3881,7 +4075,13 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       if (superseded) {
         superseded.status = "superseded";
       }
+      // Graph scope rule mirror: the superseded episode's contribution leaves
+      // before the replacement's arrives.
+      this.memRemoveGraphContributionForEpisode(episode.supersedesEpisodeId);
     }
+    // Knowledge graph mirror of the SQLite commit transaction: model episodes
+    // contribute nodes/edges/junctions; extractive placeholders contribute none.
+    this.memApplyEpisodeGraph(record);
     return structuredClone(record);
   }
 
@@ -3911,6 +4111,959 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     return [...this.brainEpisodes.values()].filter(
       (episode) => episode.status === "current" && (episode.generator === "extractive" || episode.extractionVersion < currentVersion)
     ).length;
+  }
+
+  // === Knowledge graph engine (mirror of the SQLite implementation) ========
+  // Same derivation module, same natural-key semantics, same outputs — parity
+  // by construction so the test suite exercises identical behavior.
+
+  private memEnsureGraphNode(spec: GraphNodeSpec): string {
+    const existingId = this.graphNodeIdByKey.get(spec.naturalKey);
+    if (existingId) {
+      const node = this.graphNodes.get(existingId)!;
+      if (spec.seenAtMs != null) {
+        node.firstSeenAtMs = node.firstSeenAtMs == null ? spec.seenAtMs : Math.min(node.firstSeenAtMs, spec.seenAtMs);
+        node.lastSeenAtMs = node.lastSeenAtMs == null ? spec.seenAtMs : Math.max(node.lastSeenAtMs, spec.seenAtMs);
+      }
+      node.title = node.title ?? spec.title ?? null;
+      node.payload = node.payload ?? (spec.payload ? structuredClone(spec.payload) : null);
+      return existingId;
+    }
+    const id = randomUUID();
+    const slug = slugForGraphNode(spec.kind, spec.slugSeed, spec.naturalKey, (candidate) => this.graphSlugs.has(candidate));
+    this.graphSlugs.add(slug);
+    this.graphNodes.set(id, {
+      id,
+      kind: spec.kind,
+      naturalKey: spec.naturalKey,
+      slug,
+      title: spec.title,
+      jid: spec.jid,
+      chatScope: spec.chatScope,
+      payload: spec.payload ? structuredClone(spec.payload) : null,
+      status: "active",
+      mergedInto: null,
+      salience: 0,
+      citationCount: 0,
+      evidenceDays: 0,
+      engagementFactor: 1,
+      firstSeenAtMs: spec.seenAtMs,
+      lastSeenAtMs: spec.seenAtMs
+    });
+    this.graphNodeIdByKey.set(spec.naturalKey, id);
+    return id;
+  }
+
+  private memAddGraphEdgeEvidence(
+    srcNodeId: string,
+    dstNodeId: string,
+    kind: BrainGraphEdgeKind,
+    evidence: GraphEvidenceSpec,
+    bounds?: { firstMs?: number | null; lastMs?: number | null }
+  ): boolean {
+    const key = `${srcNodeId}|${dstNodeId}|${kind}`;
+    let edge = this.graphEdges.get(key);
+    const observed = evidence.observedAtMs ?? null;
+    const firstCandidate = bounds?.firstMs ?? observed;
+    const lastCandidate = bounds?.lastMs ?? observed;
+    if (!edge) {
+      edge = {
+        id: this.graphEdgeSeq++,
+        srcNodeId,
+        dstNodeId,
+        kind,
+        firstSeenAtMs: firstCandidate ?? null,
+        lastSeenAtMs: lastCandidate ?? null,
+        evidence: new Map()
+      };
+      this.graphEdges.set(key, edge);
+      this.graphEdgesById.set(edge.id, edge);
+    } else {
+      if (firstCandidate != null) {
+        edge.firstSeenAtMs = edge.firstSeenAtMs == null ? firstCandidate : Math.min(edge.firstSeenAtMs, firstCandidate);
+      }
+      if (lastCandidate != null) {
+        edge.lastSeenAtMs = edge.lastSeenAtMs == null ? lastCandidate : Math.max(edge.lastSeenAtMs, lastCandidate);
+      }
+    }
+    if (edge.evidence.has(evidence.key)) {
+      return false;
+    }
+    edge.evidence.set(evidence.key, {
+      claimId: evidence.claimId ?? null,
+      sourceMessageKey: evidence.sourceMessageKey ?? null,
+      sourceRef: evidence.sourceRef ?? null,
+      observedAtMs: observed
+    });
+    return true;
+  }
+
+  private memApplyGraphMutations(mutations: GraphMutations): void {
+    const idByKey = new Map<string, string>();
+    for (const spec of mutations.nodes.values()) {
+      idByKey.set(spec.naturalKey, this.memEnsureGraphNode(spec));
+    }
+    const resolveKey = (key: string): string | undefined => idByKey.get(key) ?? this.graphNodeIdByKey.get(key);
+    for (const link of mutations.claimLinks) {
+      const nodeId = resolveKey(link.nodeKey);
+      if (!nodeId) {
+        continue;
+      }
+      const set = this.graphNodeClaims.get(nodeId) ?? new Set<string>();
+      set.add(link.claimId);
+      this.graphNodeClaims.set(nodeId, set);
+    }
+    for (const alias of mutations.aliases) {
+      const nodeId = resolveKey(alias.nodeKey);
+      const clean = alias.alias.trim();
+      if (!nodeId || !clean) {
+        continue;
+      }
+      const aliases = this.graphAliases.get(nodeId) ?? new Map<string, { alias: string; source: string }>();
+      if (!aliases.has(clean)) {
+        aliases.set(clean, { alias: clean, source: alias.source });
+      }
+      this.graphAliases.set(nodeId, aliases);
+    }
+    for (const edge of mutations.edges) {
+      const srcId = resolveKey(edge.srcKey);
+      const dstId = resolveKey(edge.dstKey);
+      if (srcId && dstId && srcId !== dstId) {
+        this.memAddGraphEdgeEvidence(srcId, dstId, edge.kind, edge.evidence);
+      }
+    }
+  }
+
+  private memBuildEpisodeGraphSource(record: BrainEpisodeRecord): GraphEpisodeSource {
+    return {
+      id: record.id,
+      chatSourceId: record.chatSourceId,
+      startAtMs: record.startAtMs,
+      endAtMs: record.endAtMs,
+      generator: record.generator,
+      topics: record.topics,
+      claims: record.claims.map((claim) => ({
+        id: claim.id,
+        kind: claim.kind,
+        text: claim.text,
+        eventAtMs: claim.eventAtMs,
+        validUntilMs: claim.validUntilMs,
+        entities: claim.entities.map((entity) => ({ kind: entity.kind, name: entity.name, jid: entity.jid, role: entity.role })),
+        citations: claim.citations.map((citation) => ({
+          sourceMessageKey: citation.sourceMessageKey,
+          senderSourceJid: citation.senderSourceJid,
+          timestampMs: citation.timestampMs
+        }))
+      }))
+    };
+  }
+
+  private memBuildEpisodeGraphContext(source: GraphEpisodeSource): EpisodeGraphContext {
+    const windowMentions: EpisodeGraphContext["windowMentions"] = [];
+    const windowReplies: EpisodeGraphContext["windowReplies"] = [];
+    for (const message of this.messages.values()) {
+      if (message.chatSourceId !== source.chatSourceId) {
+        continue;
+      }
+      const ts = message.timestampMs ?? null;
+      if (ts == null || ts < source.startAtMs || ts > source.endAtMs) {
+        continue;
+      }
+      for (const mentioned of message.mentionedJids ?? []) {
+        windowMentions.push({
+          mentionedJid: mentioned,
+          senderJid: message.senderSourceJid ?? null,
+          sourceMessageKey: message.sourceMessageKey,
+          timestampMs: ts
+        });
+      }
+      const quotedId = message.quotedSnapshot?.quotedSourceMessageId ?? null;
+      if (quotedId) {
+        const targetChat = message.quotedSnapshot?.quotedSourceChatId
+          ? this.canonicalJid(message.quotedSnapshot.quotedSourceChatId) ?? message.quotedSnapshot.quotedSourceChatId
+          : source.chatSourceId;
+        const target = [...this.messages.values()].find(
+          (candidate) => candidate.chatSourceId === targetChat && candidate.sourceMessageId === quotedId
+        );
+        if (target) {
+          windowReplies.push({
+            replySourceMessageKey: message.sourceMessageKey,
+            replySenderJid: message.senderSourceJid ?? null,
+            quotedSourceMessageKey: target.sourceMessageKey,
+            timestampMs: ts
+          });
+        }
+      }
+    }
+    const inboundReplies: EpisodeGraphContext["inboundReplies"] = [];
+    for (const claim of source.claims) {
+      if (claim.kind !== "commitment" && claim.kind !== "question") {
+        continue;
+      }
+      for (const citation of claim.citations) {
+        const target = this.messages.get(citation.sourceMessageKey);
+        if (!target) {
+          continue;
+        }
+        for (const message of this.messages.values()) {
+          if (message.quotedSnapshot?.quotedSourceMessageId !== target.sourceMessageId) {
+            continue;
+          }
+          const quotedChat = message.quotedSnapshot?.quotedSourceChatId
+            ? this.canonicalJid(message.quotedSnapshot.quotedSourceChatId) ?? message.quotedSnapshot.quotedSourceChatId
+            : message.chatSourceId;
+          if (quotedChat !== target.chatSourceId) {
+            continue;
+          }
+          inboundReplies.push({
+            claimId: claim.id,
+            replySourceMessageKey: message.sourceMessageKey,
+            replySenderJid: message.senderSourceJid ?? null,
+            timestampMs: message.timestampMs ?? null
+          });
+        }
+      }
+    }
+    return {
+      canonicalJid: (jid) => this.canonicalJid(jid),
+      windowMentions,
+      windowReplies,
+      lifecycleTargetsForMessage: (sourceMessageKey) => {
+        const keys: string[] = [];
+        for (const episode of this.brainEpisodes.values()) {
+          if (episode.status !== "current" || episode.generator !== "model") {
+            continue;
+          }
+          for (const claim of episode.claims) {
+            if (claim.kind !== "commitment" && claim.kind !== "question") {
+              continue;
+            }
+            if (!claim.citations.some((citation) => citation.sourceMessageKey === sourceMessageKey)) {
+              continue;
+            }
+            const naturalKey = `${claim.kind}:${claim.id}`;
+            if (this.graphNodeIdByKey.has(naturalKey)) {
+              keys.push(naturalKey);
+            }
+          }
+        }
+        return keys;
+      },
+      inboundReplies
+    };
+  }
+
+  private memApplyEpisodeGraph(record: BrainEpisodeRecord): void {
+    if (record.generator !== "model") {
+      return;
+    }
+    const source = this.memBuildEpisodeGraphSource(record);
+    this.memApplyGraphMutations(deriveEpisodeGraph(source, this.memBuildEpisodeGraphContext(source)));
+  }
+
+  private memRemoveGraphContributionForEpisode(episodeId: string): void {
+    const episode = this.brainEpisodes.get(episodeId);
+    if (!episode) {
+      return;
+    }
+    const claimIds = new Set(episode.claims.map((claim) => claim.id));
+    if (claimIds.size === 0) {
+      return;
+    }
+    // Message keys inside the removed episode's window: their derivation-time
+    // evidence (participation, mentions, window replies) leaves with it —
+    // mirror of the SQLite window cleanup.
+    const windowKeys = new Set<string>();
+    for (const message of this.messages.values()) {
+      if (
+        message.chatSourceId === episode.chatSourceId &&
+        message.timestampMs != null &&
+        message.timestampMs >= episode.startAtMs &&
+        message.timestampMs <= episode.endAtMs
+      ) {
+        windowKeys.add(message.sourceMessageKey);
+      }
+    }
+    const affected = new Set<MemGraphEdge>();
+    for (const edge of this.graphEdges.values()) {
+      for (const [key, evidence] of [...edge.evidence]) {
+        if (
+          (evidence.claimId && claimIds.has(evidence.claimId)) ||
+          (evidence.sourceMessageKey && !evidence.claimId && !evidence.sourceRef && windowKeys.has(evidence.sourceMessageKey))
+        ) {
+          edge.evidence.delete(key);
+          affected.add(edge);
+        }
+      }
+    }
+    for (const [nodeId, claims] of this.graphNodeClaims) {
+      for (const claimId of [...claims]) {
+        if (claimIds.has(claimId)) {
+          claims.delete(claimId);
+        }
+      }
+      if (claims.size === 0) {
+        this.graphNodeClaims.delete(nodeId);
+      }
+    }
+    for (const claimId of claimIds) {
+      for (const kind of ["commitment", "question", "event"] as const) {
+        const nodeId = this.graphNodeIdByKey.get(`${kind}:${claimId}`);
+        if (!nodeId) {
+          continue;
+        }
+        for (const [key, edge] of [...this.graphEdges]) {
+          if (edge.srcNodeId === nodeId || edge.dstNodeId === nodeId) {
+            this.graphEdges.delete(key);
+            this.graphEdgesById.delete(edge.id);
+            affected.delete(edge);
+          }
+        }
+        this.memDeleteGraphNode(nodeId);
+      }
+    }
+    for (const edge of affected) {
+      if (edge.evidence.size === 0) {
+        this.graphEdges.delete(`${edge.srcNodeId}|${edge.dstNodeId}|${edge.kind}`);
+        this.graphEdgesById.delete(edge.id);
+      } else {
+        const observed = [...edge.evidence.values()].map((evidence) => evidence.observedAtMs).filter((ts): ts is number => ts != null);
+        edge.firstSeenAtMs = observed.length ? Math.min(...observed) : null;
+        edge.lastSeenAtMs = observed.length ? Math.max(...observed) : null;
+      }
+    }
+    this.memPruneOrphanGraphNodes();
+  }
+
+  private memDeleteGraphNode(nodeId: string): void {
+    const node = this.graphNodes.get(nodeId);
+    if (!node) {
+      return;
+    }
+    this.graphNodes.delete(nodeId);
+    this.graphNodeIdByKey.delete(node.naturalKey);
+    this.graphSlugs.delete(node.slug);
+    this.graphNodeClaims.delete(nodeId);
+    this.graphAliases.delete(nodeId);
+  }
+
+  private memPruneOrphanGraphNodes(): void {
+    const referenced = new Set<string>();
+    for (const edge of this.graphEdges.values()) {
+      referenced.add(edge.srcNodeId);
+      referenced.add(edge.dstNodeId);
+    }
+    const mergeTargets = new Set<string>();
+    for (const node of this.graphNodes.values()) {
+      if (node.mergedInto) {
+        mergeTargets.add(node.mergedInto);
+      }
+    }
+    for (const node of [...this.graphNodes.values()]) {
+      if (node.status === "merged" || referenced.has(node.id) || mergeTargets.has(node.id)) {
+        continue;
+      }
+      if ((this.graphNodeClaims.get(node.id)?.size ?? 0) > 0) {
+        continue;
+      }
+      this.memDeleteGraphNode(node.id);
+    }
+  }
+
+  private memMergeGraphNodes(fromId: string, toId: string): void {
+    if (fromId === toId) {
+      return;
+    }
+    const from = this.graphNodes.get(fromId);
+    const to = this.graphNodes.get(toId);
+    if (!from || !to) {
+      return;
+    }
+    const fromClaims = this.graphNodeClaims.get(fromId);
+    if (fromClaims) {
+      const toClaims = this.graphNodeClaims.get(toId) ?? new Set<string>();
+      for (const claimId of fromClaims) {
+        toClaims.add(claimId);
+      }
+      this.graphNodeClaims.set(toId, toClaims);
+      this.graphNodeClaims.delete(fromId);
+    }
+    const fromAliases = this.graphAliases.get(fromId);
+    if (fromAliases) {
+      const toAliases = this.graphAliases.get(toId) ?? new Map<string, { alias: string; source: string }>();
+      for (const [key, value] of fromAliases) {
+        if (!toAliases.has(key)) {
+          toAliases.set(key, value);
+        }
+      }
+      this.graphAliases.set(toId, toAliases);
+      this.graphAliases.delete(fromId);
+    }
+    for (const [key, edge] of [...this.graphEdges]) {
+      if (edge.srcNodeId !== fromId && edge.dstNodeId !== fromId) {
+        continue;
+      }
+      const newSrc = edge.srcNodeId === fromId ? toId : edge.srcNodeId;
+      const newDst = edge.dstNodeId === fromId ? toId : edge.dstNodeId;
+      this.graphEdges.delete(key);
+      if (newSrc === newDst) {
+        this.graphEdgesById.delete(edge.id);
+        continue;
+      }
+      const newKey = `${newSrc}|${newDst}|${edge.kind}`;
+      const conflict = this.graphEdges.get(newKey);
+      if (conflict) {
+        for (const [evidenceKey, evidence] of edge.evidence) {
+          if (!conflict.evidence.has(evidenceKey)) {
+            conflict.evidence.set(evidenceKey, evidence);
+          }
+        }
+        const observed = [...conflict.evidence.values()].map((evidence) => evidence.observedAtMs).filter((ts): ts is number => ts != null);
+        conflict.firstSeenAtMs = observed.length ? Math.min(...observed) : conflict.firstSeenAtMs;
+        conflict.lastSeenAtMs = observed.length ? Math.max(...observed) : conflict.lastSeenAtMs;
+        this.graphEdgesById.delete(edge.id);
+      } else {
+        edge.srcNodeId = newSrc;
+        edge.dstNodeId = newDst;
+        this.graphEdges.set(newKey, edge);
+      }
+    }
+    to.firstSeenAtMs = from.firstSeenAtMs == null ? to.firstSeenAtMs : to.firstSeenAtMs == null ? from.firstSeenAtMs : Math.min(to.firstSeenAtMs, from.firstSeenAtMs);
+    to.lastSeenAtMs = from.lastSeenAtMs == null ? to.lastSeenAtMs : to.lastSeenAtMs == null ? from.lastSeenAtMs : Math.max(to.lastSeenAtMs, from.lastSeenAtMs);
+    to.engagementFactor = Math.max(to.engagementFactor, from.engagementFactor);
+    from.status = "merged";
+    from.mergedInto = toId;
+    from.salience = 0;
+  }
+
+  private memRekeyGraphNaturalKey(oldKey: string, newKey: string, updates: { jid?: string; chatScope?: string }): void {
+    const fromId = this.graphNodeIdByKey.get(oldKey);
+    if (!fromId) {
+      return;
+    }
+    const toId = this.graphNodeIdByKey.get(newKey);
+    if (!toId) {
+      const node = this.graphNodes.get(fromId)!;
+      this.graphNodeIdByKey.delete(oldKey);
+      node.naturalKey = newKey;
+      if (updates.jid) {
+        node.jid = updates.jid;
+      }
+      if (updates.chatScope) {
+        node.chatScope = updates.chatScope;
+      }
+      this.graphNodeIdByKey.set(newKey, fromId);
+      return;
+    }
+    this.memMergeGraphNodes(fromId, toId);
+  }
+
+  private memRekeyGraphForIdentityMerge(lid: string, pn: string): void {
+    this.memRekeyGraphNaturalKey(personJidNaturalKey(lid), personJidNaturalKey(pn), { jid: pn });
+    this.memRekeyGraphNaturalKey(chatNaturalKey(lid), chatNaturalKey(pn), { chatScope: pn });
+    for (const node of [...this.graphNodes.values()]) {
+      if (node.status === "merged" || node.chatScope !== lid) {
+        continue;
+      }
+      const marker = `:${lid}:`;
+      if (node.naturalKey.includes(marker)) {
+        this.memRekeyGraphNaturalKey(node.naturalKey, node.naturalKey.replace(marker, `:${pn}:`), { chatScope: pn });
+      } else {
+        node.chatScope = pn;
+      }
+    }
+  }
+
+  async syncBrainGraphSignals(): Promise<BrainGraphSyncResult> {
+    const result: BrainGraphSyncResult = { participationEdges: 0, vcardMentionEdges: 0, numberChangeAliases: 0, engagementFactors: 0 };
+    for (const period of this.membershipPeriods.values()) {
+      const group = this.canonicalJid(period.groupSourceId) ?? period.groupSourceId;
+      const participant = this.canonicalJid(period.participantJid) ?? period.participantJid;
+      const chatId = this.memEnsureGraphNode({
+        naturalKey: chatNaturalKey(group),
+        kind: "chat",
+        title: null,
+        jid: null,
+        chatScope: group,
+        payload: null,
+        slugSeed: group.split("@")[0] ?? group,
+        seenAtMs: period.joinedAtMs ?? period.observedAtMs ?? null
+      });
+      const personId = this.memEnsureGraphNode({
+        naturalKey: personJidNaturalKey(participant),
+        kind: "person",
+        title: null,
+        jid: participant,
+        chatScope: null,
+        payload: null,
+        slugSeed: participant.split("@")[0] ?? participant,
+        seenAtMs: period.joinedAtMs ?? period.observedAtMs ?? null
+      });
+      const inserted = this.memAddGraphEdgeEvidence(
+        personId,
+        chatId,
+        "participates_in",
+        { key: `period:${period.periodKey}`, sourceRef: period.periodKey, observedAtMs: period.joinedAtMs ?? period.observedAtMs ?? null },
+        { firstMs: period.joinedAtMs ?? null, lastMs: period.leftAtMs ?? period.joinedAtMs ?? period.observedAtMs ?? null }
+      );
+      if (inserted) {
+        result.participationEdges += 1;
+      }
+    }
+    for (const vcard of this.vcards.values()) {
+      if (!vcard.resolvedJid) {
+        continue;
+      }
+      const message = this.messages.get(vcard.sourceMessageKey);
+      const subject = this.canonicalJid(vcard.resolvedJid) ?? vcard.resolvedJid;
+      const subjectId = this.memEnsureGraphNode({
+        naturalKey: personJidNaturalKey(subject),
+        kind: "person",
+        title: null,
+        jid: subject,
+        chatScope: null,
+        payload: null,
+        slugSeed: subject.split("@")[0] ?? subject,
+        seenAtMs: message?.timestampMs ?? null
+      });
+      if (vcard.displayName?.trim()) {
+        const aliases = this.graphAliases.get(subjectId) ?? new Map<string, { alias: string; source: string }>();
+        const clean = vcard.displayName.trim();
+        if (!aliases.has(clean)) {
+          aliases.set(clean, { alias: clean, source: "vcard" });
+        }
+        this.graphAliases.set(subjectId, aliases);
+      }
+      const senderJid = message?.senderSourceJid ?? null;
+      if (!senderJid) {
+        continue;
+      }
+      const sharer = this.canonicalJid(senderJid) ?? senderJid;
+      if (sharer === subject) {
+        continue;
+      }
+      const sharerId = this.memEnsureGraphNode({
+        naturalKey: personJidNaturalKey(sharer),
+        kind: "person",
+        title: null,
+        jid: sharer,
+        chatScope: null,
+        payload: null,
+        slugSeed: sharer.split("@")[0] ?? sharer,
+        seenAtMs: message?.timestampMs ?? null
+      });
+      const inserted = this.memAddGraphEdgeEvidence(sharerId, subjectId, "mentions", {
+        key: `vcard:${vcard.sourceMessageKey}:${vcard.cardIndex}`,
+        sourceMessageKey: vcard.sourceMessageKey,
+        sourceRef: `${vcard.sourceMessageKey}#${vcard.cardIndex}`,
+        observedAtMs: message?.timestampMs ?? null
+      });
+      if (inserted) {
+        result.vcardMentionEdges += 1;
+      }
+    }
+    for (const change of this.numberChanges.values()) {
+      const oldJid = this.canonicalJid(change.oldJid) ?? change.oldJid;
+      const newJid = this.canonicalJid(change.newJid) ?? change.newJid;
+      if (oldJid === newJid) {
+        continue;
+      }
+      const oldId = this.memEnsureGraphNode({
+        naturalKey: personJidNaturalKey(oldJid),
+        kind: "person",
+        title: null,
+        jid: oldJid,
+        chatScope: null,
+        payload: null,
+        slugSeed: oldJid.split("@")[0] ?? oldJid,
+        seenAtMs: change.observedAtMs ?? null
+      });
+      const newId = this.memEnsureGraphNode({
+        naturalKey: personJidNaturalKey(newJid),
+        kind: "person",
+        title: null,
+        jid: newJid,
+        chatScope: null,
+        payload: null,
+        slugSeed: newJid.split("@")[0] ?? newJid,
+        seenAtMs: change.observedAtMs ?? null
+      });
+      const oldNumber = displayPhoneFromJid(oldJid);
+      if (oldNumber) {
+        const aliases = this.graphAliases.get(newId) ?? new Map<string, { alias: string; source: string }>();
+        if (!aliases.has(oldNumber)) {
+          aliases.set(oldNumber, { alias: oldNumber, source: "number_change" });
+          result.numberChangeAliases += 1;
+        }
+        this.graphAliases.set(newId, aliases);
+      }
+      this.memAddGraphEdgeEvidence(oldId, newId, "alias_of", {
+        key: `numchange:${change.eventKey}`,
+        sourceRef: change.eventKey,
+        observedAtMs: change.observedAtMs ?? null
+      });
+    }
+    const engagementByJid = new Map<string, { eligibleOutgoingCount: number; readCount: number }>();
+    for (const aggregate of this.engagementAggregates.values()) {
+      if (!aggregate.counterpartyJid) {
+        continue;
+      }
+      const canonical = this.canonicalJid(aggregate.counterpartyJid) ?? aggregate.counterpartyJid;
+      const entry = engagementByJid.get(canonical) ?? { eligibleOutgoingCount: 0, readCount: 0 };
+      entry.eligibleOutgoingCount += aggregate.eligibleOutgoingCount ?? 0;
+      entry.readCount += aggregate.readCount ?? 0;
+      engagementByJid.set(canonical, entry);
+    }
+    for (const [jid, entry] of engagementByJid) {
+      const nodeId = this.graphNodeIdByKey.get(personJidNaturalKey(jid));
+      if (!nodeId) {
+        continue;
+      }
+      const factor = engagementFactorFromAggregates([entry]);
+      const node = this.graphNodes.get(nodeId)!;
+      if (node.engagementFactor !== factor) {
+        node.engagementFactor = factor;
+        result.engagementFactors += 1;
+      }
+    }
+    return result;
+  }
+
+  async rebuildBrainGraph(): Promise<BrainGraphRebuildResult> {
+    const startedAt = Date.now();
+    this.graphNodes.clear();
+    this.graphNodeIdByKey.clear();
+    this.graphSlugs.clear();
+    this.graphEdges.clear();
+    this.graphEdgesById.clear();
+    this.graphNodeClaims.clear();
+    this.graphAliases.clear();
+    const episodes = [...this.brainEpisodes.values()]
+      .filter((episode) => episode.status === "current" && episode.generator === "model")
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+    for (const episode of episodes) {
+      this.memApplyEpisodeGraph(episode);
+    }
+    await this.syncBrainGraphSignals();
+    await this.recomputeBrainGraphSalience();
+    let evidence = 0;
+    for (const edge of this.graphEdges.values()) {
+      evidence += edge.evidence.size;
+    }
+    return {
+      episodesReplayed: episodes.length,
+      nodes: this.graphNodes.size,
+      edges: this.graphEdges.size,
+      evidence,
+      durationMs: Date.now() - startedAt
+    };
+  }
+
+  async recomputeBrainGraphSalience(): Promise<BrainGraphRecomputeResult> {
+    const startedAt = Date.now();
+    const claimById = new Map<string, BrainEpisodeRecord["claims"][number]>();
+    for (const episode of this.brainEpisodes.values()) {
+      for (const claim of episode.claims) {
+        claimById.set(claim.id, claim);
+      }
+    }
+    const stats = new Map<string, { citations: number; days: Set<string>; lastTs: number | null }>();
+    const record = (nodeId: string, ts: number | null) => {
+      const entry = stats.get(nodeId) ?? { citations: 0, days: new Set<string>(), lastTs: null };
+      entry.citations += 1;
+      if (ts != null) {
+        entry.days.add(new Date(ts).toISOString().slice(0, 10));
+        entry.lastTs = entry.lastTs == null ? ts : Math.max(entry.lastTs, ts);
+      }
+      stats.set(nodeId, entry);
+    };
+    for (const [nodeId, claimIds] of this.graphNodeClaims) {
+      for (const claimId of claimIds) {
+        for (const citation of claimById.get(claimId)?.citations ?? []) {
+          record(nodeId, citation.timestampMs);
+        }
+      }
+    }
+    for (const edge of this.graphEdges.values()) {
+      for (const evidence of edge.evidence.values()) {
+        record(edge.srcNodeId, evidence.observedAtMs);
+        record(edge.dstNodeId, evidence.observedAtMs);
+      }
+    }
+    const threshold = graphDormancyThreshold();
+    const nowMs = Date.now();
+    const result: BrainGraphRecomputeResult = { nodes: 0, dormant: 0, revived: 0, exemptOpenLifecycle: 0, durationMs: 0 };
+    for (const node of this.graphNodes.values()) {
+      if (node.status === "merged") {
+        continue;
+      }
+      result.nodes += 1;
+      const nodeStats = stats.get(node.id) ?? { citations: 0, days: new Set<string>(), lastTs: null };
+      const computed = computeGraphSalience({
+        kind: node.kind,
+        payload: node.payload,
+        citations: nodeStats.citations,
+        evidenceDays: nodeStats.days.size,
+        lastEvidenceAtMs: nodeStats.lastTs,
+        nowMs,
+        engagementFactor: node.engagementFactor,
+        dormancyThreshold: threshold
+      });
+      const lifecycleOpen = (node.kind === "commitment" || node.kind === "question") && (node.payload?.status ?? "open") === "open";
+      if (lifecycleOpen && computed.salience < threshold) {
+        result.exemptOpenLifecycle += 1;
+      }
+      const nextStatus: BrainGraphNodeStatus = computed.dormant ? "dormant" : "active";
+      if (nextStatus === "dormant" && node.status === "active") {
+        result.dormant += 1;
+      } else if (nextStatus === "active" && node.status === "dormant") {
+        result.revived += 1;
+      }
+      node.salience = computed.salience;
+      node.status = nextStatus;
+      node.citationCount = nodeStats.citations;
+      node.evidenceDays = nodeStats.days.size;
+      if (nodeStats.lastTs != null) {
+        node.lastSeenAtMs = node.lastSeenAtMs == null ? nodeStats.lastTs : Math.max(node.lastSeenAtMs, nodeStats.lastTs);
+      }
+    }
+    this.graphLastRecomputeAt = new Date().toISOString();
+    result.durationMs = Date.now() - startedAt;
+    return result;
+  }
+
+  async getBrainGraphStats(): Promise<BrainGraphStats> {
+    const nodesByKind: Partial<Record<BrainGraphNodeKind, number>> = {};
+    const nodesByStatus: Partial<Record<BrainGraphNodeStatus, number>> = {};
+    let unresolved = 0;
+    let openLifecycle = 0;
+    for (const node of this.graphNodes.values()) {
+      nodesByKind[node.kind] = (nodesByKind[node.kind] ?? 0) + 1;
+      nodesByStatus[node.status] = (nodesByStatus[node.status] ?? 0) + 1;
+      if (node.kind === "person" && !node.jid && node.status !== "merged") {
+        unresolved += 1;
+      }
+      if (
+        (node.kind === "commitment" || node.kind === "question") &&
+        node.status !== "merged" &&
+        (node.payload?.status ?? null) === "open"
+      ) {
+        openLifecycle += 1;
+      }
+    }
+    const edgesByKind: Partial<Record<BrainGraphEdgeKind, number>> = {};
+    let evidence = 0;
+    for (const edge of this.graphEdges.values()) {
+      edgesByKind[edge.kind] = (edgesByKind[edge.kind] ?? 0) + 1;
+      evidence += edge.evidence.size;
+    }
+    return {
+      nodeCount: this.graphNodes.size,
+      edgeCount: this.graphEdges.size,
+      evidenceCount: evidence,
+      nodesByKind,
+      nodesByStatus,
+      edgesByKind,
+      unresolvedPersonNodes: unresolved,
+      openLifecycleNodes: openLifecycle,
+      lastRecomputeAt: this.graphLastRecomputeAt
+    };
+  }
+
+  private memGraphLabel(node: MemGraphNode): string {
+    if (node.kind === "person" && node.jid) {
+      return this.systemEventDisplayName(node.jid) ?? node.jid;
+    }
+    if (node.kind === "chat" && node.chatScope) {
+      return this.chats.get(node.chatScope)?.displayName?.trim() || node.chatScope;
+    }
+    return node.title?.trim() || node.slug;
+  }
+
+  private memGraphNodeRecord(node: MemGraphNode): BrainGraphNodeRecord {
+    return {
+      id: node.id,
+      kind: node.kind,
+      naturalKey: node.naturalKey,
+      slug: node.slug,
+      label: this.memGraphLabel(node),
+      title: node.title,
+      jid: node.jid,
+      chatScope: node.chatScope,
+      payload: node.payload ? structuredClone(node.payload) : null,
+      status: node.status,
+      mergedInto: node.mergedInto,
+      salience: node.salience,
+      citationCount: node.citationCount,
+      evidenceDays: node.evidenceDays,
+      firstSeenAtMs: node.firstSeenAtMs,
+      lastSeenAtMs: node.lastSeenAtMs
+    };
+  }
+
+  async getBrainGraphEntity(query: { nodeId?: string; jid?: string; name?: string }): Promise<BrainGraphEntityView | null> {
+    let node: MemGraphNode | undefined;
+    let redirected = false;
+    if (query.nodeId) {
+      node = this.graphNodes.get(query.nodeId);
+      for (let hop = 0; node && node.status === "merged" && node.mergedInto && hop < 5; hop += 1) {
+        node = this.graphNodes.get(node.mergedInto);
+        redirected = true;
+      }
+    } else if (query.jid) {
+      const canonical = this.canonicalJid(query.jid) ?? query.jid;
+      const nodeId = this.graphNodeIdByKey.get(personJidNaturalKey(canonical));
+      node = nodeId ? this.graphNodes.get(nodeId) : undefined;
+    } else if (query.name?.trim()) {
+      const norm = query.name.trim().toLowerCase();
+      const candidates = [...this.graphNodes.values()]
+        .filter((candidate) => candidate.status !== "merged")
+        .filter(
+          (candidate) =>
+            (candidate.title ?? "").toLowerCase() === norm ||
+            [...(this.graphAliases.get(candidate.id)?.values() ?? [])].some((alias) => alias.alias.toLowerCase() === norm)
+        )
+        .sort((a, b) => b.salience - a.salience || b.citationCount - a.citationCount);
+      node = candidates[0];
+    }
+    if (!node) {
+      return null;
+    }
+    let personId: string | null = null;
+    let memberJids: string[] = [];
+    const memberNodes: MemGraphNode[] = [];
+    if (node.kind === "person" && node.jid) {
+      const person = await this.resolvePersonForJid(node.jid);
+      personId = person?.id ?? null;
+      memberJids = person ? person.members.map((member) => member.identityJid) : [node.jid];
+      for (const jid of memberJids) {
+        const canonical = this.canonicalJid(jid) ?? jid;
+        const memberId = this.graphNodeIdByKey.get(personJidNaturalKey(canonical));
+        const memberNode = memberId ? this.graphNodes.get(memberId) : undefined;
+        if (memberNode && memberNode.status !== "merged") {
+          memberNodes.push(memberNode);
+        }
+      }
+      if (!memberNodes.some((member) => member.id === node!.id)) {
+        memberNodes.push(node);
+      }
+    } else {
+      memberJids = node.jid ? [node.jid] : [];
+      memberNodes.push(node);
+    }
+    const nodeIds = new Set(memberNodes.map((member) => member.id));
+    const jidByNodeId = new Map(memberNodes.map((member) => [member.id, member.jid]));
+    const claimMeta = new Map<string, { episode: BrainEpisodeRecord; claim: BrainEpisodeRecord["claims"][number] }>();
+    for (const episode of this.brainEpisodes.values()) {
+      if (episode.status !== "current") {
+        continue;
+      }
+      for (const claim of episode.claims) {
+        claimMeta.set(claim.id, { episode, claim });
+      }
+    }
+    const claims: BrainGraphEntityClaim[] = [];
+    const seenClaims = new Set<string>();
+    for (const nodeId of nodeIds) {
+      for (const claimId of this.graphNodeClaims.get(nodeId) ?? []) {
+        if (seenClaims.has(claimId)) {
+          continue;
+        }
+        const meta = claimMeta.get(claimId);
+        if (!meta) {
+          continue;
+        }
+        seenClaims.add(claimId);
+        claims.push({
+          id: claimId,
+          kind: meta.claim.kind,
+          text: meta.claim.text,
+          confidence: meta.claim.confidence,
+          eventAtMs: meta.claim.eventAtMs,
+          validUntilMs: meta.claim.validUntilMs,
+          episodeId: meta.episode.id,
+          chatSourceId: meta.episode.chatSourceId,
+          chatDisplayName: meta.episode.chatDisplayName ?? this.chats.get(meta.episode.chatSourceId)?.displayName ?? null,
+          viaJid: jidByNodeId.get(nodeId) ?? null,
+          citations: structuredClone(meta.claim.citations)
+        });
+      }
+    }
+    claims.sort((a, b) => {
+      const aTs = Math.max(...a.citations.map((citation) => citation.timestampMs ?? 0), 0);
+      const bTs = Math.max(...b.citations.map((citation) => citation.timestampMs ?? 0), 0);
+      return bTs - aTs;
+    });
+    const edges: BrainGraphEdgeView[] = [];
+    for (const edge of this.graphEdges.values()) {
+      const outbound = nodeIds.has(edge.srcNodeId);
+      const inbound = nodeIds.has(edge.dstNodeId);
+      if (!outbound && !inbound) {
+        continue;
+      }
+      const otherId = outbound ? edge.dstNodeId : edge.srcNodeId;
+      if (nodeIds.has(otherId)) {
+        continue;
+      }
+      const other = this.graphNodes.get(otherId);
+      if (!other) {
+        continue;
+      }
+      edges.push({
+        id: edge.id,
+        kind: edge.kind,
+        direction: outbound ? "out" : "in",
+        otherNode: {
+          id: other.id,
+          kind: other.kind,
+          label: this.memGraphLabel(other),
+          slug: other.slug,
+          status: other.status,
+          salience: other.salience,
+          jid: other.jid
+        },
+        weight: edge.evidence.size,
+        evidenceCount: edge.evidence.size,
+        firstSeenAtMs: edge.firstSeenAtMs,
+        lastSeenAtMs: edge.lastSeenAtMs
+      });
+    }
+    edges.sort((a, b) => b.evidenceCount - a.evidenceCount || (b.lastSeenAtMs ?? 0) - (a.lastSeenAtMs ?? 0));
+    const aliases = new Set<string>();
+    for (const nodeId of nodeIds) {
+      for (const alias of this.graphAliases.get(nodeId)?.values() ?? []) {
+        aliases.add(alias.alias);
+      }
+    }
+    return {
+      node: this.memGraphNodeRecord(node),
+      personId,
+      memberJids,
+      memberNodes: memberNodes.map((member) => this.memGraphNodeRecord(member)),
+      claims: claims.slice(0, 200),
+      edges: edges.slice(0, 200),
+      aliases: [...aliases].sort(),
+      redirected
+    };
+  }
+
+  async listUnresolvedBrainGraphEntities(options: { limit?: number } = {}): Promise<BrainGraphUnresolvedEntity[]> {
+    const limit = Math.max(1, Math.min(200, options.limit ?? 50));
+    return [...this.graphNodes.values()]
+      .filter((node) => node.kind === "person" && !node.jid && node.status !== "merged")
+      .sort(
+        (a, b) =>
+          b.salience - a.salience ||
+          (this.graphNodeClaims.get(b.id)?.size ?? 0) - (this.graphNodeClaims.get(a.id)?.size ?? 0) ||
+          (b.lastSeenAtMs ?? 0) - (a.lastSeenAtMs ?? 0)
+      )
+      .slice(0, limit)
+      .map((node) => ({
+        node: this.memGraphNodeRecord(node),
+        chatSourceId: node.chatScope,
+        chatDisplayName: node.chatScope ? this.chats.get(node.chatScope)?.displayName ?? null : null,
+        claimCount: this.graphNodeClaims.get(node.id)?.size ?? 0
+      }));
   }
 
   // --- Brain evaluation (eval harness) — mirrors the SQLite semantics ---

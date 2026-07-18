@@ -5,6 +5,9 @@ import type {
   BrainEvalRunRecord,
   BrainGoldenSetInfo,
   BrainGradingSample,
+  BrainGraphRebuildResult,
+  BrainGraphRecomputeResult,
+  BrainGraphStats,
   BrainModelQualityAggregate,
   BrainOverview,
   BrainProviderName,
@@ -32,6 +35,8 @@ import type {
   MessageDetail,
   MessageListItem,
   MessageListOrder,
+  OwnerIdentitySuggestion,
+  OwnerSelfIdentity,
   PickKind,
   SearchIndexStatus,
   SearchReindexProgress,
@@ -423,6 +428,8 @@ export function startBrainRun(body: {
   model?: string | null;
   chatSourceId?: string | null;
   maxChats?: number;
+  maxModelCalls?: number;
+  maxTokens?: number | null;
 }): Promise<{ ok: boolean; progress: BrainRunProgress }> {
   return request<{ ok: boolean; progress: BrainRunProgress }>("/api/brain/runs", { method: "POST", body: JSON.stringify(body) });
 }
@@ -448,10 +455,33 @@ export function resetBrainData(): Promise<{ ok: boolean; episodesRemoved: number
   });
 }
 
-export function setBrainOwner(displayName: string | null): Promise<{ ok: boolean; ownerName: string | null }> {
-  return request<{ ok: boolean; ownerName: string | null }>("/api/brain/owner", {
+// Self-number autocomplete (run console): plain substring matching over
+// archived identities, each row carrying the number's CURRENT resolved name.
+export function getOwnerIdentitySuggestions(query: string): Promise<OwnerIdentitySuggestion[]> {
+  return request<OwnerIdentitySuggestion[]>(`/api/brain/owner/identity-suggestions?q=${encodeURIComponent(query)}`);
+}
+
+// --- Knowledge graph (knowledge-graph-foundation) ---
+
+export function getBrainGraphStats(): Promise<BrainGraphStats> {
+  return request<BrainGraphStats>("/api/brain/graph/stats");
+}
+
+export function rebuildBrainGraph(): Promise<{ ok: boolean } & BrainGraphRebuildResult> {
+  return request<{ ok: boolean } & BrainGraphRebuildResult>("/api/brain/graph/rebuild", { method: "POST", body: "{}" });
+}
+
+export function recomputeBrainGraph(): Promise<{ ok: boolean } & BrainGraphRecomputeResult> {
+  return request<{ ok: boolean } & BrainGraphRecomputeResult>("/api/brain/graph/recompute", { method: "POST", body: "{}" });
+}
+
+export function setBrainOwner(
+  displayName: string | null,
+  selfJids?: string[]
+): Promise<{ ok: boolean; ownerName: string | null; selfIdentities: OwnerSelfIdentity[] }> {
+  return request<{ ok: boolean; ownerName: string | null; selfIdentities: OwnerSelfIdentity[] }>("/api/brain/owner", {
     method: "POST",
-    body: JSON.stringify({ displayName })
+    body: JSON.stringify(selfJids ? { displayName, selfJids } : { displayName })
   });
 }
 

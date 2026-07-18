@@ -1461,6 +1461,10 @@ export interface BrainProviderStatus {
   reasoningEffort: BrainReasoningEffort | null;
   // Selectable models per provider, for UI pickers.
   models: Record<string, string[]>;
+  // Whether the active provider's reported token usage is exact or may fall
+  // back to character estimates — surfaces offering a token budget disclose
+  // this instead of presenting estimates as precise.
+  tokenUsage: "exact" | "may-estimate" | "none";
   health: BrainProviderHealth;
   message: string;
 }
@@ -1473,12 +1477,39 @@ export interface BrainSchedulerStatus {
   dueReason: string | null;
 }
 
+// An additional number the archive owner has claimed as themself. Evidence
+// labeling gives these ABSOLUTE precedence: they render as "Name (me)" even
+// when the number is saved under another contact name. `currentLabel` is what
+// the archive would otherwise call it — shown in the picker so selecting a
+// different person by mistake is visible before saving.
+export interface OwnerSelfIdentity {
+  jid: string;
+  number: string;
+  currentLabel: string | null;
+  messageCount: number;
+}
+
+// One row of the self-number autocomplete: plain substring matching over
+// archived identities (no inference), always showing the current name.
+export interface OwnerIdentitySuggestion {
+  jid: string;
+  number: string;
+  label: string | null;
+  messageCount: number;
+  isSelf: boolean;
+}
+
 // One-call brain overview: coverage, queue, budget, runs. Provider health is
 // attached by the server layer (it lives outside the repository).
 export interface BrainStatusSummary {
   // The archive owner's display name (UI-settable): evidence and episodes
   // label the owner's messages with it instead of the confusing "Me".
   ownerName: string | null;
+  // Additional self numbers with owner-label precedence in evidence packs.
+  selfIdentities: OwnerSelfIdentity[];
+  // Configured ledger caps, surfaced so the run console can validate budgets
+  // against what the server will actually enforce.
+  limits: { maxCallsPerHour: number; maxCallsPerDay: number };
   totalVisibleMessages: number;
   assimilatedVisibleMessages: number;
   coveragePercent: number;
@@ -1904,6 +1935,9 @@ export interface BrainRunProgress {
   processedChats: number;
   totalChats: number;
   currentChat: string | null;
+  // Accumulated input+output tokens across this run's model calls — what the
+  // per-run token budget (when set) is enforced against.
+  tokensUsed: number;
   episodesCommitted: number;
   // Of episodesCommitted, how many fell back to extractive placeholders — the
   // honest "N/M extractive" breakdown surfaced in the completion notice.
@@ -1913,6 +1947,142 @@ export interface BrainRunProgress {
   startedAt: string | null;
   finishedAt: string | null;
   error: string | null;
+}
+
+// --- Knowledge graph (knowledge-graph-foundation) ---
+// Derived-of-derived semantic substrate: typed nodes/edges rebuilt from
+// committed episodes + captured archive signals with zero model calls. All
+// meaning is server-side; UI, CLI, and future MCP consume these DTOs.
+
+export type BrainGraphNodeKind =
+  | "person"
+  | "chat"
+  | "topic"
+  | "org"
+  | "place"
+  | "project"
+  | "other"
+  | "commitment"
+  | "question"
+  | "event"
+  | "fact";
+export type BrainGraphEdgeKind =
+  | "participates_in"
+  | "mentions"
+  | "about"
+  | "involves"
+  | "related_to"
+  | "replies_to"
+  | "derived_from"
+  | "alias_of"
+  | "resolves";
+// 'merged' nodes are redirect stubs (held ids never dangle); 'dormant' hides
+// from ranked surfaces but stays directly readable — dormancy never deletes.
+export type BrainGraphNodeStatus = "active" | "dormant" | "merged";
+
+export interface BrainGraphNodeRecord {
+  id: string;
+  kind: BrainGraphNodeKind;
+  naturalKey: string;
+  slug: string;
+  // Server-resolved display label (identity/person layer for person nodes,
+  // chat display name for chat nodes, stored title otherwise) — read-time, so
+  // renames re-label with zero regeneration.
+  label: string;
+  title: string | null;
+  jid: string | null;
+  chatScope: string | null;
+  payload: Record<string, unknown> | null;
+  status: BrainGraphNodeStatus;
+  mergedInto: string | null;
+  salience: number;
+  citationCount: number;
+  evidenceDays: number;
+  firstSeenAtMs: number | null;
+  lastSeenAtMs: number | null;
+}
+
+// One-hop edge as seen from an anchor node (entity view / future explorer).
+export interface BrainGraphEdgeView {
+  id: number;
+  kind: BrainGraphEdgeKind;
+  direction: "out" | "in";
+  otherNode: Pick<BrainGraphNodeRecord, "id" | "kind" | "label" | "slug" | "status" | "salience" | "jid">;
+  weight: number;
+  evidenceCount: number;
+  firstSeenAtMs: number | null;
+  lastSeenAtMs: number | null;
+}
+
+export interface BrainGraphEntityClaim {
+  id: string;
+  kind: BrainClaimKind;
+  text: string;
+  confidence: BrainClaimConfidence;
+  eventAtMs: number | null;
+  validUntilMs: number | null;
+  episodeId: string;
+  chatSourceId: string;
+  chatDisplayName: string | null;
+  // The member identity node that anchored this claim into the aggregate.
+  viaJid: string | null;
+  citations: BrainCitationRecord[];
+}
+
+// Person-aggregated entity read: membership resolves at READ time through
+// person_members, so connect/disconnect re-derive this with zero graph writes.
+export interface BrainGraphEntityView {
+  node: BrainGraphNodeRecord;
+  personId: string | null;
+  memberJids: string[];
+  memberNodes: BrainGraphNodeRecord[];
+  claims: BrainGraphEntityClaim[];
+  edges: BrainGraphEdgeView[];
+  aliases: string[];
+  // True when the requested node id resolved through a merged redirect stub.
+  redirected: boolean;
+}
+
+export interface BrainGraphUnresolvedEntity {
+  node: BrainGraphNodeRecord;
+  chatSourceId: string | null;
+  chatDisplayName: string | null;
+  claimCount: number;
+}
+
+export interface BrainGraphStats {
+  nodeCount: number;
+  edgeCount: number;
+  evidenceCount: number;
+  nodesByKind: Partial<Record<BrainGraphNodeKind, number>>;
+  nodesByStatus: Partial<Record<BrainGraphNodeStatus, number>>;
+  edgesByKind: Partial<Record<BrainGraphEdgeKind, number>>;
+  unresolvedPersonNodes: number;
+  openLifecycleNodes: number;
+  lastRecomputeAt: string | null;
+}
+
+export interface BrainGraphRebuildResult {
+  episodesReplayed: number;
+  nodes: number;
+  edges: number;
+  evidence: number;
+  durationMs: number;
+}
+
+export interface BrainGraphRecomputeResult {
+  nodes: number;
+  dormant: number;
+  revived: number;
+  exemptOpenLifecycle: number;
+  durationMs: number;
+}
+
+export interface BrainGraphSyncResult {
+  participationEdges: number;
+  vcardMentionEdges: number;
+  numberChangeAliases: number;
+  engagementFactors: number;
 }
 
 // Progress of a search reindex job (chunked FTS rebuild).

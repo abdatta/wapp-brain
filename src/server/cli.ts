@@ -271,15 +271,25 @@ async function main(): Promise<void> {
     // and leaving the rest resumable. Together: a bounded, targeted assimilation.
     const chatSourceId = stringArg(args.chat) ?? null;
     const maxModelCalls = numberArg(args["max-model-calls"]);
+    const maxTokens = numberArg(args["max-tokens"]);
     const repository = createArchiveRepository();
     try {
+      // User-triggered runs require the owner name (episodes label the user's
+      // own messages with it); set-contact-name of self won't do it — use the
+      // Brain page or POST /api/brain/owner.
+      if (!(await repository.getArchiveOwnerName())) {
+        console.error("Set your name first — episodes label your messages with it. Set it on the Brain page (Run console → Identity).");
+        process.exitCode = 1;
+        return;
+      }
       const { startBrainRun, getBrainRunProgress } = await import("./brain/runJob");
       const started = startBrainRun(repository, {
         mode,
         model: model ?? null,
         chatSourceId,
         maxChats: numberArg(args["max-chats"]) ?? 10,
-        maxModelCalls: maxModelCalls ?? undefined
+        maxModelCalls: maxModelCalls ?? undefined,
+        maxTokens: mode === "model" && maxTokens && maxTokens > 0 ? Math.floor(maxTokens) : null
       });
       if (!started.started) {
         console.error(started.refusal ?? "Could not start the brain run.");
@@ -333,6 +343,11 @@ async function main(): Promise<void> {
       if (args["dry-run"] || stale.length === 0) {
         return;
       }
+      if (!(await repository.getArchiveOwnerName())) {
+        console.error("Set your name first — episodes label your messages with it. Set it on the Brain page (Run console → Identity).");
+        process.exitCode = 1;
+        return;
+      }
       const { startBrainRun, getBrainRunProgress } = await import("./brain/runJob");
       const started = startBrainRun(repository, { mode: "model", model: model ?? null, chatSourceId, regenerate: true });
       if (!started.started) {
@@ -370,6 +385,77 @@ async function main(): Promise<void> {
       console.log(
         `Brain reset${chatSourceId ? ` (chat ${chatSourceId})` : ""}: removed ${result.episodeIds.length} episode(s), ${result.watermarks} watermark(s), ${filesRemoved} projected file(s), and cleared pending tasks. Raw messages are untouched.`
       );
+    } finally {
+      await repository.close?.();
+    }
+    return;
+  }
+
+  // Knowledge graph (knowledge-graph-foundation): stats | rebuild | recompute |
+  // entity | unresolved. All deterministic, zero model calls. When the local
+  // server is up the CLI delegates over HTTP (the single writer stays inside
+  // the server process); otherwise it opens the repository directly.
+  if (command === "brain-graph") {
+    const { localServerListening } = await import("./brain/eval");
+    const action = stringArg(args._) ?? "stats";
+    const serverBase = `http://${config.app.host}:${config.app.port}`;
+    const serverUp = await localServerListening(serverBase);
+    const viaServer = async (path: string, method: "GET" | "POST"): Promise<unknown> => {
+      const response = await fetch(`${serverBase}${path}`, { method });
+      const payload = (await response.json().catch(() => null)) as Record<string, unknown> | null;
+      if (!response.ok) {
+        throw new Error(String(payload?.error ?? `The server rejected the request (${response.status}).`));
+      }
+      return payload;
+    };
+    if (serverUp) {
+      console.log(`Server detected at ${serverBase} — delegating (the single writer stays in the server process).`);
+      if (action === "rebuild") {
+        console.log(JSON.stringify(await viaServer("/api/brain/graph/rebuild", "POST"), null, 2));
+      } else if (action === "recompute") {
+        console.log(JSON.stringify(await viaServer("/api/brain/graph/recompute", "POST"), null, 2));
+      } else if (action === "entity") {
+        const query = new URLSearchParams();
+        if (stringArg(args.jid)) query.set("jid", stringArg(args.jid)!);
+        if (stringArg(args.name)) query.set("name", stringArg(args.name)!);
+        if (stringArg(args.node)) query.set("nodeId", stringArg(args.node)!);
+        console.log(JSON.stringify(await viaServer(`/api/brain/graph/entity?${query}`, "GET"), null, 2));
+      } else if (action === "unresolved") {
+        console.log(JSON.stringify(await viaServer("/api/brain/graph/unresolved", "GET"), null, 2));
+      } else {
+        console.log(JSON.stringify(await viaServer("/api/brain/graph/stats", "GET"), null, 2));
+      }
+      return;
+    }
+    const repository = createArchiveRepository();
+    try {
+      if (action === "rebuild") {
+        const result = await repository.rebuildBrainGraph();
+        console.log(
+          `Graph rebuilt: ${result.nodes} node(s), ${result.edges} edge(s), ${result.evidence} evidence row(s) from ${result.episodesReplayed} episode(s) in ${result.durationMs}ms.`
+        );
+      } else if (action === "recompute") {
+        const result = await repository.recomputeBrainGraphSalience();
+        console.log(
+          `Salience recomputed over ${result.nodes} node(s): ${result.dormant} newly dormant, ${result.revived} revived, ${result.exemptOpenLifecycle} open lifecycle exempt (${result.durationMs}ms).`
+        );
+      } else if (action === "entity") {
+        const view = await repository.getBrainGraphEntity({
+          jid: stringArg(args.jid) ?? undefined,
+          name: stringArg(args.name) ?? undefined,
+          nodeId: stringArg(args.node) ?? undefined
+        });
+        if (!view) {
+          console.error("No graph node matches that query (pass --jid, --name, or --node).");
+          process.exitCode = 1;
+          return;
+        }
+        console.log(JSON.stringify(view, null, 2));
+      } else if (action === "unresolved") {
+        console.log(JSON.stringify(await repository.listUnresolvedBrainGraphEntities({ limit: numberArg(args.limit) ?? 50 }), null, 2));
+      } else {
+        console.log(JSON.stringify(await repository.getBrainGraphStats(), null, 2));
+      }
     } finally {
       await repository.close?.();
     }
@@ -994,6 +1080,7 @@ function printHelp(): void {
   tsx src/server/cli.ts live-retry-gap --id <gap-id>
   tsx src/server/cli.ts live-unlink
   tsx src/server/cli.ts brain-eval [--init] [--gate] [--baseline <runId>] [--notes <text>] [--json]
+  tsx src/server/cli.ts brain-graph [stats|rebuild|recompute|entity|unresolved] [--jid <jid>] [--name <name>] [--node <id>]
   tsx src/server/cli.ts set-contact-name --jid <sourceJid> --name "<display name>"
   tsx src/server/cli.ts persons-scan [--connect-only]
   tsx src/server/cli.ts memory-status

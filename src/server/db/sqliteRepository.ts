@@ -17,6 +17,18 @@ import type {
   BrainGradingCitation,
   BrainGradingSample,
   BrainGradingSampleClaim,
+  BrainGraphEdgeKind,
+  BrainGraphEdgeView,
+  BrainGraphEntityClaim,
+  BrainGraphEntityView,
+  BrainGraphNodeKind,
+  BrainGraphNodeRecord,
+  BrainGraphNodeStatus,
+  BrainGraphRebuildResult,
+  BrainGraphRecomputeResult,
+  BrainGraphStats,
+  BrainGraphSyncResult,
+  BrainGraphUnresolvedEntity,
   BrainModelQualityAggregate,
   BrainLlmUsageSummary,
   BrainRunSummary,
@@ -88,6 +100,8 @@ import type {
   MessageListItem,
   MessageRecord,
   MessageSecretRecord,
+  OwnerIdentitySuggestion,
+  OwnerSelfIdentity,
   QuotedMessageSnapshot,
   QuotedMessageSnapshotSummary,
   QuotedReplyAnchor,
@@ -130,6 +144,22 @@ import { displayPhoneFromJid, isMaskedNumberLabel, normalizeJid, phoneFromJid, r
 import { disambiguateLabels } from "../persons/disambiguate";
 import { personDisplayLabelFromMembers } from "../persons/label";
 import { getMemoryProviderStatus } from "../memory/provider";
+import { normalizeOwnerSelfInput } from "../identity/ownerSelf";
+import {
+  chatNaturalKey,
+  computeGraphSalience,
+  deriveEpisodeGraph,
+  engagementFactorFromAggregates,
+  graphDormancyThreshold,
+  parseGraphPayload,
+  personJidNaturalKey,
+  slugForGraphNode,
+  type EpisodeGraphContext,
+  type GraphEpisodeSource,
+  type GraphEvidenceSpec,
+  type GraphMutations,
+  type GraphNodeSpec
+} from "../brain/graph";
 import { PublicError } from "../privacy";
 import { termAliasSeedRows } from "../search/aliasSeed";
 import {
@@ -1501,6 +1531,85 @@ const schemaStatements = [
   )`,
   `CREATE INDEX IF NOT EXISTS idx_brain_claim_grades_model ON brain_claim_grades (model, extraction_version)`,
 
+  // --- Knowledge graph (knowledge-graph-foundation) ---
+  // Derived-of-derived semantic substrate: rebuilt from committed episodes and
+  // captured signals with zero model calls. Natural keys make every producer
+  // idempotent; slugs are immutable from birth; person nodes key on canonical
+  // JID and titles are never load-bearing (labels resolve at read time).
+  `CREATE TABLE IF NOT EXISTS brain_nodes (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('person','chat','topic','org','place','project','other','commitment','question','event','fact')),
+    natural_key TEXT NOT NULL UNIQUE,
+    slug TEXT NOT NULL UNIQUE,
+    title TEXT NULL,
+    jid TEXT NULL,
+    chat_scope TEXT NULL,
+    payload_json TEXT NULL,
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','dormant','merged')),
+    merged_into TEXT NULL,
+    salience REAL NOT NULL DEFAULT 0,
+    citation_count INTEGER NOT NULL DEFAULT 0,
+    evidence_days INTEGER NOT NULL DEFAULT 0,
+    engagement_factor REAL NOT NULL DEFAULT 1,
+    first_seen_at_ms INTEGER NULL,
+    last_seen_at_ms INTEGER NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  )`,
+
+  // Typed weighted edges, unique per (src, dst, kind). No edge exists without
+  // evidence; counts are maintained exactly via the evidence table's insert
+  // outcomes and re-derived wholesale on rebuild.
+  `CREATE TABLE IF NOT EXISTS brain_edges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    src_node_id TEXT NOT NULL,
+    dst_node_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('participates_in','mentions','about','involves','related_to','replies_to','derived_from','alias_of','resolves')),
+    weight REAL NOT NULL DEFAULT 0,
+    evidence_count INTEGER NOT NULL DEFAULT 0,
+    first_seen_at_ms INTEGER NULL,
+    last_seen_at_ms INTEGER NULL,
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE (src_node_id, dst_node_id, kind),
+    FOREIGN KEY (src_node_id) REFERENCES brain_nodes(id) ON DELETE CASCADE,
+    FOREIGN KEY (dst_node_id) REFERENCES brain_nodes(id) ON DELETE CASCADE
+  )`,
+
+  // Per-edge provenance down to claims/messages/signal refs. evidence_key is
+  // the dedupe identity (claim id, message key, or signal ref), so replay and
+  // regeneration can never double-count.
+  `CREATE TABLE IF NOT EXISTS brain_edge_evidence (
+    edge_id INTEGER NOT NULL,
+    evidence_key TEXT NOT NULL,
+    claim_id TEXT NULL,
+    source_message_key TEXT NULL,
+    source_ref TEXT NULL,
+    observed_at_ms INTEGER NULL,
+    PRIMARY KEY (edge_id, evidence_key),
+    FOREIGN KEY (edge_id) REFERENCES brain_edges(id) ON DELETE CASCADE
+  ) WITHOUT ROWID`,
+
+  // Node ↔ claim junction: the entity-view read spine and the salience
+  // recompute's citation source. Populated inside the commit transaction.
+  `CREATE TABLE IF NOT EXISTS brain_node_claims (
+    node_id TEXT NOT NULL,
+    claim_id TEXT NOT NULL,
+    PRIMARY KEY (node_id, claim_id),
+    FOREIGN KEY (node_id) REFERENCES brain_nodes(id) ON DELETE CASCADE,
+    FOREIGN KEY (claim_id) REFERENCES brain_claims(id) ON DELETE CASCADE
+  ) WITHOUT ROWID`,
+
+  // Observed surface forms (entity-name spellings, number-change aliases):
+  // adjudication fuel and search context, never a resolution join.
+  `CREATE TABLE IF NOT EXISTS brain_node_aliases (
+    node_id TEXT NOT NULL,
+    alias TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'entity',
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (node_id, alias),
+    FOREIGN KEY (node_id) REFERENCES brain_nodes(id) ON DELETE CASCADE
+  ) WITHOUT ROWID`,
+
   // --- Two-level person model ---
   // Identities (canonical JIDs) are the immutable anchors; a person is an
   // editable grouping over them. A person row exists only while it has two or
@@ -1637,6 +1746,15 @@ const schemaStatements = [
   `CREATE INDEX IF NOT EXISTS idx_brain_issues_code ON brain_validation_issues (code, created_at)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_media_gaps_episode ON brain_media_gaps (episode_id)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_media_gaps_modality ON brain_media_gaps (modality, impact)`,
+  // Graph traversal contract (graph-explorer/retrieval consumers): bounded
+  // k-hop with kind/time/salience filters must be an index walk, not a scan.
+  `CREATE INDEX IF NOT EXISTS idx_brain_nodes_kind_status_salience ON brain_nodes (kind, status, salience DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_brain_nodes_jid ON brain_nodes (jid)`,
+  `CREATE INDEX IF NOT EXISTS idx_brain_nodes_chat_scope ON brain_nodes (chat_scope)`,
+  `CREATE INDEX IF NOT EXISTS idx_brain_edges_src ON brain_edges (src_node_id, kind, last_seen_at_ms)`,
+  `CREATE INDEX IF NOT EXISTS idx_brain_edges_dst ON brain_edges (dst_node_id, kind, last_seen_at_ms)`,
+  `CREATE INDEX IF NOT EXISTS idx_brain_edge_evidence_claim ON brain_edge_evidence (claim_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_brain_node_claims_claim ON brain_node_claims (claim_id)`,
   `CREATE INDEX IF NOT EXISTS idx_person_members_person ON person_members (person_id)`,
   `CREATE INDEX IF NOT EXISTS idx_person_suggestions_status ON person_suggestions (status, score DESC)`,
   `CREATE INDEX IF NOT EXISTS idx_person_suggestions_pair ON person_suggestions (jid_low, jid_high)`,
@@ -2883,6 +3001,124 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       .run(trimmed, currentIso());
   }
 
+  // --- Owner self-identities (brain-run-console) --------------------------
+  // Canonical identity JIDs the evidence labeler treats as the owner with
+  // absolute precedence over saved contact names. Stored beside the owner
+  // display name in schema_meta; read canonicalized so identity merges are
+  // always already applied.
+
+  private readOwnerSelfJids(): string[] {
+    const row = this.db.prepare(`SELECT value FROM schema_meta WHERE key = 'owner_self_jids'`).get() as
+      | { value: string }
+      | undefined;
+    if (!row?.value) {
+      return [];
+    }
+    try {
+      const parsed = JSON.parse(row.value) as unknown;
+      if (!Array.isArray(parsed)) {
+        return [];
+      }
+      const jids: string[] = [];
+      for (const entry of parsed) {
+        if (typeof entry !== "string") {
+          continue;
+        }
+        const canonical = this.canonicalJid(entry) ?? entry;
+        if (!jids.includes(canonical)) {
+          jids.push(canonical);
+        }
+      }
+      return jids;
+    } catch {
+      return [];
+    }
+  }
+
+  private ownerSelfIdentityRecord(jid: string): OwnerSelfIdentity {
+    const contact = this.db
+      .prepare(`SELECT display_name AS displayName, push_name AS pushName, phone_number AS phoneNumber FROM contacts WHERE source_jid = ?`)
+      .get(jid) as { displayName: string | null; pushName: string | null; phoneNumber: string | null } | undefined;
+    const number = displayPhoneFromJid(jid) ?? `+${(jid.split("@")[0] ?? "").replace(/\D/g, "")}`;
+    const label = contact
+      ? resolveDisplayLabel({ displayName: contact.displayName, pushName: contact.pushName, phoneNumber: contact.phoneNumber, jid })
+      : null;
+    // currentLabel is the mistake-prevention surface: what the archive would
+    // call this number WITHOUT self precedence. A bare-number label carries no
+    // warning value, so it reads as null.
+    const currentLabel = label && label !== number && !/^\+?\d[\d\s]*$/.test(label) ? label : null;
+    const messageCount = Number(
+      (this.db.prepare(`SELECT COUNT(*) AS count FROM messages WHERE sender_source_jid = ?`).get(jid) as { count: number }).count
+    );
+    return { jid, number, currentLabel, messageCount };
+  }
+
+  async getArchiveOwnerSelfIdentities(): Promise<OwnerSelfIdentity[]> {
+    return this.readOwnerSelfJids().map((jid) => this.ownerSelfIdentityRecord(jid));
+  }
+
+  async setArchiveOwnerSelfJids(inputs: string[]): Promise<OwnerSelfIdentity[]> {
+    const jids: string[] = [];
+    for (const raw of inputs) {
+      const normalized = normalizeOwnerSelfInput(raw);
+      if ("error" in normalized) {
+        throw new PublicError("invalid_self_number", normalized.error);
+      }
+      const canonical = this.canonicalJid(normalized.jid) ?? normalized.jid;
+      if (!jids.includes(canonical)) {
+        jids.push(canonical);
+      }
+    }
+    if (jids.length === 0) {
+      this.db.prepare(`DELETE FROM schema_meta WHERE key = 'owner_self_jids'`).run();
+    } else {
+      this.db
+        .prepare(
+          `INSERT INTO schema_meta (key, value, updated_at) VALUES ('owner_self_jids', ?, ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+        )
+        .run(JSON.stringify(jids), currentIso());
+    }
+    return jids.map((jid) => this.ownerSelfIdentityRecord(jid));
+  }
+
+  async listOwnerIdentitySuggestions(query: string, limit = 12): Promise<OwnerIdentitySuggestion[]> {
+    const q = query.trim();
+    if (q.length < 2) {
+      return [];
+    }
+    // Plain substring matching, deliberately: digits against the JID, text
+    // against saved/push names. LIKE wildcards in user input are neutralized.
+    const digits = q.replace(/\D/g, "");
+    const digitsLike = digits.length >= 2 ? `%${digits}%` : null;
+    const nameLike = `%${q.toLowerCase().replace(/[%_]/g, " ").trim()}%`;
+    const rows = this.db
+      .prepare(
+        `SELECT c.source_jid AS jid, c.display_name AS displayName, c.push_name AS pushName, c.phone_number AS phoneNumber,
+                (SELECT COUNT(*) FROM messages m WHERE m.sender_source_jid = c.source_jid) AS messageCount
+         FROM contacts c
+         WHERE (c.source_jid LIKE '%@s.whatsapp.net' OR c.source_jid LIKE '%@lid' OR c.source_jid LIKE '%@hosted.lid')
+           AND ((? IS NOT NULL AND c.source_jid LIKE ?) OR lower(COALESCE(c.display_name, '')) LIKE ? OR lower(COALESCE(c.push_name, '')) LIKE ?)
+         ORDER BY messageCount DESC, c.source_jid
+         LIMIT ?`
+      )
+      .all(digitsLike, digitsLike ?? "", nameLike, nameLike, Math.max(1, Math.min(25, limit))) as Array<{
+      jid: string;
+      displayName: string | null;
+      pushName: string | null;
+      phoneNumber: string | null;
+      messageCount: number;
+    }>;
+    const selfJids = new Set(this.readOwnerSelfJids());
+    return rows.map((row) => ({
+      jid: row.jid,
+      number: displayPhoneFromJid(row.jid) ?? `+${(row.jid.split("@")[0] ?? "").replace(/\D/g, "")}`,
+      label: resolveDisplayLabel({ displayName: row.displayName, pushName: row.pushName, phoneNumber: row.phoneNumber, jid: row.jid }),
+      messageCount: Number(row.messageCount ?? 0),
+      isSelf: selfJids.has(this.canonicalJid(row.jid) ?? row.jid)
+    }));
+  }
+
   async reconcileBrainRuns(): Promise<number> {
     const result = this.db
       .prepare(
@@ -3030,6 +3266,8 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     const assimilated = Number(coverage.assimilated ?? 0);
     const value: BrainStatusSummary = {
       ownerName: await this.getArchiveOwnerName(),
+      selfIdentities: await this.getArchiveOwnerSelfIdentities(),
+      limits: { maxCallsPerHour: config.brain.maxCallsPerHour, maxCallsPerDay: config.brain.maxCallsPerDay },
       totalVisibleMessages: total,
       assimilatedVisibleMessages: assimilated,
       coveragePercent: total > 0 ? Math.round((assimilated / total) * 1000) / 10 : 100,
@@ -3053,6 +3291,20 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     ).map((row) => row.id);
     let watermarks = 0;
     const transaction = this.db.transaction(() => {
+      // Graph first (it reads claims that are about to be deleted): a full
+      // reset wipes the derived-of-derived tables outright; a scoped reset
+      // removes exactly the affected episodes' contributions.
+      if (!chat) {
+        this.db.prepare(`DELETE FROM brain_edge_evidence`).run();
+        this.db.prepare(`DELETE FROM brain_edges`).run();
+        this.db.prepare(`DELETE FROM brain_node_claims`).run();
+        this.db.prepare(`DELETE FROM brain_node_aliases`).run();
+        this.db.prepare(`DELETE FROM brain_nodes`).run();
+      } else {
+        for (const episodeId of episodeIds) {
+          this.removeGraphContributionForEpisodeTx(episodeId);
+        }
+      }
       for (let index = 0; index < episodeIds.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
         const batch = episodeIds.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
         const placeholders = batch.map(() => "?").join(",");
@@ -3201,6 +3453,17 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       // old and the new episode read as current.
       if (episode.supersedesEpisodeId) {
         this.db.prepare(`UPDATE brain_episodes SET status = 'superseded' WHERE id = ?`).run(episode.supersedesEpisodeId);
+        // Graph scope rule: the graph derives from CURRENT model episodes
+        // only, so the superseded episode's contribution leaves in the same
+        // transaction its replacement's arrives.
+        this.removeGraphContributionForEpisodeTx(episode.supersedesEpisodeId);
+      }
+      // Knowledge graph, same transaction — D5's commit shape completed.
+      // Extractive placeholders contribute nothing (honest coverage is not
+      // knowledge); model episodes upsert nodes/edges/junctions idempotently
+      // by natural key.
+      if (episode.generator === "model") {
+        this.applyEpisodeGraphTx({ episodeId: id, chatSourceId, startAtMs: episode.startAtMs, endAtMs: episode.endAtMs });
       }
     });
     transaction();
@@ -4250,6 +4513,10 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       // key and window; drop them so the drain never re-covers an orphaned
       // window. The next due/audit pass re-enqueues from the merged cursor.
       this.db.prepare(`DELETE FROM brain_tasks WHERE chat_source_id = ?`).run(lid);
+      // Graph rekey rides the same transaction: person/chat nodes follow the
+      // canonical JID (redirect stubs keep held ids resolvable), chat-scoped
+      // natural keys rewrite, duplicate edges merge with evidence intact.
+      this.rekeyGraphForIdentityMergeTx(lid, pn);
     });
     transaction();
     this.invalidateBrainStatusCache();
@@ -4267,6 +4534,1121 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     await this.repairBrainProseForIdentities(new Set([pn, lid]));
     this.invalidateBrainStatusCache();
     return result;
+  }
+
+  // === Knowledge graph engine =============================================
+  // Derived-of-derived: every producer below is deterministic (zero model
+  // calls), keyed by natural keys so replay/regeneration/merge converge, and
+  // rebuildable from committed episodes + captured signals by construction.
+
+  private ensureGraphNodeTx(spec: GraphNodeSpec): string {
+    const existing = this.db
+      .prepare(
+        `SELECT id, title, payload_json AS payloadJson, first_seen_at_ms AS firstSeen, last_seen_at_ms AS lastSeen FROM brain_nodes WHERE natural_key = ?`
+      )
+      .get(spec.naturalKey) as
+      | { id: string; title: string | null; payloadJson: string | null; firstSeen: number | null; lastSeen: number | null }
+      | undefined;
+    const now = currentIso();
+    if (existing) {
+      const first = minNullableMs(existing.firstSeen, spec.seenAtMs);
+      const last = maxNullableMs(existing.lastSeen, spec.seenAtMs);
+      // Titles are display metadata only (identity labels resolve at read
+      // time); first non-null wins so re-derivation cannot churn them.
+      const title = existing.title ?? spec.title ?? null;
+      const payload = existing.payloadJson ?? (spec.payload ? JSON.stringify(spec.payload) : null);
+      if (first !== existing.firstSeen || last !== existing.lastSeen || title !== existing.title || payload !== existing.payloadJson) {
+        this.db
+          .prepare(`UPDATE brain_nodes SET title = ?, payload_json = ?, first_seen_at_ms = ?, last_seen_at_ms = ?, updated_at = ? WHERE id = ?`)
+          .run(title, payload, first, last, now, existing.id);
+      }
+      return existing.id;
+    }
+    const id = randomUUID();
+    const slugTaken = this.db.prepare(`SELECT 1 FROM brain_nodes WHERE slug = ?`);
+    const slug = slugForGraphNode(spec.kind, spec.slugSeed, spec.naturalKey, (candidate) => Boolean(slugTaken.get(candidate)));
+    this.db
+      .prepare(
+        `INSERT INTO brain_nodes (id, kind, natural_key, slug, title, jid, chat_scope, payload_json, first_seen_at_ms, last_seen_at_ms, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        id,
+        spec.kind,
+        spec.naturalKey,
+        slug,
+        spec.title,
+        spec.jid,
+        spec.chatScope,
+        spec.payload ? JSON.stringify(spec.payload) : null,
+        spec.seenAtMs,
+        spec.seenAtMs,
+        now,
+        now
+      );
+    return id;
+  }
+
+  // Upsert an edge and attach one evidence row. Counts stay exact under replay
+  // because the evidence key is the dedupe identity: only a genuinely new row
+  // bumps evidence_count/weight. Returns whether the evidence was new.
+  private addGraphEdgeEvidenceTx(
+    srcNodeId: string,
+    dstNodeId: string,
+    kind: BrainGraphEdgeKind,
+    evidence: GraphEvidenceSpec,
+    bounds?: { firstMs?: number | null; lastMs?: number | null }
+  ): boolean {
+    const observed = evidence.observedAtMs ?? null;
+    const firstCandidate = bounds?.firstMs ?? observed;
+    const lastCandidate = bounds?.lastMs ?? observed;
+    const now = currentIso();
+    const existing = this.db
+      .prepare(
+        `SELECT id, first_seen_at_ms AS firstSeen, last_seen_at_ms AS lastSeen FROM brain_edges WHERE src_node_id = ? AND dst_node_id = ? AND kind = ?`
+      )
+      .get(srcNodeId, dstNodeId, kind) as { id: number; firstSeen: number | null; lastSeen: number | null } | undefined;
+    const edgeId = existing
+      ? existing.id
+      : Number(
+          this.db
+            .prepare(
+              `INSERT INTO brain_edges (src_node_id, dst_node_id, kind, weight, evidence_count, first_seen_at_ms, last_seen_at_ms, updated_at)
+               VALUES (?, ?, ?, 0, 0, ?, ?, ?)`
+            )
+            .run(srcNodeId, dstNodeId, kind, firstCandidate, lastCandidate, now).lastInsertRowid
+        );
+    const inserted =
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO brain_edge_evidence (edge_id, evidence_key, claim_id, source_message_key, source_ref, observed_at_ms)
+           VALUES (?, ?, ?, ?, ?, ?)`
+        )
+        .run(edgeId, evidence.key, evidence.claimId ?? null, evidence.sourceMessageKey ?? null, evidence.sourceRef ?? null, observed).changes >
+      0;
+    const first = minNullableMs(existing?.firstSeen ?? firstCandidate, firstCandidate);
+    const last = maxNullableMs(existing?.lastSeen ?? lastCandidate, lastCandidate);
+    this.db
+      .prepare(
+        `UPDATE brain_edges SET evidence_count = evidence_count + ?, weight = weight + ?, first_seen_at_ms = ?, last_seen_at_ms = ?, updated_at = ? WHERE id = ?`
+      )
+      .run(inserted ? 1 : 0, inserted ? 1 : 0, first, last, now, edgeId);
+    return inserted;
+  }
+
+  private applyGraphMutationsTx(mutations: GraphMutations): void {
+    const idByKey = new Map<string, string>();
+    for (const spec of mutations.nodes.values()) {
+      idByKey.set(spec.naturalKey, this.ensureGraphNodeTx(spec));
+    }
+    // Edge targets may be existing nodes referenced by natural key only (e.g.
+    // lifecycle nodes from earlier episodes); resolve those from the table.
+    const resolveKey = (key: string): string | undefined => {
+      const known = idByKey.get(key);
+      if (known) {
+        return known;
+      }
+      const row = this.db.prepare(`SELECT id FROM brain_nodes WHERE natural_key = ?`).get(key) as { id: string } | undefined;
+      if (row) {
+        idByKey.set(key, row.id);
+      }
+      return row?.id;
+    };
+    const insertClaimLink = this.db.prepare(`INSERT OR IGNORE INTO brain_node_claims (node_id, claim_id) VALUES (?, ?)`);
+    for (const link of mutations.claimLinks) {
+      const nodeId = resolveKey(link.nodeKey);
+      if (nodeId) {
+        insertClaimLink.run(nodeId, link.claimId);
+      }
+    }
+    const insertAlias = this.db.prepare(`INSERT OR IGNORE INTO brain_node_aliases (node_id, alias, source, created_at) VALUES (?, ?, ?, ?)`);
+    for (const alias of mutations.aliases) {
+      const nodeId = resolveKey(alias.nodeKey);
+      const clean = alias.alias.trim();
+      if (nodeId && clean) {
+        insertAlias.run(nodeId, clean, alias.source, currentIso());
+      }
+    }
+    for (const edge of mutations.edges) {
+      const srcId = resolveKey(edge.srcKey);
+      const dstId = resolveKey(edge.dstKey);
+      if (srcId && dstId && srcId !== dstId) {
+        this.addGraphEdgeEvidenceTx(srcId, dstId, edge.kind, edge.evidence);
+      }
+    }
+  }
+
+  // Read the committed claims/entities/citations/topics back (visible inside
+  // the transaction) so commit-time derivation and rebuild replay share ONE
+  // code path over the same committed inputs.
+  private buildEpisodeGraphSourceTx(meta: {
+    episodeId: string;
+    chatSourceId: string;
+    startAtMs: number;
+    endAtMs: number;
+  }): GraphEpisodeSource {
+    const claims = (
+      this.db
+        .prepare(
+          `SELECT id, kind, text, event_at_ms AS eventAtMs, valid_until_ms AS validUntilMs FROM brain_claims WHERE episode_id = ? ORDER BY sequence`
+        )
+        .all(meta.episodeId) as Array<{ id: string; kind: string; text: string; eventAtMs: number | null; validUntilMs: number | null }>
+    ).map((claim) => ({
+      id: claim.id,
+      kind: claim.kind as GraphEpisodeSource["claims"][number]["kind"],
+      text: claim.text,
+      eventAtMs: claim.eventAtMs,
+      validUntilMs: claim.validUntilMs,
+      entities: this.db
+        .prepare(`SELECT kind, name, jid, role FROM brain_claim_entities WHERE claim_id = ? ORDER BY id`)
+        .all(claim.id) as Array<{ kind: "person" | "org" | "place" | "project" | "other"; name: string; jid: string | null; role: string | null }>,
+      citations: this.db
+        .prepare(
+          `SELECT source_message_key AS sourceMessageKey, sender_source_jid AS senderSourceJid, timestamp_ms AS timestampMs FROM brain_citations WHERE claim_id = ?`
+        )
+        .all(claim.id) as Array<{ sourceMessageKey: string; senderSourceJid: string | null; timestampMs: number | null }>
+    }));
+    const topics = (
+      this.db
+        .prepare(`SELECT t.title FROM brain_episode_topics et JOIN brain_topics t ON t.id = et.topic_id WHERE et.episode_id = ?`)
+        .all(meta.episodeId) as Array<{ title: string }>
+    ).map((row) => row.title);
+    return {
+      id: meta.episodeId,
+      chatSourceId: meta.chatSourceId,
+      startAtMs: meta.startAtMs,
+      endAtMs: meta.endAtMs,
+      generator: "model",
+      topics,
+      claims
+    };
+  }
+
+  private buildEpisodeGraphContextTx(source: GraphEpisodeSource): EpisodeGraphContext {
+    // Authoritative structured mentions on window messages — derivable from
+    // committed archive state, so rebuild sees exactly what commit saw.
+    const windowMentions = this.db
+      .prepare(
+        `SELECT mm.mentioned_jid AS mentionedJid, m.sender_source_jid AS senderJid, m.source_message_key AS sourceMessageKey, m.timestamp_ms AS timestampMs
+         FROM messages m
+         JOIN chats ch ON ch.id = m.chat_id
+         JOIN message_mentions mm ON mm.message_id = m.id
+         WHERE ch.source_chat_id = ? AND m.timestamp_ms >= ? AND m.timestamp_ms <= ? AND (mm.source_mask & 2) != 0`
+      )
+      .all(source.chatSourceId, source.startAtMs, source.endAtMs) as EpisodeGraphContext["windowMentions"];
+    const replyRows = this.db
+      .prepare(
+        `SELECT q.reply_message_key AS replyKey, m.sender_source_jid AS senderJid, m.timestamp_ms AS timestampMs,
+                q.quoted_source_message_id AS quotedId, q.quoted_source_chat_id AS quotedChatId
+         FROM message_quoted_snapshots q
+         JOIN messages m ON m.source_message_key = q.reply_message_key
+         JOIN chats ch ON ch.id = m.chat_id
+         WHERE ch.source_chat_id = ? AND m.timestamp_ms >= ? AND m.timestamp_ms <= ? AND q.quoted_source_message_id IS NOT NULL`
+      )
+      .all(source.chatSourceId, source.startAtMs, source.endAtMs) as Array<{
+      replyKey: string;
+      senderJid: string | null;
+      timestampMs: number | null;
+      quotedId: string;
+      quotedChatId: string | null;
+    }>;
+    const resolveQuotedKey = this.db.prepare(
+      `SELECT m.source_message_key AS key FROM messages m JOIN chats ch ON ch.id = m.chat_id WHERE ch.source_chat_id = ? AND m.source_message_id = ? LIMIT 1`
+    );
+    const windowReplies: EpisodeGraphContext["windowReplies"] = [];
+    for (const row of replyRows) {
+      const targetChat = row.quotedChatId ? this.canonicalJid(row.quotedChatId) ?? row.quotedChatId : source.chatSourceId;
+      const target = resolveQuotedKey.get(targetChat, row.quotedId) as { key: string } | undefined;
+      if (target) {
+        windowReplies.push({
+          replySourceMessageKey: row.replyKey,
+          replySenderJid: row.senderJid,
+          quotedSourceMessageKey: target.key,
+          timestampMs: row.timestampMs
+        });
+      }
+    }
+    const lifecycleTargets = this.db.prepare(
+      `SELECT DISTINCT n.natural_key AS naturalKey
+       FROM brain_citations c
+       JOIN brain_node_claims nc ON nc.claim_id = c.claim_id
+       JOIN brain_nodes n ON n.id = nc.node_id
+       WHERE c.source_message_key = ? AND n.kind IN ('commitment','question') AND n.status != 'merged'`
+    );
+    // Chat-wide replies quoting THIS episode's lifecycle claims' citations —
+    // makes replies_to independent of assimilation order.
+    const inboundStmt = this.db.prepare(
+      `SELECT q.reply_message_key AS replyKey, m.sender_source_jid AS senderJid, m.timestamp_ms AS timestampMs
+       FROM messages t
+       JOIN chats tc ON tc.id = t.chat_id
+       JOIN message_quoted_snapshots q ON q.quoted_source_message_id = t.source_message_id
+       JOIN messages m ON m.source_message_key = q.reply_message_key
+       JOIN chats mc ON mc.id = m.chat_id
+       WHERE t.source_message_key = ?
+         AND (q.quoted_source_chat_id = tc.source_chat_id OR (q.quoted_source_chat_id IS NULL AND mc.source_chat_id = tc.source_chat_id))`
+    );
+    const inboundReplies: EpisodeGraphContext["inboundReplies"] = [];
+    for (const claim of source.claims) {
+      if (claim.kind !== "commitment" && claim.kind !== "question") {
+        continue;
+      }
+      for (const citation of claim.citations) {
+        const rows = inboundStmt.all(citation.sourceMessageKey) as Array<{
+          replyKey: string;
+          senderJid: string | null;
+          timestampMs: number | null;
+        }>;
+        for (const row of rows) {
+          inboundReplies.push({
+            claimId: claim.id,
+            replySourceMessageKey: row.replyKey,
+            replySenderJid: row.senderJid,
+            timestampMs: row.timestampMs
+          });
+        }
+      }
+    }
+    return {
+      canonicalJid: (jid) => this.canonicalJid(jid),
+      windowMentions,
+      windowReplies,
+      lifecycleTargetsForMessage: (sourceMessageKey) =>
+        (lifecycleTargets.all(sourceMessageKey) as Array<{ naturalKey: string }>).map((row) => row.naturalKey),
+      inboundReplies
+    };
+  }
+
+  private applyEpisodeGraphTx(meta: { episodeId: string; chatSourceId: string; startAtMs: number; endAtMs: number }): void {
+    const source = this.buildEpisodeGraphSourceTx(meta);
+    const context = this.buildEpisodeGraphContextTx(source);
+    this.applyGraphMutationsTx(deriveEpisodeGraph(source, context));
+  }
+
+  // Remove everything a (superseded or reset) episode contributed: claim-keyed
+  // evidence and junctions, the lifecycle/event nodes its claims minted, and
+  // the message-keyed evidence derived from its window (participation,
+  // mentions, window replies). A regeneration replacement re-derives the same
+  // window immediately after, so the state converges either way — and a
+  // replacement-less removal (scoped reset) leaves no orphaned provenance a
+  // rebuild would not reproduce.
+  private removeGraphContributionForEpisodeTx(episodeId: string): void {
+    const claimIds = (this.db.prepare(`SELECT id FROM brain_claims WHERE episode_id = ?`).all(episodeId) as Array<{ id: string }>).map(
+      (row) => row.id
+    );
+    if (claimIds.length === 0) {
+      return;
+    }
+    const affectedEdges = new Set<number>();
+    const episodeRow = this.db
+      .prepare(`SELECT chat_source_id AS chatSourceId, start_at_ms AS startAtMs, end_at_ms AS endAtMs FROM brain_episodes WHERE id = ?`)
+      .get(episodeId) as { chatSourceId: string; startAtMs: number; endAtMs: number } | undefined;
+    if (episodeRow) {
+      const windowEvidence = this.db
+        .prepare(
+          `SELECT ev.edge_id AS edgeId, ev.evidence_key AS evidenceKey
+           FROM brain_edge_evidence ev
+           JOIN messages m ON m.source_message_key = ev.source_message_key
+           JOIN chats ch ON ch.id = m.chat_id
+           WHERE ev.source_message_key IS NOT NULL AND ev.claim_id IS NULL AND ev.source_ref IS NULL
+             AND ch.source_chat_id = ? AND m.timestamp_ms >= ? AND m.timestamp_ms <= ?`
+        )
+        .all(episodeRow.chatSourceId, episodeRow.startAtMs, episodeRow.endAtMs) as Array<{ edgeId: number; evidenceKey: string }>;
+      const deleteEvidence = this.db.prepare(`DELETE FROM brain_edge_evidence WHERE edge_id = ? AND evidence_key = ?`);
+      for (const row of windowEvidence) {
+        deleteEvidence.run(row.edgeId, row.evidenceKey);
+        affectedEdges.add(row.edgeId);
+      }
+    }
+    for (let index = 0; index < claimIds.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = claimIds.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      const placeholders = batch.map(() => "?").join(",");
+      for (const row of this.db
+        .prepare(`SELECT DISTINCT edge_id AS edgeId FROM brain_edge_evidence WHERE claim_id IN (${placeholders})`)
+        .all(...batch) as Array<{ edgeId: number }>) {
+        affectedEdges.add(row.edgeId);
+      }
+      this.db.prepare(`DELETE FROM brain_edge_evidence WHERE claim_id IN (${placeholders})`).run(...batch);
+      this.db.prepare(`DELETE FROM brain_node_claims WHERE claim_id IN (${placeholders})`).run(...batch);
+      // Lifecycle/event nodes are claim-anchored; they leave with their claims.
+      const nodeKeys = batch.flatMap((claimId) => [`commitment:${claimId}`, `question:${claimId}`, `event:${claimId}`]);
+      for (let keyIndex = 0; keyIndex < nodeKeys.length; keyIndex += SQLITE_IN_QUERY_BATCH_SIZE) {
+        const keyBatch = nodeKeys.slice(keyIndex, keyIndex + SQLITE_IN_QUERY_BATCH_SIZE);
+        const keyPlaceholders = keyBatch.map(() => "?").join(",");
+        const nodeIds = (
+          this.db.prepare(`SELECT id FROM brain_nodes WHERE natural_key IN (${keyPlaceholders})`).all(...keyBatch) as Array<{ id: string }>
+        ).map((row) => row.id);
+        for (const nodeId of nodeIds) {
+          for (const edgeRow of this.db
+            .prepare(`SELECT id FROM brain_edges WHERE src_node_id = ? OR dst_node_id = ?`)
+            .all(nodeId, nodeId) as Array<{ id: number }>) {
+            this.db.prepare(`DELETE FROM brain_edge_evidence WHERE edge_id = ?`).run(edgeRow.id);
+            this.db.prepare(`DELETE FROM brain_edges WHERE id = ?`).run(edgeRow.id);
+            affectedEdges.delete(edgeRow.id);
+          }
+          this.db.prepare(`DELETE FROM brain_node_claims WHERE node_id = ?`).run(nodeId);
+          this.db.prepare(`DELETE FROM brain_node_aliases WHERE node_id = ?`).run(nodeId);
+          this.db.prepare(`DELETE FROM brain_nodes WHERE id = ?`).run(nodeId);
+        }
+      }
+    }
+    for (const edgeId of affectedEdges) {
+      this.recountGraphEdgeTx(edgeId);
+    }
+    this.pruneOrphanGraphNodesTx();
+  }
+
+  private recountGraphEdgeTx(edgeId: number): void {
+    const stats = this.db
+      .prepare(
+        `SELECT COUNT(*) AS count, MIN(observed_at_ms) AS first, MAX(observed_at_ms) AS last FROM brain_edge_evidence WHERE edge_id = ?`
+      )
+      .get(edgeId) as { count: number; first: number | null; last: number | null };
+    if (Number(stats.count) === 0) {
+      this.db.prepare(`DELETE FROM brain_edges WHERE id = ?`).run(edgeId);
+      return;
+    }
+    this.db
+      .prepare(
+        `UPDATE brain_edges SET evidence_count = ?, weight = ?, first_seen_at_ms = ?, last_seen_at_ms = ?, updated_at = ? WHERE id = ?`
+      )
+      .run(Number(stats.count), Number(stats.count), stats.first, stats.last, currentIso(), edgeId);
+  }
+
+  // A node with no claims and no evidenced edges is a rumor — delete it.
+  // Merged redirect stubs and merge targets are kept so held ids never dangle.
+  private pruneOrphanGraphNodesTx(): void {
+    const orphans = this.db
+      .prepare(
+        `SELECT id FROM brain_nodes n
+         WHERE n.status != 'merged'
+           AND NOT EXISTS (SELECT 1 FROM brain_node_claims nc WHERE nc.node_id = n.id)
+           AND NOT EXISTS (SELECT 1 FROM brain_edges e WHERE e.src_node_id = n.id OR e.dst_node_id = n.id)
+           AND NOT EXISTS (SELECT 1 FROM brain_nodes s WHERE s.merged_into = n.id)`
+      )
+      .all() as Array<{ id: string }>;
+    for (const orphan of orphans) {
+      this.db.prepare(`DELETE FROM brain_node_aliases WHERE node_id = ?`).run(orphan.id);
+      this.db.prepare(`DELETE FROM brain_nodes WHERE id = ?`).run(orphan.id);
+    }
+  }
+
+  // Identity merge rekey: person and chat nodes follow the canonical JID with
+  // a 'merged' redirect stub left behind; chat-scoped natural keys rewrite.
+  private rekeyGraphForIdentityMergeTx(lid: string, pn: string): void {
+    this.rekeyGraphNaturalKeyTx(personJidNaturalKey(lid), personJidNaturalKey(pn), { jid: pn });
+    this.rekeyGraphNaturalKeyTx(chatNaturalKey(lid), chatNaturalKey(pn), { chatScope: pn });
+    const scoped = this.db
+      .prepare(`SELECT id, natural_key AS naturalKey FROM brain_nodes WHERE chat_scope = ? AND status != 'merged'`)
+      .all(lid) as Array<{ id: string; naturalKey: string }>;
+    for (const node of scoped) {
+      const marker = `:${lid}:`;
+      if (node.naturalKey.includes(marker)) {
+        this.rekeyGraphNaturalKeyTx(node.naturalKey, node.naturalKey.replace(marker, `:${pn}:`), { chatScope: pn });
+      } else {
+        this.db.prepare(`UPDATE brain_nodes SET chat_scope = ?, updated_at = ? WHERE id = ?`).run(pn, currentIso(), node.id);
+      }
+    }
+  }
+
+  private rekeyGraphNaturalKeyTx(oldKey: string, newKey: string, updates: { jid?: string; chatScope?: string }): void {
+    const from = this.db.prepare(`SELECT id FROM brain_nodes WHERE natural_key = ?`).get(oldKey) as { id: string } | undefined;
+    if (!from) {
+      return;
+    }
+    const to = this.db.prepare(`SELECT id FROM brain_nodes WHERE natural_key = ?`).get(newKey) as { id: string } | undefined;
+    if (!to) {
+      // No canonical node yet: the LID node simply becomes it. The slug stays
+      // immutable; only the anchor fields move to the canonical form.
+      this.db
+        .prepare(`UPDATE brain_nodes SET natural_key = ?, jid = COALESCE(?, jid), chat_scope = COALESCE(?, chat_scope), updated_at = ? WHERE id = ?`)
+        .run(newKey, updates.jid ?? null, updates.chatScope ?? null, currentIso(), from.id);
+      return;
+    }
+    this.mergeGraphNodesTx(from.id, to.id);
+  }
+
+  // Fold one node into another: junctions/aliases/edges re-point (duplicates
+  // merge, evidence accumulates), and the source becomes a redirect stub.
+  private mergeGraphNodesTx(fromId: string, toId: string): void {
+    if (fromId === toId) {
+      return;
+    }
+    this.db.prepare(`UPDATE OR IGNORE brain_node_claims SET node_id = ? WHERE node_id = ?`).run(toId, fromId);
+    this.db.prepare(`DELETE FROM brain_node_claims WHERE node_id = ?`).run(fromId);
+    this.db.prepare(`UPDATE OR IGNORE brain_node_aliases SET node_id = ? WHERE node_id = ?`).run(toId, fromId);
+    this.db.prepare(`DELETE FROM brain_node_aliases WHERE node_id = ?`).run(fromId);
+    const edges = this.db
+      .prepare(`SELECT id, src_node_id AS src, dst_node_id AS dst, kind FROM brain_edges WHERE src_node_id = ? OR dst_node_id = ?`)
+      .all(fromId, fromId) as Array<{ id: number; src: string; dst: string; kind: BrainGraphEdgeKind }>;
+    for (const edge of edges) {
+      const newSrc = edge.src === fromId ? toId : edge.src;
+      const newDst = edge.dst === fromId ? toId : edge.dst;
+      if (newSrc === newDst) {
+        this.db.prepare(`DELETE FROM brain_edge_evidence WHERE edge_id = ?`).run(edge.id);
+        this.db.prepare(`DELETE FROM brain_edges WHERE id = ?`).run(edge.id);
+        continue;
+      }
+      const conflict = this.db
+        .prepare(`SELECT id FROM brain_edges WHERE src_node_id = ? AND dst_node_id = ? AND kind = ?`)
+        .get(newSrc, newDst, edge.kind) as { id: number } | undefined;
+      if (conflict && conflict.id !== edge.id) {
+        this.db.prepare(`UPDATE OR IGNORE brain_edge_evidence SET edge_id = ? WHERE edge_id = ?`).run(conflict.id, edge.id);
+        this.db.prepare(`DELETE FROM brain_edge_evidence WHERE edge_id = ?`).run(edge.id);
+        this.db.prepare(`DELETE FROM brain_edges WHERE id = ?`).run(edge.id);
+        this.recountGraphEdgeTx(conflict.id);
+      } else {
+        this.db
+          .prepare(`UPDATE brain_edges SET src_node_id = ?, dst_node_id = ?, updated_at = ? WHERE id = ?`)
+          .run(newSrc, newDst, currentIso(), edge.id);
+      }
+    }
+    const fromRow = this.db
+      .prepare(`SELECT first_seen_at_ms AS first, last_seen_at_ms AS last, engagement_factor AS factor FROM brain_nodes WHERE id = ?`)
+      .get(fromId) as { first: number | null; last: number | null; factor: number } | undefined;
+    if (fromRow) {
+      const toRow = this.db
+        .prepare(`SELECT first_seen_at_ms AS first, last_seen_at_ms AS last, engagement_factor AS factor FROM brain_nodes WHERE id = ?`)
+        .get(toId) as { first: number | null; last: number | null; factor: number };
+      this.db
+        .prepare(`UPDATE brain_nodes SET first_seen_at_ms = ?, last_seen_at_ms = ?, engagement_factor = ?, updated_at = ? WHERE id = ?`)
+        .run(
+          minNullableMs(toRow.first, fromRow.first),
+          maxNullableMs(toRow.last, fromRow.last),
+          Math.max(toRow.factor, fromRow.factor),
+          currentIso(),
+          toId
+        );
+    }
+    this.db
+      .prepare(`UPDATE brain_nodes SET status = 'merged', merged_into = ?, salience = 0, updated_at = ? WHERE id = ?`)
+      .run(toId, currentIso(), fromId);
+  }
+
+  // Idempotent, chunked derivation from captured archive signals — the
+  // non-message-scoped half of the graph (membership timeline, vCard subjects,
+  // number-change succession, engagement factor). Zero model calls.
+  async syncBrainGraphSignals(): Promise<BrainGraphSyncResult> {
+    const result: BrainGraphSyncResult = { participationEdges: 0, vcardMentionEdges: 0, numberChangeAliases: 0, engagementFactors: 0 };
+    const periods = this.db
+      .prepare(
+        `SELECT period_key AS periodKey, group_source_id AS groupSourceId, participant_jid AS participantJid,
+                joined_at_ms AS joinedAtMs, left_at_ms AS leftAtMs, observed_at_ms AS observedAtMs
+         FROM group_membership_periods`
+      )
+      .all() as Array<{
+      periodKey: string;
+      groupSourceId: string;
+      participantJid: string;
+      joinedAtMs: number | null;
+      leftAtMs: number | null;
+      observedAtMs: number | null;
+    }>;
+    for (let index = 0; index < periods.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = periods.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      this.db.transaction(() => {
+        for (const period of batch) {
+          const group = this.canonicalJid(period.groupSourceId) ?? period.groupSourceId;
+          const participant = this.canonicalJid(period.participantJid) ?? period.participantJid;
+          const chatId = this.ensureGraphNodeTx({
+            naturalKey: chatNaturalKey(group),
+            kind: "chat",
+            title: null,
+            jid: null,
+            chatScope: group,
+            payload: null,
+            slugSeed: group.split("@")[0] ?? group,
+            seenAtMs: period.joinedAtMs ?? period.observedAtMs
+          });
+          const personId = this.ensureGraphNodeTx({
+            naturalKey: personJidNaturalKey(participant),
+            kind: "person",
+            title: null,
+            jid: participant,
+            chatScope: null,
+            payload: null,
+            slugSeed: participant.split("@")[0] ?? participant,
+            seenAtMs: period.joinedAtMs ?? period.observedAtMs
+          });
+          const inserted = this.addGraphEdgeEvidenceTx(
+            personId,
+            chatId,
+            "participates_in",
+            {
+              key: `period:${period.periodKey}`,
+              sourceRef: period.periodKey,
+              observedAtMs: period.joinedAtMs ?? period.observedAtMs ?? null
+            },
+            { firstMs: period.joinedAtMs, lastMs: period.leftAtMs ?? period.joinedAtMs ?? period.observedAtMs }
+          );
+          if (inserted) {
+            result.participationEdges += 1;
+          }
+        }
+      })();
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    const vcards = this.db
+      .prepare(
+        `SELECT v.source_message_key AS messageKey, v.card_index AS cardIndex, v.resolved_jid AS resolvedJid, v.display_name AS displayName,
+                m.sender_source_jid AS senderJid, m.timestamp_ms AS timestampMs
+         FROM message_vcards v
+         JOIN messages m ON m.source_message_key = v.source_message_key
+         WHERE v.resolved_jid IS NOT NULL`
+      )
+      .all() as Array<{
+      messageKey: string;
+      cardIndex: number;
+      resolvedJid: string;
+      displayName: string | null;
+      senderJid: string | null;
+      timestampMs: number | null;
+    }>;
+    for (let index = 0; index < vcards.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = vcards.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      this.db.transaction(() => {
+        for (const vcard of batch) {
+          const subject = this.canonicalJid(vcard.resolvedJid) ?? vcard.resolvedJid;
+          const subjectId = this.ensureGraphNodeTx({
+            naturalKey: personJidNaturalKey(subject),
+            kind: "person",
+            title: null,
+            jid: subject,
+            chatScope: null,
+            payload: null,
+            slugSeed: subject.split("@")[0] ?? subject,
+            seenAtMs: vcard.timestampMs
+          });
+          if (vcard.displayName?.trim()) {
+            this.db
+              .prepare(`INSERT OR IGNORE INTO brain_node_aliases (node_id, alias, source, created_at) VALUES (?, ?, 'vcard', ?)`)
+              .run(subjectId, vcard.displayName.trim(), currentIso());
+          }
+          if (!vcard.senderJid) {
+            continue;
+          }
+          const sharer = this.canonicalJid(vcard.senderJid) ?? vcard.senderJid;
+          if (sharer === subject) {
+            continue;
+          }
+          const sharerId = this.ensureGraphNodeTx({
+            naturalKey: personJidNaturalKey(sharer),
+            kind: "person",
+            title: null,
+            jid: sharer,
+            chatScope: null,
+            payload: null,
+            slugSeed: sharer.split("@")[0] ?? sharer,
+            seenAtMs: vcard.timestampMs
+          });
+          const inserted = this.addGraphEdgeEvidenceTx(sharerId, subjectId, "mentions", {
+            key: `vcard:${vcard.messageKey}:${vcard.cardIndex}`,
+            sourceMessageKey: vcard.messageKey,
+            sourceRef: `${vcard.messageKey}#${vcard.cardIndex}`,
+            observedAtMs: vcard.timestampMs ?? null
+          });
+          if (inserted) {
+            result.vcardMentionEdges += 1;
+          }
+        }
+      })();
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    const numberChanges = this.db
+      .prepare(`SELECT event_key AS eventKey, old_jid AS oldJid, new_jid AS newJid, observed_at_ms AS observedAtMs FROM identity_number_changes`)
+      .all() as Array<{ eventKey: string; oldJid: string; newJid: string; observedAtMs: number | null }>;
+    for (let index = 0; index < numberChanges.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = numberChanges.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      this.db.transaction(() => {
+        for (const change of batch) {
+          const oldJid = this.canonicalJid(change.oldJid) ?? change.oldJid;
+          const newJid = this.canonicalJid(change.newJid) ?? change.newJid;
+          if (oldJid === newJid) {
+            continue;
+          }
+          const oldId = this.ensureGraphNodeTx({
+            naturalKey: personJidNaturalKey(oldJid),
+            kind: "person",
+            title: null,
+            jid: oldJid,
+            chatScope: null,
+            payload: null,
+            slugSeed: oldJid.split("@")[0] ?? oldJid,
+            seenAtMs: change.observedAtMs
+          });
+          const newId = this.ensureGraphNodeTx({
+            naturalKey: personJidNaturalKey(newJid),
+            kind: "person",
+            title: null,
+            jid: newJid,
+            chatScope: null,
+            payload: null,
+            slugSeed: newJid.split("@")[0] ?? newJid,
+            seenAtMs: change.observedAtMs
+          });
+          const oldNumber = displayPhoneFromJid(oldJid);
+          if (oldNumber) {
+            const changes = this.db
+              .prepare(`INSERT OR IGNORE INTO brain_node_aliases (node_id, alias, source, created_at) VALUES (?, ?, 'number_change', ?)`)
+              .run(newId, oldNumber, currentIso()).changes;
+            result.numberChangeAliases += Number(changes);
+          }
+          this.addGraphEdgeEvidenceTx(oldId, newId, "alias_of", {
+            key: `numchange:${change.eventKey}`,
+            sourceRef: change.eventKey,
+            observedAtMs: change.observedAtMs ?? null
+          });
+        }
+      })();
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    const engagement = this.db
+      .prepare(
+        `SELECT counterparty_jid AS jid, SUM(eligible_outgoing_count) AS eligible, SUM(read_count) AS readCount
+         FROM engagement_aggregates WHERE counterparty_jid IS NOT NULL GROUP BY counterparty_jid`
+      )
+      .all() as Array<{ jid: string; eligible: number; readCount: number }>;
+    this.db.transaction(() => {
+      for (const row of engagement) {
+        const canonical = this.canonicalJid(row.jid) ?? row.jid;
+        const factor = engagementFactorFromAggregates([
+          { eligibleOutgoingCount: Number(row.eligible ?? 0), readCount: Number(row.readCount ?? 0) }
+        ]);
+        // Never mints a node: engagement is a salience input for people the
+        // graph already knows, not a reason to exist in it.
+        const changes = this.db
+          .prepare(`UPDATE brain_nodes SET engagement_factor = ?, updated_at = ? WHERE natural_key = ? AND engagement_factor != ?`)
+          .run(factor, currentIso(), personJidNaturalKey(canonical), factor).changes;
+        result.engagementFactors += Number(changes);
+      }
+    })();
+    return result;
+  }
+
+  // Wipe + replay every current model episode through the SAME derivation the
+  // commit path uses, then sync signals and recompute salience. Deterministic
+  // and model-free: this is also how pre-graph episodes gain coverage.
+  async rebuildBrainGraph(): Promise<BrainGraphRebuildResult> {
+    const startedAt = Date.now();
+    this.db.transaction(() => {
+      this.db.prepare(`DELETE FROM brain_edge_evidence`).run();
+      this.db.prepare(`DELETE FROM brain_edges`).run();
+      this.db.prepare(`DELETE FROM brain_node_claims`).run();
+      this.db.prepare(`DELETE FROM brain_node_aliases`).run();
+      this.db.prepare(`DELETE FROM brain_nodes`).run();
+    })();
+    const episodes = this.db
+      .prepare(
+        `SELECT id, chat_source_id AS chatSourceId, start_at_ms AS startAtMs, end_at_ms AS endAtMs
+         FROM brain_episodes WHERE status = 'current' AND generator = 'model' ORDER BY created_at, id`
+      )
+      .all() as Array<{ id: string; chatSourceId: string; startAtMs: number; endAtMs: number }>;
+    let replayed = 0;
+    const CHUNK = 25;
+    for (let index = 0; index < episodes.length; index += CHUNK) {
+      const batch = episodes.slice(index, index + CHUNK);
+      this.db.transaction(() => {
+        for (const episode of batch) {
+          this.applyEpisodeGraphTx({
+            episodeId: episode.id,
+            chatSourceId: episode.chatSourceId,
+            startAtMs: episode.startAtMs,
+            endAtMs: episode.endAtMs
+          });
+        }
+      })();
+      replayed += batch.length;
+      if (replayed % 100 === 0 || replayed === episodes.length) {
+        console.log(`[brain] graph rebuild: ${replayed}/${episodes.length} episode(s) replayed`);
+      }
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    await this.syncBrainGraphSignals();
+    await this.recomputeBrainGraphSalience();
+    const nodes = Number((this.db.prepare(`SELECT COUNT(*) AS count FROM brain_nodes`).get() as { count: number }).count);
+    const edges = Number((this.db.prepare(`SELECT COUNT(*) AS count FROM brain_edges`).get() as { count: number }).count);
+    const evidence = Number((this.db.prepare(`SELECT COUNT(*) AS count FROM brain_edge_evidence`).get() as { count: number }).count);
+    return { episodesReplayed: replayed, nodes, edges, evidence, durationMs: Date.now() - startedAt };
+  }
+
+  // Evidence-derived salience (never incremented blindly) with kind-aware
+  // dormancy: open commitments/questions are exempt and boost as their due
+  // date approaches. Dormancy hides from ranked surfaces; nothing is deleted.
+  async recomputeBrainGraphSalience(): Promise<BrainGraphRecomputeResult> {
+    const startedAt = Date.now();
+    const stats = new Map<string, { citations: number; days: number; lastTs: number | null }>();
+    for (const row of this.db
+      .prepare(
+        `SELECT node_id AS nodeId, COUNT(*) AS citations,
+                COUNT(DISTINCT CASE WHEN ts IS NOT NULL THEN date(ts / 1000, 'unixepoch') END) AS days,
+                MAX(ts) AS lastTs
+         FROM (
+           SELECT nc.node_id AS node_id, c.timestamp_ms AS ts
+           FROM brain_node_claims nc JOIN brain_citations c ON c.claim_id = nc.claim_id
+           UNION ALL
+           SELECT e.src_node_id, ev.observed_at_ms FROM brain_edge_evidence ev JOIN brain_edges e ON e.id = ev.edge_id
+           UNION ALL
+           SELECT e.dst_node_id, ev.observed_at_ms FROM brain_edge_evidence ev JOIN brain_edges e ON e.id = ev.edge_id
+         )
+         GROUP BY node_id`
+      )
+      .all() as Array<{ nodeId: string; citations: number; days: number; lastTs: number | null }>) {
+      stats.set(row.nodeId, { citations: Number(row.citations), days: Number(row.days), lastTs: row.lastTs });
+    }
+    const nodes = this.db
+      .prepare(
+        `SELECT id, kind, status, payload_json AS payloadJson, engagement_factor AS engagementFactor, last_seen_at_ms AS lastSeen
+         FROM brain_nodes WHERE status != 'merged'`
+      )
+      .all() as Array<{
+      id: string;
+      kind: BrainGraphNodeKind;
+      status: BrainGraphNodeStatus;
+      payloadJson: string | null;
+      engagementFactor: number;
+      lastSeen: number | null;
+    }>;
+    const threshold = graphDormancyThreshold();
+    const nowMs = Date.now();
+    const result: BrainGraphRecomputeResult = { nodes: nodes.length, dormant: 0, revived: 0, exemptOpenLifecycle: 0, durationMs: 0 };
+    const update = this.db.prepare(
+      `UPDATE brain_nodes SET salience = ?, status = ?, citation_count = ?, evidence_days = ?, last_seen_at_ms = ?, updated_at = ? WHERE id = ?`
+    );
+    for (let index = 0; index < nodes.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = nodes.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      this.db.transaction(() => {
+        for (const node of batch) {
+          const nodeStats = stats.get(node.id) ?? { citations: 0, days: 0, lastTs: null };
+          const payload = parseGraphPayload(node.payloadJson);
+          const computed = computeGraphSalience({
+            kind: node.kind,
+            payload,
+            citations: nodeStats.citations,
+            evidenceDays: nodeStats.days,
+            lastEvidenceAtMs: nodeStats.lastTs,
+            nowMs,
+            engagementFactor: node.engagementFactor,
+            dormancyThreshold: threshold
+          });
+          const lifecycleOpen = (node.kind === "commitment" || node.kind === "question") && (payload?.status ?? "open") === "open";
+          if (lifecycleOpen && computed.salience < threshold) {
+            result.exemptOpenLifecycle += 1;
+          }
+          const nextStatus: BrainGraphNodeStatus = computed.dormant ? "dormant" : "active";
+          if (nextStatus === "dormant" && node.status === "active") {
+            result.dormant += 1;
+          } else if (nextStatus === "active" && node.status === "dormant") {
+            result.revived += 1;
+          }
+          update.run(
+            computed.salience,
+            nextStatus,
+            nodeStats.citations,
+            nodeStats.days,
+            maxNullableMs(node.lastSeen, nodeStats.lastTs),
+            currentIso(),
+            node.id
+          );
+        }
+      })();
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    this.db
+      .prepare(
+        `INSERT INTO schema_meta (key, value, updated_at) VALUES ('brain_graph_last_recompute_at', ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+      )
+      .run(currentIso(), currentIso());
+    result.durationMs = Date.now() - startedAt;
+    return result;
+  }
+
+  async getBrainGraphStats(): Promise<BrainGraphStats> {
+    const nodesByKind: Partial<Record<BrainGraphNodeKind, number>> = {};
+    for (const row of this.db.prepare(`SELECT kind, COUNT(*) AS count FROM brain_nodes GROUP BY kind`).all() as Array<{
+      kind: BrainGraphNodeKind;
+      count: number;
+    }>) {
+      nodesByKind[row.kind] = Number(row.count);
+    }
+    const nodesByStatus: Partial<Record<BrainGraphNodeStatus, number>> = {};
+    for (const row of this.db.prepare(`SELECT status, COUNT(*) AS count FROM brain_nodes GROUP BY status`).all() as Array<{
+      status: BrainGraphNodeStatus;
+      count: number;
+    }>) {
+      nodesByStatus[row.status] = Number(row.count);
+    }
+    const edgesByKind: Partial<Record<BrainGraphEdgeKind, number>> = {};
+    for (const row of this.db.prepare(`SELECT kind, COUNT(*) AS count FROM brain_edges GROUP BY kind`).all() as Array<{
+      kind: BrainGraphEdgeKind;
+      count: number;
+    }>) {
+      edgesByKind[row.kind] = Number(row.count);
+    }
+    const meta = this.db.prepare(`SELECT value FROM schema_meta WHERE key = 'brain_graph_last_recompute_at'`).get() as
+      | { value: string }
+      | undefined;
+    return {
+      nodeCount: Number((this.db.prepare(`SELECT COUNT(*) AS count FROM brain_nodes`).get() as { count: number }).count),
+      edgeCount: Number((this.db.prepare(`SELECT COUNT(*) AS count FROM brain_edges`).get() as { count: number }).count),
+      evidenceCount: Number((this.db.prepare(`SELECT COUNT(*) AS count FROM brain_edge_evidence`).get() as { count: number }).count),
+      nodesByKind,
+      nodesByStatus,
+      edgesByKind,
+      unresolvedPersonNodes: Number(
+        (
+          this.db.prepare(`SELECT COUNT(*) AS count FROM brain_nodes WHERE kind = 'person' AND jid IS NULL AND status != 'merged'`).get() as {
+            count: number;
+          }
+        ).count
+      ),
+      openLifecycleNodes: Number(
+        (
+          this.db
+            .prepare(
+              `SELECT COUNT(*) AS count FROM brain_nodes
+               WHERE kind IN ('commitment','question') AND status != 'merged' AND json_extract(payload_json, '$.status') = 'open'`
+            )
+            .get() as { count: number }
+        ).count
+      ),
+      lastRecomputeAt: meta?.value ?? null
+    };
+  }
+
+  private graphNodeRowToRecord(row: GraphNodeRow): BrainGraphNodeRecord {
+    return {
+      id: row.id,
+      kind: row.kind,
+      naturalKey: row.natural_key,
+      slug: row.slug,
+      label: this.graphLabelForNodeRow(row),
+      title: row.title,
+      jid: row.jid,
+      chatScope: row.chat_scope,
+      payload: parseGraphPayload(row.payload_json),
+      status: row.status,
+      mergedInto: row.merged_into,
+      salience: Number(row.salience ?? 0),
+      citationCount: Number(row.citation_count ?? 0),
+      evidenceDays: Number(row.evidence_days ?? 0),
+      firstSeenAtMs: row.first_seen_at_ms,
+      lastSeenAtMs: row.last_seen_at_ms
+    };
+  }
+
+  // Read-time label resolution — store references, render names. Renames and
+  // person edits re-label with zero graph writes.
+  private graphLabelForNodeRow(row: GraphNodeRow): string {
+    if (row.kind === "person" && row.jid) {
+      return this.labelForJid(row.jid);
+    }
+    if (row.kind === "chat" && row.chat_scope) {
+      const chat = this.db.prepare(`SELECT display_name AS displayName FROM chats WHERE source_chat_id = ?`).get(row.chat_scope) as
+        | { displayName: string | null }
+        | undefined;
+      return chat?.displayName?.trim() || row.chat_scope;
+    }
+    return row.title?.trim() || row.slug;
+  }
+
+  async getBrainGraphEntity(query: { nodeId?: string; jid?: string; name?: string }): Promise<BrainGraphEntityView | null> {
+    const selectById = this.db.prepare(`SELECT * FROM brain_nodes WHERE id = ?`);
+    const selectByKey = this.db.prepare(`SELECT * FROM brain_nodes WHERE natural_key = ?`);
+    let row: GraphNodeRow | undefined;
+    let redirected = false;
+    if (query.nodeId) {
+      row = selectById.get(query.nodeId) as GraphNodeRow | undefined;
+      // Held ids never dangle: follow merged redirect stubs (bounded).
+      for (let hop = 0; row && row.status === "merged" && row.merged_into && hop < 5; hop += 1) {
+        row = selectById.get(row.merged_into) as GraphNodeRow | undefined;
+        redirected = true;
+      }
+    } else if (query.jid) {
+      const canonical = this.canonicalJid(query.jid) ?? query.jid;
+      row = selectByKey.get(personJidNaturalKey(canonical)) as GraphNodeRow | undefined;
+    } else if (query.name?.trim()) {
+      const norm = query.name.trim().toLowerCase();
+      row = this.db
+        .prepare(
+          `SELECT * FROM brain_nodes WHERE status != 'merged' AND lower(COALESCE(title, '')) = ? ORDER BY salience DESC, citation_count DESC LIMIT 1`
+        )
+        .get(norm) as GraphNodeRow | undefined;
+      if (!row) {
+        row = this.db
+          .prepare(
+            `SELECT n.* FROM brain_nodes n JOIN brain_node_aliases a ON a.node_id = n.id
+             WHERE n.status != 'merged' AND lower(a.alias) = ? ORDER BY n.salience DESC LIMIT 1`
+          )
+          .get(norm) as GraphNodeRow | undefined;
+      }
+    }
+    if (!row) {
+      return null;
+    }
+    // Person aggregation resolves membership at READ time: connect/disconnect
+    // re-derive this view with zero graph writes.
+    let personId: string | null = null;
+    let memberJids: string[] = [];
+    const memberRows: GraphNodeRow[] = [];
+    if (row.kind === "person" && row.jid) {
+      const person = await this.resolvePersonForJid(row.jid);
+      personId = person?.id ?? null;
+      memberJids = person ? person.members.map((member) => member.identityJid) : [row.jid];
+      for (const jid of memberJids) {
+        const canonical = this.canonicalJid(jid) ?? jid;
+        const memberRow = selectByKey.get(personJidNaturalKey(canonical)) as GraphNodeRow | undefined;
+        if (memberRow && memberRow.status !== "merged") {
+          memberRows.push(memberRow);
+        }
+      }
+      if (!memberRows.some((member) => member.id === row!.id)) {
+        memberRows.push(row);
+      }
+    } else {
+      memberJids = row.jid ? [row.jid] : [];
+      memberRows.push(row);
+    }
+    const nodeIds = memberRows.map((member) => member.id);
+    const jidByNodeId = new Map(memberRows.map((member) => [member.id, member.jid]));
+    const placeholders = nodeIds.map(() => "?").join(",");
+    const claimRows = this.db
+      .prepare(
+        `SELECT nc.node_id AS nodeId, c.id AS id, c.kind AS kind, c.text AS text, c.confidence AS confidence,
+                c.event_at_ms AS eventAtMs, c.valid_until_ms AS validUntilMs,
+                e.id AS episodeId, e.chat_source_id AS chatSourceId, ch.display_name AS chatDisplayName
+         FROM brain_node_claims nc
+         JOIN brain_claims c ON c.id = nc.claim_id
+         JOIN brain_episodes e ON e.id = c.episode_id
+         LEFT JOIN chats ch ON ch.source_chat_id = e.chat_source_id
+         WHERE nc.node_id IN (${placeholders}) AND e.status = 'current'`
+      )
+      .all(...nodeIds) as Array<{
+      nodeId: string;
+      id: string;
+      kind: BrainGraphEntityClaim["kind"];
+      text: string;
+      confidence: BrainGraphEntityClaim["confidence"];
+      eventAtMs: number | null;
+      validUntilMs: number | null;
+      episodeId: string;
+      chatSourceId: string;
+      chatDisplayName: string | null;
+    }>;
+    const citationsStmt = this.db.prepare(
+      `SELECT source_message_key, source_chat_id, message_id, sender_source_jid, timestamp_ms FROM brain_citations WHERE claim_id = ?`
+    );
+    const claims: BrainGraphEntityClaim[] = [];
+    const seenClaims = new Set<string>();
+    for (const claim of claimRows) {
+      if (seenClaims.has(claim.id)) {
+        continue;
+      }
+      seenClaims.add(claim.id);
+      claims.push({
+        id: claim.id,
+        kind: claim.kind,
+        text: claim.text,
+        confidence: claim.confidence,
+        eventAtMs: claim.eventAtMs,
+        validUntilMs: claim.validUntilMs,
+        episodeId: claim.episodeId,
+        chatSourceId: claim.chatSourceId,
+        chatDisplayName: claim.chatDisplayName,
+        viaJid: jidByNodeId.get(claim.nodeId) ?? null,
+        citations: (citationsStmt.all(claim.id) as Array<Record<string, unknown>>).map((citation) => ({
+          sourceMessageKey: String(citation.source_message_key),
+          sourceChatId: String(citation.source_chat_id),
+          messageId: (citation.message_id as number | null) ?? null,
+          senderSourceJid: (citation.sender_source_jid as string | null) ?? null,
+          timestampMs: (citation.timestamp_ms as number | null) ?? null
+        }))
+      });
+    }
+    claims.sort((a, b) => {
+      const aTs = Math.max(...a.citations.map((citation) => citation.timestampMs ?? 0), 0);
+      const bTs = Math.max(...b.citations.map((citation) => citation.timestampMs ?? 0), 0);
+      return bTs - aTs;
+    });
+    const edgeRows = this.db
+      .prepare(
+        `SELECT * FROM brain_edges WHERE src_node_id IN (${placeholders}) OR dst_node_id IN (${placeholders})
+         ORDER BY evidence_count DESC, last_seen_at_ms DESC LIMIT 200`
+      )
+      .all(...nodeIds, ...nodeIds) as Array<{
+      id: number;
+      src_node_id: string;
+      dst_node_id: string;
+      kind: BrainGraphEdgeKind;
+      weight: number;
+      evidence_count: number;
+      first_seen_at_ms: number | null;
+      last_seen_at_ms: number | null;
+    }>;
+    const nodeIdSet = new Set(nodeIds);
+    const edges: BrainGraphEdgeView[] = [];
+    for (const edge of edgeRows) {
+      const outbound = nodeIdSet.has(edge.src_node_id);
+      const otherId = outbound ? edge.dst_node_id : edge.src_node_id;
+      if (nodeIdSet.has(otherId)) {
+        continue;
+      }
+      const otherRow = selectById.get(otherId) as GraphNodeRow | undefined;
+      if (!otherRow) {
+        continue;
+      }
+      edges.push({
+        id: edge.id,
+        kind: edge.kind,
+        direction: outbound ? "out" : "in",
+        otherNode: {
+          id: otherRow.id,
+          kind: otherRow.kind,
+          label: this.graphLabelForNodeRow(otherRow),
+          slug: otherRow.slug,
+          status: otherRow.status,
+          salience: Number(otherRow.salience ?? 0),
+          jid: otherRow.jid
+        },
+        weight: Number(edge.weight ?? 0),
+        evidenceCount: Number(edge.evidence_count ?? 0),
+        firstSeenAtMs: edge.first_seen_at_ms,
+        lastSeenAtMs: edge.last_seen_at_ms
+      });
+    }
+    const aliasRows = this.db
+      .prepare(`SELECT DISTINCT alias FROM brain_node_aliases WHERE node_id IN (${placeholders}) ORDER BY alias`)
+      .all(...nodeIds) as Array<{ alias: string }>;
+    return {
+      node: this.graphNodeRowToRecord(row),
+      personId,
+      memberJids,
+      memberNodes: memberRows.map((member) => this.graphNodeRowToRecord(member)),
+      claims: claims.slice(0, 200),
+      edges,
+      aliases: aliasRows.map((alias) => alias.alias),
+      redirected
+    };
+  }
+
+  async listUnresolvedBrainGraphEntities(options: { limit?: number } = {}): Promise<BrainGraphUnresolvedEntity[]> {
+    const limit = Math.max(1, Math.min(200, options.limit ?? 50));
+    const rows = this.db
+      .prepare(
+        `SELECT n.*, ch.display_name AS chatDisplayName,
+                (SELECT COUNT(*) FROM brain_node_claims nc WHERE nc.node_id = n.id) AS claimCount
+         FROM brain_nodes n
+         LEFT JOIN chats ch ON ch.source_chat_id = n.chat_scope
+         WHERE n.kind = 'person' AND n.jid IS NULL AND n.status != 'merged'
+         ORDER BY n.salience DESC, claimCount DESC, n.last_seen_at_ms DESC
+         LIMIT ?`
+      )
+      .all(limit) as Array<GraphNodeRow & { chatDisplayName: string | null; claimCount: number }>;
+    return rows.map((row) => ({
+      node: this.graphNodeRowToRecord(row),
+      chatSourceId: row.chat_scope,
+      chatDisplayName: row.chatDisplayName,
+      claimCount: Number(row.claimCount ?? 0)
+    }));
   }
 
   // === Two-level person model =============================================
@@ -9933,6 +11315,48 @@ function utcDayString(ms: number = Date.now()): string {
 
 function currentIso(): string {
   return new Date().toISOString();
+}
+
+// Nullable millisecond folds for graph seen-window maintenance: null means
+// "no observation", never zero.
+function minNullableMs(a: number | null | undefined, b: number | null | undefined): number | null {
+  if (a == null) {
+    return b ?? null;
+  }
+  if (b == null) {
+    return a;
+  }
+  return Math.min(a, b);
+}
+
+function maxNullableMs(a: number | null | undefined, b: number | null | undefined): number | null {
+  if (a == null) {
+    return b ?? null;
+  }
+  if (b == null) {
+    return a;
+  }
+  return Math.max(a, b);
+}
+
+// Raw brain_nodes row shape shared by the graph read paths.
+interface GraphNodeRow {
+  id: string;
+  kind: BrainGraphNodeKind;
+  natural_key: string;
+  slug: string;
+  title: string | null;
+  jid: string | null;
+  chat_scope: string | null;
+  payload_json: string | null;
+  status: BrainGraphNodeStatus;
+  merged_into: string | null;
+  salience: number;
+  citation_count: number;
+  evidence_days: number;
+  engagement_factor: number;
+  first_seen_at_ms: number | null;
+  last_seen_at_ms: number | null;
 }
 
 function isLidFormJid(jid: string): boolean {

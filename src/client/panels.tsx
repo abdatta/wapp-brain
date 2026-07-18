@@ -46,6 +46,8 @@ import type {
   BrainProviderName,
   BrainRunProgress,
   ChatListItem,
+  OwnerIdentitySuggestion,
+  OwnerSelfIdentity,
   ImportJobSummary,
   ImportMode,
   ImportProgressEvent,
@@ -532,38 +534,25 @@ function BrainPanel({
   overview,
   run,
   busy,
-  onProviderAction,
-  onRun,
-  onRegenerate,
-  onSetOwner,
+  onOpenConsole,
   onReset
 }: {
   overview: BrainOverview | null;
   run: BrainRunProgress | null;
   busy: string | null;
-  onProviderAction: (body: {
-    action: "enable" | "disable" | "probe" | "set-model";
-    provider?: Exclude<BrainProviderName, "extractive">;
-    model?: string;
-  }) => void;
-  onRun: (body: { mode: "model" | "extractive"; model?: string | null; maxChats?: number }) => void;
-  onRegenerate: (body: { model?: string | null }) => void;
-  onSetOwner: (displayName: string | null) => void;
+  // Run configuration (identity, mode, provider, budgets) lives in the run
+  // console modal — the panel is a summary with one primary action, plus the
+  // reset danger control (a destructive archive-level action, not run config).
+  onOpenConsole: () => void;
   onReset: () => void;
 }) {
   const [open, setOpen] = useState(true);
-  const [ownerDraft, setOwnerDraft] = useState("");
-  // How many backlog chats one Run drains — small for a quick test, larger to
-  // catch up. Model runs still stop at the daily/hourly budget regardless.
-  const [chatsToRun, setChatsToRun] = useState(3);
   const provider = overview?.provider;
+  // Until the first status answer arrives, values are UNKNOWN — render
+  // shimmers, never placeholder zeros that read as data.
+  const loading = !overview;
   const runDue = Boolean(overview?.scheduler.runDue);
   const running = run?.state === "running";
-  useEffect(() => {
-    setOwnerDraft(overview?.ownerName ?? "");
-  }, [overview?.ownerName]);
-  const activeProviderName = provider?.provider ?? "extractive";
-  const modelOptions = provider && provider.provider !== "extractive" ? provider.models[provider.provider] ?? [] : [];
   return (
     <section className={`memoryPanel ${open ? "" : "collapsed"}`}>
       <button className="panelToggle" type="button" aria-expanded={open} onClick={() => setOpen((current) => !current)}>
@@ -578,13 +567,14 @@ function BrainPanel({
       {open && (
         <>
           <div className="statusGrid">
-            <Metric label="Coverage" value={`${overview?.coveragePercent ?? 0}%`} />
-            <Metric label="Backlog chats" value={overview?.chatsWithBacklog.toLocaleString() ?? "0"} />
+            <Metric label="Coverage" loading={loading} value={`${overview?.coveragePercent ?? 0}%`} />
+            <Metric label="Backlog chats" loading={loading} value={overview?.chatsWithBacklog.toLocaleString() ?? "0"} />
             <Metric
               label="Pending msgs"
+              loading={loading}
               value={((overview?.totalVisibleMessages ?? 0) - (overview?.assimilatedVisibleMessages ?? 0)).toLocaleString()}
             />
-            <Metric label="Calls today" value={overview?.usageToday.calls.toLocaleString() ?? "0"} />
+            <Metric label="Calls today" loading={loading} value={overview?.usageToday.calls.toLocaleString() ?? "0"} />
             {overview?.validationIssues && overview.validationIssues.error + overview.validationIssues.warning > 0 && (
               <Metric
                 label="Quality flags"
@@ -680,27 +670,389 @@ function BrainPanel({
               </span>
             </div>
           )}
-          <div className="brainProviderControls">
-            <label>
-              <span>Your name</span>
+          <div className="brainConsoleRow">
+            <button
+              className="primaryButton"
+              type="button"
+              disabled={Boolean(busy) || loading}
+              onClick={onOpenConsole}
+              title={loading ? "Waiting for brain status…" : "Configure identity, provider, and budgets, then start a run"}
+            >
+              {running ? <Loader2 className="spin" size={16} /> : <Play size={16} />}
+              {running ? "Run in progress…" : "Run brain"}
+            </button>
+            <button
+              className="miniButton dangerButton brainResetButton"
+              type="button"
+              disabled={Boolean(busy) || running || loading}
+              onClick={onReset}
+              title="Delete all generated episodes, claims, citations, and coverage watermarks (raw messages untouched); the next run starts from scratch"
+            >
+              <Trash2 size={14} />
+              Reset
+            </button>
+          </div>
+        </>
+      )}
+    </section>
+  );
+}
+
+// --- Brain run console (brain-run-console) ---------------------------------
+// Every run setting in one validated modal: identity (name required, self
+// numbers with absolute labeling precedence), mode, provider/model, and
+// budgets. The validation matrix DISABLES impossible combinations with a
+// stated reason — extractive mode has no model budgets, regeneration needs a
+// model, call budgets clamp to the remaining daily ledger — and Start stays
+// off until the owner name exists.
+
+// A number-ish current label carries no mis-pick warning value.
+function selfWarningLabel(label: string | null | undefined, ownerName: string): string | null {
+  const clean = label?.trim();
+  if (!clean || /^\+?[\d\s]+$/.test(clean)) {
+    return null;
+  }
+  const ownerShort = ownerName.trim().split(/\s+/)[0]?.toLowerCase() ?? "";
+  return ownerShort && clean.toLowerCase().includes(ownerShort) ? null : clean;
+}
+
+function RunConsoleModal({
+  overview,
+  busy,
+  running,
+  onClose,
+  onProviderAction,
+  onSaveIdentity,
+  onStartRun,
+  onStartRegenerate,
+  suggest
+}: {
+  overview: BrainOverview | null;
+  busy: string | null;
+  running: boolean;
+  onClose: () => void;
+  onProviderAction: (body: {
+    action: "enable" | "disable" | "probe" | "set-model";
+    provider?: Exclude<BrainProviderName, "extractive">;
+    model?: string;
+  }) => void;
+  onSaveIdentity: (name: string, selfJids: string[]) => Promise<boolean>;
+  onStartRun: (body: {
+    mode: "model" | "extractive";
+    model?: string | null;
+    maxChats?: number;
+    maxModelCalls?: number;
+    maxTokens?: number | null;
+  }) => Promise<boolean>;
+  onStartRegenerate: (body: { model?: string | null }) => Promise<boolean>;
+  suggest: (query: string) => Promise<OwnerIdentitySuggestion[]>;
+}) {
+  const provider = overview?.provider ?? null;
+  const ownerName = overview?.ownerName ?? "";
+  const [name, setName] = useState(ownerName);
+  const [selfEntries, setSelfEntries] = useState<OwnerSelfIdentity[]>(overview?.selfIdentities ?? []);
+  const [numberInput, setNumberInput] = useState("");
+  const [numberError, setNumberError] = useState<string | null>(null);
+  const [suggestions, setSuggestions] = useState<OwnerIdentitySuggestion[]>([]);
+  const [suggestionsOpen, setSuggestionsOpen] = useState(false);
+  const [runMode, setRunMode] = useState<"assimilate" | "regenerate">("assimilate");
+  const [maxChats, setMaxChats] = useState("3");
+  const [maxCalls, setMaxCalls] = useState(String(overview?.limits?.maxCallsPerHour ?? 30));
+  const [maxTokens, setMaxTokens] = useState("");
+  const [starting, setStarting] = useState(false);
+
+  // Plain substring autocomplete (no inference), debounced; every row shows
+  // the number's CURRENT resolved name so a mis-pick is visible before saving.
+  useEffect(() => {
+    const query = numberInput.trim();
+    if (query.length < 2) {
+      setSuggestions([]);
+      setSuggestionsOpen(false);
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      suggest(query)
+        .then((rows) => {
+          setSuggestions(rows);
+          setSuggestionsOpen(rows.length > 0);
+        })
+        .catch(() => setSuggestions([]));
+    }, 180);
+    return () => window.clearTimeout(timer);
+  }, [numberInput, suggest]);
+
+  const modelBacked = Boolean(provider && provider.provider !== "extractive");
+  const modelOptions = provider && provider.provider !== "extractive" ? provider.models[provider.provider] ?? [] : [];
+  const regenerable = overview?.regenerableEpisodes ?? 0;
+  const dailyCap = overview?.limits?.maxCallsPerDay ?? 0;
+  const usedToday = overview?.usageToday.calls ?? 0;
+  const remainingToday = Math.max(0, dailyCap - usedToday);
+
+  // --- Validation matrix: disabled-with-reason, never silently ignored. ---
+  const nameError = name.trim() ? null : "Your name is required — episodes label your own messages with it.";
+  const chatsNumber = Number(maxChats);
+  const chatsError =
+    runMode === "regenerate"
+      ? null
+      : !Number.isInteger(chatsNumber) || chatsNumber < 1 || chatsNumber > 5000
+        ? "Between 1 and 5000 chats."
+        : null;
+  const callsDisabledReason = !modelBacked
+    ? "Extractive mode makes no model calls — nothing to budget."
+    : runMode === "regenerate"
+      ? "Regeneration sizes its own queue; the call budget still caps spend via the daily ledger."
+      : null;
+  const callsNumber = Number(maxCalls);
+  const callsError =
+    callsDisabledReason != null
+      ? null
+      : !Number.isInteger(callsNumber) || callsNumber < 1 || callsNumber > 1000
+        ? "Between 1 and 1000 calls."
+        : callsNumber > remainingToday
+          ? `Only ${remainingToday.toLocaleString()} of ${dailyCap.toLocaleString()} daily calls left today.`
+          : null;
+  const tokensDisabledReason = !modelBacked
+    ? "Extractive mode makes no model calls — nothing to budget."
+    : runMode === "regenerate"
+      ? "Token budget applies to assimilation runs; regeneration enforces the call budget."
+      : null;
+  const tokensNumber = maxTokens.trim() === "" ? null : Number(maxTokens);
+  const tokensError =
+    tokensDisabledReason != null || tokensNumber == null
+      ? null
+      : !Number.isInteger(tokensNumber) || tokensNumber < 1000 || tokensNumber > 100_000_000
+        ? "Between 1,000 and 100,000,000 tokens (leave empty for no token budget)."
+        : null;
+  const tokenNote =
+    tokensDisabledReason ??
+    (provider?.tokenUsage === "may-estimate"
+      ? "Some codex calls report estimated usage — treat this budget as approximate."
+      : "Counts the provider's real reported usage.");
+  const regenerateDisabledReason =
+    regenerable === 0
+      ? "Nothing to regenerate — every current episode is on the current contract."
+      : !modelBacked
+        ? "Regeneration needs a model provider — an extractive re-run would downgrade model episodes."
+        : null;
+  const providerGate = !provider
+    ? "Provider status is still loading."
+    : modelBacked && provider.sessionMissing
+      ? provider.message
+      : modelBacked && provider.degraded
+        ? `${provider.message} Probe the provider (or pick extractive) before running.`
+        : null;
+  const startDisabledReason =
+    nameError ??
+    providerGate ??
+    (running ? "A run is already in progress." : null) ??
+    (busy ? `Busy: ${busy}.` : null) ??
+    (runMode === "regenerate"
+      ? regenerateDisabledReason
+      : chatsError ??
+        callsError ??
+        tokensError ??
+        ((overview?.chatsWithBacklog ?? 0) === 0 ? "No backlog — every visible message is already assimilated." : null) ??
+        (modelBacked && remainingToday === 0
+          ? `Daily call budget exhausted (${usedToday.toLocaleString()}/${dailyCap.toLocaleString()}). Extractive still works, or raise the cap.`
+          : null));
+
+  const addSelfEntry = (entry: OwnerSelfIdentity) => {
+    setSelfEntries((current) => (current.some((existing) => existing.jid === entry.jid) ? current : [...current, entry]));
+    setNumberInput("");
+    setNumberError(null);
+    setSuggestions([]);
+    setSuggestionsOpen(false);
+  };
+
+  const addFreeText = () => {
+    const digits = numberInput.replace(/[\s\-().+]/g, "");
+    if (!/^\d{8,15}$/.test(digits)) {
+      setNumberError("Use 8–15 digits (optional +, spaces, dashes) — or pick a suggestion.");
+      return;
+    }
+    const jid = `${digits}@s.whatsapp.net`;
+    const match = suggestions.find((suggestion) => suggestion.jid === jid);
+    addSelfEntry(
+      match
+        ? { jid: match.jid, number: match.number, currentLabel: selfWarningLabel(match.label, name), messageCount: match.messageCount }
+        : { jid, number: `+${digits}`, currentLabel: null, messageCount: 0 }
+    );
+  };
+
+  async function handleStart() {
+    if (startDisabledReason) {
+      return;
+    }
+    setStarting(true);
+    try {
+      const identitySaved = await onSaveIdentity(
+        name.trim(),
+        selfEntries.map((entry) => entry.jid)
+      );
+      if (!identitySaved) {
+        return;
+      }
+      const started =
+        runMode === "regenerate"
+          ? await onStartRegenerate({ model: provider?.model ?? null })
+          : await onStartRun({
+              mode: modelBacked ? "model" : "extractive",
+              model: modelBacked ? provider?.model ?? null : null,
+              maxChats: chatsNumber,
+              ...(modelBacked && callsDisabledReason == null ? { maxModelCalls: callsNumber } : {}),
+              ...(modelBacked && tokensDisabledReason == null && tokensNumber ? { maxTokens: tokensNumber } : {})
+            });
+      if (started) {
+        onClose();
+      }
+    } finally {
+      setStarting(false);
+    }
+  }
+
+  return (
+    <div className="modalBackdrop" role="dialog" aria-modal="true" aria-labelledby="run-console-title">
+      <section className="runConsoleModal">
+        <header className="runConsoleHeader">
+          <div>
+            <h2 id="run-console-title">Brain run console</h2>
+            <p>Identity, provider, and budgets for this run. Invalid combinations are disabled — with the reason.</p>
+          </div>
+          <button className="miniButton" type="button" onClick={onClose} aria-label="Close">
+            <X size={16} />
+          </button>
+        </header>
+
+        <div className="runConsoleSection">
+          <h3>Identity</h3>
+          <label className="runConsoleField">
+            <span>
+              Your name <em className="requiredMark">*</em>
+            </span>
+            <input
+              value={name}
+              placeholder="e.g. Abhishek"
+              onChange={(event) => setName(event.target.value)}
+              title='Labels your own messages in episodes and search ("Abhishek (me)" instead of "Me")'
+            />
+            {nameError && <span className="fieldError">{nameError}</span>}
+          </label>
+          <div className="runConsoleField">
+            <span>Also me (other numbers)</span>
+            <div className="selfChips">
+              {selfEntries.map((entry) => (
+                <span key={entry.jid} className={`selfChip ${entry.currentLabel ? "selfChipWarn" : ""}`}>
+                  <span>{entry.number}</span>
+                  {entry.currentLabel && (
+                    <span
+                      className="selfChipNote"
+                      title={`This number currently resolves to “${entry.currentLabel}”. As a self number it will be labelled “${name.trim() || "you"} (me)” with precedence over that name.`}
+                    >
+                      saved as “{entry.currentLabel}”
+                    </span>
+                  )}
+                  {entry.messageCount > 0 && <span className="selfChipCount">{entry.messageCount.toLocaleString()} msgs</span>}
+                  <button
+                    type="button"
+                    aria-label={`Remove ${entry.number}`}
+                    onClick={() => setSelfEntries((current) => current.filter((existing) => existing.jid !== entry.jid))}
+                  >
+                    <X size={12} />
+                  </button>
+                </span>
+              ))}
+            </div>
+            <div className="selfSuggestWrap">
               <input
-                value={ownerDraft}
-                disabled={Boolean(busy)}
-                placeholder="e.g. Abhishek"
-                onChange={(event) => setOwnerDraft(event.target.value)}
-                onBlur={() => {
-                  if (ownerDraft.trim() !== (overview?.ownerName ?? "")) {
-                    onSetOwner(ownerDraft.trim() || null);
+                value={numberInput}
+                placeholder="Type a number or name to search your archive…"
+                onChange={(event) => {
+                  setNumberInput(event.target.value);
+                  setNumberError(null);
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    addFreeText();
+                  } else if (event.key === "Escape") {
+                    setSuggestionsOpen(false);
                   }
                 }}
-                title='Labels your own messages in episodes and search ("Abhishek (me)" instead of "Me"), and tells the model who you are'
+                onBlur={() => window.setTimeout(() => setSuggestionsOpen(false), 150)}
+                onFocus={() => setSuggestionsOpen(suggestions.length > 0)}
               />
+              {suggestionsOpen && (
+                <ul className="selfSuggestList" role="listbox">
+                  {suggestions.map((suggestion) => {
+                    const added = selfEntries.some((entry) => entry.jid === suggestion.jid);
+                    const warning = selfWarningLabel(suggestion.label, name);
+                    return (
+                      <li key={suggestion.jid}>
+                        <button
+                          type="button"
+                          disabled={added}
+                          onMouseDown={(event) => event.preventDefault()}
+                          onClick={() =>
+                            addSelfEntry({
+                              jid: suggestion.jid,
+                              number: suggestion.number,
+                              currentLabel: warning,
+                              messageCount: suggestion.messageCount
+                            })
+                          }
+                        >
+                          <strong>{suggestion.number}</strong>
+                          <span className={warning ? "selfSuggestName" : "selfSuggestMuted"}>
+                            {warning ?? (suggestion.label && !/^\+?[\d\s]+$/.test(suggestion.label) ? suggestion.label : "no saved name")}
+                          </span>
+                          <span className="selfSuggestMeta">
+                            {suggestion.messageCount.toLocaleString()} msgs{added ? " · added" : suggestion.isSelf ? " · already you" : ""}
+                          </span>
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
+            </div>
+            {numberError && <span className="fieldError">{numberError}</span>}
+            <span className="fieldNote">
+              These numbers are treated as you with precedence over any saved contact name. New episodes label them “
+              {(name.trim() || "you").split(/\s+/)[0]} (me)”; regeneration upgrades old ones.
+            </span>
+          </div>
+        </div>
+
+        <div className="runConsoleSection">
+          <h3>Run</h3>
+          <div className="runModeRow" role="radiogroup" aria-label="Run mode">
+            <label className={runMode === "assimilate" ? "runModeActive" : ""}>
+              <input type="radio" name="runMode" checked={runMode === "assimilate"} onChange={() => setRunMode("assimilate")} />
+              <span>Assimilate new</span>
+              <small>{(overview?.chatsWithBacklog ?? 0).toLocaleString()} chat(s) with backlog</small>
             </label>
-            <label>
+            <label
+              className={`${runMode === "regenerate" ? "runModeActive" : ""} ${regenerateDisabledReason ? "runModeDisabled" : ""}`}
+              title={regenerateDisabledReason ?? undefined}
+            >
+              <input
+                type="radio"
+                name="runMode"
+                disabled={Boolean(regenerateDisabledReason)}
+                checked={runMode === "regenerate"}
+                onChange={() => setRunMode("regenerate")}
+              />
+              <span>Regenerate stale</span>
+              <small>
+                {regenerable.toLocaleString()} episode(s) below v{overview?.extractionVersion ?? "?"}
+              </small>
+            </label>
+          </div>
+          <div className="runConsoleGrid">
+            <label className="runConsoleField">
               <span>Provider</span>
               <select
-                value={activeProviderName}
-                disabled={Boolean(busy)}
+                value={provider?.provider ?? "extractive"}
                 onChange={(event) => {
                   const value = event.target.value as BrainProviderName;
                   if (value === "extractive") {
@@ -715,31 +1067,31 @@ function BrainPanel({
                 <option value="codex">codex (GPT OAuth)</option>
               </select>
             </label>
-            {provider && provider.provider !== "extractive" && (
-              <label>
-                <span>Model{provider.reasoningEffort ? ` · effort ${provider.reasoningEffort}` : ""}</span>
-                <select
-                  value={provider.model ?? modelOptions[0] ?? ""}
-                  disabled={Boolean(busy)}
-                  onChange={(event) =>
-                    onProviderAction({
-                      action: "set-model",
-                      provider: provider.provider as Exclude<BrainProviderName, "extractive">,
-                      model: event.target.value
-                    })
-                  }
-                >
-                  {modelOptions.map((model) => (
-                    <option key={model} value={model}>
-                      {model}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            )}
-            {provider && provider.provider !== "extractive" && (
+            <label className="runConsoleField" title={!modelBacked ? "Extractive mode makes no model calls." : undefined}>
+              <span>Model{provider?.reasoningEffort ? ` · effort ${provider.reasoningEffort}` : ""}</span>
+              <select
+                disabled={!modelBacked}
+                value={provider?.model ?? modelOptions[0] ?? ""}
+                onChange={(event) =>
+                  provider &&
+                  provider.provider !== "extractive" &&
+                  onProviderAction({
+                    action: "set-model",
+                    provider: provider.provider as Exclude<BrainProviderName, "extractive">,
+                    model: event.target.value
+                  })
+                }
+              >
+                {(modelBacked ? modelOptions : ["—"]).map((model) => (
+                  <option key={model} value={model}>
+                    {model}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {modelBacked && (
               <button
-                className="miniButton"
+                className="miniButton probeButton"
                 type="button"
                 disabled={Boolean(busy) || running}
                 onClick={() => onProviderAction({ action: "probe" })}
@@ -748,64 +1100,89 @@ function BrainPanel({
                 Probe
               </button>
             )}
-            <label title="How many backlog chats this run assimilates (newest first). Keep it small for a quick test.">
+          </div>
+          <div className={`statusLine ${provider?.degraded ? "degradedLine" : ""}`}>{provider?.message}</div>
+        </div>
+
+        <div className="runConsoleSection">
+          <h3>Budgets</h3>
+          <div className="runConsoleGrid">
+            <label
+              className={`runConsoleField ${runMode === "regenerate" ? "fieldDisabled" : ""}`}
+              title={runMode === "regenerate" ? "Regeneration drains its own queue of stale episodes." : "How many backlog chats this run assimilates (newest first)."}
+            >
               <span>Chats</span>
               <input
                 type="number"
                 min={1}
                 max={5000}
-                value={chatsToRun}
-                disabled={Boolean(busy) || running}
-                onChange={(event) => setChatsToRun(Math.max(1, Math.min(5000, Number(event.target.value) || 1)))}
+                disabled={runMode === "regenerate"}
+                value={maxChats}
+                onChange={(event) => setMaxChats(event.target.value)}
               />
+              {chatsError && <span className="fieldError">{chatsError}</span>}
             </label>
+            <label
+              className={`runConsoleField ${callsDisabledReason ? "fieldDisabled" : ""}`}
+              title={callsDisabledReason ?? `Hard cap on model calls this run. ${remainingToday.toLocaleString()} of ${dailyCap.toLocaleString()} daily calls left.`}
+            >
+              <span>Max model calls</span>
+              <input
+                type="number"
+                min={1}
+                max={1000}
+                disabled={Boolean(callsDisabledReason)}
+                value={maxCalls}
+                onChange={(event) => setMaxCalls(event.target.value)}
+              />
+              {callsDisabledReason ? (
+                <span className="fieldNote">{callsDisabledReason}</span>
+              ) : callsError ? (
+                <span className="fieldError">{callsError}</span>
+              ) : (
+                <span className="fieldNote">{remainingToday.toLocaleString()} of {dailyCap.toLocaleString()} daily calls left today.</span>
+              )}
+            </label>
+            <label
+              className={`runConsoleField ${tokensDisabledReason ? "fieldDisabled" : ""}`}
+              title={tokensDisabledReason ?? "Optional hard ceiling on input+output tokens this run; the run stops BEFORE the call that would cross it."}
+            >
+              <span>Max tokens (optional)</span>
+              <input
+                type="number"
+                min={1000}
+                step={1000}
+                placeholder="no token budget"
+                disabled={Boolean(tokensDisabledReason)}
+                value={maxTokens}
+                onChange={(event) => setMaxTokens(event.target.value)}
+              />
+              {tokensError ? <span className="fieldError">{tokensError}</span> : <span className="fieldNote">{tokenNote}</span>}
+            </label>
+          </div>
+        </div>
+
+        <footer className="runConsoleFooter">
+          <div className="runConsoleFooterReason">{startDisabledReason}</div>
+          <div className="runConsoleFooterActions">
+            <button className="secondaryButton" type="button" onClick={onClose}>
+              Cancel
+            </button>
             <button
               className="primaryButton"
               type="button"
-              disabled={Boolean(busy) || running || !overview || overview.chatsWithBacklog === 0 || Boolean(provider?.sessionMissing)}
-              onClick={() =>
-                onRun(
-                  provider && provider.provider !== "extractive"
-                    ? { mode: "model", model: provider.model, maxChats: chatsToRun }
-                    : { mode: "extractive", maxChats: chatsToRun }
-                )
-              }
-              title={
-                provider && provider.provider !== "extractive"
-                  ? `Assimilate the top ${chatsToRun} backlog chat(s) with ${provider.provider}/${provider.model} (stops at your daily/hourly budget)`
-                  : `Assimilate the top ${chatsToRun} backlog chat(s) with extractive placeholders (no model calls; regenerable later)`
-              }
+              disabled={Boolean(startDisabledReason) || starting}
+              title={startDisabledReason ?? undefined}
+              onClick={() => void handleStart()}
             >
-              {running ? <Loader2 className="spin" size={16} /> : <Play size={16} />}
-              Run
-            </button>
-            {(overview?.regenerableEpisodes ?? 0) > 0 && (
-              <button
-                className="miniButton"
-                type="button"
-                disabled={Boolean(busy) || running || !provider || provider.provider === "extractive" || Boolean(provider.sessionMissing)}
-                onClick={() => onRegenerate({ model: provider?.model ?? null })}
-                title={`Re-derive ${overview?.regenerableEpisodes} extractive or stale-version episode(s) from their stored windows under the current extraction contract (v${overview?.extractionVersion ?? "?"}); old episodes become superseded, watermarks untouched. Needs a model provider.`}
-              >
-                <RefreshCcw size={14} />
-                Regenerate {overview?.regenerableEpisodes}
-              </button>
-            )}
-            <button
-              className="miniButton dangerButton"
-              type="button"
-              disabled={Boolean(busy) || running}
-              onClick={onReset}
-              title="Delete all generated episodes, claims, citations, and coverage watermarks (raw messages untouched); the next run starts from scratch"
-            >
-              <Trash2 size={14} />
-              Reset
+              {starting ? <Loader2 className="spin" size={16} /> : <Play size={16} />}
+              {runMode === "regenerate" ? `Regenerate ${regenerable.toLocaleString()}` : "Start run"}
             </button>
           </div>
-          <div className={`statusLine ${provider?.degraded ? "degradedLine" : ""}`}>{provider?.message}</div>
-        </>
-      )}
-    </section>
+        </footer>
+
+      </section>
+    </div>
   );
 }
 
@@ -1856,11 +2233,13 @@ function StatusPanel({
   );
 }
 
-function Metric({ label, value }: { label: string; value: string }) {
+// `loading` renders a shimmer in place of the value — real numbers or a
+// loader, never a placeholder 0 that reads as data.
+function Metric({ label, value, loading }: { label: string; value: string; loading?: boolean }) {
   return (
     <div className="metric">
       <span>{label}</span>
-      <strong>{value}</strong>
+      {loading ? <strong className="metricSkeleton" aria-label={`${label} loading`} /> : <strong>{value}</strong>}
     </div>
   );
 }
@@ -1874,6 +2253,7 @@ export {
   GoogleContactsPanel,
   LivePanel,
   BrainPanel,
+  RunConsoleModal,
   MemoryPanel,
   OnboardingPanel,
   StatusPanel,
