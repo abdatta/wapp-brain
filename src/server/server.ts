@@ -903,9 +903,22 @@ app.get("/api/brain/status", async (_req, res) => {
   }
 });
 
+// Backfill dashboard (historical-backfill H4): one server-computed DTO —
+// coverage, queue depth, trailing drain rate, honest ETA, per-model spend,
+// and the extractive-fallback canary. Meaning lives here; UI/CLI render it.
+app.get("/api/brain/backfill/status", async (_req, res) => {
+  try {
+    const { getBrainBackfillStatus } = await import("./brain/runJob");
+    res.json(await getBrainBackfillStatus(repository));
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
 // Regeneration (contract v2): re-derive stale-version/extractive episodes from
 // their stored windows under the current contract, superseding the old rows.
-// dryRun reports the queue size without spending anything.
+// dryRun reports the queue size without spending anything. onlyExtractive is
+// the backfill dashboard's "sweep the fallbacks" scope.
 app.post("/api/brain/regenerate", async (req, res) => {
   try {
     if (!req.body?.dryRun && !(await repository.getArchiveOwnerName())) {
@@ -914,23 +927,33 @@ app.post("/api/brain/regenerate", async (req, res) => {
     }
     const { EXTRACTION_VERSION } = await import("./brain/episodes");
     const chatSourceId = typeof req.body?.chatSourceId === "string" ? req.body.chatSourceId : null;
+    const onlyExtractive = req.body?.onlyExtractive === true;
     if (req.body?.dryRun) {
       const stale = await repository.listRegenerableBrainEpisodes({
         currentVersion: EXTRACTION_VERSION,
         chatSourceId,
+        onlyExtractive,
         limit: 10_000
       });
       res.json({ ok: true, dryRun: true, episodes: stale.length });
       return;
     }
     const { startBrainRun } = await import("./brain/runJob");
+    // Turbo overrides (the fallback sweep is a bulk re-derivation): the sliding
+    // pool + no-hourly-cap machinery mirrors backfill. 0 = unset.
+    const callsPerHour = clampNumber(req.body?.callsPerHour, 1, 1000, 0);
+    const callsPerDay = clampNumber(req.body?.callsPerDay, 1, 10_000, 0);
     const result = startBrainRun(
       repository,
       {
         mode: "model",
         model: typeof req.body?.model === "string" ? req.body.model : null,
         chatSourceId,
-        regenerate: true
+        regenerate: true,
+        regenerateOnlyExtractive: onlyExtractive,
+        concurrency: req.body?.concurrency != null ? clampNumber(req.body?.concurrency, 1, 6, 5) : null,
+        callsPerHour: callsPerHour > 0 ? callsPerHour : null,
+        callsPerDay: callsPerDay > 0 ? callsPerDay : null
       },
       () => {
         broadcastArchiveChanged({ source: "manual", chatSourceIds: [], messageCount: 0, contactCount: 0 });
@@ -957,17 +980,35 @@ app.post("/api/brain/runs", async (req, res) => {
     }
     const { startBrainRun } = await import("./brain/runJob");
     const mode = req.body?.mode === "model" || req.body?.mode === "extractive" ? req.body.mode : "model";
+    const backfill = req.body?.backfill === true;
     const maxTokens = clampNumber(req.body?.maxTokens, 1000, 100_000_000, 0);
+    // Backfill turbo pacing overrides (H2): 0 = not set (clampNumber default).
+    const callsPerHour = clampNumber(req.body?.callsPerHour, 1, 1000, 0);
+    const callsPerDay = clampNumber(req.body?.callsPerDay, 1, 10_000, 0);
     const result = startBrainRun(
       repository,
       {
         mode,
         model: typeof req.body?.model === "string" ? req.body.model : null,
         chatSourceId: typeof req.body?.chatSourceId === "string" ? req.body.chatSourceId : null,
-        maxChats: clampNumber(req.body?.maxChats, 1, 5000, 10),
-        maxModelCalls: clampNumber(req.body?.maxModelCalls, 1, 1000, config.brain.maxCallsPerHour),
+        // Backfill drains the whole queue unless capped; manual keeps its 10.
+        maxChats: backfill
+          ? req.body?.maxChats != null
+            ? clampNumber(req.body?.maxChats, 1, 100_000, 0) || undefined
+            : undefined
+          : clampNumber(req.body?.maxChats, 1, 5000, 10),
+        maxModelCalls: backfill
+          ? req.body?.maxModelCalls != null
+            ? clampNumber(req.body?.maxModelCalls, 1, 100_000, 0) || undefined
+            : undefined
+          : clampNumber(req.body?.maxModelCalls, 1, 1000, config.brain.maxCallsPerHour),
         // 0 = no token budget (clampNumber's default when the field is absent).
-        maxTokens: mode === "model" && maxTokens > 0 ? maxTokens : null
+        maxTokens: mode === "model" && maxTokens > 0 ? maxTokens : null,
+        backfill,
+        callsPerHour: backfill && callsPerHour > 0 ? callsPerHour : null,
+        callsPerDay: backfill && callsPerDay > 0 ? callsPerDay : null,
+        strict: backfill && req.body?.strict === true,
+        concurrency: backfill ? clampNumber(req.body?.concurrency, 1, 6, 5) : null
       },
       () => {
         broadcastArchiveChanged({ source: "manual", chatSourceIds: [], messageCount: 0, contactCount: 0 });

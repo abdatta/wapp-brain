@@ -528,6 +528,94 @@ function LivePanel({
   );
 }
 
+// Compact counts for chips (11,528 → "11.5k") so a chip stays one glanceable token.
+function compactCount(value: number): string {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k`;
+  return value.toLocaleString();
+}
+
+// One live fact as a pill: a muted label and its value. `truncate` clamps long
+// values (a chat name) with the full text on hover; `warn` tints it (fallbacks).
+function RunChip({ label, value, truncate, warn }: { label: string; value: string; truncate?: boolean; warn?: boolean }) {
+  return (
+    <span className={`runChip ${warn ? "runChipWarn" : ""}`} title={truncate ? value : undefined}>
+      <span className="runChipLabel">{label}</span>
+      <span className={`runChipValue ${truncate ? "runChipTruncate" : ""}`}>{value}</span>
+    </span>
+  );
+}
+
+// A live run's progress: a determinate bar against the precomputed episode
+// estimate (indeterminate until it lands), the run's live facts as chips, and a
+// Stop control. Replaces the panel's action row while a run executes — the Run
+// button is meaningless then (only one run at a time).
+function RunProgressCard({ run, stopping, onStop }: { run: BrainRunProgress; stopping: boolean; onStop: () => void }) {
+  const kindLabel = run.kind === "backfill" ? "Backfill" : run.kind === "regenerate" ? "Regeneration" : "Assimilation";
+  const committed = run.episodesCommitted;
+  const estimate = run.estimatedEpisodes;
+  const known = estimate != null && estimate > 0;
+  // Once the actual count passes the estimate, the denominator is meaningless —
+  // flip to the indeterminate sweep rather than pin a false 100%. So the bar is
+  // determinate only while committed is within the estimate.
+  const over = known && committed > estimate;
+  const determinate = known && !over;
+  const percent = determinate ? Math.min(100, Math.round((committed / estimate) * 100)) : null;
+  // Regeneration knows its total exactly; assimilation/backfill estimate it.
+  const approx = run.kind !== "regenerate";
+  return (
+    <div className="runProgressCard">
+      <div className="runProgressHead">
+        <span className="runProgressTitle">
+          <Loader2 className="spin" size={15} />
+          <span>
+            {kindLabel} running{stopping ? " — stopping…" : ""}
+          </span>
+        </span>
+        <button
+          className="miniButton runStopButton"
+          type="button"
+          disabled={stopping}
+          onClick={onStop}
+          title="Stop after the current episode; committed episodes and coverage are kept, the rest stays pending"
+        >
+          <CircleStop size={14} />
+          {stopping ? "Stopping…" : "Stop"}
+        </button>
+      </div>
+      <div
+        className={`runProgressBar ${determinate ? "" : "indeterminate"}`}
+        role="progressbar"
+        aria-valuenow={percent ?? undefined}
+        aria-valuemin={0}
+        aria-valuemax={100}
+      >
+        <div className="runProgressFill" style={determinate ? { width: `${percent}%` } : undefined} />
+      </div>
+      <div className="runProgressCounts">
+        <span className="runProgressEpisodes">
+          <strong>{committed.toLocaleString()}</strong>
+          {over
+            ? ` episodes · ${approx ? "≈" : ""}${estimate.toLocaleString()} expected`
+            : known
+              ? ` / ${approx ? "≈" : ""}${estimate.toLocaleString()} episodes`
+              : " episodes"}
+        </span>
+        {percent != null && <span className="runProgressPercent">{percent}%</span>}
+      </div>
+      <div className="runChips">
+        <RunChip label={run.mode === "model" ? "model" : "mode"} value={run.model ?? run.mode} />
+        <RunChip label="chats" value={`${run.processedChats.toLocaleString()} / ${run.totalChats.toLocaleString()}`} />
+        {run.currentChat && <RunChip label="now" value={run.currentChat} truncate />}
+        {run.mode === "model" && <RunChip label="calls" value={run.modelCalls.toLocaleString()} />}
+        {run.mode === "model" && run.tokensUsed > 0 && <RunChip label="tokens" value={compactCount(run.tokensUsed)} />}
+        {run.queuedTasks != null && <RunChip label="queued" value={run.queuedTasks.toLocaleString()} />}
+        {run.extractiveEpisodes > 0 && <RunChip label="extractive" value={run.extractiveEpisodes.toLocaleString()} warn />}
+      </div>
+    </div>
+  );
+}
+
 // The brain's operator panel: coverage truth, run-due alert, and full provider
 // control (opt-in, model choice, probe) — manual-first, everything from the UI.
 function BrainPanel({
@@ -535,7 +623,8 @@ function BrainPanel({
   run,
   busy,
   onOpenConsole,
-  onReset
+  onReset,
+  onStop
 }: {
   overview: BrainOverview | null;
   run: BrainRunProgress | null;
@@ -545,14 +634,23 @@ function BrainPanel({
   // reset danger control (a destructive archive-level action, not run config).
   onOpenConsole: () => void;
   onReset: () => void;
+  // Cooperative stop for the in-progress run (the Stop control on the card).
+  onStop: () => void;
 }) {
   const [open, setOpen] = useState(true);
+  const [stopRequested, setStopRequested] = useState(false);
   const provider = overview?.provider;
   // Until the first status answer arrives, values are UNKNOWN — render
   // shimmers, never placeholder zeros that read as data.
   const loading = !overview;
   const runDue = Boolean(overview?.scheduler.runDue);
   const running = run?.state === "running";
+  // A finished (or freshly started) run clears the optimistic "stopping" latch.
+  useEffect(() => {
+    if (!running) {
+      setStopRequested(false);
+    }
+  }, [running]);
   return (
     <section className={`memoryPanel ${open ? "" : "collapsed"}`}>
       <button className="panelToggle" type="button" aria-expanded={open} onClick={() => setOpen((current) => !current)}>
@@ -645,16 +743,15 @@ function BrainPanel({
               </span>
             </div>
           )}
-          {running && (
-            <div className="brainDueAlert">
-              <Loader2 className="spin" size={14} />
-              <span>
-                Run in progress ({run?.mode}
-                {run?.model ? `/${run.model}` : ""}): {run?.episodesCommitted ?? 0} episodes from {run?.processedChats ?? 0}/
-                {run?.totalChats ?? 0} chats{run?.currentChat ? ` — now: ${run.currentChat}` : ""}. {run?.modelCalls ?? 0} model
-                calls.
-              </span>
-            </div>
+          {running && run && (
+            <RunProgressCard
+              run={run}
+              stopping={stopRequested}
+              onStop={() => {
+                setStopRequested(true);
+                onStop();
+              }}
+            />
           )}
           {!running && overview?.latestRun && (
             <div className="brainDueAlert">
@@ -670,28 +767,33 @@ function BrainPanel({
               </span>
             </div>
           )}
-          <div className="brainConsoleRow">
-            <button
-              className="primaryButton"
-              type="button"
-              disabled={Boolean(busy) || loading}
-              onClick={onOpenConsole}
-              title={loading ? "Waiting for brain status…" : "Configure identity, provider, and budgets, then start a run"}
-            >
-              {running ? <Loader2 className="spin" size={16} /> : <Play size={16} />}
-              {running ? "Run in progress…" : "Run brain"}
-            </button>
-            <button
-              className="miniButton dangerButton brainResetButton"
-              type="button"
-              disabled={Boolean(busy) || running || loading}
-              onClick={onReset}
-              title="Delete all generated episodes, claims, citations, and coverage watermarks (raw messages untouched); the next run starts from scratch"
-            >
-              <Trash2 size={14} />
-              Reset
-            </button>
-          </div>
+          {/* While a run executes, the progress card above owns the action
+              area — a second "Run" button is meaningless (one run at a time),
+              and Reset is unsafe mid-run. Both return when the run ends. */}
+          {!running && (
+            <div className="brainConsoleRow">
+              <button
+                className="primaryButton"
+                type="button"
+                disabled={Boolean(busy) || loading}
+                onClick={onOpenConsole}
+                title={loading ? "Waiting for brain status…" : "Configure identity, provider, and budgets, then start a run"}
+              >
+                <Play size={16} />
+                Run brain
+              </button>
+              <button
+                className="miniButton dangerButton brainResetButton"
+                type="button"
+                disabled={Boolean(busy) || loading}
+                onClick={onReset}
+                title="Delete all generated episodes, claims, citations, and coverage watermarks (raw messages untouched); the next run starts from scratch"
+              >
+                <Trash2 size={14} />
+                Reset
+              </button>
+            </div>
+          )}
         </>
       )}
     </section>
@@ -743,6 +845,11 @@ function RunConsoleModal({
     maxChats?: number;
     maxModelCalls?: number;
     maxTokens?: number | null;
+    backfill?: boolean;
+    callsPerHour?: number | null;
+    callsPerDay?: number | null;
+    strict?: boolean;
+    concurrency?: number | null;
   }) => Promise<boolean>;
   onStartRegenerate: (body: { model?: string | null }) => Promise<boolean>;
   suggest: (query: string) => Promise<OwnerIdentitySuggestion[]>;
@@ -755,10 +862,17 @@ function RunConsoleModal({
   const [numberError, setNumberError] = useState<string | null>(null);
   const [suggestions, setSuggestions] = useState<OwnerIdentitySuggestion[]>([]);
   const [suggestionsOpen, setSuggestionsOpen] = useState(false);
-  const [runMode, setRunMode] = useState<"assimilate" | "regenerate">("assimilate");
+  const [runMode, setRunMode] = useState<"assimilate" | "backfill" | "regenerate">("assimilate");
   const [maxChats, setMaxChats] = useState("3");
   const [maxCalls, setMaxCalls] = useState(String(overview?.limits?.maxCallsPerHour ?? 30));
   const [maxTokens, setMaxTokens] = useState("");
+  // Backfill (historical-backfill H6): optional task cap (empty = the whole
+  // uncovered queue), per-run pacing overrides, worker pool width, strict mode.
+  const [backfillChats, setBackfillChats] = useState("");
+  const [rateOverride, setRateOverride] = useState("");
+  const [dailyOverride, setDailyOverride] = useState("");
+  const [concurrency, setConcurrency] = useState("5");
+  const [strictMode, setStrictMode] = useState(false);
   const [starting, setStarting] = useState(false);
 
   // Plain substring autocomplete (no inference), debounced; every row shows
@@ -784,33 +898,51 @@ function RunConsoleModal({
   const modelBacked = Boolean(provider && provider.provider !== "extractive");
   const modelOptions = provider && provider.provider !== "extractive" ? provider.models[provider.provider] ?? [] : [];
   const regenerable = overview?.regenerableEpisodes ?? 0;
-  const dailyCap = overview?.limits?.maxCallsPerDay ?? 0;
+  const backfill = runMode === "backfill";
+  const dailyOverrideNumber = dailyOverride.trim() === "" ? null : Number(dailyOverride);
+  // The remaining-today guard validates against what the server will actually
+  // enforce: the per-run daily override when given, else the configured cap.
+  const dailyCap = backfill && dailyOverrideNumber != null && Number.isInteger(dailyOverrideNumber)
+    ? dailyOverrideNumber
+    : overview?.limits?.maxCallsPerDay ?? 0;
   const usedToday = overview?.usageToday.calls ?? 0;
   const remainingToday = Math.max(0, dailyCap - usedToday);
+  const pendingMessages = Math.max(0, (overview?.totalVisibleMessages ?? 0) - (overview?.assimilatedVisibleMessages ?? 0));
 
   // --- Validation matrix: disabled-with-reason, never silently ignored. ---
   const nameError = name.trim() ? null : "Your name is required — episodes label your own messages with it.";
   const chatsNumber = Number(maxChats);
   const chatsError =
-    runMode === "regenerate"
+    runMode !== "assimilate"
       ? null
       : !Number.isInteger(chatsNumber) || chatsNumber < 1 || chatsNumber > 5000
         ? "Between 1 and 5000 chats."
+        : null;
+  const backfillChatsNumber = backfillChats.trim() === "" ? null : Number(backfillChats);
+  const backfillChatsError =
+    !backfill || backfillChatsNumber == null
+      ? null
+      : !Number.isInteger(backfillChatsNumber) || backfillChatsNumber < 1 || backfillChatsNumber > 100_000
+        ? "Between 1 and 100,000 tasks (leave empty to drain the whole queue)."
         : null;
   const callsDisabledReason = !modelBacked
     ? "Extractive mode makes no model calls — nothing to budget."
     : runMode === "regenerate"
       ? "Regeneration sizes its own queue; the call budget still caps spend via the daily ledger."
       : null;
-  const callsNumber = Number(maxCalls);
+  const callsNumber = maxCalls.trim() === "" ? null : Number(maxCalls);
   const callsError =
     callsDisabledReason != null
       ? null
-      : !Number.isInteger(callsNumber) || callsNumber < 1 || callsNumber > 1000
-        ? "Between 1 and 1000 calls."
-        : callsNumber > remainingToday
-          ? `Only ${remainingToday.toLocaleString()} of ${dailyCap.toLocaleString()} daily calls left today.`
-          : null;
+      : callsNumber == null
+        ? backfill
+          ? null
+          : "Between 1 and 1000 calls."
+        : !Number.isInteger(callsNumber) || callsNumber < 1 || callsNumber > (backfill ? 100_000 : 1000)
+          ? `Between 1 and ${backfill ? "100,000" : "1000"} calls${backfill ? " (leave empty for no per-run ceiling)" : ""}.`
+          : callsNumber > remainingToday
+            ? `Only ${remainingToday.toLocaleString()} of ${dailyCap.toLocaleString()} daily calls left today${backfill ? " (raise the daily override for a turbo session)" : ""}.`
+            : null;
   const tokensDisabledReason = !modelBacked
     ? "Extractive mode makes no model calls — nothing to budget."
     : runMode === "regenerate"
@@ -828,6 +960,34 @@ function RunConsoleModal({
     (provider?.tokenUsage === "may-estimate"
       ? "Some codex calls report estimated usage — treat this budget as approximate."
       : "Counts the provider's real reported usage.");
+  // Backfill-only rows: pacing overrides, worker pool, strict. Overrides need
+  // a model (extractive backfill spends nothing — permitted, with a note).
+  const pacingDisabledReason = !backfill
+    ? null
+    : !modelBacked
+      ? "Extractive backfill makes zero model calls — pacing has nothing to pace."
+      : null;
+  const rateNumber = rateOverride.trim() === "" ? null : Number(rateOverride);
+  const rateError =
+    !backfill || pacingDisabledReason != null || rateNumber == null
+      ? null
+      : !Number.isInteger(rateNumber) || rateNumber < 1 || rateNumber > 1000
+        ? "Between 1 and 1000 calls/hour (leave empty for the configured pace)."
+        : null;
+  const dailyError =
+    !backfill || pacingDisabledReason != null || dailyOverrideNumber == null
+      ? null
+      : !Number.isInteger(dailyOverrideNumber) || dailyOverrideNumber < 1 || dailyOverrideNumber > 10_000
+        ? "Between 1 and 10,000 calls/day (leave empty for the configured ceiling)."
+        : null;
+  const concurrencyNumber = Number(concurrency);
+  const concurrencyError =
+    !backfill || pacingDisabledReason != null
+      ? null
+      : !Number.isInteger(concurrencyNumber) || concurrencyNumber < 1 || concurrencyNumber > 6
+        ? "Between 1 and 6 workers."
+        : null;
+  const strictDisabledReason = !backfill ? null : !modelBacked ? "Strict mode needs a model — extractive generation has no model failures to refuse." : null;
   const regenerateDisabledReason =
     regenerable === 0
       ? "Nothing to regenerate — every current episode is on the current contract."
@@ -848,13 +1008,24 @@ function RunConsoleModal({
     (busy ? `Busy: ${busy}.` : null) ??
     (runMode === "regenerate"
       ? regenerateDisabledReason
-      : chatsError ??
-        callsError ??
-        tokensError ??
-        ((overview?.chatsWithBacklog ?? 0) === 0 ? "No backlog — every visible message is already assimilated." : null) ??
-        (modelBacked && remainingToday === 0
-          ? `Daily call budget exhausted (${usedToday.toLocaleString()}/${dailyCap.toLocaleString()}). Extractive still works, or raise the cap.`
-          : null));
+      : backfill
+        ? backfillChatsError ??
+          callsError ??
+          tokensError ??
+          rateError ??
+          dailyError ??
+          concurrencyError ??
+          (pendingMessages === 0 ? "Nothing uncovered — historical coverage is complete." : null) ??
+          (modelBacked && remainingToday === 0
+            ? `Daily call budget exhausted (${usedToday.toLocaleString()}/${dailyCap.toLocaleString()}). Raise the daily override for a turbo session, or wait for the ledger day to roll.`
+            : null)
+        : chatsError ??
+          callsError ??
+          tokensError ??
+          ((overview?.chatsWithBacklog ?? 0) === 0 ? "No backlog — every visible message is already assimilated." : null) ??
+          (modelBacked && remainingToday === 0
+            ? `Daily call budget exhausted (${usedToday.toLocaleString()}/${dailyCap.toLocaleString()}). Extractive still works, or raise the cap.`
+            : null));
 
   const addSelfEntry = (entry: OwnerSelfIdentity) => {
     setSelfEntries((current) => (current.some((existing) => existing.jid === entry.jid) ? current : [...current, entry]));
@@ -895,13 +1066,25 @@ function RunConsoleModal({
       const started =
         runMode === "regenerate"
           ? await onStartRegenerate({ model: provider?.model ?? null })
-          : await onStartRun({
-              mode: modelBacked ? "model" : "extractive",
-              model: modelBacked ? provider?.model ?? null : null,
-              maxChats: chatsNumber,
-              ...(modelBacked && callsDisabledReason == null ? { maxModelCalls: callsNumber } : {}),
-              ...(modelBacked && tokensDisabledReason == null && tokensNumber ? { maxTokens: tokensNumber } : {})
-            });
+          : runMode === "backfill"
+            ? await onStartRun({
+                mode: modelBacked ? "model" : "extractive",
+                model: modelBacked ? provider?.model ?? null : null,
+                backfill: true,
+                ...(backfillChatsNumber != null ? { maxChats: backfillChatsNumber } : {}),
+                ...(modelBacked && callsNumber != null ? { maxModelCalls: callsNumber } : {}),
+                ...(modelBacked && tokensNumber ? { maxTokens: tokensNumber } : {}),
+                ...(modelBacked && rateNumber != null ? { callsPerHour: rateNumber } : {}),
+                ...(modelBacked && dailyOverrideNumber != null ? { callsPerDay: dailyOverrideNumber } : {}),
+                ...(modelBacked ? { concurrency: concurrencyNumber, strict: strictMode } : {})
+              })
+            : await onStartRun({
+                mode: modelBacked ? "model" : "extractive",
+                model: modelBacked ? provider?.model ?? null : null,
+                maxChats: chatsNumber,
+                ...(modelBacked && callsDisabledReason == null && callsNumber != null ? { maxModelCalls: callsNumber } : {}),
+                ...(modelBacked && tokensDisabledReason == null && tokensNumber ? { maxTokens: tokensNumber } : {})
+              });
       if (started) {
         onClose();
       }
@@ -1032,6 +1215,14 @@ function RunConsoleModal({
               <small>{(overview?.chatsWithBacklog ?? 0).toLocaleString()} chat(s) with backlog</small>
             </label>
             <label
+              className={runMode === "backfill" ? "runModeActive" : ""}
+              title="Drain the full uncovered history through the durable queue — newest chat first, resumable after any interruption"
+            >
+              <input type="radio" name="runMode" checked={runMode === "backfill"} onChange={() => setRunMode("backfill")} />
+              <span>Backfill history</span>
+              <small>{pendingMessages.toLocaleString()} message(s) uncovered</small>
+            </label>
+            <label
               className={`${runMode === "regenerate" ? "runModeActive" : ""} ${regenerateDisabledReason ? "runModeDisabled" : ""}`}
               title={regenerateDisabledReason ?? undefined}
             >
@@ -1048,6 +1239,12 @@ function RunConsoleModal({
               </small>
             </label>
           </div>
+          {backfill && !modelBacked && (
+            <div className="statusLine">
+              Extractive backfill is permitted but spends zero model calls: every episode is a placeholder, all of them sweepable
+              by a later model regeneration.
+            </div>
+          )}
           <div className="runConsoleGrid">
             <label className="runConsoleField">
               <span>Provider</span>
@@ -1107,30 +1304,50 @@ function RunConsoleModal({
         <div className="runConsoleSection">
           <h3>Budgets</h3>
           <div className="runConsoleGrid">
-            <label
-              className={`runConsoleField ${runMode === "regenerate" ? "fieldDisabled" : ""}`}
-              title={runMode === "regenerate" ? "Regeneration drains its own queue of stale episodes." : "How many backlog chats this run assimilates (newest first)."}
-            >
-              <span>Chats</span>
-              <input
-                type="number"
-                min={1}
-                max={5000}
-                disabled={runMode === "regenerate"}
-                value={maxChats}
-                onChange={(event) => setMaxChats(event.target.value)}
-              />
-              {chatsError && <span className="fieldError">{chatsError}</span>}
-            </label>
+            {backfill ? (
+              <label className="runConsoleField" title="Optional cap on queue tasks this run (newest chats first) — the scoped confidence-pass knob. Empty drains the whole uncovered queue.">
+                <span>Chats (optional cap)</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={100000}
+                  placeholder="whole queue"
+                  value={backfillChats}
+                  onChange={(event) => setBackfillChats(event.target.value)}
+                />
+                {backfillChatsError ? (
+                  <span className="fieldError">{backfillChatsError}</span>
+                ) : (
+                  <span className="fieldNote">Empty = drain everything; set ~20–30 for a confidence pass first.</span>
+                )}
+              </label>
+            ) : (
+              <label
+                className={`runConsoleField ${runMode === "regenerate" ? "fieldDisabled" : ""}`}
+                title={runMode === "regenerate" ? "Regeneration drains its own queue of stale episodes." : "How many backlog chats this run assimilates (newest first)."}
+              >
+                <span>Chats</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={5000}
+                  disabled={runMode === "regenerate"}
+                  value={maxChats}
+                  onChange={(event) => setMaxChats(event.target.value)}
+                />
+                {chatsError && <span className="fieldError">{chatsError}</span>}
+              </label>
+            )}
             <label
               className={`runConsoleField ${callsDisabledReason ? "fieldDisabled" : ""}`}
               title={callsDisabledReason ?? `Hard cap on model calls this run. ${remainingToday.toLocaleString()} of ${dailyCap.toLocaleString()} daily calls left.`}
             >
-              <span>Max model calls</span>
+              <span>Max model calls{backfill ? " (optional)" : ""}</span>
               <input
                 type="number"
                 min={1}
-                max={1000}
+                max={backfill ? 100_000 : 1000}
+                placeholder={backfill ? "no per-run ceiling" : undefined}
                 disabled={Boolean(callsDisabledReason)}
                 value={maxCalls}
                 onChange={(event) => setMaxCalls(event.target.value)}
@@ -1162,6 +1379,95 @@ function RunConsoleModal({
           </div>
         </div>
 
+        {backfill && (
+          <div className="runConsoleSection">
+            <h3>Turbo pacing</h3>
+            <div className="runConsoleGrid">
+              <label
+                className={`runConsoleField ${pacingDisabledReason ? "fieldDisabled" : ""}`}
+                title={pacingDisabledReason ?? "Optional hourly throttle for THIS run. Leave empty for no hourly limit — the worker pool and the daily ceiling pace it. Set a value only to deliberately go slower; reaching it ends the run as a named budget stop."}
+              >
+                <span>Calls/hour override</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={1000}
+                  placeholder="no hourly limit"
+                  disabled={Boolean(pacingDisabledReason)}
+                  value={rateOverride}
+                  onChange={(event) => setRateOverride(event.target.value)}
+                />
+                {pacingDisabledReason ? (
+                  <span className="fieldNote">{pacingDisabledReason}</span>
+                ) : rateError ? (
+                  <span className="fieldError">{rateError}</span>
+                ) : (
+                  <span className="fieldNote">Empty = no hourly cap (overnight-safe). Set a number only to throttle slower.</span>
+                )}
+              </label>
+              <label
+                className={`runConsoleField ${pacingDisabledReason ? "fieldDisabled" : ""}`}
+                title={pacingDisabledReason ?? "Per-run daily ceiling — the real budget guard for a long run. Empty falls back to the configured daily cap; raise it for an overnight drain. Reaching it ends the run as a named budget stop, resumable next day."}
+              >
+                <span>Calls/day override</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={10000}
+                  placeholder={`default ${overview?.limits?.maxCallsPerDay ?? "—"}`}
+                  disabled={Boolean(pacingDisabledReason)}
+                  value={dailyOverride}
+                  onChange={(event) => setDailyOverride(event.target.value)}
+                />
+                {dailyError ? (
+                  <span className="fieldError">{dailyError}</span>
+                ) : (
+                  <span className="fieldNote">
+                    The real budget guard — empty uses {(overview?.limits?.maxCallsPerDay ?? 0).toLocaleString()}/day. Raise it above the run's total for an unbroken drain.
+                  </span>
+                )}
+              </label>
+              <label
+                className={`runConsoleField ${pacingDisabledReason ? "fieldDisabled" : ""}`}
+                title={pacingDisabledReason ?? "Sliding worker pool width: parallel across chats, always serial within a chat. A freed slot claims the next task immediately — never batch barriers."}
+              >
+                <span>Parallel workers</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={6}
+                  disabled={Boolean(pacingDisabledReason)}
+                  value={concurrency}
+                  onChange={(event) => setConcurrency(event.target.value)}
+                />
+                {concurrencyError ? (
+                  <span className="fieldError">{concurrencyError}</span>
+                ) : (
+                  <span className="fieldNote">Verified safe at 5 (2026-07-18 spikes): ~4× throughput, zero cross-talk.</span>
+                )}
+              </label>
+            </div>
+            <label
+              className={`runConsoleStrictRow ${strictDisabledReason ? "fieldDisabled" : ""}`}
+              title={
+                strictDisabledReason ??
+                "When model generation fails twice for a pack, commit NOTHING (no extractive placeholder, watermark unchanged) and fail the task visibly. Coverage stalls honestly instead of degrading silently."
+              }
+            >
+              <input
+                type="checkbox"
+                disabled={Boolean(strictDisabledReason)}
+                checked={strictMode && !strictDisabledReason}
+                onChange={(event) => setStrictMode(event.target.checked)}
+              />
+              <span>
+                Strict mode — no extractive placeholders; twice-failed packs stay pending as visible failed work
+              </span>
+            </label>
+            {strictDisabledReason && <span className="fieldNote">{strictDisabledReason}</span>}
+          </div>
+        )}
+
         <footer className="runConsoleFooter">
           <div className="runConsoleFooterReason">{startDisabledReason}</div>
           <div className="runConsoleFooterActions">
@@ -1176,7 +1482,7 @@ function RunConsoleModal({
               onClick={() => void handleStart()}
             >
               {starting ? <Loader2 className="spin" size={16} /> : <Play size={16} />}
-              {runMode === "regenerate" ? `Regenerate ${regenerable.toLocaleString()}` : "Start run"}
+              {runMode === "regenerate" ? `Regenerate ${regenerable.toLocaleString()}` : backfill ? "Start backfill" : "Start run"}
             </button>
           </div>
         </footer>

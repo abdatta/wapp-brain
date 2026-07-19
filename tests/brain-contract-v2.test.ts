@@ -270,6 +270,43 @@ describe("contract v2: temporal and epistemic fields (7.4)", () => {
     );
   });
 
+  it("accepts a month-granularity event_at (YYYY-MM) as the month's first day — the Sonnet tolerance", async () => {
+    await withModelStub(
+      {
+        summary: "The move happened in May 2022.",
+        claims: [
+          { kind: "event", text: "The office move happened in 2022-05.", cites: ["m1"], event_at: "2022-05", confidence: "stated" },
+          { kind: "fact", text: "The lease was signed.", cites: ["m2"], confidence: "stated" }
+        ]
+      },
+      async (repository) => {
+        const chat = await seedChat(repository);
+        const packs = await buildEvidencePacks(repository, { chatSourceId: chat, startAtMs: 0, endAtMs: Date.now() });
+        const result = await generateEpisodeForPack(repository, packs[0], { generator: "model", model: "sonnet" });
+        // No fallback — month-granularity dates no longer drop the whole episode.
+        expect(result.fellBackToExtractive).toBe(false);
+        const [dated] = result.episode.claims;
+        expect(dated.eventAtMs).toBe(Date.UTC(2022, 4, 1));
+      }
+    );
+  });
+
+  it("still rejects a bogus month (YYYY-13) rather than rolling it over", async () => {
+    await withModelStub(
+      {
+        summary: "Bad month.",
+        claims: [{ kind: "event", text: "Something in 2022-13.", cites: ["m1"], event_at: "2022-13", confidence: "stated" }]
+      },
+      async (repository) => {
+        const chat = await seedChat(repository);
+        const packs = await buildEvidencePacks(repository, { chatSourceId: chat, startAtMs: 0, endAtMs: Date.now() });
+        const result = await generateEpisodeForPack(repository, packs[0], { generator: "model", model: "sonnet" });
+        expect(result.fellBackToExtractive).toBe(true);
+        expect(result.episode.fallbackReason).toContain("event_at");
+      }
+    );
+  });
+
   it("treats an unparseable event_at as a collected retryable error", async () => {
     await withModelStub(
       {

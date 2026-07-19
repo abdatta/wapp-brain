@@ -139,7 +139,13 @@ export async function enqueueEpisodeTasksForChats(
       chatSourceId: chat.chatSourceId,
       payload: { chatSourceId: chat.chatSourceId, sinceMs: chat.assimilatedThroughMs + 1, throughMs: chat.newestVisibleMs },
       dedupeKey: `episode:${chat.chatSourceId}:${chat.assimilatedThroughMs}`,
-      priority: Math.floor((chat.newestVisibleMs ?? 0) / 1000) + (isVolumeDue(chat, nowMs) ? VOLUME_PRIORITY_BOOST : 0)
+      // Significance floor (backfill H3 / resolved D12): the trivia tail —
+      // chats below the significance minimum — drains last at priority 0;
+      // everything else keeps newest-chat-first recency order.
+      priority:
+        chat.pendingVisibleMessages < config.brain.significanceMin
+          ? 0
+          : Math.floor((chat.newestVisibleMs ?? 0) / 1000) + (isVolumeDue(chat, nowMs) ? VOLUME_PRIORITY_BOOST : 0)
     }));
   return repository.enqueueBrainTasks(tasks);
 }
@@ -149,11 +155,16 @@ export async function enqueueEpisodeTasksForChats(
 // is newest-first; within-chat oldest-first is inherent to buildEvidencePacks
 // (chronological packs). Under manual mode these sit pending and surface as due
 // work; under auto mode the next pass drains them rate-limited.
-export async function auditCatchup(repository: ArchiveRepository, nowMs: number = Date.now()): Promise<{ enqueued: number; chats: number }> {
+export async function auditCatchup(
+  repository: ArchiveRepository,
+  nowMs: number = Date.now()
+): Promise<{ enqueued: number; chats: number; backlog: BrainChatBacklogItem[] }> {
   const backlog = await repository.getBrainChatBacklog({ limit: 5000 });
   const newestFirst = [...backlog].sort((a, b) => (b.newestVisibleMs ?? 0) - (a.newestVisibleMs ?? 0));
   const enqueued = await enqueueEpisodeTasksForChats(repository, newestFirst, nowMs);
-  return { enqueued, chats: newestFirst.length };
+  // Returns the newest-first backlog it enqueued so a caller (the backfill run)
+  // can size the work without a second full scan.
+  return { enqueued, chats: newestFirst.length, backlog: newestFirst };
 }
 
 interface DrainOptions {
@@ -165,8 +176,25 @@ interface DrainOptions {
   // Restrict the drain to one task kind (a regenerate run must not claim
   // forward episode tasks). Undefined claims everything due.
   onlyKind?: BrainTaskKind;
+  // Per-run ledger pacing overrides (backfill turbo, H2): replace the
+  // configured hourly/daily caps for THIS drain only.
+  callsPerHour?: number | null;
+  callsPerDay?: number | null;
+  // Per-run ceilings — named stops distinct from the ledger caps.
+  maxModelCalls?: number | null;
+  maxTokens?: number | null;
+  // Strict backfill (H5): a pack whose model generation fails after the retry
+  // throws instead of committing an extractive placeholder, failing the task
+  // into backoff/retirement with the watermark unchanged.
+  strict?: boolean;
+  // Sliding worker pool width (H7): parallel ACROSS chats, always serial
+  // within a chat. 1 (the default) is the plain serial drain.
+  concurrency?: number;
   // Cooperative hooks for run-job integration: progress ticks and cancellation.
   onTaskDone?: () => void;
+  // Live per-episode hook so long drains stream progress (tokens, fallbacks)
+  // instead of reporting only at the end.
+  onEpisode?: (event: { chatName: string | null; fellBack: boolean; claims: number; tokens: number; modelCall: boolean }) => void;
   shouldStop?: () => boolean;
 }
 
@@ -176,12 +204,32 @@ export interface DrainResult {
   extractive: number;
   claims: number;
   modelCalls: number;
+  // Accumulated input+output tokens across this drain's model calls.
+  tokensUsed: number;
   tasksDone: number;
   // Tasks that actually produced at least one episode (the honest chat count);
   // already-covered/empty windows increment tasksDone only.
   chatsProduced: number;
   dailyExceeded: boolean;
   rateLimited: boolean;
+  // Per-run ceilings (backfill): distinct named stops for the run record.
+  callBudgetExceeded: boolean;
+  tokenBudgetExceeded: boolean;
+  // The provider health-tracker latched degraded mid-drain (usage limit,
+  // outage, auth) — the drain stopped rather than mass-committing extractive
+  // placeholders. Remaining work stays pending; resume after recovery.
+  providerDegraded: boolean;
+}
+
+// Hooks a drain hands to task execution: `record` centralizes accounting
+// (counters + ledger + live progress) in the drain closure so a pooled drain
+// has ONE consistent view; `shouldStopPacks` is consulted before each pack so
+// budgets and cancellation stop a long chat MID-task (the committed packs keep
+// the watermark honest; the task stays claimed and is reclaimed to pending by
+// the caller, resuming precisely from the watermark).
+interface TaskExecutionHooks {
+  record: (result: Awaited<ReturnType<typeof generateEpisodeForPack>>, purpose: string, chatName: string | null) => Promise<void>;
+  shouldStopPacks: () => Promise<boolean>;
 }
 
 // Execute one `episode` or `regenerate` task. Forward episode tasks clamp
@@ -194,40 +242,21 @@ export interface DrainResult {
 async function executeEpisodeTask(
   repository: ArchiveRepository,
   task: { kind: string; chatSourceId: string | null; payload: Record<string, unknown> | null },
-  options: DrainOptions
-): Promise<{ episodes: number; extractive: number; claims: number; modelCalls: number }> {
+  options: DrainOptions,
+  hooks: TaskExecutionHooks
+): Promise<{ episodes: number; stopped: boolean }> {
   const payload = task.payload ?? {};
   const chatSourceId = String(payload.chatSourceId ?? task.chatSourceId ?? "");
   if (!chatSourceId) {
-    return { episodes: 0, extractive: 0, claims: 0, modelCalls: 0 };
+    return { episodes: 0, stopped: false };
   }
   const regenEpisodeId = task.kind === "regenerate" || payload.regen === true ? String(payload.episodeId ?? "") : "";
   let episodes = 0;
-  let extractive = 0;
-  let claims = 0;
-  let modelCalls = 0;
-  const recordResult = async (result: Awaited<ReturnType<typeof generateEpisodeForPack>>, purpose: string) => {
-    episodes += 1;
-    if (result.fellBackToExtractive) {
-      extractive += 1;
-    }
-    claims += result.episode.claims.length;
-    if (result.usage) {
-      modelCalls += 1;
-      await repository.recordBrainLlmUsage({
-        purpose,
-        provider: `${options.provider}/${options.model ?? "default"}`,
-        inputTokens: result.usage.inputTokens,
-        outputTokens: result.usage.outputTokens,
-        estimated: result.usage.estimated ?? false
-      });
-    }
-  };
   if (regenEpisodeId) {
     const [oldEpisode] = await repository.listBrainEpisodes({ episodeId: regenEpisodeId, limit: 1 });
     if (!oldEpisode || oldEpisode.status === "superseded") {
       // Already regenerated (or reset); the task is complete by construction.
-      return { episodes, extractive, claims, modelCalls };
+      return { episodes, stopped: false };
     }
     const outcome = await regenerateEpisode(repository, oldEpisode, {
       generator: options.mode,
@@ -235,15 +264,19 @@ async function executeEpisodeTask(
       runId: options.runId
     });
     for (const result of outcome.results) {
-      await recordResult(result, "episode-regen");
+      episodes += 1;
+      await hooks.record(result, "episode-regen", oldEpisode.chatDisplayName ?? chatSourceId);
       await new Promise((resolve) => setImmediate(resolve));
     }
-    return { episodes, extractive, claims, modelCalls };
+    return { episodes, stopped: false };
   }
-  const item = (await repository.getBrainChatBacklog({ limit: 5000 })).find((candidate) => candidate.chatSourceId === chatSourceId);
+  // Chat-scoped backlog read: the full-archive aggregation costs ~400ms of
+  // synchronous scan per claim at real-archive size — a pooled drain would
+  // stall the event loop paying it five times in a burst.
+  const [item] = await repository.getBrainChatBacklog({ limit: 1, chatSourceId });
   if (!item) {
     // Watermark already covers this window (e.g. a manual run got here first).
-    return { episodes, extractive, claims, modelCalls };
+    return { episodes, stopped: false };
   }
   const endAtMs = Math.max(Number(payload.throughMs ?? Date.now()), item.newestVisibleMs ?? 0);
   const packs = await buildEvidencePacks(repository, {
@@ -253,47 +286,140 @@ async function executeEpisodeTask(
     endAtMs
   });
   for (const pack of packs) {
-    const result = await generateEpisodeForPack(repository, pack, { generator: options.mode, model: options.model, runId: options.runId });
-    await recordResult(result, "episode");
+    if (await hooks.shouldStopPacks()) {
+      return { episodes, stopped: true };
+    }
+    const result = await generateEpisodeForPack(repository, pack, {
+      generator: options.mode,
+      model: options.model,
+      runId: options.runId,
+      strict: options.strict
+    });
+    episodes += 1;
+    await hooks.record(result, "episode", item.chatDisplayName ?? chatSourceId);
     // Yield between packs so live ingestion and HTTP stay responsive.
     await new Promise((resolve) => setImmediate(resolve));
   }
-  return { episodes, extractive, claims, modelCalls };
+  return { episodes, stopped: false };
 }
 
-// Drain due tasks under the budget. Budget is read from the ledger before each
-// task: the hourly cap paces the drain (leaves work pending), the daily cap is a
-// hard stop. A failing task backs off exponentially and retires after the
-// attempt cap so one poison task can never starve the queue.
+// Drain due tasks under the budget through a SLIDING worker pool (H7).
+//
+// Concurrency 1 (auto passes, regeneration) is the plain serial drain.
+// Backfill turbo widens the pool: parallelism exists only ACROSS chats (one
+// whole chat task per worker; a per-chat lane chains any second task for the
+// same chat behind the first), and the pool is sliding, never batched — the
+// moment any in-flight task settles, its slot claims the next due task.
+//
+// Budgets are read before EACH claim (per-claim, not per-batch): the ledger
+// caps (hourly pace / daily ceiling — per-run overrides replace the config
+// defaults when given) and the per-run ceilings (call count / token budget)
+// each set a distinct named stop. Calls already in flight can land after a
+// check, so a stop may overshoot by at most workers−1 calls, every one still
+// recorded in the ledger. Between packs inside a long chat the same checks run
+// again, so a single 500-pack chat cannot sail past a budget inside one task.
+// A failing task backs off exponentially and retires after the attempt cap so
+// one poison task (or a provider rate-limit) can never starve the queue or
+// fail the run.
 export async function drainBrainTasks(repository: ArchiveRepository, options: DrainOptions): Promise<DrainResult> {
-  let episodes = 0;
-  let extractive = 0;
-  let claims = 0;
-  let modelCalls = 0;
-  let tasksDone = 0;
-  let chatsProduced = 0;
+  const workers = Math.max(1, Math.min(6, Math.floor(options.concurrency ?? 1)));
+  const hourlyCap = options.callsPerHour ?? config.brain.maxCallsPerHour;
+  const dailyCap = options.callsPerDay ?? config.brain.maxCallsPerDay;
+  const counters = { episodes: 0, extractive: 0, claims: 0, modelCalls: 0, tokensUsed: 0, tasksDone: 0, chatsProduced: 0 };
   let dailyExceeded = false;
   let rateLimited = false;
-  while (tasksDone < options.maxTasks) {
-    if (options.shouldStop?.()) {
+  let callBudgetExceeded = false;
+  let tokenBudgetExceeded = false;
+  let providerDegraded = false;
+  let claimed = 0;
+  const inFlight = new Set<Promise<void>>();
+  const chatLanes = new Map<string, Promise<void>>();
+  // A repository-level failure inside a worker must not reject the pool while
+  // sibling workers are mid-commit: capture the first fatal, let the pool
+  // reach quiescence, then throw it (the run still fails, but never with
+  // detached writers left running).
+  let fatalError: unknown = null;
+
+  const record: TaskExecutionHooks["record"] = async (result, purpose, chatName) => {
+    counters.episodes += 1;
+    if (result.fellBackToExtractive) {
+      counters.extractive += 1;
+    }
+    counters.claims += result.episode.claims.length;
+    let tokens = 0;
+    let modelCall = false;
+    if (result.usage) {
+      modelCall = true;
+      tokens = result.usage.inputTokens + result.usage.outputTokens;
+      counters.modelCalls += 1;
+      counters.tokensUsed += tokens;
+      await repository.recordBrainLlmUsage({
+        purpose,
+        provider: `${options.provider}/${options.model ?? "default"}`,
+        inputTokens: result.usage.inputTokens,
+        outputTokens: result.usage.outputTokens,
+        estimated: result.usage.estimated ?? false
+      });
+    }
+    options.onEpisode?.({ chatName, fellBack: result.fellBackToExtractive, claims: result.episode.claims.length, tokens, modelCall });
+  };
+
+  const budgetStopped = () => dailyExceeded || rateLimited || callBudgetExceeded || tokenBudgetExceeded || providerDegraded;
+  // One stop gate for both granularities (pre-claim and between packs). Sets
+  // the named flag as a side effect so the reason survives to the result.
+  const checkBudgets = async (): Promise<boolean> => {
+    if (options.mode !== "model") {
+      return false;
+    }
+    // Provider health FIRST: a mid-drain degradation (usage limit, outage,
+    // auth) must STOP the drain, never fill coverage with extractive
+    // placeholders. The flag latches after the configured consecutive-failure
+    // threshold, so at most a pool's worth of packs fall back before this
+    // halts new claims — the remaining queue stays pending for a clean resume.
+    if (getBrainProviderStatus().degraded) {
+      providerDegraded = true;
+      return true;
+    }
+    if (options.maxModelCalls != null && counters.modelCalls >= options.maxModelCalls) {
+      callBudgetExceeded = true;
+      return true;
+    }
+    if (options.maxTokens != null && options.maxTokens > 0 && counters.tokensUsed >= options.maxTokens) {
+      tokenBudgetExceeded = true;
+      return true;
+    }
+    const now = Date.now();
+    const daily = await repository.getBrainLlmUsage({ day: utcDayString(now) });
+    if (daily.calls >= dailyCap) {
+      dailyExceeded = true;
+      return true;
+    }
+    const hourly = await repository.getBrainLlmUsage({ sinceMs: now - 3600_000 });
+    if (hourly.calls >= hourlyCap) {
+      rateLimited = true;
+      return true;
+    }
+    return false;
+  };
+  const shouldStopPacks: TaskExecutionHooks["shouldStopPacks"] = async () =>
+    Boolean(options.shouldStop?.()) || budgetStopped() || checkBudgets();
+
+  while (true) {
+    if (fatalError || options.shouldStop?.() || (await checkBudgets())) {
       break;
     }
-    if (options.mode === "model") {
-      const now = Date.now();
-      const daily = await repository.getBrainLlmUsage({ day: utcDayString(now) });
-      if (daily.calls + modelCalls >= config.brain.maxCallsPerDay) {
-        dailyExceeded = true;
-        break;
-      }
-      const hourly = await repository.getBrainLlmUsage({ sinceMs: now - 3600_000 });
-      if (hourly.calls + modelCalls >= config.brain.maxCallsPerHour) {
-        rateLimited = true;
-        break;
-      }
+    if (claimed >= options.maxTasks) {
+      break;
     }
     const [task] = await repository.claimDueBrainTasks(1, Date.now(), options.onlyKind);
     if (!task) {
-      break;
+      if (inFlight.size === 0) {
+        break;
+      }
+      // Nothing claimable right now (queue empty or all remaining tasks are in
+      // retry backoff) — wait for ANY in-flight task, then look again.
+      await Promise.race(inFlight);
+      continue;
     }
     if (task.kind !== "episode" && task.kind !== "regenerate") {
       // The spine only executes episode work; other kinds belong to sibling
@@ -301,25 +427,56 @@ export async function drainBrainTasks(repository: ArchiveRepository, options: Dr
       await repository.failBrainTask(task.id, `Task kind "${task.kind}" is not supported by the brain spine executor.`);
       continue;
     }
-    try {
-      const result = await executeEpisodeTask(repository, task, options);
-      episodes += result.episodes;
-      extractive += result.extractive;
-      claims += result.claims;
-      modelCalls += result.modelCalls;
-      if (result.episodes > 0) {
-        chatsProduced += 1;
+    claimed += 1;
+    const laneKey = task.chatSourceId ?? `task:${task.id}`;
+    const lane = chatLanes.get(laneKey) ?? Promise.resolve();
+    const execution = lane.then(async () => {
+      try {
+        try {
+          const result = await executeEpisodeTask(repository, task, options, { record, shouldStopPacks });
+          if (result.episodes > 0) {
+            counters.chatsProduced += 1;
+          }
+          if (result.stopped) {
+            // A budget or cancel stopped this chat mid-window: committed packs
+            // already advanced the watermark; the task stays claimed and is
+            // returned to pending by the caller's post-drain reclaim, resuming
+            // exactly from the watermark.
+            return;
+          }
+          await repository.completeBrainTask(task.id);
+          counters.tasksDone += 1;
+          options.onTaskDone?.();
+        } catch (error) {
+          const attempts = task.attempts + 1;
+          const retryInMs = attempts < TASK_MAX_ATTEMPTS ? Math.min(TASK_MAX_BACKOFF_MS, TASK_BACKOFF_BASE_MS * 2 ** task.attempts) : null;
+          await repository.failBrainTask(task.id, publicErrorMessage(error), { retryInMs });
+        }
+      } catch (error) {
+        fatalError = fatalError ?? error;
       }
-      await repository.completeBrainTask(task.id);
-      tasksDone += 1;
-      options.onTaskDone?.();
-    } catch (error) {
-      const attempts = task.attempts + 1;
-      const retryInMs = attempts < TASK_MAX_ATTEMPTS ? Math.min(TASK_MAX_BACKOFF_MS, TASK_BACKOFF_BASE_MS * 2 ** task.attempts) : null;
-      await repository.failBrainTask(task.id, publicErrorMessage(error), { retryInMs });
+    });
+    const tracked: Promise<void> = execution.finally(() => {
+      inFlight.delete(tracked);
+      if (chatLanes.get(laneKey) === tracked) {
+        chatLanes.delete(laneKey);
+      }
+    });
+    chatLanes.set(laneKey, tracked);
+    inFlight.add(tracked);
+    if (inFlight.size >= workers) {
+      // The sliding refill: block only until ANY task settles, then claim the
+      // next immediately — never a barrier over the whole pool.
+      await Promise.race(inFlight);
     }
   }
-  return { episodes, extractive, claims, modelCalls, tasksDone, chatsProduced, dailyExceeded, rateLimited };
+  // A stop lets in-flight work finish its current pack-bounded stride; the
+  // overshoot is bounded by the pool width.
+  await Promise.all(inFlight);
+  if (fatalError) {
+    throw fatalError;
+  }
+  return { ...counters, dailyExceeded, rateLimited, callBudgetExceeded, tokenBudgetExceeded, providerDegraded };
 }
 
 export interface BrainPassResult extends Partial<DrainResult> {
@@ -393,7 +550,14 @@ export async function runBrainMaintenancePass(
       modelCalls: result.modelCalls,
       skippedForBudget: result.dailyExceeded ? (await repository.getBrainTaskSummary()).pending : 0
     };
-    if (result.dailyExceeded) {
+    if (result.providerDegraded) {
+      await repository.failBrainRun(
+        runId,
+        "interrupted",
+        `Provider ${provider.provider} went unavailable mid-pass (usage limit, outage, or auth); ${result.episodes} episode(s) committed, remaining work stays pending until the provider recovers.`,
+        totals
+      );
+    } else if (result.dailyExceeded) {
       await repository.failBrainRun(
         runId,
         "budget_exceeded",
@@ -405,7 +569,13 @@ export async function runBrainMaintenancePass(
     }
     console.log(
       `[brain] auto pass (${mode}${mode === "model" ? `/${provider.model ?? "default"}` : ""}): ${result.episodes} episode(s, ${result.extractive} extractive), ${result.claims} claim(s), ${result.modelCalls} model call(s), ${result.chatsProduced}/${result.tasksDone} chat(s) produced` +
-        (result.dailyExceeded ? " — DAILY BUDGET REACHED, remaining work pending" : result.rateLimited ? " — hourly rate limit, paused until budget frees" : "")
+        (result.providerDegraded
+          ? " — PROVIDER DEGRADED, stopped to avoid placeholders, remaining work pending"
+          : result.dailyExceeded
+            ? " — DAILY BUDGET REACHED, remaining work pending"
+            : result.rateLimited
+              ? " — hourly rate limit, paused until budget frees"
+              : "")
     );
     if (result.episodes > 0) {
       options.onEpisodesCommitted?.();

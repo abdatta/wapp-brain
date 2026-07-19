@@ -24,7 +24,7 @@
 |  | 11 | `semantic-rollups` | **Fable** | seeded | #9, #10 (adjacent) | coherent cited entity pages; undeclared claim-drop refused; mechanical rollback |
 |  | 12 | `brain-retrieval-pipeline` | **Fable** | seeded | #8, #9, #11, #19 (query-panel UI) | zero-keyword paraphrase recovered in deep mode; coverage verdict + gap sentences; one-call week summary |
 |  | 13 | `mcp-agent-surface` | Opus | seeded | #5, #12 | Haiku-class client answers cited in ≤2 calls via `brain_ask`; attributed agent spend |
-|  | 14 | `historical-backfill` | Opus | seeded | #0 (spine), #3, #4, #7 | kill-resume clean; coverage climbing; named budget stops |
+| ✅ | 14 | `historical-backfill` | Opus | **archived 2026-07-19** | #0 (spine), #3, #4, #7 | kill-resume clean; coverage climbing; named budget stops |
 |  | 15 | `memory-teardown-and-docs` | Sonnet | seeded | #12, #13, #23 | no `memory_*` remnants; docs match reality; full suite green |
 | ✅ | 16 | `native-import-picker` | Sonnet | **archived 2026-07-11** | — (independent of the brain chain) | gate 9.1 passed; archived to `archive/2026-07-11-native-import-picker` |
 | ✅ | 17 | `import-media-cdn-recovery` | Sonnet | **archived 2026-07-12** | — (independent) | gates 6.1/6.2 passed on the real archive; archived to `archive/2026-07-12-import-media-cdn-recovery` |

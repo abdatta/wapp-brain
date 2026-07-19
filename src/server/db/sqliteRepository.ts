@@ -6,6 +6,8 @@ import type {
   ArchiveSignalBatch,
   ArchiveSignalKind,
   ArchiveSignalAnchor,
+  BrainBackfillDbStats,
+  BrainBackfillModelSpend,
   BrainChatBacklogItem,
   BrainClaimEntityRecord,
   BrainClaimGradeRecord,
@@ -2830,7 +2832,14 @@ export class SqliteArchiveRepository implements ArchiveRepository {
 
   // --- Brain substrate ---
 
-  async getBrainChatBacklog(options: { limit: number; minPending?: number }): Promise<BrainChatBacklogItem[]> {
+  async getBrainChatBacklog(options: { limit: number; minPending?: number; chatSourceId?: string | null }): Promise<BrainChatBacklogItem[]> {
+    // A chat-scoped read (the drain's per-task lookup) must not pay the full
+    // 645-chat aggregation — ~400ms of synchronous scan on the real archive.
+    const chat = options.chatSourceId ? this.canonicalJid(options.chatSourceId) ?? options.chatSourceId : null;
+    const chatClause = chat ? `AND ch.source_chat_id = ?` : "";
+    const params: unknown[] = chat
+      ? [chat, Math.max(1, options.minPending ?? 1), options.limit]
+      : [Math.max(1, options.minPending ?? 1), options.limit];
     const rows = this.db
       .prepare(
         `SELECT ch.source_chat_id AS chat_source_id,
@@ -2845,12 +2854,13 @@ export class SqliteArchiveRepository implements ArchiveRepository {
          JOIN messages m ON m.chat_id = ch.id
          WHERE ${watermarkPendingPredicate("m", "w")}
            AND ${visibleExchangePredicate("m")}
+           ${chatClause}
          GROUP BY ch.id
          HAVING COUNT(m.id) >= ?
          ORDER BY pending DESC
          LIMIT ?`
       )
-      .all(Math.max(1, options.minPending ?? 1), options.limit) as Array<{
+      .all(...params) as Array<{
       chat_source_id: string;
       chat_display_name: string | null;
       assimilated_through_ms: number;
@@ -3120,13 +3130,24 @@ export class SqliteArchiveRepository implements ArchiveRepository {
   }
 
   async reconcileBrainRuns(): Promise<number> {
-    const result = this.db
-      .prepare(
-        `UPDATE brain_runs SET status = 'interrupted', finished_at = ?, error_message = 'Interrupted by a server restart.'
-         WHERE status = 'running'`
-      )
-      .run(currentIso());
-    return result.changes;
+    const transaction = this.db.transaction(() => {
+      // A brain lock held by a run we are about to mark interrupted belongs to
+      // a provably dead process (backfill locks are keyed by run id) — release
+      // it now so kill-resume never waits out the TTL.
+      this.db
+        .prepare(
+          `DELETE FROM memory_job_locks
+           WHERE name = 'brain' AND run_id IN (SELECT id FROM brain_runs WHERE status = 'running')`
+        )
+        .run();
+      return this.db
+        .prepare(
+          `UPDATE brain_runs SET status = 'interrupted', finished_at = ?, error_message = 'Interrupted by a server restart.'
+           WHERE status = 'running'`
+        )
+        .run(currentIso()).changes;
+    });
+    return transaction();
   }
 
   async startBrainRun(kind: BrainRunSummary["kind"], timezone?: string | null): Promise<string> {
@@ -3280,6 +3301,69 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     };
     this.brainStatusCache = { at: Date.now(), value };
     return value;
+  }
+
+  async getBrainBackfillStats(): Promise<BrainBackfillDbStats> {
+    // Coverage comes from the TTL-cached status (ONE source of coverage truth,
+    // and the two heavy 310k-row scans are never duplicated for a dashboard
+    // poll — measured ~700ms cold on the real archive, ~0ms via the cache).
+    const status = await this.getBrainStatus();
+    const taskRows = this.db
+      .prepare(`SELECT status, COUNT(*) AS count FROM brain_tasks WHERE kind = 'episode' GROUP BY status`)
+      .all() as Array<{ status: string; count: number }>;
+    const episodesLastHour = this.db
+      .prepare(`SELECT COUNT(*) AS count FROM brain_episodes WHERE created_at >= ?`)
+      .get(new Date(Date.now() - 3600_000).toISOString()) as { count: number };
+    const currentEpisodes = this.db
+      .prepare(
+        `SELECT COUNT(*) AS count,
+                AVG(message_count) AS avg_messages,
+                COALESCE(SUM(CASE WHEN generator = 'model' OR attempted_model IS NOT NULL THEN 1 ELSE 0 END), 0) AS attempted,
+                COALESCE(SUM(CASE WHEN attempted_model IS NOT NULL THEN 1 ELSE 0 END), 0) AS fallbacks,
+                COALESCE(SUM(CASE WHEN generator = 'extractive' THEN 1 ELSE 0 END), 0) AS extractive
+         FROM brain_episodes
+         WHERE status = 'current'`
+      )
+      .get() as { count: number; avg_messages: number | null; attempted: number; fallbacks: number; extractive: number };
+    const today = utcDayString();
+    const spendRows = this.db
+      .prepare(
+        `SELECT provider,
+                COUNT(*) AS calls,
+                COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                COALESCE(SUM(CASE WHEN day = ? THEN 1 ELSE 0 END), 0) AS calls_today,
+                COALESCE(SUM(CASE WHEN day = ? THEN input_tokens ELSE 0 END), 0) AS input_today,
+                COALESCE(SUM(CASE WHEN day = ? THEN output_tokens ELSE 0 END), 0) AS output_today
+         FROM brain_llm_ledger
+         GROUP BY provider
+         ORDER BY calls DESC`
+      )
+      .all(today, today, today) as Array<Record<string, unknown>>;
+    const spendByModel: BrainBackfillModelSpend[] = spendRows.map((row) => ({
+      provider: String(row.provider ?? "unknown"),
+      calls: Number(row.calls ?? 0),
+      inputTokens: Number(row.input_tokens ?? 0),
+      outputTokens: Number(row.output_tokens ?? 0),
+      callsToday: Number(row.calls_today ?? 0),
+      inputTokensToday: Number(row.input_today ?? 0),
+      outputTokensToday: Number(row.output_today ?? 0)
+    }));
+    const taskCount = (state: string) => Number(taskRows.find((row) => row.status === state)?.count ?? 0);
+    return {
+      totalVisibleMessages: status.totalVisibleMessages,
+      assimilatedVisibleMessages: status.assimilatedVisibleMessages,
+      pendingChats: status.chatsWithBacklog,
+      queuedEpisodeTasks: taskCount("pending"),
+      failedEpisodeTasks: taskCount("failed"),
+      episodesLastHour: Number(episodesLastHour.count ?? 0),
+      currentEpisodes: Number(currentEpisodes.count ?? 0),
+      avgEpisodeMessages: currentEpisodes.avg_messages != null ? Math.round(Number(currentEpisodes.avg_messages) * 10) / 10 : null,
+      modelAttemptedEpisodes: Number(currentEpisodes.attempted ?? 0),
+      fallbackEpisodes: Number(currentEpisodes.fallbacks ?? 0),
+      sweepableExtractive: Number(currentEpisodes.extractive ?? 0),
+      spendByModel
+    };
   }
 
   async resetBrainDerivedData(options?: { chatSourceId?: string | null }): Promise<{ episodeIds: string[]; watermarks: number }> {
@@ -3602,10 +3686,19 @@ export class SqliteArchiveRepository implements ArchiveRepository {
   async listRegenerableBrainEpisodes(options: {
     currentVersion: number;
     chatSourceId?: string | null;
+    onlyExtractive?: boolean;
     limit: number;
   }): Promise<BrainEpisodeRecord[]> {
-    const params: unknown[] = [options.currentVersion];
-    let where = `WHERE e.status = 'current' AND (e.generator = 'extractive' OR e.extraction_version < ?)`;
+    const params: unknown[] = [];
+    // onlyExtractive is the backfill "sweep the fallbacks" scope: placeholders
+    // alone, not stale-but-model episodes.
+    let where = `WHERE e.status = 'current' AND `;
+    if (options.onlyExtractive) {
+      where += `e.generator = 'extractive'`;
+    } else {
+      where += `(e.generator = 'extractive' OR e.extraction_version < ?)`;
+      params.push(options.currentVersion);
+    }
     if (options.chatSourceId) {
       where += ` AND e.chat_source_id = ?`;
       params.push(options.chatSourceId);

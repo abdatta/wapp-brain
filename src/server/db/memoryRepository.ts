@@ -5,6 +5,8 @@ import type {
 import type {
   ArchiveSignalBatch,
   ArchiveSignalObservation,
+  BrainBackfillDbStats,
+  BrainBackfillModelSpend,
   BrainChatBacklogItem,
   BrainClaimGradeRecord,
   BrainClaimGradeValue,
@@ -3608,10 +3610,14 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     return maxId;
   }
 
-  async getBrainChatBacklog(options: { limit: number; minPending?: number }): Promise<BrainChatBacklogItem[]> {
+  async getBrainChatBacklog(options: { limit: number; minPending?: number; chatSourceId?: string | null }): Promise<BrainChatBacklogItem[]> {
     const minPending = Math.max(1, options.minPending ?? 1);
+    const scope = options.chatSourceId ? this.canonicalJid(options.chatSourceId) ?? options.chatSourceId : null;
     const items: BrainChatBacklogItem[] = [];
     for (const chat of this.chats.values()) {
+      if (scope && chat.sourceChatId !== scope) {
+        continue;
+      }
       const watermark = this.brainWatermarks.get(chat.sourceChatId);
       const pendingMessages = [...this.messages.values()].filter(
         (message) =>
@@ -3837,6 +3843,11 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     let reconciled = 0;
     for (const run of this.brainRuns.values()) {
       if (run.status === "running") {
+        // Mirror of the SQLite semantics: a lock keyed by a dead run releases
+        // with the reconcile, so kill-resume never waits out the TTL.
+        if (this.brainLockRunId === run.id) {
+          this.brainLockRunId = null;
+        }
         run.status = "interrupted";
         run.finishedAt = new Date().toISOString();
         run.errorMessage = "Interrupted by a server restart.";
@@ -3947,6 +3958,52 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       usageToday: await this.getBrainLlmUsage({ day: new Date().toISOString().slice(0, 10) }),
       latestRun: runs[0] ?? null,
       activeRun: runs.find((run) => run.status === "running") ?? null
+    };
+  }
+
+  async getBrainBackfillStats(): Promise<BrainBackfillDbStats> {
+    const visible = [...this.messages.values()].filter((message) => isVisibleExchangeMessage(message));
+    const pending = visible.filter((message) => this.isMessagePending(message, message.chatSourceId));
+    const episodeTasks = [...this.brainTasks.values()].filter((task) => task.kind === "episode");
+    const current = [...this.brainEpisodes.values()].filter((episode) => episode.status === "current");
+    const hourAgoIso = new Date(Date.now() - 3600_000).toISOString();
+    const today = new Date().toISOString().slice(0, 10);
+    const spend = new Map<string, BrainBackfillModelSpend>();
+    for (const entry of this.brainLedger) {
+      const row = spend.get(entry.provider) ?? {
+        provider: entry.provider,
+        calls: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        callsToday: 0,
+        inputTokensToday: 0,
+        outputTokensToday: 0
+      };
+      row.calls += 1;
+      row.inputTokens += entry.inputTokens;
+      row.outputTokens += entry.outputTokens;
+      if (entry.day === today) {
+        row.callsToday += 1;
+        row.inputTokensToday += entry.inputTokens;
+        row.outputTokensToday += entry.outputTokens;
+      }
+      spend.set(entry.provider, row);
+    }
+    const avgMessages =
+      current.length > 0 ? Math.round((current.reduce((sum, episode) => sum + episode.messageCount, 0) / current.length) * 10) / 10 : null;
+    return {
+      totalVisibleMessages: visible.length,
+      assimilatedVisibleMessages: visible.length - pending.length,
+      pendingChats: new Set(pending.map((message) => message.chatSourceId)).size,
+      queuedEpisodeTasks: episodeTasks.filter((task) => task.status === "pending").length,
+      failedEpisodeTasks: episodeTasks.filter((task) => task.status === "failed").length,
+      episodesLastHour: [...this.brainEpisodes.values()].filter((episode) => episode.createdAt >= hourAgoIso).length,
+      currentEpisodes: current.length,
+      avgEpisodeMessages: avgMessages,
+      modelAttemptedEpisodes: current.filter((episode) => episode.generator === "model" || episode.attemptedModel != null).length,
+      fallbackEpisodes: current.filter((episode) => episode.attemptedModel != null).length,
+      sweepableExtractive: current.filter((episode) => episode.generator === "extractive").length,
+      spendByModel: [...spend.values()].sort((a, b) => b.calls - a.calls)
     };
   }
 
@@ -4088,12 +4145,17 @@ export class MemoryArchiveRepository implements ArchiveRepository {
   async listRegenerableBrainEpisodes(options: {
     currentVersion: number;
     chatSourceId?: string | null;
+    onlyExtractive?: boolean;
     limit: number;
   }): Promise<BrainEpisodeRecord[]> {
     return structuredClone(
       [...this.brainEpisodes.values()]
         .filter((episode) => episode.status === "current")
-        .filter((episode) => episode.generator === "extractive" || episode.extractionVersion < options.currentVersion)
+        .filter((episode) =>
+          options.onlyExtractive
+            ? episode.generator === "extractive"
+            : episode.generator === "extractive" || episode.extractionVersion < options.currentVersion
+        )
         .filter((episode) => !options.chatSourceId || episode.chatSourceId === options.chatSourceId)
         .sort((a, b) => b.endAtMs - a.endAtMs)
         .slice(0, options.limit)

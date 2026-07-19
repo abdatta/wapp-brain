@@ -4,17 +4,35 @@
 // from memory; lifecycle mirrors to the server console; budgets are hard
 // named stops, never silent.
 
-import type { BrainRunProgress } from "../../shared/types";
+import type { BrainBackfillStatus, BrainChatBacklogItem, BrainRunProgress } from "../../shared/types";
 import { config } from "../config";
 import type { ArchiveRepository } from "../db/repository";
-import { publicErrorMessage } from "../privacy";
+import { PublicError, publicErrorMessage } from "../privacy";
 import { buildEvidencePacks, EXTRACTION_VERSION, generateEpisodeForPack } from "./episodes";
 import { getBrainProviderStatus } from "./provider";
-import { drainBrainTasks } from "./scheduler";
+import { auditCatchup, drainBrainTasks } from "./scheduler";
+
+// Backfill fallback canary (historical-backfill H5): the warning fires only
+// after this many attempted model episodes in the run, past this rate.
+export const BACKFILL_FALLBACK_MIN_ATTEMPTS = 20;
+export const BACKFILL_FALLBACK_WARNING_RATE = 0.1;
+// ETA needs this many trailing-hour episodes before it stops lying.
+const BACKFILL_ETA_MIN_EPISODES = 10;
+// Fallback pack size when no episode has been committed yet to observe one —
+// well under the 150-message cap because week-span splitting yields smaller
+// packs on average (the real archive settles near ~60).
+const DEFAULT_AVG_PACK_MESSAGES = 60;
+// Backfill worker pool (H7): sliding, parallel across chats only.
+const BACKFILL_DEFAULT_CONCURRENCY = 5;
+const BACKFILL_MAX_CONCURRENCY = 6;
+const BACKFILL_LOCK_TTL_MS = 30 * 60_000;
 
 const progress: BrainRunProgress = {
   state: "idle",
   runId: null,
+  kind: null,
+  queuedTasks: null,
+  estimatedEpisodes: null,
   mode: "extractive",
   provider: null,
   model: null,
@@ -63,10 +81,26 @@ export interface BrainRunRequest {
   // extraction version, enqueue durable 'regenerate' tasks, and drain those.
   // Model mode only — regenerating a model episode extractively would downgrade it.
   regenerate?: boolean;
+  // Regeneration scope: only extractive episodes — the backfill dashboard's
+  // "sweep the fallbacks" action (skips stale-but-model episodes).
+  regenerateOnlyExtractive?: boolean;
+  // Historical backfill (historical-backfill H1): produce the full uncovered
+  // work-list through the idempotent catch-up audit, then drain it as episode
+  // tasks under this run's pacing. Resume = start another backfill run.
+  backfill?: boolean;
   // Per-run token budget (assimilation runs): once accumulated input+output
   // tokens reach this, no further model call is made and the run ends as a
   // NAMED budget_exceeded — the token sibling of maxModelCalls.
   maxTokens?: number | null;
+  // Backfill turbo pacing overrides (H2): replace the configured ledger caps
+  // for THIS run only. Clamped 1–1000/hour and 1–10000/day.
+  callsPerHour?: number | null;
+  callsPerDay?: number | null;
+  // Strict backfill (H5): twice-failed packs commit nothing and fail their
+  // task; coverage stalls honestly instead of degrading silently.
+  strict?: boolean;
+  // Backfill worker pool width (H7): sliding, clamped 1–6, default 5.
+  concurrency?: number | null;
 }
 
 export function startBrainRun(
@@ -86,6 +120,30 @@ export function startBrainRun(
       refusal: "Regeneration needs a model: replacing a model episode with an extractive placeholder would downgrade it."
     };
   }
+  if (request.backfill && request.regenerate) {
+    return {
+      started: false,
+      progress: getBrainRunProgress(),
+      refusal: "Backfill and regeneration are separate runs — start one at a time."
+    };
+  }
+  if (request.backfill && request.chatSourceId) {
+    return {
+      started: false,
+      progress: getBrainRunProgress(),
+      refusal: "Backfill covers the whole uncovered archive (newest chat first). Cap it with maxChats, or use a manual run for a single chat."
+    };
+  }
+  if (request.strict && !request.backfill) {
+    return { started: false, progress: getBrainRunProgress(), refusal: "Strict mode applies to backfill runs only." };
+  }
+  if (request.strict && request.mode !== "model") {
+    return {
+      started: false,
+      progress: getBrainRunProgress(),
+      refusal: "Strict mode needs a model — extractive generation has no model failures to refuse."
+    };
+  }
   if (request.mode === "model") {
     if (!provider.modelBacked || !provider.enabled || provider.sessionMissing) {
       return { started: false, progress: getBrainRunProgress(), refusal: provider.message };
@@ -101,6 +159,9 @@ export function startBrainRun(
   progress.state = "running";
   cancelRequested = false;
   progress.runId = null;
+  progress.kind = request.backfill ? "backfill" : request.regenerate ? "regenerate" : "manual";
+  progress.queuedTasks = null;
+  progress.estimatedEpisodes = null;
   progress.mode = request.mode;
   progress.provider = request.mode === "model" ? provider.provider : "extractive";
   progress.model = request.mode === "model" ? request.model?.trim() || provider.model : null;
@@ -161,6 +222,9 @@ async function executeRun(
   if (request.regenerate) {
     return executeRegenerateRun(repository, request);
   }
+  if (request.backfill) {
+    return executeBackfillRun(repository, request);
+  }
   const runId = await repository.startBrainRun("manual");
   progress.runId = runId;
   const maxModelCalls = Math.max(1, request.maxModelCalls ?? config.brain.maxCallsPerHour);
@@ -169,13 +233,16 @@ async function executeRun(
   );
   try {
     const backlog = request.chatSourceId
-      ? (await repository.getBrainChatBacklog({ limit: 5000 })).filter((item) => item.chatSourceId === request.chatSourceId)
+      ? await repository.getBrainChatBacklog({ limit: 1, chatSourceId: request.chatSourceId })
       : await repository.getBrainChatBacklog({ limit: request.maxChats ?? 10 });
     progress.totalChats = backlog.length;
+    progress.estimatedEpisodes = estimateEpisodeCount(backlog, await observedAvgPackMessages(repository));
     let budgetExhausted = false;
     // Which budget stopped the run — the stop is always NAMED, never generic.
     let budgetStopMessage = "Model-call budget for this run was reached; remaining backlog stays pending.";
     let cancelled = false;
+    // Provider went unavailable mid-run: stop rather than commit placeholders.
+    let providerDegraded = false;
     // Chats that actually produced an episode vs. windows merely visited — the
     // honest chat count, so "12 chats for 3 episodes" can't happen.
     let chatsProduced = 0;
@@ -196,6 +263,12 @@ async function executeRun(
       let producedThisChat = false;
       for (const pack of packs) {
         if (progress.mode === "model") {
+          // Provider health FIRST: a mid-run degradation stops the run instead
+          // of committing extractive placeholders over the rest of the backlog.
+          if (getBrainProviderStatus().degraded) {
+            providerDegraded = true;
+            break;
+          }
           const usedToday = await repository.getBrainLlmUsage({ day: utcDayString() });
           if (progress.modelCalls >= maxModelCalls || usedToday.calls >= config.brain.maxCallsPerDay) {
             budgetExhausted = true;
@@ -238,7 +311,7 @@ async function executeRun(
       if (producedThisChat) {
         chatsProduced += 1;
       }
-      if (budgetExhausted) {
+      if (budgetExhausted || providerDegraded) {
         break;
       }
     }
@@ -258,6 +331,15 @@ async function executeRun(
         runId,
         "interrupted",
         "Run cancelled; committed episodes and coverage are kept, remaining backlog stays pending.",
+        totals
+      );
+      return "interrupted";
+    }
+    if (providerDegraded) {
+      await repository.failBrainRun(
+        runId,
+        "interrupted",
+        `Provider ${progress.provider}${progress.model ? `/${progress.model}` : ""} became unavailable mid-run (usage limit, outage, or auth); ${progress.episodesCommitted.toLocaleString()} episode(s) committed, remaining backlog stays pending. Probe/recover the provider (or switch), then run again.`,
         totals
       );
       return "interrupted";
@@ -288,6 +370,7 @@ async function executeRegenerateRun(
     const stale = await repository.listRegenerableBrainEpisodes({
       currentVersion: EXTRACTION_VERSION,
       chatSourceId: request.chatSourceId ?? null,
+      onlyExtractive: request.regenerateOnlyExtractive ?? false,
       limit: 10_000
     });
     await repository.enqueueBrainTasks(
@@ -300,7 +383,23 @@ async function executeRegenerateRun(
       }))
     );
     progress.totalChats = stale.length;
-    console.log(`[brain] regenerate run started (${progress.model ?? "default"}) — ${stale.length} stale/extractive episode(s)`);
+    progress.queuedTasks = (await repository.getBrainTaskSummary()).pending;
+    // Regeneration replaces exactly one episode per selected episode — the
+    // denominator is known, not estimated.
+    progress.estimatedEpisodes = stale.length;
+    // Turbo, like backfill: a bulk re-derivation (the fallback sweep can be
+    // thousands of episodes) runs the sliding pool, and an unset hourly override
+    // means NO hourly ceiling — the daily cap, the queue, and provider health
+    // bound it. The provider-degradation guard turns a mid-run usage-limit hit
+    // into a clean resumable stop.
+    const concurrency = clampInt(request.concurrency ?? BACKFILL_DEFAULT_CONCURRENCY, 1, BACKFILL_MAX_CONCURRENCY);
+    const callsPerHour = request.callsPerHour != null ? clampInt(request.callsPerHour, 1, 1000) : null;
+    const callsPerDay = request.callsPerDay != null ? clampInt(request.callsPerDay, 1, 10_000) : null;
+    console.log(
+      `[brain] regenerate run started (${progress.model ?? "default"}) — ${stale.length} episode(s), ${concurrency} worker(s)` +
+        (callsPerHour != null ? `, ${callsPerHour} calls/hour` : "") +
+        (callsPerDay != null ? `, ${callsPerDay} calls/day` : "")
+    );
     const result = await drainBrainTasks(repository, {
       maxTasks: Math.max(1, request.maxChats ?? stale.length),
       mode: "model",
@@ -308,8 +407,30 @@ async function executeRegenerateRun(
       provider: progress.provider ?? "model",
       runId,
       onlyKind: "regenerate",
+      callsPerHour: callsPerHour ?? Number.POSITIVE_INFINITY,
+      callsPerDay,
+      concurrency,
       onTaskDone: () => {
         progress.processedChats += 1;
+        void repository
+          .getBrainTaskSummary()
+          .then((summary) => {
+            progress.queuedTasks = summary.pending;
+          })
+          .catch(() => undefined);
+      },
+      // Live progress so the bar/chips move during a long sweep, not just at end.
+      onEpisode: (event) => {
+        progress.episodesCommitted += 1;
+        if (event.fellBack) {
+          progress.extractiveEpisodes += 1;
+        }
+        progress.claimsCommitted += event.claims;
+        if (event.modelCall) {
+          progress.modelCalls += 1;
+          progress.tokensUsed += event.tokens;
+        }
+        progress.currentChat = event.chatName;
       },
       shouldStop: () => cancelRequested
     });
@@ -317,6 +438,7 @@ async function executeRegenerateRun(
     progress.extractiveEpisodes = result.extractive;
     progress.claimsCommitted = result.claims;
     progress.modelCalls = result.modelCalls;
+    progress.tokensUsed = result.tokensUsed;
     const totals = {
       episodes: result.episodes,
       extractive: result.extractive,
@@ -324,6 +446,7 @@ async function executeRegenerateRun(
       chats: result.chatsProduced,
       chatsVisited: result.tasksDone,
       modelCalls: result.modelCalls,
+      tokens: result.tokensUsed,
       skippedForBudget: result.dailyExceeded || result.rateLimited ? Math.max(0, stale.length - result.tasksDone) : 0
     };
     if (cancelRequested) {
@@ -331,6 +454,15 @@ async function executeRegenerateRun(
         runId,
         "interrupted",
         "Regeneration cancelled; superseded episodes and committed replacements are kept, remaining tasks stay pending.",
+        totals
+      );
+      return "interrupted";
+    }
+    if (result.providerDegraded) {
+      await repository.failBrainRun(
+        runId,
+        "interrupted",
+        `Provider ${progress.provider}${progress.model ? `/${progress.model}` : ""} became unavailable mid-regeneration (usage limit, outage, or auth); ${result.episodes.toLocaleString()} replacement(s) committed, remaining regenerate tasks stay pending. Probe/recover the provider (or switch), then re-run the sweep.`,
         totals
       );
       return "interrupted";
@@ -350,6 +482,268 @@ async function executeRegenerateRun(
     await repository.failBrainRun(runId, "failed", publicErrorMessage(error)).catch(() => undefined);
     throw error;
   }
+}
+
+// Historical backfill run (historical-backfill H1/H2/H7): the catch-up audit
+// IS the producer (idempotent, watermark-keyed — a re-run enqueues only
+// genuinely new windows), and the queue drain does the work through the
+// sliding worker pool. Runs under the cross-process brain lock so the auto
+// pass can never spend the budget concurrently; a killed run's claimed tasks
+// are reclaimed at the next start (kill-resume needs no new machinery).
+async function executeBackfillRun(
+  repository: ArchiveRepository,
+  request: BrainRunRequest
+): Promise<"completed" | "budget_exceeded" | "interrupted"> {
+  // The lock is keyed by the RUN id: boot-time run reconciliation can then
+  // prove the holder dead and release it, so a killed turbo never blocks its
+  // own resume behind the TTL.
+  let runId: string | null = null;
+  let lockHeld = false;
+  try {
+    runId = await repository.startBrainRun("backfill");
+    progress.runId = runId;
+    if (!(await repository.tryAcquireBrainLock(runId, BACKFILL_LOCK_TTL_MS))) {
+      throw new PublicError("BRAIN_LOCKED", "Another brain pass holds the maintenance lock; try again in a moment.");
+    }
+    lockHeld = true;
+    // Under the lock every 'running' task is an orphan from a killed run —
+    // return them to pending so this run continues them immediately.
+    const reclaimed = await repository.resetInFlightBrainTasks(0);
+    const audit = await auditCatchup(repository);
+    const queuedAtStart = (await repository.getBrainTaskSummary()).pending;
+    progress.queuedTasks = queuedAtStart;
+    progress.totalChats = Math.min(queuedAtStart, request.maxChats ?? queuedAtStart);
+    // Precompute the episode total from the SCOPE this run will actually drain
+    // (the newest maxChats chats), so the progress bar's denominator matches
+    // the work, not the whole archive.
+    const scopeForEstimate = request.maxChats != null ? audit.backlog.slice(0, request.maxChats) : audit.backlog;
+    progress.estimatedEpisodes = estimateEpisodeCount(scopeForEstimate, await observedAvgPackMessages(repository));
+    // Hourly pace: absent means NO hourly ceiling for a backfill. The config
+    // default (30/hour) is the auto scheduler's spread-across-the-day pace and
+    // would pointlessly stop a turbo drain within minutes — so an unset field
+    // lets the pool run at full speed, bounded by the daily ceiling, the queue,
+    // and the worker count. An explicit override still sets a named hourly stop
+    // (only ever used to throttle slower, so the 1000 clamp is ample).
+    const callsPerHour = request.callsPerHour != null ? clampInt(request.callsPerHour, 1, 1000) : null;
+    const callsPerDay = request.callsPerDay != null ? clampInt(request.callsPerDay, 1, 10_000) : null;
+    const concurrency =
+      progress.mode === "model" ? clampInt(request.concurrency ?? BACKFILL_DEFAULT_CONCURRENCY, 1, BACKFILL_MAX_CONCURRENCY) : 1;
+    const strict = Boolean(request.strict) && progress.mode === "model";
+    const maxTokens = progress.mode === "model" && request.maxTokens != null && request.maxTokens > 0 ? request.maxTokens : null;
+    const maxModelCalls = progress.mode === "model" && request.maxModelCalls != null ? Math.max(1, request.maxModelCalls) : null;
+    // The start notice echoes every override — a run's spend posture must be
+    // readable off its console line and its stored record alike.
+    console.log(
+      `[brain] backfill run started (${progress.mode}${progress.model ? `/${progress.model}` : ""}) — ` +
+        `${queuedAtStart.toLocaleString()} queued task(s) (${audit.enqueued.toLocaleString()} newly enqueued, ${reclaimed} reclaimed)` +
+        (request.maxChats ? `, capped at ${request.maxChats} task(s)` : "") +
+        (progress.mode === "model"
+          ? `, ${concurrency} worker(s)` +
+            (callsPerHour != null ? `, ${callsPerHour} calls/hour override` : "") +
+            (callsPerDay != null ? `, ${callsPerDay} calls/day override` : "") +
+            (maxModelCalls != null ? `, ≤${maxModelCalls} call(s)` : "") +
+            (maxTokens != null ? `, ≤${maxTokens.toLocaleString()} tokens` : "") +
+            (strict ? ", STRICT (no extractive placeholders)" : "")
+          : ", extractive (zero model calls)")
+    );
+    let fallbackWarned = false;
+    const result = await drainBrainTasks(repository, {
+      maxTasks: request.maxChats ?? Number.MAX_SAFE_INTEGER,
+      mode: progress.mode,
+      model: progress.model,
+      provider: progress.provider ?? "extractive",
+      runId,
+      onlyKind: "episode",
+      // Unset hourly override → no hourly ceiling (Infinity), not the config
+      // pace; the daily cap, the queue, and the pool bound the run instead.
+      callsPerHour: callsPerHour ?? Number.POSITIVE_INFINITY,
+      callsPerDay,
+      maxModelCalls,
+      maxTokens,
+      strict,
+      concurrency,
+      onTaskDone: () => {
+        progress.processedChats += 1;
+        // Queue-depth refresh (H8), cheap and never allowed to stall the drain.
+        void repository
+          .getBrainTaskSummary()
+          .then((summary) => {
+            progress.queuedTasks = summary.pending;
+          })
+          .catch(() => undefined);
+      },
+      onEpisode: (event) => {
+        // Lock heartbeat per committed pack (~one model call apart): a single
+        // long chat task must never let the TTL lapse mid-run.
+        void repository.tryAcquireBrainLock(runId!, BACKFILL_LOCK_TTL_MS).catch(() => undefined);
+        progress.episodesCommitted += 1;
+        if (event.fellBack) {
+          progress.extractiveEpisodes += 1;
+        }
+        progress.claimsCommitted += event.claims;
+        if (event.modelCall) {
+          progress.modelCalls += 1;
+          progress.tokensUsed += event.tokens;
+        }
+        progress.currentChat = event.chatName;
+        // Mid-run canary (H5): fallback-rate spikes are alert-worthy states,
+        // not footnotes — warn LOUDLY the moment the threshold is crossed.
+        if (!fallbackWarned && progress.mode === "model" && progress.episodesCommitted >= BACKFILL_FALLBACK_MIN_ATTEMPTS) {
+          const rate = progress.extractiveEpisodes / progress.episodesCommitted;
+          if (rate > BACKFILL_FALLBACK_WARNING_RATE) {
+            fallbackWarned = true;
+            console.warn(
+              `[brain] BACKFILL FALLBACK WARNING: ${progress.extractiveEpisodes}/${progress.episodesCommitted} episode(s) ` +
+                `(${Math.round(rate * 100)}%) fell back to extractive placeholders — check provider health and the model before ` +
+                `continuing; the dashboard sweep can regenerate them later.`
+            );
+          }
+        }
+      },
+      shouldStop: () => cancelRequested
+    });
+    // Reclaim budget/cancel-stopped mid-chat claims BEFORE snapshotting the
+    // queue for the run record, so queuedRemaining is the queue the next run
+    // actually sees (the finally-reclaim stays as the crash-path safety net).
+    await repository.resetInFlightBrainTasks(0).catch(() => undefined);
+    progress.queuedTasks = (await repository.getBrainTaskSummary()).pending;
+    const totals: Record<string, number> = {
+      episodes: result.episodes,
+      extractive: result.extractive,
+      claims: result.claims,
+      chats: result.chatsProduced,
+      chatsVisited: result.tasksDone,
+      modelCalls: result.modelCalls,
+      tokens: result.tokensUsed,
+      queuedAtStart,
+      queuedRemaining: progress.queuedTasks,
+      concurrency,
+      ...(callsPerHour != null ? { callsPerHourOverride: callsPerHour } : {}),
+      ...(callsPerDay != null ? { callsPerDayOverride: callsPerDay } : {}),
+      ...(strict ? { strict: 1 } : {})
+    };
+    if (cancelRequested) {
+      await repository.failBrainRun(
+        runId,
+        "interrupted",
+        "Backfill cancelled; committed episodes and coverage are kept, the remaining queue stays pending.",
+        totals
+      );
+      return "interrupted";
+    }
+    // Provider went unavailable mid-run (usage limit, outage, auth): STOP
+    // rather than fill coverage with extractive placeholders. Named, resumable.
+    if (result.providerDegraded) {
+      await repository.failBrainRun(
+        runId,
+        "interrupted",
+        `Provider ${progress.provider}${progress.model ? `/${progress.model}` : ""} became unavailable mid-run (usage limit, outage, or auth). The run stopped to avoid filling coverage with extractive placeholders — ${result.episodes.toLocaleString()} episode(s) committed, ${progress.queuedTasks?.toLocaleString() ?? "the remaining"} task(s) still pending. Probe/recover the provider (or switch providers in the Run console), then resume the backfill.`,
+        totals
+      );
+      return "interrupted";
+    }
+    // Every budget stop is NAMED after the budget that fired (H2).
+    const budgetStop = result.tokenBudgetExceeded
+      ? `Token budget for this run (${(maxTokens ?? 0).toLocaleString()} tokens) was reached; the remaining backfill queue stays pending.`
+      : result.callBudgetExceeded
+        ? `Model-call ceiling for this run (${maxModelCalls ?? 0} call(s)) was reached; the remaining backfill queue stays pending.`
+        : result.dailyExceeded
+          ? `Daily model-call budget (${callsPerDay ?? config.brain.maxCallsPerDay}) was reached; the remaining backfill queue stays pending.`
+          : result.rateLimited
+            ? `Hourly pace (${callsPerHour ?? config.brain.maxCallsPerHour} calls/hour) was reached; the remaining backfill queue stays pending.`
+            : null;
+    if (budgetStop) {
+      await repository.failBrainRun(runId, "budget_exceeded", budgetStop, totals);
+      return "budget_exceeded";
+    }
+    await repository.completeBrainRun(runId, totals);
+    return "completed";
+  } catch (error) {
+    if (runId) {
+      await repository.failBrainRun(runId, "failed", publicErrorMessage(error)).catch(() => undefined);
+    }
+    throw error;
+  } finally {
+    // Return any budget/cancel-stopped mid-chat claims to pending — but only
+    // when this run actually held the lock (a lock refusal must never yank
+    // another pass's claimed tasks).
+    if (lockHeld) {
+      await repository.resetInFlightBrainTasks(0).catch(() => undefined);
+      await repository.releaseBrainLock(runId!);
+    }
+  }
+}
+
+// Server-computed backfill dashboard (H4): repository rollups + the live run
+// progress folded into one DTO. Meaning lives here — UI/CLI/MCP render it.
+export async function getBrainBackfillStatus(repository: ArchiveRepository): Promise<BrainBackfillStatus> {
+  const stats = await repository.getBrainBackfillStats();
+  const current = getBrainRunProgress();
+  const running = current.state === "running" ? current : null;
+  const pendingMessages = Math.max(0, stats.totalVisibleMessages - stats.assimilatedVisibleMessages);
+  const coveragePercent =
+    stats.totalVisibleMessages > 0
+      ? Math.round(((stats.totalVisibleMessages - pendingMessages) / stats.totalVisibleMessages) * 1000) / 10
+      : 100;
+  const drainRatePerHour = stats.episodesLastHour > 0 ? stats.episodesLastHour : null;
+  const remainingPacks =
+    stats.avgEpisodeMessages != null && stats.avgEpisodeMessages > 0 ? Math.ceil(pendingMessages / stats.avgEpisodeMessages) : null;
+  const etaHours =
+    drainRatePerHour != null && stats.episodesLastHour >= BACKFILL_ETA_MIN_EPISODES && remainingPacks != null
+      ? Math.round((remainingPacks / drainRatePerHour) * 10) / 10
+      : null;
+  const currentRunAttempted = running && running.mode === "model" ? running.episodesCommitted : 0;
+  const currentRunExtractive = running && running.mode === "model" ? running.extractiveEpisodes : 0;
+  const currentRunWarning =
+    currentRunAttempted >= BACKFILL_FALLBACK_MIN_ATTEMPTS &&
+    currentRunExtractive / currentRunAttempted > BACKFILL_FALLBACK_WARNING_RATE;
+  const overallWarning =
+    stats.modelAttemptedEpisodes >= BACKFILL_FALLBACK_MIN_ATTEMPTS &&
+    stats.fallbackEpisodes / stats.modelAttemptedEpisodes > BACKFILL_FALLBACK_WARNING_RATE;
+  return {
+    coveragePercent,
+    totalVisibleMessages: stats.totalVisibleMessages,
+    assimilatedVisibleMessages: stats.assimilatedVisibleMessages,
+    pendingMessages,
+    pendingChats: stats.pendingChats,
+    queuedTasks: stats.queuedEpisodeTasks,
+    failedTasks: stats.failedEpisodeTasks,
+    running,
+    drainRatePerHour,
+    etaHours,
+    avgEpisodeMessages: stats.avgEpisodeMessages,
+    spendByModel: stats.spendByModel,
+    fallback: {
+      totalEpisodes: stats.modelAttemptedEpisodes,
+      extractiveEpisodes: stats.fallbackEpisodes,
+      ratePercent:
+        stats.modelAttemptedEpisodes > 0 ? Math.round((stats.fallbackEpisodes / stats.modelAttemptedEpisodes) * 1000) / 10 : 0,
+      currentRunAttempted,
+      currentRunExtractive,
+      currentRunWarning,
+      warning: currentRunWarning || overallWarning
+    },
+    sweepableExtractive: stats.sweepableExtractive
+  };
+}
+
+function clampInt(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, Math.floor(value)));
+}
+
+// Precompute the run's episode total for the progress bar: each in-scope chat
+// yields at least one episode, more when its pending message count exceeds the
+// observed pack size. Aggregate over many chats, the observed average absorbs
+// week-span splitting, so this is a good ≈ denominator even though any single
+// chat's split is uneven.
+function estimateEpisodeCount(items: BrainChatBacklogItem[], avgPackMessages: number): number {
+  const avg = avgPackMessages > 0 ? avgPackMessages : DEFAULT_AVG_PACK_MESSAGES;
+  return items.reduce((sum, item) => sum + Math.max(1, Math.ceil(item.pendingVisibleMessages / avg)), 0);
+}
+
+async function observedAvgPackMessages(repository: ArchiveRepository): Promise<number> {
+  const stats = await repository.getBrainBackfillStats();
+  return stats.avgEpisodeMessages && stats.avgEpisodeMessages > 0 ? stats.avgEpisodeMessages : DEFAULT_AVG_PACK_MESSAGES;
 }
 
 // UTC date (YYYY-MM-DD) matching the ledger's `day` column, so the per-run

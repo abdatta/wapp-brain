@@ -1,9 +1,17 @@
 import { useCallback, useEffect, useState } from "react";
-import type { BrainGraphStats, BrainProviderName, MemoryCitationResolution, MemoryQueryResult } from "../../../shared/types";
+import type {
+  BrainBackfillStatus,
+  BrainGraphStats,
+  BrainProviderName,
+  MemoryCitationResolution,
+  MemoryQueryResult
+} from "../../../shared/types";
 import {
   brainProviderAction,
+  cancelBrainRun,
   disableMemoryProvider,
   enableCodexMemoryProvider,
+  getBrainBackfillStatus,
   getBrainGraphStats,
   getOwnerIdentitySuggestions,
   queryMemory,
@@ -172,6 +180,178 @@ function BrainGraphSection({ running }: { running: boolean }) {
   );
 }
 
+// Backfill strip (historical-backfill H4): the pre-brain archive drain's
+// dashboard — coverage, queue depth, trailing drain rate, honest ETA,
+// per-model spend, and the extractive-fallback canary with its one-click
+// sweep. Everything shown is the server-computed DTO; the strip only renders.
+function BrainBackfillSection({ running }: { running: boolean }) {
+  const { setNotice, setError } = useToast();
+  const { setBrainRun } = useStatus();
+  const [backfill, setBackfill] = useState<BrainBackfillStatus | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [sweeping, setSweeping] = useState(false);
+
+  const refresh = useCallback(async () => {
+    try {
+      setBackfill(await getBrainBackfillStatus());
+      setLoadError(null);
+    } catch (err) {
+      setLoadError(err instanceof Error ? err.message : "Could not load backfill status.");
+    }
+  }, []);
+
+  // Live without a reload: mount + run-terminal transitions + the throttled
+  // archive-updated stream, and a 5s poll while a run is draining (episode
+  // commits do not emit SSE mid-run; the DTO carries the live progress).
+  useEffect(() => {
+    void refresh();
+    if (!running) {
+      return;
+    }
+    const timer = window.setInterval(() => void refresh(), 5000);
+    return () => window.clearInterval(timer);
+  }, [running, refresh]);
+  useArchiveEvents(useCallback(() => void refresh(), [refresh]));
+
+  async function handleSweep() {
+    setSweeping(true);
+    setError(null);
+    try {
+      // Turbo sweep: 5 sliding lanes, no hourly cap, high daily ceiling — runs
+      // until the provider's usage limit trips the guard, then resumes on the
+      // next click. Mirrors the backfill turbo posture.
+      const response = await startBrainRegenerate({ onlyExtractive: true, concurrency: 5, callsPerDay: 10000 });
+      setBrainRun(response.progress);
+      setNotice("Fallback sweep started (5 lanes) — placeholders re-derived with the model; it runs until the provider's limit, then resume to continue.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not start the fallback sweep.");
+    } finally {
+      setSweeping(false);
+    }
+  }
+
+  const loading = !backfill && !loadError;
+  const metricValue = (text: string) => (loading ? <strong className="metricSkeleton" aria-label="loading" /> : <strong>{text}</strong>);
+  const run = backfill?.running ?? null;
+  const fallback = backfill?.fallback;
+  const spendToday = backfill?.spendByModel.reduce((sum, spend) => sum + spend.callsToday, 0) ?? 0;
+  const spendTitle =
+    backfill && backfill.spendByModel.length > 0
+      ? `Ledger spend by model — all-time (today): ${backfill.spendByModel
+          .map(
+            (spend) =>
+              `${spend.provider}: ${spend.calls.toLocaleString()} calls, ${(spend.inputTokens + spend.outputTokens).toLocaleString()} tokens (${spend.callsToday.toLocaleString()} calls today)`
+          )
+          .join(" · ")}`
+      : "No model calls recorded yet.";
+  return (
+    <section className="memoryPanel">
+      <div className="panelToggle" role="heading" aria-level={2}>
+        <span className="panelTitle">
+          <span>Backfill</span>
+          {run?.kind === "backfill" && <span className="dueBadge">draining</span>}
+        </span>
+      </div>
+      {loadError ? (
+        <div className="brainDueAlert">
+          <span>Backfill status unavailable: {loadError}</span>
+        </div>
+      ) : (
+        <>
+          <div className="statusGrid">
+            <div
+              className="metric"
+              title={
+                backfill
+                  ? `${backfill.pendingMessages.toLocaleString()} message(s) across ${backfill.pendingChats.toLocaleString()} chat(s) still uncovered`
+                  : undefined
+              }
+            >
+              <span>Coverage</span>
+              {metricValue(`${backfill?.coveragePercent ?? 0}%`)}
+            </div>
+            <div
+              className="metric"
+              title={
+                backfill
+                  ? `Episode tasks waiting in the durable queue${backfill.failedTasks > 0 ? ` — ${backfill.failedTasks} retired as failed (visible in the task summary)` : ""}`
+                  : undefined
+              }
+            >
+              <span>Queue</span>
+              {metricValue(
+                (backfill?.queuedTasks ?? 0).toLocaleString() + (backfill && backfill.failedTasks > 0 ? ` (+${backfill.failedTasks} failed)` : "")
+              )}
+            </div>
+            <div className="metric" title="Episodes committed in the trailing 60 minutes">
+              <span>Drain rate</span>
+              {metricValue(backfill?.drainRatePerHour != null ? `${backfill.drainRatePerHour.toLocaleString()}/h` : "—")}
+            </div>
+            <div
+              className="metric"
+              title={
+                backfill?.etaHours != null
+                  ? `Approximate — ${Math.ceil(backfill.pendingMessages / (backfill.avgEpisodeMessages ?? 1)).toLocaleString()} estimated pack(s) at the current trailing-hour rate`
+                  : "Appears once the trailing hour holds enough committed episodes to ground it"
+              }
+            >
+              <span>ETA</span>
+              {metricValue(backfill?.etaHours != null ? `≈${backfill.etaHours}h` : "—")}
+            </div>
+            <div className="metric" title={spendTitle}>
+              <span>Calls today</span>
+              {metricValue(spendToday.toLocaleString())}
+            </div>
+            <div
+              className={`metric ${fallback?.warning ? "metricWarn" : ""}`}
+              title={
+                fallback
+                  ? `Of ${fallback.totalEpisodes.toLocaleString()} model-attempted episode(s), ${fallback.extractiveEpisodes.toLocaleString()} fell back to extractive placeholders${run && fallback.currentRunAttempted > 0 ? ` — this run: ${fallback.currentRunExtractive}/${fallback.currentRunAttempted}` : ""}. A spike means the model is failing validation — never silent.`
+                  : undefined
+              }
+            >
+              <span>Fallbacks</span>
+              {metricValue(fallback ? `${fallback.ratePercent}%` : "—")}
+            </div>
+          </div>
+          {fallback?.warning && (
+            <div className="brainDueAlert backfillWarnAlert">
+              <span>
+                Fallback rate is above {`10%`} after {fallback.currentRunWarning ? fallback.currentRunAttempted : fallback.totalEpisodes}{" "}
+                attempted episode(s) — check provider health and the model before spending further. Placeholders stay sweepable below.
+              </span>
+            </div>
+          )}
+          <div className="brainHint">
+            {loading ? (
+              <span className="metricSkeleton lineSkeleton short" aria-label="loading" />
+            ) : run?.kind === "backfill" ? (
+              `Backfill draining: ${run.episodesCommitted.toLocaleString()} episode(s) this run (${run.extractiveEpisodes} extractive), ${run.tokensUsed.toLocaleString()} tokens${run.currentChat ? ` — now: ${run.currentChat}` : ""}. Pause live sync for the heaviest stretches.`
+            ) : (backfill?.pendingMessages ?? 0) > 0 ? (
+              `${backfill!.pendingMessages.toLocaleString()} message(s) uncovered — start a backfill from the Run console (mode: Backfill history). Kill-resume is clean; re-running only ever covers new ground.`
+            ) : (
+              "Every visible message is covered — nothing left to backfill."
+            )}
+          </div>
+          {(backfill?.sweepableExtractive ?? 0) > 0 && (
+            <div className="brainProviderControls">
+              <button
+                className="miniButton"
+                type="button"
+                disabled={sweeping || running || loading}
+                title="Regenerate every current extractive placeholder episode with the model (coverage with placeholders is not final quality)"
+                onClick={() => void handleSweep()}
+              >
+                {sweeping ? "Starting sweep…" : `Sweep ${backfill!.sweepableExtractive.toLocaleString()} fallback${backfill!.sweepableExtractive === 1 ? "" : "s"}`}
+              </button>
+            </div>
+          )}
+        </>
+      )}
+    </section>
+  );
+}
+
 // The brain surface: coverage/runs/provider control (BrainPanel) plus the
 // second-brain memory panel, which is slated for teardown (change #15) and lives
 // here as a section until then. Run progress and completion toasts are owned by
@@ -215,16 +395,42 @@ export function BrainPage() {
     maxChats?: number;
     maxModelCalls?: number;
     maxTokens?: number | null;
+    backfill?: boolean;
+    callsPerHour?: number | null;
+    callsPerDay?: number | null;
+    strict?: boolean;
+    concurrency?: number | null;
   }): Promise<boolean> {
     setError(null);
     try {
-      const response = await startBrainRun({ ...body, maxChats: body.maxChats ?? 10 });
+      // A backfill without a cap drains the whole queue — never default it.
+      const response = await startBrainRun(body.backfill ? body : { ...body, maxChats: body.maxChats ?? 10 });
       setBrainRun(response.progress);
-      setNotice("Brain run started — progress shows below and in the nav.");
+      setNotice(
+        body.backfill
+          ? "Backfill started — the strip below tracks coverage, drain rate, and the fallback canary live."
+          : "Brain run started — progress shows below and in the nav."
+      );
       return true;
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not start the brain run.");
       return false;
+    }
+  }
+
+  // Cooperative stop: the run ends after its current episode as 'interrupted'
+  // (committed episodes and coverage are kept). The status poller surfaces the
+  // terminal toast; here we just flip the flag and reflect the returned state.
+  async function handleStopBrainRun() {
+    setError(null);
+    try {
+      const response = await cancelBrainRun();
+      setBrainRun(response.progress);
+      if (response.cancelling) {
+        setNotice("Stopping after the current episode — committed episodes and coverage are kept.");
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not stop the run.");
     }
   }
 
@@ -360,6 +566,7 @@ export function BrainPage() {
         busy={busy}
         onOpenConsole={() => setConsoleOpen(true)}
         onReset={() => void handleResetBrain()}
+        onStop={() => void handleStopBrainRun()}
       />
       {consoleOpen && (
         <RunConsoleModal
@@ -374,6 +581,7 @@ export function BrainPage() {
           suggest={getOwnerIdentitySuggestions}
         />
       )}
+      <BrainBackfillSection running={brainRun?.state === "running"} />
       <BrainGraphSection running={brainRun?.state === "running"} />
       <MemoryPanel
         status={status}

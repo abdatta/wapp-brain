@@ -391,6 +391,154 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Historical backfill (historical-backfill H6): the attended long-session
+  // surface — a weekend turbo drain should survive a closed browser tab. When
+  // the local server is up the CLI delegates over HTTP (single writer stays in
+  // the server process) and polls progress; otherwise it runs the same backfill
+  // in-process. Subactions: (default) start | status | cancel.
+  if (command === "brain-backfill") {
+    const { localServerListening } = await import("./brain/eval");
+    const action = stringArg(args._) ?? "start";
+    const serverBase = `http://${config.app.host}:${config.app.port}`;
+    const serverUp = await localServerListening(serverBase);
+    const body = {
+      mode: args.extractive ? ("extractive" as const) : ("model" as const),
+      model: stringArg(args.model) ?? null,
+      backfill: true,
+      maxChats: numberArg(args["max-chats"]),
+      maxModelCalls: numberArg(args["max-calls"]),
+      maxTokens: numberArg(args["max-tokens"]),
+      callsPerHour: numberArg(args.rate),
+      callsPerDay: numberArg(args.daily),
+      concurrency: numberArg(args.concurrency),
+      strict: Boolean(args.strict)
+    };
+    const describeProgress = (progress: {
+      state: string;
+      episodesCommitted: number;
+      extractiveEpisodes: number;
+      processedChats: number;
+      queuedTasks: number | null;
+      modelCalls: number;
+      tokensUsed: number;
+      currentChat: string | null;
+      error: string | null;
+    }): string =>
+      `${progress.episodesCommitted} episode(s) (${progress.extractiveEpisodes} extractive), ${progress.processedChats} task(s) done` +
+      (progress.queuedTasks != null ? `, ${progress.queuedTasks} queued` : "") +
+      `, ${progress.modelCalls} call(s), ${progress.tokensUsed.toLocaleString()} tokens` +
+      (progress.currentChat ? ` — now: ${progress.currentChat}` : "");
+    if (serverUp) {
+      const viaServer = async (path: string, method: "GET" | "POST", payload?: unknown): Promise<Record<string, unknown>> => {
+        const response = await fetch(`${serverBase}${path}`, {
+          method,
+          headers: payload ? { "content-type": "application/json" } : undefined,
+          body: payload ? JSON.stringify(payload) : undefined
+        });
+        const parsed = (await response.json().catch(() => null)) as Record<string, unknown> | null;
+        if (!response.ok) {
+          throw new Error(String(parsed?.error ?? `The server rejected the request (${response.status}).`));
+        }
+        return parsed ?? {};
+      };
+      console.log(`Server detected at ${serverBase} — delegating (the single writer stays in the server process).`);
+      if (action === "status") {
+        console.log(JSON.stringify(await viaServer("/api/brain/backfill/status", "GET"), null, 2));
+        return;
+      }
+      if (action === "cancel") {
+        const cancelled = await viaServer("/api/brain/runs/cancel", "POST");
+        console.log(cancelled.cancelling ? "Cancel requested; the run ends as interrupted." : "No run in progress to cancel.");
+        return;
+      }
+      await viaServer("/api/brain/runs", "POST", body);
+      console.log(
+        `Backfill started (${body.mode}${body.model ? `/${body.model}` : ""}). Ctrl-C only stops this monitor — the run keeps going server-side (use \`brain-backfill cancel\` to stop it).`
+      );
+      let lastLine = "";
+      // The monitor must survive transient poll failures (an event-loop stall
+      // or socket hiccup) — the run is server-side; only give up after several
+      // consecutive misses, and say the run may still be going.
+      let consecutiveFailures = 0;
+      for (;;) {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        let progress: Parameters<typeof describeProgress>[0];
+        try {
+          progress = (await viaServer("/api/brain/runs/current", "GET")) as unknown as Parameters<typeof describeProgress>[0];
+          consecutiveFailures = 0;
+        } catch (error) {
+          consecutiveFailures += 1;
+          if (consecutiveFailures >= 5) {
+            console.error(
+              `Lost the server after ${consecutiveFailures} polls (${publicErrorMessage(error)}). The run may still be going — re-attach with \`brain-backfill status\`.`
+            );
+            process.exitCode = 1;
+            return;
+          }
+          continue;
+        }
+        const line = describeProgress(progress);
+        if (line !== lastLine) {
+          console.log(line);
+          lastLine = line;
+        }
+        if (progress.state !== "running") {
+          console.log(`Backfill ${progress.state}.${progress.error ? ` ${progress.error}` : ""}`);
+          if (progress.state === "failed") {
+            process.exitCode = 1;
+          }
+          return;
+        }
+      }
+    }
+    if (action === "status" || action === "cancel") {
+      console.error("The server is not running; start it (or start a backfill directly with `brain-backfill`).");
+      process.exitCode = 1;
+      return;
+    }
+    const { enableBrainProvider, setBrainProviderModel } = await import("./brain/provider");
+    const provider = stringArg(args.provider);
+    if (provider === "claude-cli" || provider === "codex") {
+      enableBrainProvider(provider);
+      if (body.model) {
+        setBrainProviderModel(provider, body.model);
+      }
+    }
+    const repository = createArchiveRepository();
+    try {
+      if (!(await repository.getArchiveOwnerName())) {
+        console.error("Set your name first — episodes label your messages with it. Set it on the Brain page (Run console → Identity).");
+        process.exitCode = 1;
+        return;
+      }
+      const { startBrainRun, getBrainRunProgress } = await import("./brain/runJob");
+      const started = startBrainRun(repository, body);
+      if (!started.started) {
+        console.error(started.refusal ?? "Could not start the backfill run.");
+        process.exitCode = 1;
+        return;
+      }
+      console.log(`Backfill started (${body.mode}${body.model ? `/${body.model}` : ""}) — Ctrl-C interrupts it (kill-resume is clean).`);
+      let lastLine = "";
+      while (getBrainRunProgress().state === "running") {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        const line = describeProgress(getBrainRunProgress());
+        if (line !== lastLine) {
+          console.log(line);
+          lastLine = line;
+        }
+      }
+      const final = getBrainRunProgress();
+      console.log(`Backfill ${final.state}: ${describeProgress(final)}.${final.error ? ` ${final.error}` : ""}`);
+      if (final.state === "failed") {
+        process.exitCode = 1;
+      }
+    } finally {
+      await repository.close?.();
+    }
+    return;
+  }
+
   // Knowledge graph (knowledge-graph-foundation): stats | rebuild | recompute |
   // entity | unresolved. All deterministic, zero model calls. When the local
   // server is up the CLI delegates over HTTP (the single writer stays inside
@@ -1081,6 +1229,7 @@ function printHelp(): void {
   tsx src/server/cli.ts live-unlink
   tsx src/server/cli.ts brain-eval [--init] [--gate] [--baseline <runId>] [--notes <text>] [--json]
   tsx src/server/cli.ts brain-graph [stats|rebuild|recompute|entity|unresolved] [--jid <jid>] [--name <name>] [--node <id>]
+  tsx src/server/cli.ts brain-backfill [start|status|cancel] [--rate <calls/hour>] [--daily <calls/day>] [--max-calls N] [--max-tokens N] [--max-chats N] [--concurrency 1-6] [--strict] [--extractive] [--provider codex|claude-cli] [--model <model>]
   tsx src/server/cli.ts set-contact-name --jid <sourceJid> --name "<display name>"
   tsx src/server/cli.ts persons-scan [--connect-only]
   tsx src/server/cli.ts memory-status

@@ -2,6 +2,7 @@ import type {
   ArchiveSignalBatch,
   ChatMetadataHistoryRecord,
   EngagementAggregateRecord,
+  BrainBackfillDbStats,
   BrainChatBacklogItem,
   BrainClaimGradeRecord,
   BrainClaimGradeValue,
@@ -283,7 +284,9 @@ export interface ArchiveRepository {
   // --- Brain substrate: watermarks (coverage truth), durable task queue,
   // run ledger, and model-usage ledger. Watermarks advance only on commit;
   // backlog is derived live from messages newer than the watermark.
-  getBrainChatBacklog(options: { limit: number; minPending?: number }): Promise<BrainChatBacklogItem[]>;
+  // chatSourceId scopes the read to one chat (the drain's per-task lookup) —
+  // never the full-archive aggregation.
+  getBrainChatBacklog(options: { limit: number; minPending?: number; chatSourceId?: string | null }): Promise<BrainChatBacklogItem[]>;
   advanceBrainWatermark(chatSourceId: string, throughMs: number): Promise<void>;
   enqueueBrainTasks(tasks: BrainTaskInput[]): Promise<number>;
   // Optional kind filter: a regenerate run drains only its own task kind while
@@ -334,6 +337,10 @@ export interface ArchiveRepository {
   }): Promise<void>;
   getBrainLlmUsage(options: { sinceMs?: number; day?: string }): Promise<BrainLlmUsageSummary>;
   getBrainStatus(): Promise<BrainStatusSummary>;
+  // Backfill dashboard rollups (historical-backfill H4): coverage, episode-task
+  // queue depth, trailing-hour drain count, fallback canary counts, and
+  // per-model ledger spend — all cheap indexed aggregates, polled by the UI.
+  getBrainBackfillStats(): Promise<BrainBackfillDbStats>;
   // Episode commit is atomic: episode + claims + citations + watermark advance
   // in one transaction — coverage moves only when the evidence lands.
   // Reset derived brain data (episodes + claims + citations + watermarks),
@@ -355,9 +362,12 @@ export interface ArchiveRepository {
   }): Promise<BrainEpisodeRecord[]>;
   // Regeneration selection: current episodes that are extractive-generated or
   // carry a stale extraction version, optionally scoped to one chat.
+  // onlyExtractive narrows to extractive episodes alone — the backfill
+  // dashboard's "sweep the fallbacks" action.
   listRegenerableBrainEpisodes(options: {
     currentVersion: number;
     chatSourceId?: string | null;
+    onlyExtractive?: boolean;
     limit: number;
   }): Promise<BrainEpisodeRecord[]>;
   // Cheap count for status surfaces (no record materialization).

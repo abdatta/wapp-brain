@@ -702,10 +702,26 @@ export class EpisodeValidationError extends PublicError {
 
 // Contract dates: "YYYY-MM-DD" (UTC midnight — day granularity is the contract)
 // or "YYYY-MM-DDTHH:MM" (parsed as UTC). Returns null when unparseable.
+//
+// Tolerance (2026-07-19): also accept bare "YYYY-MM" as the first of that month
+// at UTC midnight. Some models (notably claude-sonnet-5) emit month-granularity
+// event_at like "2022-05"; rejecting it dropped whole episodes to extractive
+// fallback (~12.5% of Sonnet's in the eval) when a month-start timestamp is a
+// perfectly usable coarse anchor. This is a liberal-in-what-we-accept loosening
+// — existing episodes are unaffected and no re-extraction is implied.
 function parseContractDate(raw: string): number | null {
   const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw);
   if (dateOnly) {
     const ms = Date.UTC(Number(dateOnly[1]), Number(dateOnly[2]) - 1, Number(dateOnly[3]));
+    return Number.isFinite(ms) ? ms : null;
+  }
+  const yearMonth = /^(\d{4})-(\d{2})$/.exec(raw);
+  if (yearMonth) {
+    const month = Number(yearMonth[2]);
+    if (month < 1 || month > 12) {
+      return null;
+    }
+    const ms = Date.UTC(Number(yearMonth[1]), month - 1, 1);
     return Number.isFinite(ms) ? ms : null;
   }
   if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(raw)) {
@@ -1204,6 +1220,11 @@ export async function generateEpisodeForPack(
     advanceWatermark?: boolean;
     // Regeneration: supersede this episode atomically with the commit.
     supersedesEpisodeId?: string | null;
+    // Strict backfill (historical-backfill H5): when model generation fails
+    // after the retry, THROW instead of committing an extractive placeholder —
+    // nothing lands, the watermark stays put, and the caller's task fails into
+    // backoff/retirement. Non-backfill runs never set this.
+    strict?: boolean;
   }
 ): Promise<EpisodeGenerationResult> {
   const ownerName = (await repository.getArchiveOwnerName()) ?? "the archive owner";
@@ -1284,6 +1305,13 @@ export async function generateEpisodeForPack(
       }
     }
     if (!validated) {
+      if (options.strict) {
+        const detail = (attemptErrors ?? []).join(" ").slice(0, 400);
+        throw new PublicError(
+          "BRAIN_STRICT_MODEL_FAILED",
+          `Strict mode: model generation failed after a retry for a pack of ${pack.messages.length} message(s); no placeholder committed, the watermark is unchanged.${detail ? ` Errors: ${detail}` : ""}`
+        );
+      }
       generator = "extractive";
       fellBack = true;
       fallbackReason = attemptErrors?.join(" ") ?? null;

@@ -1929,6 +1929,17 @@ export interface BrainModelQualityAggregate {
 export interface BrainRunProgress {
   state: "idle" | "running" | "completed" | "failed" | "budget_exceeded" | "interrupted";
   runId: string | null;
+  // Which run flavor is executing: manual assimilation, historical backfill,
+  // or regeneration. Null until the first run of the process.
+  kind: "manual" | "backfill" | "regenerate" | null;
+  // Pending episode tasks in the durable queue, refreshed per task completion
+  // during a backfill run (null for run kinds that do not drain the queue).
+  queuedTasks: number | null;
+  // Approximate total episodes THIS run will commit, precomputed at run start
+  // (regeneration knows it exactly; assimilation/backfill estimate it from the
+  // scope's pending messages ÷ observed pack size). Drives the progress bar;
+  // null until computed. The denominator is a guide, not a guarantee.
+  estimatedEpisodes: number | null;
   mode: BrainEpisodeGenerator;
   provider: string | null;
   model: string | null;
@@ -1947,6 +1958,80 @@ export interface BrainRunProgress {
   startedAt: string | null;
   finishedAt: string | null;
   error: string | null;
+}
+
+// --- Historical backfill (historical-backfill) ---
+// Server-computed dashboard for the pre-brain archive drain: coverage, queue,
+// drain rate, honest ETA, per-model spend, and the extractive-fallback canary.
+// All meaning lives server-side (downstream-consumer principle).
+
+// Per-model ledger spend, all-time and today, keyed by the ledger's provider
+// string (e.g. "codex/gpt-5.6-terra").
+export interface BrainBackfillModelSpend {
+  provider: string;
+  calls: number;
+  inputTokens: number;
+  outputTokens: number;
+  callsToday: number;
+  inputTokensToday: number;
+  outputTokensToday: number;
+}
+
+// The no-silent-degradation canary: of current episodes where a model was
+// attempted, how many are extractive placeholders — plus the running run's
+// own rate and a server-computed warning flag (threshold after a minimum
+// attempted-episode denominator, so tiny runs never cry wolf).
+export interface BrainBackfillFallbackCanary {
+  totalEpisodes: number;
+  extractiveEpisodes: number;
+  ratePercent: number;
+  currentRunAttempted: number;
+  currentRunExtractive: number;
+  currentRunWarning: boolean;
+  // Warning across either scope (all-time or the running run) — the strip
+  // styles from this, never from client-side thresholds.
+  warning: boolean;
+}
+
+export interface BrainBackfillStatus {
+  coveragePercent: number;
+  totalVisibleMessages: number;
+  assimilatedVisibleMessages: number;
+  pendingMessages: number;
+  pendingChats: number;
+  // Episode tasks waiting in (or retired from) the durable queue.
+  queuedTasks: number;
+  failedTasks: number;
+  // The in-flight run's live progress; null when idle.
+  running: BrainRunProgress | null;
+  // Episodes committed in the trailing 60 minutes; null when idle.
+  drainRatePerHour: number | null;
+  // Approximate hours to full coverage at the current rate. Null until the
+  // trailing hour holds enough episodes to ground it — an early ETA lies.
+  etaHours: number | null;
+  // Observed mean messages per episode (the ETA's pack-size denominator).
+  avgEpisodeMessages: number | null;
+  spendByModel: BrainBackfillModelSpend[];
+  fallback: BrainBackfillFallbackCanary;
+  // Current extractive episodes the one-click sweep would regenerate.
+  sweepableExtractive: number;
+}
+
+// Repository-level rollups behind BrainBackfillStatus (the server layer folds
+// in run progress and the derived rate/ETA/warning semantics).
+export interface BrainBackfillDbStats {
+  totalVisibleMessages: number;
+  assimilatedVisibleMessages: number;
+  pendingChats: number;
+  queuedEpisodeTasks: number;
+  failedEpisodeTasks: number;
+  episodesLastHour: number;
+  currentEpisodes: number;
+  avgEpisodeMessages: number | null;
+  modelAttemptedEpisodes: number;
+  fallbackEpisodes: number;
+  sweepableExtractive: number;
+  spendByModel: BrainBackfillModelSpend[];
 }
 
 // --- Knowledge graph (knowledge-graph-foundation) ---

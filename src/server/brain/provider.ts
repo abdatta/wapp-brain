@@ -317,7 +317,13 @@ async function generateWithHealthTracking(
 const WSL_STDIN_READY_MARKER = "__WAPP_BRAIN_STDIN_READY__";
 
 export function claudeCliInvocation(model?: string): { command: string; args: string[]; stdinReadyMarker?: string } {
-  const cliArgs = ["-p", "--output-format", "json", "--max-turns", "1"];
+  // `--max-turns 1` throttled real episode generation to a ~40% extractive
+  // fallback (observed 2026-07-19): Claude Code is agentic by default, so on a
+  // large pack the model sometimes spends its one turn on a tool call and then
+  // has no turn left to answer, erroring `error_max_turns`. A generation call
+  // should never be cut off, so give it headroom — the final `result` is still
+  // the single JSON answer regardless of any intermediate turns.
+  const cliArgs = ["-p", "--output-format", "json", "--max-turns", "8"];
   if (model) {
     // Sanitized upstream: plain token characters only, safe inside the WSL
     // shell string below.
@@ -457,6 +463,13 @@ interface CodexClientLike {
 // optional sibling install, mirroring the memory subsystem's Codex loading.
 const dynamicImport = new Function("specifier", "return import(specifier)") as (specifier: string) => Promise<unknown>;
 
+// H7 guard (historical-backfill): each call gets its own stateless client, but
+// CONNECT is serialized behind this in-process queue — two in-flight token
+// refreshes racing the session file are the one shared-state hazard under the
+// concurrent worker pool. The queue must survive a failed connect (a rejection
+// never poisons later calls).
+let codexConnectQueue: Promise<unknown> = Promise.resolve();
+
 async function loadCodexClient(): Promise<CodexClientLike> {
   let moduleExports: { GPTOAuthClient?: new (options: { storagePath: string }) => CodexClientLike };
   try {
@@ -474,7 +487,9 @@ async function loadCodexClient(): Promise<CodexClientLike> {
     throw new PublicError("BRAIN_CODEX_UNAVAILABLE", "The Codex OAuth client package is not available.");
   }
   const client = new moduleExports.GPTOAuthClient({ storagePath: config.memory.codexSessionPath });
-  await client.connect();
+  const connectTurn = codexConnectQueue.then(() => client.connect());
+  codexConnectQueue = connectTurn.catch(() => undefined);
+  await connectTurn;
   return client;
 }
 

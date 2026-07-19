@@ -5,6 +5,7 @@ import type {
   BrainEvalRunRecord,
   BrainGoldenSetInfo,
   BrainGradingSample,
+  BrainBackfillStatus,
   BrainGraphRebuildResult,
   BrainGraphRecomputeResult,
   BrainGraphStats,
@@ -430,6 +431,13 @@ export function startBrainRun(body: {
   maxChats?: number;
   maxModelCalls?: number;
   maxTokens?: number | null;
+  // Historical backfill: drain the full uncovered queue with optional turbo
+  // pacing overrides, strict mode, and the sliding worker pool width.
+  backfill?: boolean;
+  callsPerHour?: number | null;
+  callsPerDay?: number | null;
+  strict?: boolean;
+  concurrency?: number | null;
 }): Promise<{ ok: boolean; progress: BrainRunProgress }> {
   return request<{ ok: boolean; progress: BrainRunProgress }>("/api/brain/runs", { method: "POST", body: JSON.stringify(body) });
 }
@@ -438,14 +446,36 @@ export function getBrainRunProgress(): Promise<BrainRunProgress> {
   return request<BrainRunProgress>("/api/brain/runs/current");
 }
 
+// Cooperative stop: the run loop checks a flag between packs and ends as
+// 'interrupted' — committed episodes and advanced coverage are kept.
+export function cancelBrainRun(): Promise<{ ok: boolean; cancelling: boolean; progress: BrainRunProgress }> {
+  return request<{ ok: boolean; cancelling: boolean; progress: BrainRunProgress }>("/api/brain/runs/cancel", {
+    method: "POST",
+    body: "{}"
+  });
+}
+
 export function startBrainRegenerate(body: {
   model?: string | null;
   chatSourceId?: string | null;
+  // The backfill dashboard's "sweep the fallbacks": extractive episodes only.
+  onlyExtractive?: boolean;
+  // Turbo pacing (the sweep can be thousands of episodes): sliding worker pool
+  // width and per-run ledger overrides, mirroring backfill.
+  concurrency?: number | null;
+  callsPerHour?: number | null;
+  callsPerDay?: number | null;
 }): Promise<{ ok: boolean; progress: BrainRunProgress }> {
   return request<{ ok: boolean; progress: BrainRunProgress }>("/api/brain/regenerate", {
     method: "POST",
     body: JSON.stringify(body)
   });
+}
+
+// Backfill dashboard DTO (historical-backfill): server-computed coverage,
+// queue, drain rate, ETA, spend, and the fallback canary.
+export function getBrainBackfillStatus(): Promise<BrainBackfillStatus> {
+  return request<BrainBackfillStatus>("/api/brain/backfill/status");
 }
 
 export function resetBrainData(): Promise<{ ok: boolean; episodesRemoved: number; watermarksReset: number; filesRemoved: number }> {
