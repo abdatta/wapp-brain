@@ -1,3 +1,4 @@
+import domain from "node:domain";
 import type { MediaDownloadDescriptor, MediaDownloadQueueRecord } from "../../shared/types";
 import type { MediaDownloadOutcome } from "../live/types";
 
@@ -102,12 +103,63 @@ async function fetchContentFromWhatsApp(
   mediaType: MediaDownloadDescriptor["mediaType"]
 ): Promise<Buffer> {
   const { downloadContentFromMessage } = await import("@whiskeysockets/baileys");
-  const stream = await downloadContentFromMessage(downloadable, mediaType as never, {});
-  const chunks: Buffer[] = [];
-  for await (const chunk of stream) {
-    chunks.push(chunk as Buffer);
-  }
-  return Buffer.concat(chunks);
+  return collectMediaStream(() => downloadContentFromMessage(downloadable, mediaType as never, {}));
+}
+
+// Baileys' downloadEncryptedContent returns `httpSource.pipe(decryptTransform)`
+// (verified against @whiskeysockets/baileys 7.0.0-rc13, lib/Utils/messages-media.js
+// line 515), and Node's pipe() never forwards source errors to the destination.
+// When the media CDN resets the connection mid-body, undici destroys its
+// internal Readable with `TypeError: terminated`, nothing is listening, and
+// the emit escalates to an unhandled 'error' event that kills the whole
+// server (observed 2026-07-20 during a live media pass). The domain adopts
+// every emitter constructed during the download — including undici internals
+// no caller can reach — so those errors reject here into the caller's
+// transient-retry path. Errors surfacing after the iterator settles (teardown
+// races) are logged and absorbed by the same handler.
+export async function collectMediaStream(
+  open: () => Promise<AsyncIterable<Uint8Array>> | AsyncIterable<Uint8Array>
+): Promise<Buffer> {
+  const guard = domain.create();
+  return new Promise<Buffer>((resolve, reject) => {
+    let settled = false;
+    let stream: (AsyncIterable<Uint8Array> & { destroy?: (error?: Error) => void }) | null = null;
+    const fail = (error: unknown) => {
+      if (settled) {
+        console.warn(`[live] media stream error after settle (absorbed): ${shortError(error)}`);
+        return;
+      }
+      settled = true;
+      // Destroying the destination unblocks the pending iteration; the source
+      // is already dead or gets torn down by the pipe machinery.
+      try {
+        stream?.destroy?.(error instanceof Error ? error : new Error(String(error)));
+      } catch {}
+      reject(error);
+    };
+    guard.on("error", fail);
+    void guard.run(async () => {
+      try {
+        // The stream graph must be constructed inside the domain so its
+        // emitters bind to it — hence a factory instead of a stream argument.
+        stream = await open();
+        const chunks: Buffer[] = [];
+        for await (const chunk of stream) {
+          chunks.push(Buffer.from(chunk));
+        }
+        if (!settled) {
+          settled = true;
+          resolve(Buffer.concat(chunks));
+        }
+      } catch (error) {
+        // A rejection after fail() already settled is the echo of our own
+        // stream.destroy(), not a new failure.
+        if (!settled) {
+          fail(error);
+        }
+      }
+    });
+  });
 }
 
 // Minimal WebMessageInfo shape updateMediaMessage needs: the exact platform
@@ -182,5 +234,12 @@ function nonEmpty(value: unknown): string | undefined {
 }
 
 function shortError(error: unknown): string {
-  return error instanceof Error ? error.message.slice(0, 300) : "Media download failed.";
+  if (!(error instanceof Error)) {
+    return "Media download failed.";
+  }
+  // undici teardown errors read as bare "terminated"; the cause carries the
+  // actual socket failure and belongs in the queue's last_error.
+  const cause = (error as { cause?: unknown }).cause;
+  const causeSuffix = cause instanceof Error && cause.message ? ` (${cause.message})` : "";
+  return `${error.message}${causeSuffix}`.slice(0, 300);
 }

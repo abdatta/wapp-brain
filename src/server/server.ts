@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { config } from "./config";
 import { cleanupSensitiveWorkDirs } from "./cleanup";
+import { installLiveProcessGuards } from "./diagnostics/processGuards";
 import { createArchiveRepository, initializeArchiveDatabase } from "./db/archive";
 import { mediaBlobStore } from "./media/blobStore";
 import { configuredTraceRecorder, getTraceRecorderSummary } from "./diagnostics/traceRecorder";
@@ -36,6 +37,11 @@ import type { ArchiveChangeEvent, BrainGraphEdgeKind, LivePairingSummary, PickKi
 import type { LiveMessageEvent } from "./live/types";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// Survive stray network-stream 'error' events from undici/Baileys internals
+// instead of dying mid-live-sync; unknown exceptions still crash loudly.
+installLiveProcessGuards();
+
 const app = express();
 
 app.disable("x-powered-by");
