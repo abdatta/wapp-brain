@@ -315,6 +315,129 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Commitment lifecycle: list the L0 open-items surface, apply user
+  // transitions, or run the model closure sweep. `brain-lifecycle` lists open
+  // items (--status open|fulfilled|dismissed|all, --kind, --chat, --json);
+  // `brain-lifecycle close|dismiss|reopen --claim <id> [--note …]` records a
+  // user transition; `brain-lifecycle sweep [--chat …] [--model …] [--effort …]
+  // [--max-model-calls N] [--max-tokens N]` judges sweep-due items against
+  // their deterministic candidate evidence (run with the server STOPPED —
+  // SQLite is single-writer).
+  if (command === "brain-lifecycle") {
+    const action = stringArg(args._) ?? "list";
+    const repository = createArchiveRepository();
+    try {
+      if (action === "close" || action === "dismiss" || action === "reopen") {
+        const claimId = stringArg(args.claim);
+        if (!claimId) {
+          throw new Error(`Usage: brain-lifecycle ${action} --claim <claimId> [--note "…"]`);
+        }
+        const toStatus = action === "close" ? "fulfilled" : action === "dismiss" ? "dismissed" : "reopened";
+        const result = await repository.applyBrainLifecycleTransitions(
+          [{ claimId, toStatus, note: stringArg(args.note) ?? null }],
+          { source: "user" }
+        );
+        console.log(`Recorded ${toStatus} for claim ${claimId} (${result.applied} event(s)).`);
+        return;
+      }
+      if (action === "sweep") {
+        const { enableBrainProvider, setBrainProviderModel } = await import("./brain/provider");
+        const provider = stringArg(args.provider);
+        const model = stringArg(args.model);
+        if (provider === "claude-cli" || provider === "codex") {
+          enableBrainProvider(provider);
+          if (model) {
+            setBrainProviderModel(provider, model);
+          }
+        }
+        const { startBrainLifecycleSweep, getBrainRunProgress } = await import("./brain/runJob");
+        const effortRaw = stringArg(args.effort);
+        // --claim id (repeatable) or --claims id,id,… selects a specific subset.
+        const claimArg = args.claim ?? args.claims;
+        const claimIds = (Array.isArray(claimArg) ? claimArg : claimArg != null ? [String(claimArg)] : [])
+          .flatMap((entry) => String(entry).split(","))
+          .map((entry) => entry.trim())
+          .filter((entry) => entry.length > 0);
+        const started = startBrainLifecycleSweep(repository, {
+          chatSourceId: stringArg(args.chat) ?? null,
+          claimIds: claimIds.length > 0 ? claimIds : null,
+          model: model ?? null,
+          effort:
+            effortRaw === "none" || effortRaw === "low" || effortRaw === "medium" || effortRaw === "high" || effortRaw === "xhigh" || effortRaw === "max"
+              ? effortRaw
+              : null,
+          maxModelCalls: numberArg(args["max-model-calls"]) ?? null,
+          maxTokens: numberArg(args["max-tokens"]) ?? null
+        });
+        if (!started.started) {
+          console.error(started.refusal ?? "Could not start the closure sweep.");
+          process.exitCode = 1;
+          return;
+        }
+        console.log("Closure sweep started…");
+        while (getBrainRunProgress().state === "running") {
+          await new Promise((resolve) => setTimeout(resolve, 500));
+        }
+        const final = getBrainRunProgress();
+        const counters = final.lifecycle;
+        console.log(
+          `Sweep ${final.state}: ${counters?.nodesOffered ?? 0} node(s) offered — ${counters?.fulfilled ?? 0} fulfilled, ` +
+            `${counters?.dismissed ?? 0} dismissed, ${counters?.stillOpen ?? 0} still open, ${counters?.failedCalls ?? 0} failed call(s), ` +
+            `${final.modelCalls} model call(s).${final.error ? ` ${final.error}` : ""}`
+        );
+        if (final.state === "failed") {
+          process.exitCode = 1;
+        }
+        return;
+      }
+      // Default: list.
+      const statusRaw = stringArg(args.status);
+      const kindRaw = stringArg(args.kind);
+      const flagRaw = stringArg(args.flag);
+      const sortRaw = stringArg(args.sort);
+      const sorts = ["smart", "due_asc", "due_desc", "opened_asc", "opened_desc", "evidence_desc", "recent_activity"];
+      const response = await repository.listBrainLifecycleItems({
+        status:
+          statusRaw === "open" || statusRaw === "fulfilled" || statusRaw === "dismissed" || statusRaw === "all" || statusRaw === "closed"
+            ? statusRaw
+            : undefined,
+        flag: flagRaw === "overdue" || flagRaw === "stale" || flagRaw === "sweep_due" ? flagRaw : undefined,
+        hideOverdue: Boolean(args["hide-overdue"]),
+        hideStale: Boolean(args["hide-stale"]),
+        hideFulfilled: Boolean(args["hide-fulfilled"]),
+        hideDismissed: Boolean(args["hide-dismissed"]),
+        dueUpcoming: Boolean(args.upcoming),
+        includeChats: stringArg(args["only-chats"])?.split(",").map((entry) => entry.trim()).filter(Boolean),
+        excludeChats: stringArg(args["hide-chats"])?.split(",").map((entry) => entry.trim()).filter(Boolean),
+        kind: kindRaw === "commitment" || kindRaw === "question" ? kindRaw : undefined,
+        sort: sortRaw && sorts.includes(sortRaw) ? (sortRaw as import("../shared/types").BrainLifecycleSort) : undefined,
+        chatSourceId: stringArg(args.chat) ?? null,
+        limit: numberArg(args.limit) ?? 50
+      });
+      if (args.json) {
+        console.log(JSON.stringify(response, null, 2));
+        return;
+      }
+      const counts = response.counts;
+      console.log(
+        `Lifecycle: ${counts.open} open (${counts.overdue} overdue, ${counts.stale} stale, ${counts.sweepDue} sweep-due), ` +
+          `${counts.fulfilled} fulfilled, ${counts.dismissed} dismissed` +
+          (counts.orphanedEvents > 0 ? `, ${counts.orphanedEvents} orphaned resolution(s)` : "")
+      );
+      for (const item of response.items) {
+        const due = item.dueMs != null ? ` due ${new Date(item.dueMs).toISOString().slice(0, 10)}` : "";
+        const flags = [item.overdue ? "OVERDUE" : null, item.stale ? "stale" : null].filter(Boolean).join(", ");
+        const holder = item.holderLabel ? ` [${item.holderLabel}]` : "";
+        console.log(
+          `  ${item.status.toUpperCase().padEnd(9)} ${item.kind} ${item.claimId.slice(0, 8)}…${holder}${due}${flags ? ` (${flags})` : ""} — ${item.text.slice(0, 100)}${item.candidateCount > 0 ? ` [+${item.candidateCount} evidence]` : ""}`
+        );
+      }
+      return;
+    } finally {
+      await repository.close?.();
+    }
+  }
+
   // Regenerate stale episodes (contract v2): current episodes that are
   // extractive-generated or carry a stale extraction_version are re-derived
   // from their stored windows under the current contract; old rows become

@@ -33,7 +33,7 @@ import { isMaskedNumberLabel } from "./import/jid";
 import { GoogleContactsService } from "./googleContacts";
 import { getSearchReindexProgress, startSearchReindex } from "./search/reindexJob";
 import { withGuidedSetup } from "./onboarding";
-import type { ArchiveChangeEvent, BrainGraphEdgeKind, LivePairingSummary, PickKind } from "../shared/types";
+import type { ArchiveChangeEvent, BrainGraphEdgeKind, BrainLifecycleSort, LivePairingSummary, PickKind } from "../shared/types";
 import type { LiveMessageEvent } from "./live/types";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1274,6 +1274,121 @@ app.post("/api/brain/graph/recompute", async (_req, res) => {
   }
 });
 
+// --- Commitment lifecycle (commitment-lifecycle) ---
+// The L0 open-items surface: status-driven (independent of salience and
+// dormancy), overdue/stale flagged, as-of stamped. Meaning lives server-side.
+app.get("/api/brain/lifecycle", async (req, res) => {
+  try {
+    const statusRaw = stringQuery(req.query.status);
+    const kindRaw = stringQuery(req.query.kind);
+    const flagRaw = stringQuery(req.query.flag);
+    const sortRaw = stringQuery(req.query.sort);
+    const sorts = ["smart", "due_asc", "due_desc", "opened_asc", "opened_desc", "evidence_desc", "recent_activity"];
+    res.json(
+      await repository.listBrainLifecycleItems({
+        status:
+          statusRaw === "open" || statusRaw === "fulfilled" || statusRaw === "dismissed" || statusRaw === "all" || statusRaw === "closed"
+            ? statusRaw
+            : undefined,
+        flag: flagRaw === "overdue" || flagRaw === "stale" || flagRaw === "sweep_due" ? flagRaw : undefined,
+        hideOverdue: req.query.hideOverdue === "true",
+        hideStale: req.query.hideStale === "true",
+        hideFulfilled: req.query.hideFulfilled === "true",
+        hideDismissed: req.query.hideDismissed === "true",
+        dueUpcoming: req.query.dueUpcoming === "true",
+        kind: kindRaw === "commitment" || kindRaw === "question" ? kindRaw : undefined,
+        includeChats: csvQuery(req.query.includeChats),
+        excludeChats: csvQuery(req.query.excludeChats),
+        sort: sortRaw && sorts.includes(sortRaw) ? (sortRaw as BrainLifecycleSort) : undefined,
+        chatSourceId: stringQuery(req.query.chatSourceId) ?? null,
+        limit: clampNumber(req.query.limit, 1, 500, 200)
+      })
+    );
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+// Full context for one item (the detail modal): origin, all candidate
+// evidence with thread coordinates, and event history.
+app.get("/api/brain/lifecycle/item", async (req, res) => {
+  try {
+    const claimId = stringQuery(req.query.claimId);
+    if (!claimId) {
+      res.status(400).json({ error: "Provide claimId." });
+      return;
+    }
+    const detail = await repository.getBrainLifecycleItemDetail(claimId);
+    if (!detail) {
+      res.status(404).json({ error: "No lifecycle item with that claim id." });
+      return;
+    }
+    res.json(detail);
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+// User transitions (certainty-grade source): close, cancel, or reopen an item
+// with an optional note and no citation requirement. Applied through the same
+// transactional writer as model resolutions — no second write path.
+app.post("/api/brain/lifecycle/transition", async (req, res) => {
+  try {
+    const claimId = typeof req.body?.claimId === "string" ? req.body.claimId.trim() : "";
+    const action = req.body?.action;
+    if (!claimId || (action !== "fulfilled" && action !== "dismissed" && action !== "reopened")) {
+      res.status(400).json({ error: "Provide claimId and an action of fulfilled, dismissed, or reopened." });
+      return;
+    }
+    const note = typeof req.body?.note === "string" && req.body.note.trim() ? req.body.note.trim().slice(0, 500) : null;
+    const result = await repository.applyBrainLifecycleTransitions([{ claimId, toStatus: action, note }], { source: "user" });
+    broadcastArchiveChanged({ source: "manual", chatSourceIds: [], messageCount: 0, contactCount: 0 });
+    res.json({ ok: true, applied: result.applied });
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+// Manual-first model closure sweep: judge sweep-due open items (or an explicit
+// selection) against their deterministic candidate evidence. Rollup-class call
+// — fixed high effort.
+app.post("/api/brain/lifecycle/sweep", async (req, res) => {
+  try {
+    const { startBrainLifecycleSweep } = await import("./brain/runJob");
+    const effortRaw = typeof req.body?.effort === "string" ? req.body.effort : null;
+    const effort =
+      effortRaw === "none" || effortRaw === "low" || effortRaw === "medium" || effortRaw === "high" || effortRaw === "xhigh" || effortRaw === "max"
+        ? effortRaw
+        : null;
+    const maxModelCalls = clampNumber(req.body?.maxModelCalls, 1, 1000, 0);
+    const maxTokens = clampNumber(req.body?.maxTokens, 1000, 100_000_000, 0);
+    const claimIds = Array.isArray(req.body?.claimIds)
+      ? (req.body.claimIds as unknown[]).filter((id): id is string => typeof id === "string").slice(0, 500)
+      : null;
+    const result = startBrainLifecycleSweep(
+      repository,
+      {
+        chatSourceId: typeof req.body?.chatSourceId === "string" ? req.body.chatSourceId : null,
+        claimIds: claimIds && claimIds.length > 0 ? claimIds : null,
+        model: typeof req.body?.model === "string" ? req.body.model : null,
+        effort,
+        maxModelCalls: maxModelCalls > 0 ? maxModelCalls : null,
+        maxTokens: maxTokens > 0 ? maxTokens : null
+      },
+      () => {
+        broadcastArchiveChanged({ source: "manual", chatSourceIds: [], messageCount: 0, contactCount: 0 });
+      }
+    );
+    if (!result.started) {
+      res.status(409).json({ error: result.refusal ?? "The closure sweep could not start.", progress: result.progress });
+      return;
+    }
+    res.json({ ok: true, progress: result.progress });
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
 // Who "me" is: evidence, episodes, and new search indexing label the owner's
 // messages with this name. Historical search rows update on the next reindex.
 // `selfJids` (run console): additional numbers labelled as the owner with
@@ -1766,6 +1881,19 @@ async function autoResumeLiveSync(): Promise<void> {
 
 function stringQuery(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+// Comma-separated list query param → trimmed non-empty strings (undefined when
+// absent/empty), used by the lifecycle group include/exclude filters.
+function csvQuery(value: unknown): string[] | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const parts = value
+    .split(",")
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0);
+  return parts.length > 0 ? parts : undefined;
 }
 
 function booleanQuery(value: unknown): boolean {

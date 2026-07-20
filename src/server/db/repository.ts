@@ -21,6 +21,15 @@ import type {
   BrainGraphSyncResult,
   BrainGraphUnresolvedEntity,
   BrainGraphNodeSuggestion,
+  BrainLifecycleApplyResult,
+  BrainLifecycleCandidate,
+  BrainLifecycleItemDetail,
+  BrainLifecycleListResponse,
+  BrainLifecycleSort,
+  BrainLifecycleSource,
+  BrainLifecycleStatus,
+  BrainLifecycleSweepBatch,
+  BrainLifecycleTransitionInput,
   BrainModelQualityAggregate,
   BrainLlmUsageSummary,
   BrainMediaGapImpact,
@@ -448,6 +457,65 @@ export interface ArchiveRepository {
   // its claims/citations, each citation carrying the chat id + message id to
   // open the thread at the exact cited message. Null when the edge is unknown.
   getBrainGraphEdgeEvidence(edgeId: number): Promise<BrainGraphEdgeEvidenceView | null>;
+  // --- Commitment lifecycle: durable append-only transitions keyed by claim
+  // id (survive graph wipes), folded to node payload status; `resolves` edges
+  // are a projection of event cites. One writer serves the sweep, user
+  // controls, and future rollup calls — no second write path exists.
+  // The single transactional transition writer: validates preconditions and
+  // the closed-world postdating rule (model-source terminals must cite offered
+  // evidence newer than the claim's own), inserts events + cites, re-projects
+  // node payloads and `resolves` edges, and refreshes touched nodes' salience.
+  // `allowedCitesByClaim` is the offered-candidate closed world for model
+  // transitions; user transitions need no cites. Throws PublicError with every
+  // violation collected when any transition is invalid (nothing applies).
+  applyBrainLifecycleTransitions(
+    transitions: BrainLifecycleTransitionInput[],
+    context: {
+      source: BrainLifecycleSource;
+      runId?: string | null;
+      model?: string | null;
+      allowedCitesByClaim?: Map<string, BrainLifecycleCandidate[]>;
+    }
+  ): Promise<BrainLifecycleApplyResult>;
+  // The L0 surface: status-driven items independent of salience/dormancy, with
+  // overdue/stale flags, read-time labels, candidate counts, resolution trails
+  // for closed items, and deterministic ordering. Counts include the sweep-due
+  // and orphaned-event debt totals. Zero model calls.
+  listBrainLifecycleItems(options?: {
+    // 'closed' = fulfilled + cancelled, ordered most-recently-resolved first.
+    status?: BrainLifecycleStatus | "all" | "closed";
+    // Narrows OPEN items to those carrying the flag; counts stay full totals.
+    flag?: "overdue" | "stale" | "sweep_due";
+    // Exclusions layered on the view; counts stay full totals.
+    hideOverdue?: boolean;
+    hideStale?: boolean;
+    hideFulfilled?: boolean;
+    hideDismissed?: boolean;
+    // Upcoming deadlines: open items with a future due date only.
+    dueUpcoming?: boolean;
+    kind?: "commitment" | "question";
+    chatSourceId?: string | null;
+    // Group filter: show only these source chats, or hide these.
+    includeChats?: string[];
+    excludeChats?: string[];
+    // 'smart' keeps the pinned default ordering; the rest are explicit sorts.
+    sort?: BrainLifecycleSort;
+    limit?: number;
+  }): Promise<BrainLifecycleListResponse>;
+  // Full context for one item (the detail modal): origin messages, all
+  // postdating candidate evidence with thread coordinates, and event history.
+  getBrainLifecycleItemDetail(claimId: string): Promise<BrainLifecycleItemDetail | null>;
+  // Sweep input: open nodes that are DUE (candidate evidence newer than the
+  // last review, or a due date passed since it), grouped per chat with their
+  // bounded candidate evidence — pure SQL, ready for prompt rendering. An
+  // explicit `claimIds` selection sweeps exactly those open items, overriding
+  // the sweep-due heuristic (the user chose them, so no-evidence nodes still
+  // get an honest review).
+  listBrainLifecycleSweepBatches(options?: {
+    chatSourceId?: string | null;
+    claimIds?: string[];
+    maxNodesPerBatch?: number;
+  }): Promise<BrainLifecycleSweepBatch[]>;
   // --- Two-level person model: identities (canonical JIDs) stay immutable
   // anchors; persons are an editable membership. Connect/disconnect touch only
   // person-layer tables — never episodes, claims, citations, or archive rows.

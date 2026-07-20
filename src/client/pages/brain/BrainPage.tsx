@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import type {
   BrainBackfillStatus,
   BrainGraphStats,
+  BrainLifecycleCounts,
   BrainProviderName,
   MemoryCitationResolution,
   MemoryQueryResult
@@ -15,6 +16,7 @@ import {
   getBrainBackfillStatus,
   getBrainGraphStats,
   getOwnerIdentitySuggestions,
+  listBrainLifecycleItems,
   queryMemory,
   rebuildBrainGraph,
   recomputeBrainGraph,
@@ -37,6 +39,7 @@ import { useToast } from "../../state/ToastContext";
 function BrainGraphSection({ running }: { running: boolean }) {
   const { setNotice, setError } = useToast();
   const [stats, setStats] = useState<BrainGraphStats | null>(null);
+  const [lifecycleCounts, setLifecycleCounts] = useState<BrainLifecycleCounts | null>(null);
   const [graphBusy, setGraphBusy] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
 
@@ -46,6 +49,13 @@ function BrainGraphSection({ running }: { running: boolean }) {
       setLoadError(null);
     } catch (err) {
       setLoadError(err instanceof Error ? err.message : "Could not load graph stats.");
+    }
+    // Lifecycle counts (overdue/sweep-due) are a separate, heavier read; a
+    // failure here never blanks the graph stats.
+    try {
+      setLifecycleCounts((await listBrainLifecycleItems({ status: "open", limit: 1 })).counts);
+    } catch {
+      setLifecycleCounts(null);
     }
   }, []);
 
@@ -125,10 +135,22 @@ function BrainGraphSection({ running }: { running: boolean }) {
               <span>People · topics</span>
               {metricValue(`${persons.toLocaleString()} · ${topics.toLocaleString()}`)}
             </div>
-            <div className="metric" title="Open commitments and questions — exempt from dormancy until closed">
+            <div className="metric" title="Open commitments and questions — status-driven, exempt from dormancy until closed. Click through to review, close, or sweep them.">
               <span>Open commitments</span>
               {metricValue((stats?.openLifecycleNodes ?? 0).toLocaleString())}
             </div>
+            {lifecycleCounts && lifecycleCounts.overdue > 0 && (
+              <div className="metric" title="Open items whose due date has passed — the last thing that should fade">
+                <span>Overdue</span>
+                <strong className="lifecycleOverdue">{lifecycleCounts.overdue.toLocaleString()}</strong>
+              </div>
+            )}
+            {lifecycleCounts && lifecycleCounts.sweepDue > 0 && (
+              <div className="metric" title="Open items with new closure evidence (or a newly passed due date) — a sweep would judge exactly these">
+                <span>Sweep-due</span>
+                <strong>{lifecycleCounts.sweepDue.toLocaleString()}</strong>
+              </div>
+            )}
             {(stats?.unresolvedPersonNodes ?? 0) > 0 && (
               <div className="metric" title="Chat-scoped people the model named but pack-local resolution could not anchor to an identity">
                 <span>Unresolved entities</span>
@@ -176,6 +198,9 @@ function BrainGraphSection({ running }: { running: boolean }) {
             </button>
             <Link className="miniButton" to="/graph" title="Open the interactive graph explorer">
               Open explorer
+            </Link>
+            <Link className="miniButton" to="/brain/commitments" title="Review open commitments/questions, close them manually, or run the closure sweep">
+              Commitments
             </Link>
           </div>
         </>

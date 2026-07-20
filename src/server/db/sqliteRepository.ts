@@ -37,6 +37,21 @@ import type {
   BrainGraphSyncResult,
   BrainGraphUnresolvedEntity,
   BrainGraphNodeSuggestion,
+  BrainLifecycleApplyResult,
+  BrainLifecycleCandidate,
+  BrainLifecycleCiteView,
+  BrainLifecycleDetailCandidate,
+  BrainLifecycleEventRecord,
+  BrainLifecycleItem,
+  BrainLifecycleItemDetail,
+  BrainLifecycleListResponse,
+  BrainLifecycleResolutionView,
+  BrainLifecycleSort,
+  BrainLifecycleSource,
+  BrainLifecycleStatus,
+  BrainLifecycleSweepBatch,
+  BrainLifecycleSweepNode,
+  BrainLifecycleTransitionInput,
   BrainModelQualityAggregate,
   BrainLlmUsageSummary,
   BrainRunSummary,
@@ -168,6 +183,18 @@ import {
   type GraphMutations,
   type GraphNodeSpec
 } from "../brain/graph";
+import {
+  compareLifecycleItems,
+  computeLifecycleFlags,
+  foldLifecycleEvents,
+  LIFECYCLE_MAX_CANDIDATES_PER_NODE,
+  LIFECYCLE_SWEEP_MAX_NODES_PER_CALL,
+  lifecycleStaleDays,
+  projectLifecyclePayload,
+  sortLifecycleItems,
+  validateLifecycleTransition,
+  type LifecycleFold
+} from "../brain/lifecycle";
 import { resolveNeighborhoodParams, shapeNeighborhood, type NeighborhoodWalk } from "../brain/graphQuery";
 import { PublicError } from "../privacy";
 import { termAliasSeedRows } from "../search/aliasSeed";
@@ -640,6 +667,45 @@ function rowToMediaAsset(row: SqliteMediaAssetRow): MediaAssetRecord {
     isViewOnce: Boolean(row.is_view_once),
     createdAt: row.created_at
   };
+}
+
+// Run kinds mirror BrainRunKind; 'lifecycle' (commitment-lifecycle) is the
+// closure sweep. The CHECK migrates via copy-rename like the other kind CHECKs.
+const BRAIN_RUN_KINDS = ["nightly", "catchup", "manual", "backfill", "regenerate", "lifecycle"] as const;
+
+// Lifecycle transition statuses; 'dismissed' replaced the former 'cancelled'
+// (one "not-done / off-my-list" terminal). The CHECK migrates via copy-rename.
+const BRAIN_LIFECYCLE_STATUSES = ["fulfilled", "dismissed", "still_open", "reopened"] as const;
+
+function brainLifecycleEventsTableDdl(tableName: string): string {
+  return `CREATE TABLE IF NOT EXISTS ${tableName} (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    claim_id TEXT NOT NULL,
+    to_status TEXT NOT NULL CHECK (to_status IN (${BRAIN_LIFECYCLE_STATUSES.map((status) => `'${status}'`).join(",")})),
+    source TEXT NOT NULL CHECK (source IN ('model','user')),
+    evidence_at_ms INTEGER NULL,
+    note TEXT NULL,
+    run_id TEXT NULL,
+    model TEXT NULL,
+    -- Set when regeneration could not re-key this event onto a replacement
+    -- claim: kept for audit, excluded from folds, surfaced as debt.
+    orphaned_at_ms INTEGER NULL,
+    created_at_ms INTEGER NOT NULL
+  )`;
+}
+
+function brainRunsTableDdl(tableName: string): string {
+  return `CREATE TABLE IF NOT EXISTS ${tableName} (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN (${BRAIN_RUN_KINDS.map((kind) => `'${kind}'`).join(",")})),
+    status TEXT NOT NULL CHECK (status IN ('running','completed','failed','interrupted','budget_exceeded')),
+    started_at TEXT NOT NULL,
+    finished_at TEXT NULL,
+    timezone TEXT NULL,
+    totals_json TEXT NULL,
+    error_message TEXT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  )`;
 }
 
 function liveMessageUpdatesTableDdl(tableName: string): string {
@@ -1354,17 +1420,7 @@ const schemaStatements = [
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   )`,
 
-  `CREATE TABLE IF NOT EXISTS brain_runs (
-    id TEXT PRIMARY KEY,
-    kind TEXT NOT NULL CHECK (kind IN ('nightly','catchup','manual','backfill','regenerate')),
-    status TEXT NOT NULL CHECK (status IN ('running','completed','failed','interrupted','budget_exceeded')),
-    started_at TEXT NOT NULL,
-    finished_at TEXT NULL,
-    timezone TEXT NULL,
-    totals_json TEXT NULL,
-    error_message TEXT NULL,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-  )`,
+  brainRunsTableDdl("brain_runs"),
 
   // Episodic tier: cited per-chat conversation digests. Generator records how
   // each episode was produced ('extractive' episodes are honest placeholders,
@@ -1619,6 +1675,26 @@ const schemaStatements = [
     FOREIGN KEY (node_id) REFERENCES brain_nodes(id) ON DELETE CASCADE
   ) WITHOUT ROWID`,
 
+  // --- Commitment lifecycle (commitment-lifecycle) ---
+  // Durable truth for lifecycle transitions, OUTSIDE the wipeable graph
+  // tables: append-only events keyed by the lifecycle CLAIM id (stable across
+  // graph rebuilds — node ids are not). Node payload status is a projection of
+  // the fold over these rows; rebuild re-applies it with zero model calls.
+  brainLifecycleEventsTableDdl("brain_lifecycle_events"),
+
+  // Citations behind a transition: the resolving evidence messages, each with
+  // the acting identity (reactor / reply sender / citing sender) so `resolves`
+  // edges re-derive from these rows alone on rebuild.
+  `CREATE TABLE IF NOT EXISTS brain_lifecycle_event_cites (
+    event_id INTEGER NOT NULL,
+    source_message_key TEXT NOT NULL,
+    resolving_claim_id TEXT NULL,
+    actor_jid TEXT NULL,
+    timestamp_ms INTEGER NULL,
+    PRIMARY KEY (event_id, source_message_key),
+    FOREIGN KEY (event_id) REFERENCES brain_lifecycle_events(id) ON DELETE CASCADE
+  ) WITHOUT ROWID`,
+
   // --- Two-level person model ---
   // Identities (canonical JIDs) are the immutable anchors; a person is an
   // editable grouping over them. A person row exists only while it has two or
@@ -1764,6 +1840,17 @@ const schemaStatements = [
   `CREATE INDEX IF NOT EXISTS idx_brain_edges_dst ON brain_edges (dst_node_id, kind, last_seen_at_ms)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_edge_evidence_claim ON brain_edge_evidence (claim_id)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_node_claims_claim ON brain_node_claims (claim_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_brain_lifecycle_events_claim ON brain_lifecycle_events (claim_id, id)`,
+  // Candidate-producer indexes (commitment-lifecycle): reactions by target
+  // message, pointer replies by their quoted id, and NULL-jid entity names —
+  // the closure-candidate sweep over thousands of open nodes must be index
+  // walks, never table scans (measured: 2m+ without these on the real archive).
+  `CREATE INDEX IF NOT EXISTS idx_live_updates_reaction_key ON live_message_updates (source_message_key) WHERE update_type = 'reaction'`,
+  // Composite: the single-column form lost to idx_messages_chat_time in the
+  // planner (measured 35s vs 76ms on the real archive) — the chat_id column
+  // makes this strictly cheapest for the pointer-reply join.
+  `DROP INDEX IF EXISTS idx_messages_quoted_source`,
+  `CREATE INDEX IF NOT EXISTS idx_messages_quoted_chat ON messages (quoted_source_message_id, chat_id) WHERE quoted_source_message_id IS NOT NULL`,
   `CREATE INDEX IF NOT EXISTS idx_person_members_person ON person_members (person_id)`,
   `CREATE INDEX IF NOT EXISTS idx_person_suggestions_status ON person_suggestions (status, score DESC)`,
   `CREATE INDEX IF NOT EXISTS idx_person_suggestions_pair ON person_suggestions (jid_low, jid_high)`,
@@ -3399,6 +3486,20 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       for (let index = 0; index < episodeIds.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
         const batch = episodeIds.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
         const placeholders = batch.map(() => "?").join(",");
+        // Lifecycle transitions are derived state whose re-derivation costs
+        // model spend (same class as episodes): a reset wipes them with their
+        // claims — run before the claims are deleted.
+        this.db
+          .prepare(
+            `DELETE FROM brain_lifecycle_event_cites WHERE event_id IN (
+               SELECT id FROM brain_lifecycle_events WHERE claim_id IN (SELECT id FROM brain_claims WHERE episode_id IN (${placeholders})))`
+          )
+          .run(...batch);
+        this.db
+          .prepare(
+            `DELETE FROM brain_lifecycle_events WHERE claim_id IN (SELECT id FROM brain_claims WHERE episode_id IN (${placeholders}))`
+          )
+          .run(...batch);
         this.db
           .prepare(`DELETE FROM brain_citations WHERE claim_id IN (SELECT id FROM brain_claims WHERE episode_id IN (${placeholders}))`)
           .run(...batch);
@@ -3416,6 +3517,10 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         // vocabulary itself go too — the brain starts from a truly clean slate.
         this.db.prepare(`DELETE FROM brain_validation_issues`).run();
         this.db.prepare(`DELETE FROM brain_topics`).run();
+        // Belt-and-braces: orphaned lifecycle events reference already-dead
+        // claims and are not covered by the per-episode deletes above.
+        this.db.prepare(`DELETE FROM brain_lifecycle_event_cites`).run();
+        this.db.prepare(`DELETE FROM brain_lifecycle_events`).run();
       }
       watermarks = Number(
         (chat
@@ -3542,8 +3647,13 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       }
       // Supersede-with-replacement is atomic: no crash window where both the
       // old and the new episode read as current.
+      let rekeyedLifecycleClaims: string[] = [];
       if (episode.supersedesEpisodeId) {
         this.db.prepare(`UPDATE brain_episodes SET status = 'superseded' WHERE id = ?`).run(episode.supersedesEpisodeId);
+        // Lifecycle transitions follow the commitment across regeneration:
+        // re-key onto the unique citation-sharing replacement claim (this
+        // commit's or an earlier replacement pack's), else orphan honestly.
+        rekeyedLifecycleClaims = this.rekeyLifecycleEventsForSupersededEpisodeTx(episode.supersedesEpisodeId);
         // Graph scope rule: the graph derives from CURRENT model episodes
         // only, so the superseded episode's contribution leaves in the same
         // transaction its replacement's arrives.
@@ -3555,6 +3665,12 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       // by natural key.
       if (episode.generator === "model") {
         this.applyEpisodeGraphTx({ episodeId: id, chatSourceId, startAtMs: episode.startAtMs, endAtMs: episode.endAtMs });
+      }
+      // Re-project re-keyed lifecycle state AFTER the replacement's nodes
+      // exist, so the new node folds to its recorded status in the same
+      // transaction — no window where a closed commitment reads open.
+      for (const claimId of rekeyedLifecycleClaims) {
+        this.projectLifecycleClaimTx(claimId);
       }
     });
     transaction();
@@ -3725,7 +3841,16 @@ export class SqliteArchiveRepository implements ArchiveRepository {
   }
 
   async markBrainEpisodeSuperseded(episodeId: string): Promise<void> {
-    this.db.prepare(`UPDATE brain_episodes SET status = 'superseded' WHERE id = ?`).run(episodeId);
+    // The replacement-less supersede (a window that re-derives to no evidence):
+    // the graph scope rule and lifecycle re-key/orphan apply here too.
+    this.db.transaction(() => {
+      this.db.prepare(`UPDATE brain_episodes SET status = 'superseded' WHERE id = ?`).run(episodeId);
+      const rekeyed = this.rekeyLifecycleEventsForSupersededEpisodeTx(episodeId);
+      this.removeGraphContributionForEpisodeTx(episodeId);
+      for (const claimId of rekeyed) {
+        this.projectLifecycleClaimTx(claimId);
+      }
+    })();
     this.invalidateBrainStatusCache();
   }
 
@@ -5363,6 +5488,13 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       await new Promise((resolve) => setImmediate(resolve));
     }
     await this.syncBrainGraphSignals();
+    // Lifecycle projection: closures live OUTSIDE the wiped graph tables, so
+    // a rebuild re-applies folded statuses and `resolves` edges from the
+    // durable events — a closed commitment never silently reopens.
+    const lifecycleProjected = this.db.transaction(() => this.projectLifecycleStateTx())();
+    if (lifecycleProjected > 0) {
+      console.log(`[brain] graph rebuild: lifecycle state re-projected for ${lifecycleProjected} claim(s)`);
+    }
     await this.recomputeBrainGraphSalience();
     const nodes = Number((this.db.prepare(`SELECT COUNT(*) AS count FROM brain_nodes`).get() as { count: number }).count);
     const edges = Number((this.db.prepare(`SELECT COUNT(*) AS count FROM brain_edges`).get() as { count: number }).count);
@@ -6057,6 +6189,1081 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       chatDisplayName: row.chatDisplayName,
       claimCount: Number(row.claimCount ?? 0)
     }));
+  }
+
+  // === Commitment lifecycle ===============================================
+  // Durable truth is brain_lifecycle_events (append-only, keyed by CLAIM id —
+  // stable across graph wipes); node payload status and `resolves` edges are
+  // projections re-derived by projectLifecycleClaimTx. One writer serves the
+  // sweep, user controls, and future rollup calls. Zero model calls here.
+
+  private lifecycleNodeRowForClaimTx(claimId: string): GraphNodeRow | undefined {
+    return this.db
+      .prepare(`SELECT * FROM brain_nodes WHERE natural_key IN (?, ?) AND status != 'merged'`)
+      .get(`commitment:${claimId}`, `question:${claimId}`) as GraphNodeRow | undefined;
+  }
+
+  private loadLifecycleEventsTx(claimIds: string[]): Map<string, BrainLifecycleEventRecord[]> {
+    const byClaim = new Map<string, BrainLifecycleEventRecord[]>();
+    if (claimIds.length === 0) {
+      return byClaim;
+    }
+    const citesStmt = this.db.prepare(
+      `SELECT source_message_key AS sourceMessageKey, resolving_claim_id AS resolvingClaimId, actor_jid AS actorJid, timestamp_ms AS timestampMs
+       FROM brain_lifecycle_event_cites WHERE event_id = ? ORDER BY timestamp_ms ASC, source_message_key ASC`
+    );
+    for (let index = 0; index < claimIds.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = claimIds.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      const placeholders = batch.map(() => "?").join(",");
+      const rows = this.db
+        .prepare(
+          `SELECT id, claim_id AS claimId, to_status AS toStatus, source, evidence_at_ms AS evidenceAtMs, note, run_id AS runId, model,
+                  orphaned_at_ms AS orphanedAtMs, created_at_ms AS createdAtMs
+           FROM brain_lifecycle_events WHERE claim_id IN (${placeholders}) ORDER BY claim_id, id`
+        )
+        .all(...batch) as Array<Omit<BrainLifecycleEventRecord, "cites">>;
+      for (const row of rows) {
+        const record: BrainLifecycleEventRecord = {
+          ...row,
+          cites: citesStmt.all(row.id) as BrainLifecycleEventRecord["cites"]
+        };
+        const list = byClaim.get(row.claimId) ?? [];
+        list.push(record);
+        byClaim.set(row.claimId, list);
+      }
+    }
+    return byClaim;
+  }
+
+  // Bulk anchors for the list/sweep surfaces: one grouped query per id-chunk.
+  private bulkLifecycleAnchorsTx(claimIds: string[]): Map<string, number> {
+    const anchors = new Map<string, number>();
+    for (let index = 0; index < claimIds.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = claimIds.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      const placeholders = batch.map(() => "?").join(",");
+      for (const row of this.db
+        .prepare(`SELECT claim_id AS claimId, MAX(timestamp_ms) AS anchorMs FROM brain_citations WHERE claim_id IN (${placeholders}) GROUP BY claim_id`)
+        .all(...batch) as Array<{ claimId: string; anchorMs: number | null }>) {
+        if (row.anchorMs != null) {
+          anchors.set(row.claimId, row.anchorMs);
+        }
+      }
+    }
+    return anchors;
+  }
+
+  // The postdating anchor: the lifecycle claim's own last evidence. Cited
+  // resolutions must be strictly later. Null when the claim's citations carry
+  // no timestamps (postdating is then unverifiable and not enforced).
+  private lifecycleAnchorTx(claimId: string): { anchorMs: number | null; anchorKeys: string[] } {
+    const rows = this.db
+      .prepare(`SELECT source_message_key AS key, timestamp_ms AS ts FROM brain_citations WHERE claim_id = ?`)
+      .all(claimId) as Array<{ key: string; ts: number | null }>;
+    let anchorMs: number | null = null;
+    for (const row of rows) {
+      if (row.ts != null) {
+        anchorMs = anchorMs == null ? row.ts : Math.max(anchorMs, row.ts);
+      }
+    }
+    return { anchorMs, anchorKeys: rows.map((row) => row.key) };
+  }
+
+  // The owner's evidence lines must never read "Me" (the importer sentinel):
+  // resolve the configured owner name at read time, like episode packs do.
+  private lifecycleOwnerLabelTx(): string {
+    const row = this.db.prepare(`SELECT value FROM schema_meta WHERE key = 'owner_display_name'`).get() as { value: string } | undefined;
+    return row?.value?.trim() || "the archive owner";
+  }
+
+  private lifecycleActorLabelTx(jid: string): string {
+    return jid === "me" ? this.lifecycleOwnerLabelTx() : this.labelForJid(jid);
+  }
+
+  // Read-time labels for many actors at once: one contacts query per chunk
+  // instead of a per-row lookup (the per-row path was a measured hot spot).
+  private bulkLifecycleLabelsTx(jids: Iterable<string>): Map<string, string> {
+    const labels = new Map<string, string>();
+    const distinct = [...new Set(jids)].filter((jid) => jid && jid !== "me");
+    for (let index = 0; index < distinct.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = distinct.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      const placeholders = batch.map(() => "?").join(",");
+      const rows = this.db
+        .prepare(
+          `SELECT source_jid AS jid, display_name AS displayName, push_name AS pushName, phone_number AS phoneNumber
+           FROM contacts WHERE source_jid IN (${placeholders})`
+        )
+        .all(...batch) as Array<{ jid: string; displayName: string | null; pushName: string | null; phoneNumber: string | null }>;
+      for (const row of rows) {
+        labels.set(
+          row.jid,
+          resolveDisplayLabel({ displayName: row.displayName, pushName: row.pushName, phoneNumber: row.phoneNumber, jid: row.jid }) ?? row.jid
+        );
+      }
+    }
+    for (const jid of distinct) {
+      if (!labels.has(jid)) {
+        labels.set(jid, jid);
+      }
+    }
+    labels.set("me", this.lifecycleOwnerLabelTx());
+    return labels;
+  }
+
+  // Deterministic closure candidates for MANY open lifecycle nodes at once —
+  // the three producers pinned by the spec (postdating reactions on cited
+  // messages, replies quoting them incl. cross-chat snapshots, later
+  // entity-overlapping model claims), each ONE indexed set query per id-chunk
+  // rather than three queries per node. Measured on the real archive (2.2k
+  // open nodes, 43k reactions, 326k messages): the per-node form took minutes
+  // and blocked the event loop; this form answers in well under a second.
+  private bulkLifecycleCandidatesTx(
+    inputs: Array<{ claimId: string; chatSourceId: string; sinceMs: number }>
+  ): Map<string, BrainLifecycleCandidate[]> {
+    const result = new Map<string, BrainLifecycleCandidate[]>();
+    if (inputs.length === 0) {
+      return result;
+    }
+    const sinceByClaim = new Map(inputs.map((input) => [input.claimId, input.sinceMs]));
+    type RawCandidate = Omit<BrainLifecycleCandidate, "senderLabel">;
+    const rawByClaim = new Map<string, RawCandidate[]>();
+    const seenByClaim = new Map<string, Set<string>>();
+    const push = (claimId: string, candidate: RawCandidate) => {
+      const since = sinceByClaim.get(claimId);
+      if (since == null || candidate.timestampMs == null || candidate.timestampMs <= since) {
+        return;
+      }
+      const dedupeKey = `${candidate.kind}:${candidate.claimId ?? candidate.sourceMessageKey}`;
+      const seen = seenByClaim.get(claimId) ?? new Set<string>();
+      if (seen.has(dedupeKey)) {
+        return;
+      }
+      seen.add(dedupeKey);
+      seenByClaim.set(claimId, seen);
+      const list = rawByClaim.get(claimId) ?? [];
+      list.push(candidate);
+      rawByClaim.set(claimId, list);
+    };
+    const claimIds = inputs.map((input) => input.claimId);
+    const messageText = (alias: string) =>
+      `COALESCE(NULLIF(TRIM(COALESCE(${alias}.body, '')), ''), NULLIF(TRIM(COALESCE(${alias}.caption, '')), ''), '[' || ${alias}.message_type || ' message]')`;
+    for (let index = 0; index < claimIds.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = claimIds.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      const placeholders = batch.map(() => "?").join(",");
+      // (a) Reactions on the claims' cited messages — the WhatsApp-native ack.
+      for (const row of this.db
+        .prepare(
+          `SELECT c.claim_id AS claimId, lmu.source_message_key AS key,
+                  json_extract(lmu.metadata_json, '$.emoji') AS emoji,
+                  json_extract(lmu.metadata_json, '$.reactorJid') AS reactorJid,
+                  lmu.occurred_at_ms AS ts
+           FROM brain_citations c
+           JOIN live_message_updates lmu ON lmu.source_message_key = c.source_message_key AND lmu.update_type = 'reaction'
+           WHERE c.claim_id IN (${placeholders})
+             AND lmu.applied = 1 AND lmu.occurred_at_ms IS NOT NULL
+             AND json_extract(lmu.metadata_json, '$.emoji') IS NOT NULL
+             AND json_extract(lmu.metadata_json, '$.emoji') <> ''`
+        )
+        .all(...batch) as Array<{ claimId: string; key: string; emoji: string; reactorJid: string | null; ts: number }>) {
+        const reactor = row.reactorJid ? this.canonicalJid(row.reactorJid) ?? row.reactorJid : null;
+        push(row.claimId, { kind: "reaction", sourceMessageKey: row.key, timestampMs: row.ts, senderJid: reactor, text: row.emoji, claimId: null });
+      }
+      // (b) Replies quoting a cited message: snapshot-keyed (incl. cross-chat
+      // Reply Privately) plus the legacy same-chat pointer.
+      for (const row of this.db
+        .prepare(
+          `SELECT c.claim_id AS claimId, r.source_message_key AS key, r.sender_source_jid AS senderJid, r.timestamp_ms AS ts,
+                  ${messageText("r")} AS text
+           FROM brain_citations c
+           JOIN messages t ON t.source_message_key = c.source_message_key
+           JOIN chats tc ON tc.id = t.chat_id
+           JOIN message_quoted_snapshots q ON q.quoted_source_message_id = t.source_message_id
+           JOIN messages r ON r.source_message_key = q.reply_message_key
+           JOIN chats rc ON rc.id = r.chat_id
+           WHERE c.claim_id IN (${placeholders})
+             AND (q.quoted_source_chat_id = tc.source_chat_id OR (q.quoted_source_chat_id IS NULL AND rc.source_chat_id = tc.source_chat_id))
+             AND r.timestamp_ms IS NOT NULL`
+        )
+        .all(...batch) as Array<{ claimId: string; key: string; senderJid: string | null; ts: number; text: string }>) {
+        const sender = row.senderJid ? this.canonicalJid(row.senderJid) ?? row.senderJid : null;
+        push(row.claimId, { kind: "reply", sourceMessageKey: row.key, timestampMs: row.ts, senderJid: sender, text: row.text, claimId: null });
+      }
+      for (const row of this.db
+        .prepare(
+          `SELECT c.claim_id AS claimId, r.source_message_key AS key, r.sender_source_jid AS senderJid, r.timestamp_ms AS ts,
+                  ${messageText("r")} AS text
+           FROM brain_citations c
+           JOIN messages t ON t.source_message_key = c.source_message_key
+           JOIN messages r ON r.quoted_source_message_id = t.source_message_id AND r.chat_id = t.chat_id
+           WHERE c.claim_id IN (${placeholders}) AND r.timestamp_ms IS NOT NULL`
+        )
+        .all(...batch) as Array<{ claimId: string; key: string; senderJid: string | null; ts: number; text: string }>) {
+        const sender = row.senderJid ? this.canonicalJid(row.senderJid) ?? row.senderJid : null;
+        push(row.claimId, { kind: "reply", sourceMessageKey: row.key, timestampMs: row.ts, senderJid: sender, text: row.text, claimId: null });
+      }
+    }
+    // (c) Later model claims in the same chat sharing an entity (JID match;
+    // normalized-name match when both sides lack a JID). NOT a SQL self-join:
+    // popular JIDs (the owner) make entity×entity quadratic — measured 600k+
+    // pairs / 50s on the real archive. Instead: per-chat recent postdating
+    // claims + their entities in bulk, matched per node in JS with the same
+    // recency-cap semantics.
+    const ownEntitiesByClaim = new Map<string, { jids: Set<string>; names: Set<string> }>();
+    for (let index = 0; index < claimIds.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = claimIds.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      const placeholders = batch.map(() => "?").join(",");
+      for (const row of this.db
+        .prepare(`SELECT claim_id AS claimId, jid, LOWER(TRIM(name)) AS name FROM brain_claim_entities WHERE claim_id IN (${placeholders})`)
+        .all(...batch) as Array<{ claimId: string; jid: string | null; name: string }>) {
+        const own = ownEntitiesByClaim.get(row.claimId) ?? { jids: new Set<string>(), names: new Set<string>() };
+        if (row.jid) {
+          own.jids.add(row.jid);
+        } else if (row.name) {
+          own.names.add(row.name);
+        }
+        ownEntitiesByClaim.set(row.claimId, own);
+      }
+    }
+    const minSinceByChat = new Map<string, number>();
+    const inputsByChat = new Map<string, Array<{ claimId: string; sinceMs: number }>>();
+    for (const input of inputs) {
+      if (!input.chatSourceId) {
+        continue;
+      }
+      const own = ownEntitiesByClaim.get(input.claimId);
+      if (!own || (own.jids.size === 0 && own.names.size === 0)) {
+        continue;
+      }
+      minSinceByChat.set(input.chatSourceId, Math.min(minSinceByChat.get(input.chatSourceId) ?? Number.POSITIVE_INFINITY, input.sinceMs));
+      const list = inputsByChat.get(input.chatSourceId) ?? [];
+      list.push({ claimId: input.claimId, sinceMs: input.sinceMs });
+      inputsByChat.set(input.chatSourceId, list);
+    }
+    const chats = [...inputsByChat.keys()];
+    type RecentClaim = { claimId: string; text: string; ts: number; chat: string };
+    const recentByChat = new Map<string, RecentClaim[]>();
+    const RECENT_PER_CHAT = 300;
+    for (let index = 0; index < chats.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = chats.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      const placeholders = batch.map(() => "?").join(",");
+      for (const row of this.db
+        .prepare(
+          `SELECT c.id AS claimId, c.text AS text, MAX(ct.timestamp_ms) AS ts, e.chat_source_id AS chat
+           FROM brain_claims c
+           JOIN brain_episodes e ON e.id = c.episode_id
+           JOIN brain_citations ct ON ct.claim_id = c.id
+           WHERE e.status = 'current' AND e.generator = 'model' AND e.chat_source_id IN (${placeholders})
+           GROUP BY c.id
+           HAVING MAX(ct.timestamp_ms) IS NOT NULL`
+        )
+        .all(...batch) as RecentClaim[]) {
+        if (row.ts <= (minSinceByChat.get(row.chat) ?? 0)) {
+          continue;
+        }
+        const list = recentByChat.get(row.chat) ?? [];
+        list.push(row);
+        recentByChat.set(row.chat, list);
+      }
+    }
+    // Entities of the recent claims (bulk), then match per lifecycle node.
+    const recentClaimIds: string[] = [];
+    for (const [chat, list] of recentByChat) {
+      list.sort((a, b) => b.ts - a.ts);
+      recentByChat.set(chat, list.slice(0, RECENT_PER_CHAT));
+      for (const row of recentByChat.get(chat)!) {
+        recentClaimIds.push(row.claimId);
+      }
+    }
+    const recentEntities = new Map<string, { jids: Set<string>; names: Set<string> }>();
+    for (let index = 0; index < recentClaimIds.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = recentClaimIds.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      const placeholders = batch.map(() => "?").join(",");
+      for (const row of this.db
+        .prepare(`SELECT claim_id AS claimId, jid, LOWER(TRIM(name)) AS name FROM brain_claim_entities WHERE claim_id IN (${placeholders})`)
+        .all(...batch) as Array<{ claimId: string; jid: string | null; name: string }>) {
+        const entry = recentEntities.get(row.claimId) ?? { jids: new Set<string>(), names: new Set<string>() };
+        if (row.jid) {
+          entry.jids.add(row.jid);
+        } else if (row.name) {
+          entry.names.add(row.name);
+        }
+        recentEntities.set(row.claimId, entry);
+      }
+    }
+    const matched: Array<{ lifecycleClaimId: string; other: RecentClaim }> = [];
+    const matchedOtherIds = new Set<string>();
+    for (const [chat, group] of inputsByChat) {
+      const recent = recentByChat.get(chat) ?? [];
+      for (const lifecycle of group) {
+        const own = ownEntitiesByClaim.get(lifecycle.claimId)!;
+        let taken = 0;
+        for (const other of recent) {
+          if (other.claimId === lifecycle.claimId || other.ts <= lifecycle.sinceMs) {
+            continue;
+          }
+          const theirs = recentEntities.get(other.claimId);
+          if (!theirs) {
+            continue;
+          }
+          let overlap = false;
+          for (const jid of own.jids) {
+            if (theirs.jids.has(jid)) {
+              overlap = true;
+              break;
+            }
+          }
+          if (!overlap) {
+            for (const name of own.names) {
+              if (theirs.names.has(name)) {
+                overlap = true;
+                break;
+              }
+            }
+          }
+          if (!overlap) {
+            continue;
+          }
+          matched.push({ lifecycleClaimId: lifecycle.claimId, other });
+          matchedOtherIds.add(other.claimId);
+          taken += 1;
+          if (taken >= 6) {
+            break;
+          }
+        }
+      }
+    }
+    // Latest citation (key + sender) for exactly the matched claims.
+    const latestCite = new Map<string, { key: string; senderJid: string | null; ts: number }>();
+    const matchedIds = [...matchedOtherIds];
+    for (let index = 0; index < matchedIds.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = matchedIds.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      const placeholders = batch.map(() => "?").join(",");
+      for (const row of this.db
+        .prepare(
+          `SELECT claim_id AS claimId, source_message_key AS key, sender_source_jid AS senderJid, timestamp_ms AS ts
+           FROM brain_citations WHERE claim_id IN (${placeholders}) AND timestamp_ms IS NOT NULL`
+        )
+        .all(...batch) as Array<{ claimId: string; key: string; senderJid: string | null; ts: number }>) {
+        const existing = latestCite.get(row.claimId);
+        if (!existing || row.ts > existing.ts) {
+          latestCite.set(row.claimId, { key: row.key, senderJid: row.senderJid, ts: row.ts });
+        }
+      }
+    }
+    for (const entry of matched) {
+      const cite = latestCite.get(entry.other.claimId);
+      if (!cite) {
+        continue;
+      }
+      const sender = cite.senderJid ? this.canonicalJid(cite.senderJid) ?? cite.senderJid : null;
+      push(entry.lifecycleClaimId, {
+        kind: "claim",
+        sourceMessageKey: cite.key,
+        timestampMs: entry.other.ts,
+        senderJid: sender,
+        text: entry.other.text,
+        claimId: entry.other.claimId
+      });
+    }
+    // Rank, cap, then resolve labels for exactly the kept candidates.
+    const priority: Record<BrainLifecycleCandidate["kind"], number> = { reaction: 0, reply: 1, claim: 2 };
+    const keptByClaim = new Map<string, RawCandidate[]>();
+    const actorJids = new Set<string>();
+    for (const [claimId, list] of rawByClaim) {
+      list.sort((a, b) => priority[a.kind] - priority[b.kind] || (b.timestampMs ?? 0) - (a.timestampMs ?? 0));
+      const kept = list.slice(0, LIFECYCLE_MAX_CANDIDATES_PER_NODE);
+      keptByClaim.set(claimId, kept);
+      for (const candidate of kept) {
+        if (candidate.senderJid) {
+          actorJids.add(candidate.senderJid);
+        }
+      }
+    }
+    const labels = this.bulkLifecycleLabelsTx(actorJids);
+    for (const [claimId, kept] of keptByClaim) {
+      result.set(
+        claimId,
+        kept.map((candidate) => ({ ...candidate, senderLabel: candidate.senderJid ? labels.get(candidate.senderJid) ?? candidate.senderJid : null }))
+      );
+    }
+    return result;
+  }
+
+  // Re-project one claim's lifecycle state onto its graph node: payload status
+  // from the fold, `resolves` edges re-derived from the current resolving
+  // event's cites (actor person → lifecycle node), scoped salience refresh.
+  private projectLifecycleClaimTx(claimId: string, fold?: LifecycleFold): void {
+    const node = this.lifecycleNodeRowForClaimTx(claimId);
+    if (!node) {
+      return;
+    }
+    const resolved = fold ?? foldLifecycleEvents(this.loadLifecycleEventsTx([claimId]).get(claimId) ?? []);
+    const payload = projectLifecyclePayload(parseGraphPayload(node.payload_json), resolved);
+    this.db.prepare(`UPDATE brain_nodes SET payload_json = ?, updated_at = ? WHERE id = ?`).run(JSON.stringify(payload), currentIso(), node.id);
+    // resolves edges are a projection of the CURRENT fold: a reopen removes
+    // them (the judgment was disputed), a re-close re-derives them.
+    for (const edge of this.db
+      .prepare(`SELECT id FROM brain_edges WHERE dst_node_id = ? AND kind = 'resolves'`)
+      .all(node.id) as Array<{ id: number }>) {
+      this.db.prepare(`DELETE FROM brain_edge_evidence WHERE edge_id = ?`).run(edge.id);
+      this.db.prepare(`DELETE FROM brain_edges WHERE id = ?`).run(edge.id);
+    }
+    const resolvingEvent = resolved.resolvingEvent;
+    if (resolvingEvent && resolvingEvent.source === "model") {
+      for (const cite of resolvingEvent.cites) {
+        if (!cite.actorJid) {
+          continue;
+        }
+        const canonical = this.canonicalJid(cite.actorJid) ?? cite.actorJid;
+        const actorNodeId = this.ensureGraphNodeTx({
+          naturalKey: personJidNaturalKey(canonical),
+          kind: "person",
+          title: null,
+          jid: canonical,
+          chatScope: null,
+          payload: null,
+          slugSeed: canonical.split("@")[0] ?? canonical,
+          seenAtMs: cite.timestampMs
+        });
+        if (actorNodeId !== node.id) {
+          this.addGraphEdgeEvidenceTx(actorNodeId, node.id, "resolves", {
+            key: `msg:${cite.sourceMessageKey}`,
+            sourceMessageKey: cite.sourceMessageKey,
+            observedAtMs: cite.timestampMs
+          });
+        }
+      }
+    }
+    this.recomputeSalienceForNodeTx(node.id);
+  }
+
+  // Scoped single-node salience refresh (same math as the global recompute) so
+  // a transition's dormancy/boost effect lands in the same transaction.
+  private recomputeSalienceForNodeTx(nodeId: string): void {
+    const node = this.db
+      .prepare(
+        `SELECT id, kind, status, payload_json AS payloadJson, engagement_factor AS engagementFactor, last_seen_at_ms AS lastSeen
+         FROM brain_nodes WHERE id = ? AND status != 'merged'`
+      )
+      .get(nodeId) as
+      | { id: string; kind: BrainGraphNodeKind; status: BrainGraphNodeStatus; payloadJson: string | null; engagementFactor: number; lastSeen: number | null }
+      | undefined;
+    if (!node) {
+      return;
+    }
+    const stats = this.db
+      .prepare(
+        `SELECT COUNT(*) AS citations,
+                COUNT(DISTINCT CASE WHEN ts IS NOT NULL THEN date(ts / 1000, 'unixepoch') END) AS days,
+                MAX(ts) AS lastTs
+         FROM (
+           SELECT c.timestamp_ms AS ts FROM brain_node_claims nc JOIN brain_citations c ON c.claim_id = nc.claim_id WHERE nc.node_id = ?
+           UNION ALL
+           SELECT ev.observed_at_ms FROM brain_edge_evidence ev JOIN brain_edges e ON e.id = ev.edge_id WHERE e.src_node_id = ? OR e.dst_node_id = ?
+         )`
+      )
+      .get(nodeId, nodeId, nodeId) as { citations: number; days: number; lastTs: number | null };
+    const computed = computeGraphSalience({
+      kind: node.kind,
+      payload: parseGraphPayload(node.payloadJson),
+      citations: Number(stats.citations ?? 0),
+      evidenceDays: Number(stats.days ?? 0),
+      lastEvidenceAtMs: stats.lastTs,
+      nowMs: Date.now(),
+      engagementFactor: node.engagementFactor,
+      dormancyThreshold: graphDormancyThreshold()
+    });
+    this.db
+      .prepare(`UPDATE brain_nodes SET salience = ?, status = ?, citation_count = ?, evidence_days = ?, last_seen_at_ms = ?, updated_at = ? WHERE id = ?`)
+      .run(
+        computed.salience,
+        computed.dormant ? "dormant" : "active",
+        Number(stats.citations ?? 0),
+        Number(stats.days ?? 0),
+        maxNullableMs(node.lastSeen, stats.lastTs),
+        currentIso(),
+        nodeId
+      );
+  }
+
+  // Rebuild step: re-apply every recorded (non-orphaned) claim's lifecycle
+  // state onto the freshly replayed graph. Pure SQL — closures survive wipes.
+  private projectLifecycleStateTx(): number {
+    const claimIds = (
+      this.db.prepare(`SELECT DISTINCT claim_id AS claimId FROM brain_lifecycle_events WHERE orphaned_at_ms IS NULL`).all() as Array<{
+        claimId: string;
+      }>
+    ).map((row) => row.claimId);
+    for (const claimId of claimIds) {
+      this.projectLifecycleClaimTx(claimId);
+    }
+    return claimIds.length;
+  }
+
+  // Supersede re-key: transitions follow the commitment across regeneration.
+  // The replacement is any CURRENT same-kind lifecycle claim citing one of the
+  // old claim's messages (replacement packs may commit before the supersede,
+  // so the search spans current claims, not just the superseding episode);
+  // exactly one match re-keys, anything else orphans honestly.
+  private rekeyLifecycleEventsForSupersededEpisodeTx(oldEpisodeId: string): string[] {
+    const rekeyedClaims: string[] = [];
+    const oldClaims = this.db
+      .prepare(`SELECT id, kind FROM brain_claims WHERE episode_id = ? AND kind IN ('commitment','question')`)
+      .all(oldEpisodeId) as Array<{ id: string; kind: string }>;
+    for (const oldClaim of oldClaims) {
+      const hasEvents = this.db.prepare(`SELECT 1 FROM brain_lifecycle_events WHERE claim_id = ? LIMIT 1`).get(oldClaim.id);
+      if (!hasEvents) {
+        continue;
+      }
+      const keys = (
+        this.db.prepare(`SELECT source_message_key AS key FROM brain_citations WHERE claim_id = ?`).all(oldClaim.id) as Array<{ key: string }>
+      ).map((row) => row.key);
+      let replacementId: string | null = null;
+      if (keys.length > 0) {
+        const placeholders = keys.map(() => "?").join(",");
+        const matches = this.db
+          .prepare(
+            `SELECT DISTINCT c.id AS id
+             FROM brain_claims c
+             JOIN brain_episodes e ON e.id = c.episode_id
+             JOIN brain_citations ct ON ct.claim_id = c.id
+             WHERE e.status = 'current' AND e.generator = 'model'
+               AND c.kind = ? AND c.id != ?
+               AND ct.source_message_key IN (${placeholders})
+             LIMIT 2`
+          )
+          .all(oldClaim.kind, oldClaim.id, ...keys) as Array<{ id: string }>;
+        replacementId = matches.length === 1 ? matches[0]!.id : null;
+      }
+      if (replacementId) {
+        this.db.prepare(`UPDATE brain_lifecycle_events SET claim_id = ? WHERE claim_id = ?`).run(replacementId, oldClaim.id);
+        rekeyedClaims.push(replacementId);
+      } else {
+        this.db
+          .prepare(`UPDATE brain_lifecycle_events SET orphaned_at_ms = ? WHERE claim_id = ? AND orphaned_at_ms IS NULL`)
+          .run(Date.now(), oldClaim.id);
+      }
+    }
+    return rekeyedClaims;
+  }
+
+  async applyBrainLifecycleTransitions(
+    transitions: BrainLifecycleTransitionInput[],
+    context: {
+      source: BrainLifecycleSource;
+      runId?: string | null;
+      model?: string | null;
+      allowedCitesByClaim?: Map<string, BrainLifecycleCandidate[]>;
+    }
+  ): Promise<BrainLifecycleApplyResult> {
+    if (transitions.length === 0) {
+      return { applied: 0, events: [] };
+    }
+    const eventIds: number[] = [];
+    const transaction = this.db.transaction(() => {
+      // Validate EVERYTHING first (collect-all), apply nothing on any error.
+      const errors: string[] = [];
+      const prepared: Array<{
+        input: BrainLifecycleTransitionInput;
+        cites: Array<{ sourceMessageKey: string; timestampMs: number | null; resolvingClaimId: string | null; actorJid: string | null }>;
+      }> = [];
+      for (const input of transitions) {
+        const node = this.lifecycleNodeRowForClaimTx(input.claimId);
+        if (!node) {
+          errors.push(`claim ${input.claimId} has no open commitment/question node`);
+          continue;
+        }
+        const fold = foldLifecycleEvents(this.loadLifecycleEventsTx([input.claimId]).get(input.claimId) ?? []);
+        const { anchorMs } = this.lifecycleAnchorTx(input.claimId);
+        const allowed = context.allowedCitesByClaim?.get(input.claimId) ?? null;
+        const allowedByKey = allowed ? new Map(allowed.map((candidate) => [candidate.sourceMessageKey, candidate])) : null;
+        const cites: Array<{ sourceMessageKey: string; timestampMs: number | null; resolvingClaimId: string | null; actorJid: string | null }> = [];
+        for (const key of input.cites ?? []) {
+          const candidate = allowedByKey?.get(key);
+          if (candidate) {
+            cites.push({
+              sourceMessageKey: key,
+              timestampMs: candidate.timestampMs,
+              resolvingClaimId: candidate.claimId,
+              actorJid: candidate.senderJid
+            });
+          } else {
+            // No offered-candidate metadata (user cites): resolve what the
+            // archive knows; closed-world validation below rejects model cites.
+            const message = this.db
+              .prepare(`SELECT timestamp_ms AS ts, sender_source_jid AS senderJid FROM messages WHERE source_message_key = ?`)
+              .get(key) as { ts: number | null; senderJid: string | null } | undefined;
+            cites.push({ sourceMessageKey: key, timestampMs: message?.ts ?? null, resolvingClaimId: null, actorJid: message?.senderJid ?? null });
+          }
+        }
+        const violations = validateLifecycleTransition({
+          toStatus: input.toStatus,
+          source: context.source,
+          currentStatus: fold.status,
+          cites,
+          anchorMs,
+          allowedKeys: context.source === "model" ? new Set(allowedByKey?.keys() ?? []) : null
+        });
+        for (const violation of violations) {
+          errors.push(`claim ${input.claimId}: ${violation}`);
+        }
+        prepared.push({ input, cites });
+      }
+      if (errors.length > 0) {
+        throw new PublicError("BRAIN_LIFECYCLE_INVALID", `Lifecycle transition rejected: ${errors.join("; ")}`);
+      }
+      const insertEvent = this.db.prepare(
+        `INSERT INTO brain_lifecycle_events (claim_id, to_status, source, evidence_at_ms, note, run_id, model, created_at_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      );
+      const insertCite = this.db.prepare(
+        `INSERT OR IGNORE INTO brain_lifecycle_event_cites (event_id, source_message_key, resolving_claim_id, actor_jid, timestamp_ms)
+         VALUES (?, ?, ?, ?, ?)`
+      );
+      const now = Date.now();
+      for (const entry of prepared) {
+        const citeTimestamps = entry.cites.map((cite) => cite.timestampMs).filter((ts): ts is number => ts != null);
+        const evidenceAtMs = citeTimestamps.length > 0 ? Math.max(...citeTimestamps) : null;
+        const eventId = Number(
+          insertEvent.run(
+            entry.input.claimId,
+            entry.input.toStatus,
+            context.source,
+            evidenceAtMs,
+            entry.input.note?.trim() || null,
+            context.runId ?? null,
+            context.model ?? null,
+            now
+          ).lastInsertRowid
+        );
+        eventIds.push(eventId);
+        for (const cite of entry.cites) {
+          insertCite.run(eventId, cite.sourceMessageKey, cite.resolvingClaimId, cite.actorJid, cite.timestampMs);
+        }
+      }
+      for (const entry of prepared) {
+        this.projectLifecycleClaimTx(entry.input.claimId);
+      }
+    });
+    transaction();
+    this.invalidateBrainStatusCache();
+    const events: BrainLifecycleEventRecord[] = [];
+    const byClaim = this.loadLifecycleEventsTx([...new Set(transitions.map((transition) => transition.claimId))]);
+    for (const list of byClaim.values()) {
+      for (const event of list) {
+        if (eventIds.includes(event.id)) {
+          events.push(event);
+        }
+      }
+    }
+    return { applied: events.length, events };
+  }
+
+  private lifecycleCiteViewsTx(event: BrainLifecycleEventRecord): BrainLifecycleCiteView[] {
+    const messageStmt = this.db.prepare(
+      `SELECT m.id AS messageId, ch.id AS chatId, m.timestamp_ms AS ts,
+              COALESCE(NULLIF(TRIM(COALESCE(m.body, '')), ''), NULLIF(TRIM(COALESCE(m.caption, '')), '')) AS text
+       FROM messages m JOIN chats ch ON ch.id = m.chat_id WHERE m.source_message_key = ?`
+    );
+    return event.cites.map((cite) => {
+      const message = messageStmt.get(cite.sourceMessageKey) as
+        | { messageId: number; chatId: number; ts: number | null; text: string | null }
+        | undefined;
+      const snippet = message?.text ? (message.text.length > 160 ? `${message.text.slice(0, 159)}…` : message.text) : null;
+      return {
+        sourceMessageKey: cite.sourceMessageKey,
+        chatId: message?.chatId ?? null,
+        messageId: message?.messageId ?? null,
+        timestampMs: cite.timestampMs ?? message?.ts ?? null,
+        senderLabel: cite.actorJid
+          ? this.lifecycleActorLabelTx(cite.actorJid === "me" ? "me" : this.canonicalJid(cite.actorJid) ?? cite.actorJid)
+          : null,
+        snippet
+      };
+    });
+  }
+
+  async listBrainLifecycleItems(
+    options: {
+      status?: BrainLifecycleStatus | "all" | "closed";
+      // Narrows OPEN items to those carrying the flag (overdue/stale/sweep_due).
+      flag?: "overdue" | "stale" | "sweep_due";
+      // Exclusions layered on the current view (e.g. future-due only = hide
+      // overdue). Counts stay the full totals; only the shown list narrows.
+      hideOverdue?: boolean;
+      hideStale?: boolean;
+      hideFulfilled?: boolean;
+      hideDismissed?: boolean;
+      // The "upcoming deadlines" filter: keep only open items with a due date
+      // still in the future (excludes overdue AND undated). Counts stay full.
+      dueUpcoming?: boolean;
+      kind?: "commitment" | "question";
+      chatSourceId?: string | null;
+      // Group filter: show only these source chats, or hide these. Empty/absent
+      // means no restriction. Canonicalized against identity merges.
+      includeChats?: string[];
+      excludeChats?: string[];
+      sort?: BrainLifecycleSort;
+      limit?: number;
+    } = {}
+  ): Promise<BrainLifecycleListResponse> {
+    const asOfMs = Date.now();
+    const staleDays = lifecycleStaleDays();
+    // A flag filter is inherently an open-set view, whatever status was passed.
+    const statusFilter = options.flag ? "open" : options.status ?? "open";
+    const limit = Math.max(1, Math.min(500, options.limit ?? 200));
+    const includeChats =
+      options.includeChats && options.includeChats.length > 0
+        ? new Set(options.includeChats.map((chat) => this.canonicalJid(chat) ?? chat))
+        : null;
+    const excludeChats =
+      options.excludeChats && options.excludeChats.length > 0
+        ? new Set(options.excludeChats.map((chat) => this.canonicalJid(chat) ?? chat))
+        : null;
+    const clauses = [`n.kind IN ('commitment','question')`, `n.status != 'merged'`];
+    const params: unknown[] = [];
+    if (options.kind) {
+      clauses.push(`n.kind = ?`);
+      params.push(options.kind);
+    }
+    if (options.chatSourceId) {
+      clauses.push(`n.chat_scope = ?`);
+      params.push(this.canonicalJid(options.chatSourceId) ?? options.chatSourceId);
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT n.*, ch.display_name AS chatDisplayName FROM brain_nodes n
+         LEFT JOIN chats ch ON ch.source_chat_id = n.chat_scope
+         WHERE ${clauses.join(" AND ")}`
+      )
+      .all(...params) as Array<GraphNodeRow & { chatDisplayName: string | null }>;
+    const claimIds = rows.map((row) => row.natural_key.slice(row.natural_key.indexOf(":") + 1));
+    const eventsByClaim = this.loadLifecycleEventsTx(claimIds);
+    const anchorByClaim = this.bulkLifecycleAnchorsTx(claimIds);
+    // One bulk candidate pass for every OPEN node (set queries, not per-node).
+    const candidateInputs: Array<{ claimId: string; chatSourceId: string; sinceMs: number }> = [];
+    const foldByClaim = new Map<string, LifecycleFold>();
+    for (let index = 0; index < claimIds.length; index += 1) {
+      const claimId = claimIds[index]!;
+      const fold = foldLifecycleEvents(eventsByClaim.get(claimId) ?? []);
+      foldByClaim.set(claimId, fold);
+      if (fold.status === "open") {
+        candidateInputs.push({
+          claimId,
+          chatSourceId: rows[index]!.chat_scope ?? "",
+          sinceMs: Math.max(anchorByClaim.get(claimId) ?? 0, fold.lastReviewedAtMs ?? 0)
+        });
+      }
+    }
+    const candidatesByClaim = this.bulkLifecycleCandidatesTx(candidateInputs);
+    const holderLabels = this.bulkLifecycleLabelsTx(
+      rows
+        .map((row) => parseGraphPayload(row.payload_json)?.holderJid)
+        .filter((jid): jid is string => typeof jid === "string")
+    );
+    const claimTextStmt = this.db.prepare(`SELECT text FROM brain_claims WHERE id = ?`);
+    const counts = { open: 0, overdue: 0, stale: 0, fulfilled: 0, dismissed: 0, sweepDue: 0, orphanedEvents: 0 };
+    // Group facets: item counts per source chat within the status+kind scope,
+    // BEFORE flag/hide/include/exclude — a stable picker for the group filter.
+    const facetCount = new Map<string, number>();
+    const facetLabel = new Map<string, string | null>();
+    const items: BrainLifecycleItem[] = [];
+    for (let index = 0; index < rows.length; index += 1) {
+      const row = rows[index]!;
+      const claimId = claimIds[index]!;
+      const fold = foldByClaim.get(claimId)!;
+      const payload = parseGraphPayload(row.payload_json);
+      const anchorMs = anchorByClaim.get(claimId) ?? null;
+      const dueMs = typeof payload?.dueMs === "number" ? (payload.dueMs as number) : null;
+      const flags = computeLifecycleFlags({
+        status: fold.status,
+        dueMs,
+        lastEvidenceAtMs: row.last_seen_at_ms,
+        lastReviewedAtMs: fold.lastReviewedAtMs,
+        openedAtMs: anchorMs,
+        asOfMs,
+        staleDays
+      });
+      let candidateCount = 0;
+      let sweepDue = false;
+      if (fold.status === "open") {
+        counts.open += 1;
+        if (flags.overdue) counts.overdue += 1;
+        if (flags.stale) counts.stale += 1;
+        candidateCount = candidatesByClaim.get(claimId)?.length ?? 0;
+        const duePassedSinceReview = dueMs != null && dueMs < asOfMs && (fold.lastReviewedAtMs == null || fold.lastReviewedAtMs < dueMs);
+        sweepDue = candidateCount > 0 || duePassedSinceReview;
+        if (sweepDue) {
+          counts.sweepDue += 1;
+        }
+      } else if (fold.status === "fulfilled") {
+        counts.fulfilled += 1;
+      } else {
+        counts.dismissed += 1;
+      }
+      if (statusFilter === "closed" ? fold.status === "open" : statusFilter !== "all" && fold.status !== statusFilter) {
+        continue;
+      }
+      // In the status+kind scope: count this group toward the facet picker
+      // (before the narrowing filters, so a group never vanishes from its own
+      // picker just because it's currently excluded).
+      const chatKey = row.chat_scope ?? "";
+      facetCount.set(chatKey, (facetCount.get(chatKey) ?? 0) + 1);
+      if (!facetLabel.has(chatKey)) {
+        facetLabel.set(chatKey, row.chatDisplayName?.trim() || null);
+      }
+      // Flag filter (open views only): keep just the items carrying the flag —
+      // counts above are already the full totals, so the chips stay honest.
+      if (options.flag === "overdue" && !flags.overdue) continue;
+      if (options.flag === "stale" && !flags.stale) continue;
+      if (options.flag === "sweep_due" && !sweepDue) continue;
+      // Exclusions: hide a category from the shown list (counts stay full).
+      if (options.hideOverdue && flags.overdue) continue;
+      if (options.hideStale && flags.stale) continue;
+      if (options.hideFulfilled && fold.status === "fulfilled") continue;
+      if (options.hideDismissed && fold.status === "dismissed") continue;
+      // Upcoming deadlines only: open, dated, and due in the future.
+      if (options.dueUpcoming && (fold.status !== "open" || dueMs == null || dueMs < asOfMs)) continue;
+      // Group include/exclude.
+      if (includeChats && !includeChats.has(chatKey)) continue;
+      if (excludeChats && excludeChats.has(chatKey)) continue;
+      const holderJid = typeof payload?.holderJid === "string" ? (payload.holderJid as string) : null;
+      const claimRow = claimTextStmt.get(claimId) as { text: string } | undefined;
+      let resolution: BrainLifecycleResolutionView | null = null;
+      if (fold.resolvingEvent) {
+        resolution = {
+          status: fold.resolvingEvent.toStatus,
+          source: fold.resolvingEvent.source,
+          atMs: fold.resolvedAtMs ?? fold.resolvingEvent.createdAtMs,
+          note: fold.resolvingEvent.note,
+          model: fold.resolvingEvent.model,
+          cites: this.lifecycleCiteViewsTx(fold.resolvingEvent)
+        };
+      }
+      items.push({
+        nodeId: row.id,
+        slug: row.slug,
+        kind: row.kind as "commitment" | "question",
+        claimId,
+        text: claimRow?.text ?? row.title ?? "",
+        chatSourceId: row.chat_scope ?? "",
+        chatDisplayName: row.chatDisplayName?.trim() || null,
+        holderJid,
+        holderLabel: holderJid ? holderLabels.get(holderJid) ?? holderJid : null,
+        openedAtMs: anchorMs,
+        dueMs,
+        lastEvidenceAtMs: row.last_seen_at_ms,
+        lastReviewedAtMs: fold.lastReviewedAtMs,
+        status: fold.status,
+        overdue: flags.overdue,
+        stale: flags.stale,
+        candidateCount,
+        salience: Number(row.salience ?? 0),
+        dormant: row.status === "dormant",
+        resolution
+      });
+    }
+    counts.orphanedEvents = Number(
+      (
+        this.db.prepare(`SELECT COUNT(DISTINCT claim_id) AS count FROM brain_lifecycle_events WHERE orphaned_at_ms IS NOT NULL`).get() as {
+          count: number;
+        }
+      ).count
+    );
+    sortLifecycleItems(items, options.sort ?? "smart", statusFilter);
+    const chatFacets = [...facetCount.entries()]
+      .map(([chatSourceId, count]) => ({ chatSourceId, chatDisplayName: facetLabel.get(chatSourceId) ?? null, count }))
+      .sort((a, b) => b.count - a.count || (a.chatDisplayName ?? a.chatSourceId).localeCompare(b.chatDisplayName ?? b.chatSourceId))
+      .slice(0, 300);
+    return { items: items.slice(0, limit), counts, chatFacets, asOfMs, staleDays };
+  }
+
+  // Full context for one lifecycle item (the detail modal): the item, the
+  // messages it was extracted FROM (origin), all postdating candidate evidence
+  // with thread coordinates, and the transition history. Zero model calls.
+  async getBrainLifecycleItemDetail(claimId: string): Promise<BrainLifecycleItemDetail | null> {
+    const row = this.lifecycleNodeRowForClaimTx(claimId) as (GraphNodeRow & { chatDisplayName?: string | null }) | undefined;
+    if (!row) {
+      return null;
+    }
+    const chatDisplayName =
+      (this.db.prepare(`SELECT display_name AS name FROM chats WHERE source_chat_id = ?`).get(row.chat_scope) as { name: string | null } | undefined)
+        ?.name?.trim() || null;
+    const events = this.loadLifecycleEventsTx([claimId]).get(claimId) ?? [];
+    const fold = foldLifecycleEvents(events);
+    const payload = parseGraphPayload(row.payload_json);
+    const { anchorMs } = this.lifecycleAnchorTx(claimId);
+    const dueMs = typeof payload?.dueMs === "number" ? (payload.dueMs as number) : null;
+    const flags = computeLifecycleFlags({
+      status: fold.status,
+      dueMs,
+      lastEvidenceAtMs: row.last_seen_at_ms,
+      lastReviewedAtMs: fold.lastReviewedAtMs,
+      openedAtMs: anchorMs,
+      asOfMs: Date.now(),
+      staleDays: lifecycleStaleDays()
+    });
+    // All postdating candidates (since the anchor, not just since last review)
+    // so the modal shows the complete evidence picture.
+    const candidates = this.bulkLifecycleCandidatesTx([{ claimId, chatSourceId: row.chat_scope ?? "", sinceMs: anchorMs ?? 0 }]).get(claimId) ?? [];
+    const holderJid = typeof payload?.holderJid === "string" ? (payload.holderJid as string) : null;
+    const claimRow = this.db.prepare(`SELECT text FROM brain_claims WHERE id = ?`).get(claimId) as { text: string } | undefined;
+    const item: BrainLifecycleItem = {
+      nodeId: row.id,
+      slug: row.slug,
+      kind: row.kind as "commitment" | "question",
+      claimId,
+      text: claimRow?.text ?? row.title ?? "",
+      chatSourceId: row.chat_scope ?? "",
+      chatDisplayName,
+      holderJid,
+      holderLabel: holderJid ? this.lifecycleActorLabelTx(holderJid === "me" ? "me" : this.canonicalJid(holderJid) ?? holderJid) : null,
+      openedAtMs: anchorMs,
+      dueMs,
+      lastEvidenceAtMs: row.last_seen_at_ms,
+      lastReviewedAtMs: fold.lastReviewedAtMs,
+      status: fold.status,
+      overdue: flags.overdue,
+      stale: flags.stale,
+      candidateCount: candidates.length,
+      salience: Number(row.salience ?? 0),
+      dormant: row.status === "dormant",
+      resolution: fold.resolvingEvent
+        ? {
+            status: fold.resolvingEvent.toStatus,
+            source: fold.resolvingEvent.source,
+            atMs: fold.resolvedAtMs ?? fold.resolvingEvent.createdAtMs,
+            note: fold.resolvingEvent.note,
+            model: fold.resolvingEvent.model,
+            cites: this.lifecycleCiteViewsTx(fold.resolvingEvent)
+          }
+        : null
+    };
+    // Origin: the claim's own citations — the conversation where it was made.
+    const originRows = this.db
+      .prepare(
+        `SELECT bc.source_message_key AS key, bc.sender_source_jid AS senderJid, bc.message_id AS messageId, ch.id AS chatId, bc.timestamp_ms AS ts,
+                COALESCE(NULLIF(TRIM(COALESCE(m.body, '')), ''), NULLIF(TRIM(COALESCE(m.caption, '')), '')) AS text
+         FROM brain_citations bc
+         LEFT JOIN messages m ON m.source_message_key = bc.source_message_key
+         LEFT JOIN chats ch ON ch.source_chat_id = bc.source_chat_id
+         WHERE bc.claim_id = ? ORDER BY bc.timestamp_ms ASC, bc.id ASC`
+      )
+      .all(claimId) as Array<{ key: string; senderJid: string | null; messageId: number | null; chatId: number | null; ts: number | null; text: string | null }>;
+    const origin: BrainLifecycleCiteView[] = originRows.map((cite) => ({
+      sourceMessageKey: cite.key,
+      chatId: cite.chatId ?? null,
+      messageId: cite.messageId ?? null,
+      timestampMs: cite.ts ?? null,
+      senderLabel: cite.senderJid ? this.lifecycleActorLabelTx(cite.senderJid === "me" ? "me" : this.canonicalJid(cite.senderJid) ?? cite.senderJid) : null,
+      snippet: cite.text ? (cite.text.length > 200 ? `${cite.text.slice(0, 199)}…` : cite.text) : null
+    }));
+    // Thread coordinates for each candidate's message, for click-through.
+    const coordStmt = this.db.prepare(
+      `SELECT m.id AS messageId, ch.id AS chatId FROM messages m JOIN chats ch ON ch.id = m.chat_id WHERE m.source_message_key = ?`
+    );
+    const detailCandidates: BrainLifecycleDetailCandidate[] = candidates.map((candidate) => {
+      const coords = coordStmt.get(candidate.sourceMessageKey) as { messageId: number; chatId: number } | undefined;
+      return { ...candidate, chatId: coords?.chatId ?? null, messageId: coords?.messageId ?? null };
+    });
+    return { item, origin, candidates: detailCandidates, events };
+  }
+
+  async listBrainLifecycleSweepBatches(
+    options: { chatSourceId?: string | null; claimIds?: string[]; maxNodesPerBatch?: number } = {}
+  ): Promise<BrainLifecycleSweepBatch[]> {
+    const asOfMs = Date.now();
+    const maxNodes = Math.max(1, Math.min(LIFECYCLE_SWEEP_MAX_NODES_PER_CALL, options.maxNodesPerBatch ?? LIFECYCLE_SWEEP_MAX_NODES_PER_CALL));
+    // Explicit selection: sweep exactly these claims, overriding the sweep-due
+    // heuristic (the user asked for them, so a no-evidence node still gets an
+    // honest review). Empty set means "no explicit selection" (whole scope).
+    const selected = options.claimIds && options.claimIds.length > 0 ? new Set(options.claimIds) : null;
+    const clauses = [`n.kind IN ('commitment','question')`, `n.status != 'merged'`];
+    const params: unknown[] = [];
+    if (options.chatSourceId) {
+      clauses.push(`n.chat_scope = ?`);
+      params.push(this.canonicalJid(options.chatSourceId) ?? options.chatSourceId);
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT n.*, ch.display_name AS chatDisplayName FROM brain_nodes n
+         LEFT JOIN chats ch ON ch.source_chat_id = n.chat_scope
+         WHERE ${clauses.join(" AND ")}`
+      )
+      .all(...params) as Array<GraphNodeRow & { chatDisplayName: string | null }>;
+    const claimIds = rows.map((row) => row.natural_key.slice(row.natural_key.indexOf(":") + 1));
+    const eventsByClaim = this.loadLifecycleEventsTx(claimIds);
+    const anchorByClaim = this.bulkLifecycleAnchorsTx(claimIds);
+    const foldByClaim = new Map<string, LifecycleFold>();
+    const candidateInputs: Array<{ claimId: string; chatSourceId: string; sinceMs: number }> = [];
+    for (let index = 0; index < claimIds.length; index += 1) {
+      const claimId = claimIds[index]!;
+      const fold = foldLifecycleEvents(eventsByClaim.get(claimId) ?? []);
+      foldByClaim.set(claimId, fold);
+      if (fold.status === "open") {
+        candidateInputs.push({
+          claimId,
+          chatSourceId: rows[index]!.chat_scope ?? "",
+          sinceMs: Math.max(anchorByClaim.get(claimId) ?? 0, fold.lastReviewedAtMs ?? 0)
+        });
+      }
+    }
+    const candidatesByClaim = this.bulkLifecycleCandidatesTx(candidateInputs);
+    const holderLabels = this.bulkLifecycleLabelsTx(
+      rows
+        .map((row) => parseGraphPayload(row.payload_json)?.holderJid)
+        .filter((jid): jid is string => typeof jid === "string")
+    );
+    const claimTextStmt = this.db.prepare(`SELECT text FROM brain_claims WHERE id = ?`);
+    const dueByChat = new Map<string, { chatDisplayName: string | null; nodes: Array<BrainLifecycleSweepNode & { overdue: boolean; lastEvidenceAtMs: number | null }> }>();
+    for (let index = 0; index < rows.length; index += 1) {
+      const row = rows[index]!;
+      const claimId = claimIds[index]!;
+      const fold = foldByClaim.get(claimId)!;
+      if (fold.status !== "open" || !row.chat_scope) {
+        continue;
+      }
+      if (selected && !selected.has(claimId)) {
+        continue;
+      }
+      const payload = parseGraphPayload(row.payload_json);
+      const dueMs = typeof payload?.dueMs === "number" ? (payload.dueMs as number) : null;
+      const anchorMs = anchorByClaim.get(claimId) ?? null;
+      const candidates = candidatesByClaim.get(claimId) ?? [];
+      const duePassedSinceReview = dueMs != null && dueMs < asOfMs && (fold.lastReviewedAtMs == null || fold.lastReviewedAtMs < dueMs);
+      // Sweep-due rule: no new evidence and no newly passed due date → no model
+      // call for this node — UNLESS it was explicitly selected, which overrides.
+      if (!selected && candidates.length === 0 && !duePassedSinceReview) {
+        continue;
+      }
+      const holderJid = typeof payload?.holderJid === "string" ? (payload.holderJid as string) : null;
+      const claimRow = claimTextStmt.get(claimId) as { text: string } | undefined;
+      const bucket = dueByChat.get(row.chat_scope) ?? { chatDisplayName: row.chatDisplayName?.trim() || null, nodes: [] };
+      bucket.nodes.push({
+        nodeId: row.id,
+        claimId,
+        kind: row.kind as "commitment" | "question",
+        text: claimRow?.text ?? row.title ?? "",
+        holderLabel: holderJid ? holderLabels.get(holderJid) ?? holderJid : null,
+        openedAtMs: anchorMs,
+        dueMs,
+        candidates,
+        overdue: dueMs != null && dueMs < asOfMs,
+        lastEvidenceAtMs: row.last_seen_at_ms
+      });
+      dueByChat.set(row.chat_scope, bucket);
+    }
+    const batches: BrainLifecycleSweepBatch[] = [];
+    for (const [chatSourceId, bucket] of [...dueByChat.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+      bucket.nodes.sort(compareLifecycleItems);
+      for (let start = 0; start < bucket.nodes.length; start += maxNodes) {
+        batches.push({
+          chatSourceId,
+          chatDisplayName: bucket.chatDisplayName,
+          nodes: bucket.nodes.slice(start, start + maxNodes).map(({ overdue: _overdue, lastEvidenceAtMs: _last, ...node }) => node)
+        });
+      }
+    }
+    return batches;
   }
 
   // === Two-level person model =============================================
@@ -10838,6 +12045,8 @@ function ensureSchema(db: Database.Database): void {
   migrateLiveSessionStatuses(db);
   migrateLiveMessageUpdateTypes(db);
   migratePersonLinkEventActions(db);
+  migrateBrainRunKinds(db);
+  migrateLifecycleDismissed(db);
   rebuildBrainDerivedTablesIfStale(db);
   db.exec(schemaStatements.join(";\n"));
   migrateAdditiveColumns(db);
@@ -10903,6 +12112,50 @@ function rebuildBrainDerivedTablesIfStale(db: Database.Database): void {
     `[brain] contract-v2 schema rebuild: dropped pre-v2 derived tables (${episodeCount} episode(s) discarded — all regenerable), ` +
       `wiped watermarks and the task queue, removed ${filesRemoved} projected file(s). The next run re-assimilates from scratch.`
   );
+}
+
+// SQLite cannot alter CHECK constraints in place; rebuild brain_runs when an
+// older archive lacks a run kind the app now uses ('lifecycle'). The table is
+// a small run-history log — copy-rename preserves it whole.
+function migrateBrainRunKinds(db: Database.Database): void {
+  const existing = db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'brain_runs'`).get() as
+    | { sql: string }
+    | undefined;
+  if (!existing?.sql || BRAIN_RUN_KINDS.every((kind) => existing.sql.includes(`'${kind}'`))) {
+    return;
+  }
+  db.transaction(() => {
+    db.exec(brainRunsTableDdl("brain_runs_migrated"));
+    db.exec(
+      `INSERT INTO brain_runs_migrated (id, kind, status, started_at, finished_at, timezone, totals_json, error_message, created_at)
+       SELECT id, kind, status, started_at, finished_at, timezone, totals_json, error_message, created_at FROM brain_runs`
+    );
+    db.exec(`DROP TABLE brain_runs`);
+    db.exec(`ALTER TABLE brain_runs_migrated RENAME TO brain_runs`);
+  })();
+}
+
+// The former 'cancelled' lifecycle status was renamed 'dismissed' (one
+// "not-done / off-my-list" terminal). Rebuild brain_lifecycle_events with the
+// new CHECK, mapping any existing cancelled rows to dismissed so no audited
+// user/model transition is lost. Copy-rename (SQLite can't alter a CHECK).
+function migrateLifecycleDismissed(db: Database.Database): void {
+  const existing = db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'brain_lifecycle_events'`).get() as
+    | { sql: string }
+    | undefined;
+  if (!existing?.sql || !existing.sql.includes("'cancelled'")) {
+    return;
+  }
+  db.transaction(() => {
+    db.exec(brainLifecycleEventsTableDdl("brain_lifecycle_events_migrated"));
+    db.exec(
+      `INSERT INTO brain_lifecycle_events_migrated (id, claim_id, to_status, source, evidence_at_ms, note, run_id, model, orphaned_at_ms, created_at_ms)
+       SELECT id, claim_id, CASE to_status WHEN 'cancelled' THEN 'dismissed' ELSE to_status END, source, evidence_at_ms, note, run_id, model, orphaned_at_ms, created_at_ms
+       FROM brain_lifecycle_events`
+    );
+    db.exec(`DROP TABLE brain_lifecycle_events`);
+    db.exec(`ALTER TABLE brain_lifecycle_events_migrated RENAME TO brain_lifecycle_events`);
+  })();
 }
 
 // SQLite cannot alter CHECK constraints in place; rebuild live_message_updates

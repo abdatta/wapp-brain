@@ -1368,7 +1368,7 @@ export interface MessageContextWindow {
 
 export type BrainTaskKind = "episode" | "regenerate" | "rollup" | "overview" | "merge_adjudicate" | "reindex" | "project_pages";
 export type BrainTaskStatus = "pending" | "running" | "done" | "failed";
-export type BrainRunKind = "nightly" | "catchup" | "manual" | "backfill" | "regenerate";
+export type BrainRunKind = "nightly" | "catchup" | "manual" | "backfill" | "regenerate" | "lifecycle";
 export type BrainRunStatus = "running" | "completed" | "failed" | "interrupted" | "budget_exceeded";
 
 export interface BrainTaskInput {
@@ -1930,8 +1930,9 @@ export interface BrainRunProgress {
   state: "idle" | "running" | "completed" | "failed" | "budget_exceeded" | "interrupted";
   runId: string | null;
   // Which run flavor is executing: manual assimilation, historical backfill,
-  // or regeneration. Null until the first run of the process.
-  kind: "manual" | "backfill" | "regenerate" | null;
+  // regeneration, or a lifecycle closure sweep. Null until the first run of
+  // the process.
+  kind: "manual" | "backfill" | "regenerate" | "lifecycle" | null;
   // Pending episode tasks in the durable queue, refreshed per task completion
   // during a backfill run (null for run kinds that do not drain the queue).
   queuedTasks: number | null;
@@ -1958,6 +1959,18 @@ export interface BrainRunProgress {
   startedAt: string | null;
   finishedAt: string | null;
   error: string | null;
+  // Closure-sweep counters (kind 'lifecycle' only): what the sweep offered and
+  // what the model resolved, so the run surface reads in lifecycle terms.
+  lifecycle?: BrainLifecycleSweepProgress | null;
+}
+
+export interface BrainLifecycleSweepProgress {
+  nodesOffered: number;
+  fulfilled: number;
+  dismissed: number;
+  stillOpen: number;
+  // Calls whose response failed validation twice — nodes stayed open.
+  failedCalls: number;
 }
 
 // --- Historical backfill (historical-backfill) ---
@@ -2279,6 +2292,216 @@ export interface BrainGraphSyncResult {
   vcardMentionEdges: number;
   numberChangeAliases: number;
   engagementFactors: number;
+}
+
+// --- Commitment lifecycle (commitment-tracking) ---------------------------
+// Durable truth is the append-only event log keyed by the LIFECYCLE CLAIM id
+// (stable across graph wipes — node ids are not); node payload status is a
+// mechanical projection of the fold. Meaning lives server-side: flags,
+// ordering, and labels ship in these DTOs for the UI/CLI/MCP to render.
+
+// Folded current status of a lifecycle node. `dismissed` = not fulfilled and
+// no longer active (withdrawn, made moot, or not a real/relevant item).
+export type BrainLifecycleStatus = "open" | "fulfilled" | "dismissed";
+// A recorded transition: terminals, a reviewed-and-still-open stamp, or a
+// reopen that undoes a terminal (so any terminal is reversible).
+export type BrainLifecycleTransitionStatus = "fulfilled" | "dismissed" | "still_open" | "reopened";
+export type BrainLifecycleSource = "model" | "user";
+
+export interface BrainLifecycleEventCite {
+  sourceMessageKey: string;
+  // The offered candidate claim whose citations include this message, when one
+  // does — the claim-level "resolves" link.
+  resolvingClaimId: string | null;
+  timestampMs: number | null;
+  // Who provided the resolving evidence: the reactor for reaction evidence,
+  // the reply sender for replies, the citing message's sender for claims. The
+  // `resolves` edge projects from this identity's person node.
+  actorJid: string | null;
+}
+
+export interface BrainLifecycleEventRecord {
+  id: number;
+  claimId: string;
+  toStatus: BrainLifecycleTransitionStatus;
+  source: BrainLifecycleSource;
+  // When the resolving evidence happened (max cite timestamp for model
+  // events); createdAtMs is when the event was recorded.
+  evidenceAtMs: number | null;
+  note: string | null;
+  runId: string | null;
+  model: string | null;
+  // Set when regeneration could not re-key this event onto a replacement
+  // claim; orphaned events are kept for audit but excluded from folds.
+  orphanedAtMs: number | null;
+  createdAtMs: number;
+  cites: BrainLifecycleEventCite[];
+}
+
+// Writer input — one validated transition. Model-source terminals must cite
+// offered, postdating evidence; user transitions need no cites.
+export interface BrainLifecycleTransitionInput {
+  claimId: string;
+  toStatus: BrainLifecycleTransitionStatus;
+  cites?: string[];
+  note?: string | null;
+}
+
+export interface BrainLifecycleApplyResult {
+  applied: number;
+  events: BrainLifecycleEventRecord[];
+}
+
+// A cited message resolved for display: thread coordinates for click-through
+// plus a read-time sender label and bounded snippet.
+export interface BrainLifecycleCiteView {
+  sourceMessageKey: string;
+  chatId: number | null;
+  messageId: number | null;
+  timestampMs: number | null;
+  senderLabel: string | null;
+  snippet: string | null;
+}
+
+export interface BrainLifecycleResolutionView {
+  status: BrainLifecycleTransitionStatus;
+  source: BrainLifecycleSource;
+  atMs: number;
+  note: string | null;
+  model: string | null;
+  cites: BrainLifecycleCiteView[];
+}
+
+// One open/closed item on the L0 surface. Open-items semantics are pinned
+// STATUS-driven: every node folding open appears regardless of salience or
+// dormancy, with overdue/stale flags distinct from plain open.
+export interface BrainLifecycleItem {
+  nodeId: string;
+  slug: string;
+  kind: "commitment" | "question";
+  claimId: string;
+  text: string;
+  chatSourceId: string;
+  chatDisplayName: string | null;
+  holderJid: string | null;
+  holderLabel: string | null;
+  // The anchor: max citation timestamp of the claim that minted the node —
+  // resolutions must postdate this.
+  openedAtMs: number | null;
+  dueMs: number | null;
+  lastEvidenceAtMs: number | null;
+  lastReviewedAtMs: number | null;
+  status: BrainLifecycleStatus;
+  overdue: boolean;
+  stale: boolean;
+  // Deterministic closure candidates newer than the last review (sweep fuel).
+  candidateCount: number;
+  salience: number;
+  dormant: boolean;
+  resolution: BrainLifecycleResolutionView | null;
+}
+
+export interface BrainLifecycleCounts {
+  open: number;
+  overdue: number;
+  stale: number;
+  fulfilled: number;
+  dismissed: number;
+  // Open nodes with unreviewed candidate evidence (or a due date passed since
+  // the last review) — what a closure sweep would actually spend calls on.
+  sweepDue: number;
+  // Events left keyed to superseded claims that could not be re-keyed.
+  orphanedEvents: number;
+}
+
+// The unified surface filter: the count chips double as filter buttons. The
+// flag views (overdue/stale/sweep_due) narrow the OPEN set; fulfilled/dismissed
+// are the closed views; open shows all open; all shows everything.
+export type BrainLifecycleView = "open" | "overdue" | "stale" | "sweep_due" | "fulfilled" | "dismissed" | "all";
+
+// User-selectable ordering. `smart` keeps the pinned default (overdue-first for
+// open views, most-recently-resolved for closed views); the rest are explicit.
+export type BrainLifecycleSort =
+  | "smart"
+  | "due_asc"
+  | "due_desc"
+  | "opened_asc"
+  | "opened_desc"
+  | "evidence_desc"
+  | "recent_activity";
+
+// One source group present in the current status view, with how many items it
+// holds — powers the include/exclude group filter (focus / ignore groups).
+export interface BrainLifecycleChatFacet {
+  chatSourceId: string;
+  chatDisplayName: string | null;
+  count: number;
+}
+
+export interface BrainLifecycleListResponse {
+  items: BrainLifecycleItem[];
+  counts: BrainLifecycleCounts;
+  // Groups that have items in the current status+kind scope (before flag/hide/
+  // include/exclude narrowing), ranked by count — the group-filter picker.
+  chatFacets: BrainLifecycleChatFacet[];
+  asOfMs: number;
+  staleDays: number;
+}
+
+// A candidate evidence line enriched with thread coordinates for the detail
+// modal's click-through (the list DTO carries only the count).
+export interface BrainLifecycleDetailCandidate extends BrainLifecycleCandidate {
+  chatId: number | null;
+  messageId: number | null;
+}
+
+// Full context for one lifecycle item (the detail modal): the item itself, the
+// messages the commitment/question was extracted FROM (origin), all later
+// evidence gathered for it, and the transition history.
+export interface BrainLifecycleItemDetail {
+  item: BrainLifecycleItem;
+  // The claim's own citations — the conversation where it was made ("why this
+  // exists"), with thread coordinates.
+  origin: BrainLifecycleCiteView[];
+  // Every postdating candidate (not just since-last-review), so the modal shows
+  // the complete evidence picture.
+  candidates: BrainLifecycleDetailCandidate[];
+  // Recorded transitions (reviews, closures, reopens) newest-last.
+  events: BrainLifecycleEventRecord[];
+}
+
+// One candidate evidence line for the sweep prompt (deterministic, pure SQL).
+export type BrainLifecycleCandidateKind = "reaction" | "reply" | "claim";
+
+export interface BrainLifecycleCandidate {
+  kind: BrainLifecycleCandidateKind;
+  sourceMessageKey: string;
+  timestampMs: number | null;
+  senderJid: string | null;
+  senderLabel: string | null;
+  // Reaction emoji, reply/message text, or the candidate claim's text.
+  text: string;
+  // For 'claim' candidates: the claim whose citations back this line.
+  claimId: string | null;
+}
+
+// One sweep-due node with its rendered evidence, grouped per chat by the
+// repository so the run loop can batch calls chat-by-chat.
+export interface BrainLifecycleSweepNode {
+  nodeId: string;
+  claimId: string;
+  kind: "commitment" | "question";
+  text: string;
+  holderLabel: string | null;
+  openedAtMs: number | null;
+  dueMs: number | null;
+  candidates: BrainLifecycleCandidate[];
+}
+
+export interface BrainLifecycleSweepBatch {
+  chatSourceId: string;
+  chatDisplayName: string | null;
+  nodes: BrainLifecycleSweepNode[];
 }
 
 // Progress of a search reindex job (chunked FTS rebuild).

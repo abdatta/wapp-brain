@@ -4,12 +4,19 @@
 // from memory; lifecycle mirrors to the server console; budgets are hard
 // named stops, never silent.
 
-import type { BrainBackfillStatus, BrainChatBacklogItem, BrainRunProgress } from "../../shared/types";
+import type {
+  BrainBackfillStatus,
+  BrainChatBacklogItem,
+  BrainLifecycleSweepProgress,
+  BrainReasoningEffort,
+  BrainRunProgress
+} from "../../shared/types";
 import { config } from "../config";
 import type { ArchiveRepository } from "../db/repository";
 import { PublicError, publicErrorMessage } from "../privacy";
 import { buildEvidencePacks, EXTRACTION_VERSION, generateEpisodeForPack } from "./episodes";
-import { getBrainProviderStatus } from "./provider";
+import { buildLifecycleSweepPrompt, parseLifecycleSweepResponse, type LifecycleSweepResolution } from "./lifecycle";
+import { generateStructured, getBrainProviderStatus } from "./provider";
 import { auditCatchup, drainBrainTasks } from "./scheduler";
 
 // Backfill fallback canary (historical-backfill H5): the warning fires only
@@ -46,7 +53,8 @@ const progress: BrainRunProgress = {
   modelCalls: 0,
   startedAt: null,
   finishedAt: null,
-  error: null
+  error: null,
+  lifecycle: null
 };
 
 // Cooperative cancellation: the run loop checks this between chats. A cancel
@@ -176,6 +184,7 @@ export function startBrainRun(
   progress.startedAt = new Date().toISOString();
   progress.finishedAt = null;
   progress.error = null;
+  progress.lifecycle = null;
   void executeRun(repository, request, beforeAssimilation)
     .then(async (outcome) => {
       // Graph maintenance after every terminal run that committed episodes:
@@ -671,6 +680,276 @@ async function executeBackfillRun(
       await repository.resetInFlightBrainTasks(0).catch(() => undefined);
       await repository.releaseBrainLock(runId!);
     }
+  }
+}
+
+// --- Lifecycle closure sweep (commitment-lifecycle) -------------------------
+// The standalone executor of the single resolutions contract: per-chat batches
+// of sweep-due nodes + deterministic candidate evidence go to the model, the
+// validated resolutions apply through the one transactional writer, and there
+// is NO fallback — a twice-failed call leaves its nodes open with visible
+// validation issues (there is no honest extractive closure). semantic-rollups
+// embeds the same contract inside its rollup calls later.
+
+export interface BrainLifecycleSweepRequest {
+  chatSourceId?: string | null;
+  // Explicit item selection: sweep exactly these lifecycle claims (a specific
+  // item or a chosen subset), overriding the whole-scope sweep-due set.
+  claimIds?: string[] | null;
+  model?: string | null;
+  // Rollup-class judgment always runs at HIGH reasoning effort (fixed for
+  // every provider — the claude CLI has no effort knob, and high is the right
+  // pick for closure judgment on GPT too). Kept overridable for the CLI/API.
+  effort?: BrainReasoningEffort | null;
+  maxModelCalls?: number | null;
+  maxTokens?: number | null;
+}
+
+export function startBrainLifecycleSweep(
+  repository: ArchiveRepository,
+  request: BrainLifecycleSweepRequest,
+  onDone?: (result: { ok: boolean }) => void
+): { started: boolean; progress: BrainRunProgress; refusal?: string } {
+  if (progress.state === "running") {
+    return { started: false, progress: getBrainRunProgress(), refusal: "A brain run is already in progress." };
+  }
+  const provider = getBrainProviderStatus();
+  if (!provider.modelBacked || !provider.enabled || provider.sessionMissing) {
+    return { started: false, progress: getBrainRunProgress(), refusal: provider.message };
+  }
+  if (provider.degraded) {
+    return {
+      started: false,
+      progress: getBrainRunProgress(),
+      refusal: `${provider.message} Probe the provider before sweeping.`
+    };
+  }
+  progress.state = "running";
+  cancelRequested = false;
+  progress.runId = null;
+  progress.kind = "lifecycle";
+  progress.queuedTasks = null;
+  progress.estimatedEpisodes = null;
+  progress.mode = "model";
+  progress.provider = provider.provider;
+  progress.model = request.model?.trim() || provider.model;
+  progress.processedChats = 0;
+  progress.totalChats = 0;
+  progress.currentChat = null;
+  progress.tokensUsed = 0;
+  progress.episodesCommitted = 0;
+  progress.extractiveEpisodes = 0;
+  progress.claimsCommitted = 0;
+  progress.modelCalls = 0;
+  progress.startedAt = new Date().toISOString();
+  progress.finishedAt = null;
+  progress.error = null;
+  progress.lifecycle = { nodesOffered: 0, fulfilled: 0, dismissed: 0, stillOpen: 0, failedCalls: 0 };
+  void executeLifecycleSweep(repository, request)
+    .then((outcome) => {
+      progress.state = outcome;
+      progress.finishedAt = new Date().toISOString();
+      const counters = progress.lifecycle!;
+      console.log(
+        `[brain] lifecycle sweep ${outcome}: ${counters.nodesOffered} node(s) offered — ${counters.fulfilled} fulfilled, ` +
+          `${counters.dismissed} dismissed, ${counters.stillOpen} still open, ${counters.failedCalls} failed call(s), ` +
+          `${progress.modelCalls} model call(s)`
+      );
+      onDone?.({ ok: outcome === "completed" });
+    })
+    .catch((error) => {
+      progress.state = "failed";
+      progress.error = publicErrorMessage(error);
+      progress.finishedAt = new Date().toISOString();
+      console.error(`[brain] lifecycle sweep FAILED: ${progress.error}`);
+      onDone?.({ ok: false });
+    });
+  return { started: true, progress: getBrainRunProgress() };
+}
+
+async function executeLifecycleSweep(
+  repository: ArchiveRepository,
+  request: BrainLifecycleSweepRequest
+): Promise<"completed" | "budget_exceeded" | "interrupted"> {
+  const runId = await repository.startBrainRun("lifecycle");
+  progress.runId = runId;
+  const counters: BrainLifecycleSweepProgress = progress.lifecycle!;
+  try {
+    const batches = await repository.listBrainLifecycleSweepBatches({
+      chatSourceId: request.chatSourceId ?? null,
+      claimIds: request.claimIds ?? undefined
+    });
+    const chats = new Set(batches.map((batch) => batch.chatSourceId));
+    progress.totalChats = chats.size;
+    const effort = request.effort ?? "high";
+    const scope = request.claimIds && request.claimIds.length > 0 ? `${request.claimIds.length} selected item(s)` : "sweep-due node(s)";
+    console.log(
+      `[brain] lifecycle sweep started (${progress.provider}/${progress.model ?? "default"}, effort ${effort}) — ` +
+        `${batches.reduce((sum, batch) => sum + batch.nodes.length, 0)} ${scope} across ${chats.size} chat(s), ${batches.length} call(s) planned` +
+        (request.maxModelCalls != null ? `, ≤${request.maxModelCalls} call(s)` : "") +
+        (request.maxTokens != null ? `, ≤${request.maxTokens.toLocaleString()} tokens` : "")
+    );
+    let budgetStop: string | null = null;
+    let cancelled = false;
+    let providerDegraded = false;
+    const processedChats = new Set<string>();
+    for (const batch of batches) {
+      if (cancelRequested) {
+        cancelled = true;
+        break;
+      }
+      if (getBrainProviderStatus().degraded) {
+        providerDegraded = true;
+        break;
+      }
+      const usedToday = await repository.getBrainLlmUsage({ day: utcDayString() });
+      if (usedToday.calls >= config.brain.maxCallsPerDay) {
+        budgetStop = `Daily model-call budget (${config.brain.maxCallsPerDay}) was reached; remaining sweep-due nodes stay open and sweepable.`;
+        break;
+      }
+      if (request.maxModelCalls != null && progress.modelCalls >= request.maxModelCalls) {
+        budgetStop = `Model-call ceiling for this sweep (${request.maxModelCalls} call(s)) was reached; remaining sweep-due nodes stay open and sweepable.`;
+        break;
+      }
+      if (request.maxTokens != null && request.maxTokens > 0 && progress.tokensUsed >= request.maxTokens) {
+        budgetStop = `Token budget for this sweep (${request.maxTokens.toLocaleString()} tokens) was reached; remaining sweep-due nodes stay open and sweepable.`;
+        break;
+      }
+      progress.currentChat = batch.chatDisplayName ?? batch.chatSourceId;
+      const prompt = buildLifecycleSweepPrompt(batch, Date.now());
+      let resolutions: LifecycleSweepResolution[] | null = null;
+      let stillOpenClaimIds: string[] = [];
+      let lastErrors: string[] = [];
+      for (let attempt = 0; attempt < 2 && resolutions == null; attempt += 1) {
+        const user =
+          attempt === 0
+            ? prompt.user
+            : `${prompt.user}\n\nYour previous response had these problems — fix ALL of them and respond again with the complete JSON:\n${lastErrors.map((error) => `- ${error}`).join("\n")}`;
+        const result = await generateStructured({
+          system: prompt.system,
+          user,
+          maxOutputTokens: prompt.maxOutputTokens,
+          model: progress.model,
+          effort
+        });
+        progress.modelCalls += 1;
+        progress.tokensUsed += result.usage.inputTokens + result.usage.outputTokens;
+        await repository.recordBrainLlmUsage({
+          purpose: "lifecycle",
+          provider: `${progress.provider}/${progress.model ?? "default"}`,
+          inputTokens: result.usage.inputTokens,
+          outputTokens: result.usage.outputTokens,
+          estimated: result.usage.estimated ?? false
+        });
+        const parsed = parseLifecycleSweepResponse(result.json, prompt);
+        if (parsed.errors.length === 0) {
+          resolutions = parsed.resolutions;
+          stillOpenClaimIds = parsed.missingAliases.map((alias) => prompt.nodeByAlias.get(alias)!.claimId);
+        } else {
+          lastErrors = parsed.errors;
+        }
+      }
+      counters.nodesOffered += batch.nodes.length;
+      if (resolutions == null) {
+        // No fallback by design: an invented closure would be worse than an
+        // open item. The nodes stay open AND sweep-due; the failure is loud.
+        counters.failedCalls += 1;
+        await repository.recordBrainValidationIssues([
+          {
+            runId,
+            chatSourceId: batch.chatSourceId,
+            code: "lifecycle_sweep_invalid",
+            severity: "error",
+            detail: `Closure sweep response failed validation twice; ${batch.nodes.length} node(s) left open. Errors: ${lastErrors.join("; ")}`
+          }
+        ]);
+        console.warn(`[brain] lifecycle sweep: response failed validation twice for one chat batch (${batch.nodes.length} node(s) left open)`);
+      } else {
+        const transitions = [
+          ...resolutions.map((resolution) => ({
+            claimId: resolution.claimId,
+            toStatus: resolution.toStatus,
+            cites: resolution.cites.map((cite) => cite.sourceMessageKey),
+            note: resolution.note
+          })),
+          // Offered-but-unresolved nodes get a still_open review stamp, so
+          // `stale` can honestly mean "reviewed and still open".
+          ...stillOpenClaimIds.map((claimId) => ({ claimId, toStatus: "still_open" as const, cites: [], note: null }))
+        ];
+        const allowedCitesByClaim = new Map(batch.nodes.map((node) => [node.claimId, node.candidates]));
+        try {
+          await repository.applyBrainLifecycleTransitions(transitions, {
+            source: "model",
+            runId,
+            model: progress.model,
+            allowedCitesByClaim
+          });
+          for (const resolution of resolutions) {
+            if (resolution.toStatus === "fulfilled") counters.fulfilled += 1;
+            else if (resolution.toStatus === "dismissed") counters.dismissed += 1;
+            else counters.stillOpen += 1;
+          }
+          counters.stillOpen += stillOpenClaimIds.length;
+        } catch (error) {
+          // The writer's independent re-check refused (defense in depth):
+          // record and move on — nodes stay open.
+          counters.failedCalls += 1;
+          await repository.recordBrainValidationIssues([
+            {
+              runId,
+              chatSourceId: batch.chatSourceId,
+              code: "lifecycle_apply_refused",
+              severity: "error",
+              detail: publicErrorMessage(error)
+            }
+          ]);
+          console.warn(`[brain] lifecycle sweep: transition writer refused a batch: ${publicErrorMessage(error)}`);
+        }
+      }
+      if (!processedChats.has(batch.chatSourceId)) {
+        processedChats.add(batch.chatSourceId);
+        progress.processedChats = processedChats.size;
+      }
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    const totals = {
+      chats: processedChats.size,
+      chatsVisited: processedChats.size,
+      modelCalls: progress.modelCalls,
+      tokens: progress.tokensUsed,
+      nodesOffered: counters.nodesOffered,
+      fulfilled: counters.fulfilled,
+      dismissed: counters.dismissed,
+      stillOpen: counters.stillOpen,
+      failedCalls: counters.failedCalls
+    };
+    if (cancelled) {
+      await repository.failBrainRun(
+        runId,
+        "interrupted",
+        "Sweep cancelled; applied transitions are kept, remaining sweep-due nodes stay open.",
+        totals
+      );
+      return "interrupted";
+    }
+    if (providerDegraded) {
+      await repository.failBrainRun(
+        runId,
+        "interrupted",
+        `Provider ${progress.provider}${progress.model ? `/${progress.model}` : ""} became unavailable mid-sweep; applied transitions are kept, remaining sweep-due nodes stay open. Probe/recover the provider, then sweep again.`,
+        totals
+      );
+      return "interrupted";
+    }
+    if (budgetStop) {
+      await repository.failBrainRun(runId, "budget_exceeded", budgetStop, totals);
+      return "budget_exceeded";
+    }
+    await repository.completeBrainRun(runId, totals);
+    return "completed";
+  } catch (error) {
+    await repository.failBrainRun(runId, "failed", publicErrorMessage(error)).catch(() => undefined);
+    throw error;
   }
 }
 

@@ -36,6 +36,21 @@ import type {
   BrainGraphSyncResult,
   BrainGraphUnresolvedEntity,
   BrainGraphNodeSuggestion,
+  BrainLifecycleApplyResult,
+  BrainLifecycleCandidate,
+  BrainLifecycleCiteView,
+  BrainLifecycleEventRecord,
+  BrainLifecycleItem,
+  BrainLifecycleDetailCandidate,
+  BrainLifecycleItemDetail,
+  BrainLifecycleListResponse,
+  BrainLifecycleResolutionView,
+  BrainLifecycleSort,
+  BrainLifecycleSource,
+  BrainLifecycleStatus,
+  BrainLifecycleSweepBatch,
+  BrainLifecycleSweepNode,
+  BrainLifecycleTransitionInput,
   BrainModelQualityAggregate,
   BrainLlmUsageSummary,
   BrainMediaGapImpact,
@@ -153,6 +168,18 @@ import {
   type GraphMutations,
   type GraphNodeSpec
 } from "../brain/graph";
+import {
+  compareLifecycleItems,
+  computeLifecycleFlags,
+  foldLifecycleEvents,
+  LIFECYCLE_MAX_CANDIDATES_PER_NODE,
+  LIFECYCLE_SWEEP_MAX_NODES_PER_CALL,
+  lifecycleStaleDays,
+  projectLifecyclePayload,
+  sortLifecycleItems,
+  validateLifecycleTransition,
+  type LifecycleFold
+} from "../brain/lifecycle";
 import { resolveNeighborhoodParams, shapeNeighborhood, type NeighborhoodWalk } from "../brain/graphQuery";
 import { isMaskedNumberLabel, normalizeJid, phoneFromJid, resolveDisplayLabel } from "../import/jid";
 import { normalizeOwnerSelfInput } from "../identity/ownerSelf";
@@ -308,6 +335,10 @@ export class MemoryArchiveRepository implements ArchiveRepository {
   private graphNodeClaims = new Map<string, Set<string>>();
   private graphAliases = new Map<string, Map<string, { alias: string; source: string }>>();
   private graphLastRecomputeAt: string | null = null;
+  // Commitment lifecycle (mirror): the durable append-only event log keyed by
+  // claim id, exactly like brain_lifecycle_events + cites in SQLite.
+  private lifecycleEvents: BrainLifecycleEventRecord[] = [];
+  private lifecycleEventSeq = 1;
   private editRevisions = new Map<string, MessageEditRevisionRecord[]>();
   private nextMediaQueueId = 1;
   private nextMediaAssetId = 1;
@@ -4036,6 +4067,16 @@ export class MemoryArchiveRepository implements ArchiveRepository {
         this.memRemoveGraphContributionForEpisode(id);
       }
     }
+    // Lifecycle transitions are derived state (model spend to re-derive): a
+    // reset wipes them with their claims, mirroring the SQLite deletes.
+    if (!chat) {
+      this.lifecycleEvents = [];
+    } else {
+      const claimIds = new Set(
+        episodeIds.flatMap((id) => this.brainEpisodes.get(id)?.claims.map((claim) => claim.id) ?? [])
+      );
+      this.lifecycleEvents = this.lifecycleEvents.filter((event) => !claimIds.has(event.claimId));
+    }
     for (const id of episodeIds) {
       this.brainEpisodes.delete(id);
     }
@@ -4135,11 +4176,15 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       await this.advanceBrainWatermark(episode.chatSourceId, episode.endAtMs);
     }
     // Supersede-with-replacement mirrors the SQLite transaction semantics.
+    let rekeyedLifecycleClaims: string[] = [];
     if (episode.supersedesEpisodeId) {
       const superseded = this.brainEpisodes.get(episode.supersedesEpisodeId);
       if (superseded) {
         superseded.status = "superseded";
       }
+      // Lifecycle transitions follow the commitment across regeneration:
+      // re-key onto the unique citation-sharing replacement, else orphan.
+      rekeyedLifecycleClaims = this.memRekeyLifecycleEventsForSupersededEpisode(episode.supersedesEpisodeId);
       // Graph scope rule mirror: the superseded episode's contribution leaves
       // before the replacement's arrives.
       this.memRemoveGraphContributionForEpisode(episode.supersedesEpisodeId);
@@ -4147,6 +4192,9 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     // Knowledge graph mirror of the SQLite commit transaction: model episodes
     // contribute nodes/edges/junctions; extractive placeholders contribute none.
     this.memApplyEpisodeGraph(record);
+    for (const claimId of rekeyedLifecycleClaims) {
+      this.memProjectLifecycleClaim(claimId);
+    }
     return structuredClone(record);
   }
 
@@ -4174,6 +4222,13 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     const episode = this.brainEpisodes.get(episodeId);
     if (episode) {
       episode.status = "superseded";
+      // The replacement-less supersede mirrors SQLite: graph scope rule plus
+      // lifecycle re-key/orphan apply here too.
+      const rekeyed = this.memRekeyLifecycleEventsForSupersededEpisode(episodeId);
+      this.memRemoveGraphContributionForEpisode(episodeId);
+      for (const claimId of rekeyed) {
+        this.memProjectLifecycleClaim(claimId);
+      }
     }
   }
 
@@ -4181,6 +4236,725 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     return [...this.brainEpisodes.values()].filter(
       (episode) => episode.status === "current" && (episode.generator === "extractive" || episode.extractionVersion < currentVersion)
     ).length;
+  }
+
+  // === Commitment lifecycle (mirror of the SQLite implementation) ==========
+  // Durable events keyed by claim id, folded via the shared pure module; node
+  // payload status and `resolves` edges are projections — parity by module.
+
+  private memLifecycleEventsForClaim(claimId: string): BrainLifecycleEventRecord[] {
+    return this.lifecycleEvents.filter((event) => event.claimId === claimId).sort((a, b) => a.id - b.id);
+  }
+
+  private memLifecycleNodeForClaim(claimId: string): MemGraphNode | undefined {
+    const nodeId = this.graphNodeIdByKey.get(`commitment:${claimId}`) ?? this.graphNodeIdByKey.get(`question:${claimId}`);
+    const node = nodeId ? this.graphNodes.get(nodeId) : undefined;
+    return node && node.status !== "merged" ? node : undefined;
+  }
+
+  private memLifecycleClaim(claimId: string): { claim: BrainEpisodeRecord["claims"][number]; episode: BrainEpisodeRecord } | undefined {
+    for (const episode of this.brainEpisodes.values()) {
+      const claim = episode.claims.find((candidate) => candidate.id === claimId);
+      if (claim) {
+        return { claim, episode };
+      }
+    }
+    return undefined;
+  }
+
+  private memLifecycleAnchor(claimId: string): { anchorMs: number | null; anchorKeys: string[] } {
+    const found = this.memLifecycleClaim(claimId);
+    if (!found) {
+      return { anchorMs: null, anchorKeys: [] };
+    }
+    let anchorMs: number | null = null;
+    for (const citation of found.claim.citations) {
+      if (citation.timestampMs != null) {
+        anchorMs = anchorMs == null ? citation.timestampMs : Math.max(anchorMs, citation.timestampMs);
+      }
+    }
+    return { anchorMs, anchorKeys: found.claim.citations.map((citation) => citation.sourceMessageKey) };
+  }
+
+  private memLifecycleLabelForJid(jid: string): string {
+    if (jid === "me") {
+      return this.ownerDisplayName?.trim() || "the archive owner";
+    }
+    const canonical = this.canonicalJid(jid) ?? jid;
+    const contact = this.contacts.get(canonical);
+    return (
+      resolveDisplayLabel({
+        displayName: contact?.displayName ?? null,
+        pushName: contact?.pushName ?? null,
+        phoneNumber: contact?.phoneNumber ?? null,
+        jid: canonical
+      }) ?? canonical
+    );
+  }
+
+  private memLifecycleCandidates(input: {
+    claimId: string;
+    chatSourceId: string;
+    sinceMs: number;
+    anchorKeys: string[];
+  }): BrainLifecycleCandidate[] {
+    const candidates: BrainLifecycleCandidate[] = [];
+    if (input.anchorKeys.length === 0) {
+      return candidates;
+    }
+    const anchorKeySet = new Set(input.anchorKeys);
+    // (a) Reactions on the claim's cited messages.
+    for (const update of this.liveUpdates.values()) {
+      if (update.updateType !== "reaction" || !update.applied || !anchorKeySet.has(update.sourceMessageKey)) {
+        continue;
+      }
+      const emoji = typeof update.metadata?.emoji === "string" ? update.metadata.emoji : "";
+      if (!emoji || update.occurredAtMs == null || update.occurredAtMs <= input.sinceMs) {
+        continue;
+      }
+      const reactorRaw = (update.metadata?.reactorJid as string | null | undefined) ?? null;
+      const reactor = reactorRaw ? this.canonicalJid(reactorRaw) ?? reactorRaw : null;
+      candidates.push({
+        kind: "reaction",
+        sourceMessageKey: update.sourceMessageKey,
+        timestampMs: update.occurredAtMs,
+        senderJid: reactor,
+        senderLabel: reactor ? this.memLifecycleLabelForJid(reactor) : null,
+        text: emoji,
+        claimId: null
+      });
+    }
+    // (b) Replies quoting a cited message (snapshot incl. cross-chat, or the
+    // legacy same-chat pointer).
+    const anchorMessages = [...this.messages.values()].filter((message) => anchorKeySet.has(message.sourceMessageKey));
+    const seenReplies = new Set<string>();
+    for (const anchor of anchorMessages) {
+      for (const message of this.messages.values()) {
+        if (message.timestampMs == null || message.timestampMs <= input.sinceMs || seenReplies.has(message.sourceMessageKey)) {
+          continue;
+        }
+        const snapshotId = message.quotedSnapshot?.quotedSourceMessageId ?? null;
+        const pointerId = message.quotedSourceMessageId ?? null;
+        let matches = false;
+        if (snapshotId === anchor.sourceMessageId) {
+          const quotedChat = message.quotedSnapshot?.quotedSourceChatId
+            ? this.canonicalJid(message.quotedSnapshot.quotedSourceChatId) ?? message.quotedSnapshot.quotedSourceChatId
+            : message.chatSourceId;
+          matches = quotedChat === anchor.chatSourceId;
+        } else if (pointerId === anchor.sourceMessageId) {
+          matches = message.chatSourceId === anchor.chatSourceId;
+        }
+        if (!matches) {
+          continue;
+        }
+        seenReplies.add(message.sourceMessageKey);
+        const sender = message.senderSourceJid ? this.canonicalJid(message.senderSourceJid) ?? message.senderSourceJid : null;
+        const text = message.body?.trim() || message.caption?.trim() || `[${message.messageType} message]`;
+        candidates.push({
+          kind: "reply",
+          sourceMessageKey: message.sourceMessageKey,
+          timestampMs: message.timestampMs,
+          senderJid: sender,
+          senderLabel: sender ? this.memLifecycleLabelForJid(sender) : null,
+          text,
+          claimId: null
+        });
+      }
+    }
+    // (c) Later model claims in the same chat sharing an entity.
+    const found = this.memLifecycleClaim(input.claimId);
+    if (found) {
+      const entityJids = new Set(found.claim.entities.filter((entity) => entity.jid).map((entity) => entity.jid!));
+      const entityNames = new Set(
+        found.claim.entities.filter((entity) => !entity.jid && entity.name.trim()).map((entity) => entity.name.trim().toLowerCase())
+      );
+      if (entityJids.size > 0 || entityNames.size > 0) {
+        const claimRows: Array<{ claimId: string; text: string; ts: number; key: string; senderJid: string | null }> = [];
+        for (const episode of this.brainEpisodes.values()) {
+          if (episode.status !== "current" || episode.generator !== "model" || episode.chatSourceId !== input.chatSourceId) {
+            continue;
+          }
+          for (const claim of episode.claims) {
+            if (claim.id === input.claimId) {
+              continue;
+            }
+            const overlap = claim.entities.some(
+              (entity) =>
+                (entity.jid && entityJids.has(entity.jid)) ||
+                (!entity.jid && entityNames.has(entity.name.trim().toLowerCase()))
+            );
+            if (!overlap) {
+              continue;
+            }
+            const dated = claim.citations.filter((citation) => citation.timestampMs != null);
+            if (dated.length === 0) {
+              continue;
+            }
+            const latest = dated.reduce((best, citation) => (citation.timestampMs! > best.timestampMs! ? citation : best));
+            if (latest.timestampMs! <= input.sinceMs) {
+              continue;
+            }
+            claimRows.push({
+              claimId: claim.id,
+              text: claim.text,
+              ts: latest.timestampMs!,
+              key: latest.sourceMessageKey,
+              senderJid: latest.senderSourceJid ? this.canonicalJid(latest.senderSourceJid) ?? latest.senderSourceJid : null
+            });
+          }
+        }
+        claimRows.sort((a, b) => b.ts - a.ts);
+        for (const row of claimRows.slice(0, 6)) {
+          candidates.push({
+            kind: "claim",
+            sourceMessageKey: row.key,
+            timestampMs: row.ts,
+            senderJid: row.senderJid,
+            senderLabel: row.senderJid ? this.memLifecycleLabelForJid(row.senderJid) : null,
+            text: row.text,
+            claimId: row.claimId
+          });
+        }
+      }
+    }
+    const priority: Record<BrainLifecycleCandidate["kind"], number> = { reaction: 0, reply: 1, claim: 2 };
+    candidates.sort((a, b) => priority[a.kind] - priority[b.kind] || (b.timestampMs ?? 0) - (a.timestampMs ?? 0));
+    return candidates.slice(0, LIFECYCLE_MAX_CANDIDATES_PER_NODE);
+  }
+
+  private memRecomputeSalienceForNode(nodeId: string): void {
+    const node = this.graphNodes.get(nodeId);
+    if (!node || node.status === "merged") {
+      return;
+    }
+    const claimById = new Map<string, BrainEpisodeRecord["claims"][number]>();
+    for (const episode of this.brainEpisodes.values()) {
+      for (const claim of episode.claims) {
+        claimById.set(claim.id, claim);
+      }
+    }
+    let citations = 0;
+    const days = new Set<string>();
+    let lastTs: number | null = null;
+    const record = (ts: number | null) => {
+      citations += 1;
+      if (ts != null) {
+        days.add(new Date(ts).toISOString().slice(0, 10));
+        lastTs = lastTs == null ? ts : Math.max(lastTs, ts);
+      }
+    };
+    for (const claimId of this.graphNodeClaims.get(nodeId) ?? []) {
+      for (const citation of claimById.get(claimId)?.citations ?? []) {
+        record(citation.timestampMs);
+      }
+    }
+    for (const edge of this.graphEdges.values()) {
+      if (edge.srcNodeId !== nodeId && edge.dstNodeId !== nodeId) {
+        continue;
+      }
+      for (const evidence of edge.evidence.values()) {
+        record(evidence.observedAtMs);
+      }
+    }
+    const computed = computeGraphSalience({
+      kind: node.kind,
+      payload: node.payload,
+      citations,
+      evidenceDays: days.size,
+      lastEvidenceAtMs: lastTs,
+      nowMs: Date.now(),
+      engagementFactor: node.engagementFactor,
+      dormancyThreshold: graphDormancyThreshold()
+    });
+    node.salience = computed.salience;
+    node.status = computed.dormant ? "dormant" : "active";
+    node.citationCount = citations;
+    node.evidenceDays = days.size;
+    if (lastTs != null) {
+      node.lastSeenAtMs = node.lastSeenAtMs == null ? lastTs : Math.max(node.lastSeenAtMs, lastTs);
+    }
+  }
+
+  private memProjectLifecycleClaim(claimId: string, fold?: LifecycleFold): void {
+    const node = this.memLifecycleNodeForClaim(claimId);
+    if (!node) {
+      return;
+    }
+    const resolved = fold ?? foldLifecycleEvents(this.memLifecycleEventsForClaim(claimId));
+    node.payload = projectLifecyclePayload(node.payload, resolved);
+    for (const [key, edge] of [...this.graphEdges]) {
+      if (edge.dstNodeId === node.id && edge.kind === "resolves") {
+        this.graphEdges.delete(key);
+        this.graphEdgesById.delete(edge.id);
+      }
+    }
+    const resolvingEvent = resolved.resolvingEvent;
+    if (resolvingEvent && resolvingEvent.source === "model") {
+      for (const cite of resolvingEvent.cites) {
+        if (!cite.actorJid) {
+          continue;
+        }
+        const canonical = this.canonicalJid(cite.actorJid) ?? cite.actorJid;
+        const actorNodeId = this.memEnsureGraphNode({
+          naturalKey: personJidNaturalKey(canonical),
+          kind: "person",
+          title: null,
+          jid: canonical,
+          chatScope: null,
+          payload: null,
+          slugSeed: canonical.split("@")[0] ?? canonical,
+          seenAtMs: cite.timestampMs
+        });
+        if (actorNodeId !== node.id) {
+          this.memAddGraphEdgeEvidence(actorNodeId, node.id, "resolves", {
+            key: `msg:${cite.sourceMessageKey}`,
+            sourceMessageKey: cite.sourceMessageKey,
+            observedAtMs: cite.timestampMs
+          });
+        }
+      }
+    }
+    this.memRecomputeSalienceForNode(node.id);
+  }
+
+  private memProjectLifecycleState(): number {
+    const claimIds = [...new Set(this.lifecycleEvents.filter((event) => event.orphanedAtMs == null).map((event) => event.claimId))];
+    for (const claimId of claimIds) {
+      this.memProjectLifecycleClaim(claimId);
+    }
+    return claimIds.length;
+  }
+
+  private memRekeyLifecycleEventsForSupersededEpisode(oldEpisodeId: string): string[] {
+    const rekeyed: string[] = [];
+    const oldEpisode = this.brainEpisodes.get(oldEpisodeId);
+    if (!oldEpisode) {
+      return rekeyed;
+    }
+    for (const oldClaim of oldEpisode.claims) {
+      if (oldClaim.kind !== "commitment" && oldClaim.kind !== "question") {
+        continue;
+      }
+      const events = this.lifecycleEvents.filter((event) => event.claimId === oldClaim.id);
+      if (events.length === 0) {
+        continue;
+      }
+      const oldKeys = new Set(oldClaim.citations.map((citation) => citation.sourceMessageKey));
+      const matches: string[] = [];
+      for (const episode of this.brainEpisodes.values()) {
+        if (episode.status !== "current" || episode.generator !== "model") {
+          continue;
+        }
+        for (const claim of episode.claims) {
+          if (claim.kind !== oldClaim.kind || claim.id === oldClaim.id) {
+            continue;
+          }
+          if (claim.citations.some((citation) => oldKeys.has(citation.sourceMessageKey))) {
+            matches.push(claim.id);
+          }
+        }
+      }
+      const unique = [...new Set(matches)];
+      if (unique.length === 1) {
+        for (const event of events) {
+          event.claimId = unique[0]!;
+        }
+        rekeyed.push(unique[0]!);
+      } else {
+        const now = Date.now();
+        for (const event of events) {
+          if (event.orphanedAtMs == null) {
+            event.orphanedAtMs = now;
+          }
+        }
+      }
+    }
+    return rekeyed;
+  }
+
+  async applyBrainLifecycleTransitions(
+    transitions: BrainLifecycleTransitionInput[],
+    context: {
+      source: BrainLifecycleSource;
+      runId?: string | null;
+      model?: string | null;
+      allowedCitesByClaim?: Map<string, BrainLifecycleCandidate[]>;
+    }
+  ): Promise<BrainLifecycleApplyResult> {
+    if (transitions.length === 0) {
+      return { applied: 0, events: [] };
+    }
+    const errors: string[] = [];
+    const prepared: Array<{
+      input: BrainLifecycleTransitionInput;
+      cites: BrainLifecycleEventRecord["cites"];
+    }> = [];
+    for (const input of transitions) {
+      const node = this.memLifecycleNodeForClaim(input.claimId);
+      if (!node) {
+        errors.push(`claim ${input.claimId} has no open commitment/question node`);
+        continue;
+      }
+      const fold = foldLifecycleEvents(this.memLifecycleEventsForClaim(input.claimId));
+      const { anchorMs } = this.memLifecycleAnchor(input.claimId);
+      const allowed = context.allowedCitesByClaim?.get(input.claimId) ?? null;
+      const allowedByKey = allowed ? new Map(allowed.map((candidate) => [candidate.sourceMessageKey, candidate])) : null;
+      const cites: BrainLifecycleEventRecord["cites"] = [];
+      for (const key of input.cites ?? []) {
+        const candidate = allowedByKey?.get(key);
+        if (candidate) {
+          cites.push({
+            sourceMessageKey: key,
+            timestampMs: candidate.timestampMs,
+            resolvingClaimId: candidate.claimId,
+            actorJid: candidate.senderJid
+          });
+        } else {
+          const message = [...this.messages.values()].find((entry) => entry.sourceMessageKey === key);
+          cites.push({
+            sourceMessageKey: key,
+            timestampMs: message?.timestampMs ?? null,
+            resolvingClaimId: null,
+            actorJid: message?.senderSourceJid ?? null
+          });
+        }
+      }
+      const violations = validateLifecycleTransition({
+        toStatus: input.toStatus,
+        source: context.source,
+        currentStatus: fold.status,
+        cites,
+        anchorMs,
+        allowedKeys: context.source === "model" ? new Set(allowedByKey?.keys() ?? []) : null
+      });
+      for (const violation of violations) {
+        errors.push(`claim ${input.claimId}: ${violation}`);
+      }
+      prepared.push({ input, cites });
+    }
+    if (errors.length > 0) {
+      throw new PublicError("BRAIN_LIFECYCLE_INVALID", `Lifecycle transition rejected: ${errors.join("; ")}`);
+    }
+    const now = Date.now();
+    const created: BrainLifecycleEventRecord[] = [];
+    for (const entry of prepared) {
+      const citeTimestamps = entry.cites.map((cite) => cite.timestampMs).filter((ts): ts is number => ts != null);
+      const event: BrainLifecycleEventRecord = {
+        id: this.lifecycleEventSeq++,
+        claimId: entry.input.claimId,
+        toStatus: entry.input.toStatus,
+        source: context.source,
+        evidenceAtMs: citeTimestamps.length > 0 ? Math.max(...citeTimestamps) : null,
+        note: entry.input.note?.trim() || null,
+        runId: context.runId ?? null,
+        model: context.model ?? null,
+        orphanedAtMs: null,
+        createdAtMs: now,
+        cites: entry.cites
+      };
+      this.lifecycleEvents.push(event);
+      created.push(event);
+    }
+    for (const entry of prepared) {
+      this.memProjectLifecycleClaim(entry.input.claimId);
+    }
+    return { applied: created.length, events: structuredClone(created) };
+  }
+
+  private memLifecycleCiteViews(event: BrainLifecycleEventRecord): BrainLifecycleCiteView[] {
+    return event.cites.map((cite) => {
+      const message = [...this.messages.values()].find((entry) => entry.sourceMessageKey === cite.sourceMessageKey);
+      const chat = message ? this.chats.get(message.chatSourceId) : undefined;
+      const text = message?.body?.trim() || message?.caption?.trim() || null;
+      return {
+        sourceMessageKey: cite.sourceMessageKey,
+        chatId: chat?.id ?? null,
+        messageId: message?.id ?? null,
+        timestampMs: cite.timestampMs ?? message?.timestampMs ?? null,
+        senderLabel: cite.actorJid ? this.memLifecycleLabelForJid(cite.actorJid) : null,
+        snippet: text ? (text.length > 160 ? `${text.slice(0, 159)}…` : text) : null
+      };
+    });
+  }
+
+  async getBrainLifecycleItemDetail(claimId: string): Promise<BrainLifecycleItemDetail | null> {
+    const node = this.memLifecycleNodeForClaim(claimId);
+    if (!node) {
+      return null;
+    }
+    const events = this.memLifecycleEventsForClaim(claimId);
+    const fold = foldLifecycleEvents(events);
+    const { anchorMs, anchorKeys } = this.memLifecycleAnchor(claimId);
+    const dueMs = typeof node.payload?.dueMs === "number" ? (node.payload.dueMs as number) : null;
+    const flags = computeLifecycleFlags({
+      status: fold.status,
+      dueMs,
+      lastEvidenceAtMs: node.lastSeenAtMs,
+      lastReviewedAtMs: fold.lastReviewedAtMs,
+      openedAtMs: anchorMs,
+      asOfMs: Date.now(),
+      staleDays: lifecycleStaleDays()
+    });
+    const candidates = this.memLifecycleCandidates({ claimId, chatSourceId: node.chatScope ?? "", sinceMs: anchorMs ?? 0, anchorKeys });
+    const holderJid = typeof node.payload?.holderJid === "string" ? (node.payload.holderJid as string) : null;
+    const found = this.memLifecycleClaim(claimId);
+    const item: BrainLifecycleItem = {
+      nodeId: node.id,
+      slug: node.slug,
+      kind: node.kind as "commitment" | "question",
+      claimId,
+      text: found?.claim.text ?? node.title ?? "",
+      chatSourceId: node.chatScope ?? "",
+      chatDisplayName: node.chatScope ? this.chats.get(node.chatScope)?.displayName ?? null : null,
+      holderJid,
+      holderLabel: holderJid ? this.memLifecycleLabelForJid(holderJid) : null,
+      openedAtMs: anchorMs,
+      dueMs,
+      lastEvidenceAtMs: node.lastSeenAtMs,
+      lastReviewedAtMs: fold.lastReviewedAtMs,
+      status: fold.status,
+      overdue: flags.overdue,
+      stale: flags.stale,
+      candidateCount: candidates.length,
+      salience: node.salience,
+      dormant: node.status === "dormant",
+      resolution: fold.resolvingEvent
+        ? {
+            status: fold.resolvingEvent.toStatus,
+            source: fold.resolvingEvent.source,
+            atMs: fold.resolvedAtMs ?? fold.resolvingEvent.createdAtMs,
+            note: fold.resolvingEvent.note,
+            model: fold.resolvingEvent.model,
+            cites: this.memLifecycleCiteViews(fold.resolvingEvent)
+          }
+        : null
+    };
+    const origin: BrainLifecycleCiteView[] = (found?.claim.citations ?? []).map((cite) => {
+      const message = [...this.messages.values()].find((entry) => entry.sourceMessageKey === cite.sourceMessageKey);
+      const chat = message ? this.chats.get(message.chatSourceId) : undefined;
+      const text = message?.body?.trim() || message?.caption?.trim() || null;
+      return {
+        sourceMessageKey: cite.sourceMessageKey,
+        chatId: chat?.id ?? null,
+        messageId: message?.id ?? null,
+        timestampMs: cite.timestampMs ?? message?.timestampMs ?? null,
+        senderLabel: cite.senderSourceJid ? this.memLifecycleLabelForJid(cite.senderSourceJid) : null,
+        snippet: text ? (text.length > 200 ? `${text.slice(0, 199)}…` : text) : null
+      };
+    });
+    const detailCandidates: BrainLifecycleDetailCandidate[] = candidates.map((candidate) => {
+      const message = this.messages.get(candidate.sourceMessageKey);
+      const chat = message ? this.chats.get(message.chatSourceId) : undefined;
+      return { ...candidate, chatId: chat?.id ?? null, messageId: message?.id ?? null };
+    });
+    return { item, origin, candidates: detailCandidates, events: structuredClone(events) };
+  }
+
+  async listBrainLifecycleItems(
+    options: {
+      status?: BrainLifecycleStatus | "all" | "closed";
+      flag?: "overdue" | "stale" | "sweep_due";
+      hideOverdue?: boolean;
+      hideStale?: boolean;
+      hideFulfilled?: boolean;
+      hideDismissed?: boolean;
+      dueUpcoming?: boolean;
+      kind?: "commitment" | "question";
+      chatSourceId?: string | null;
+      includeChats?: string[];
+      excludeChats?: string[];
+      sort?: BrainLifecycleSort;
+      limit?: number;
+    } = {}
+  ): Promise<BrainLifecycleListResponse> {
+    const asOfMs = Date.now();
+    const staleDays = lifecycleStaleDays();
+    const statusFilter = options.flag ? "open" : options.status ?? "open";
+    const limit = Math.max(1, Math.min(500, options.limit ?? 200));
+    const chatFilter = options.chatSourceId ? this.canonicalJid(options.chatSourceId) ?? options.chatSourceId : null;
+    const includeChats =
+      options.includeChats && options.includeChats.length > 0
+        ? new Set(options.includeChats.map((chat) => this.canonicalJid(chat) ?? chat))
+        : null;
+    const excludeChats =
+      options.excludeChats && options.excludeChats.length > 0
+        ? new Set(options.excludeChats.map((chat) => this.canonicalJid(chat) ?? chat))
+        : null;
+    const counts = { open: 0, overdue: 0, stale: 0, fulfilled: 0, dismissed: 0, sweepDue: 0, orphanedEvents: 0 };
+    const facetCount = new Map<string, number>();
+    const facetLabel = new Map<string, string | null>();
+    const items: BrainLifecycleItem[] = [];
+    for (const node of this.graphNodes.values()) {
+      if ((node.kind !== "commitment" && node.kind !== "question") || node.status === "merged") {
+        continue;
+      }
+      if (options.kind && node.kind !== options.kind) {
+        continue;
+      }
+      if (chatFilter && node.chatScope !== chatFilter) {
+        continue;
+      }
+      const claimId = node.naturalKey.slice(node.naturalKey.indexOf(":") + 1);
+      const fold = foldLifecycleEvents(this.memLifecycleEventsForClaim(claimId));
+      const { anchorMs, anchorKeys } = this.memLifecycleAnchor(claimId);
+      const dueMs = typeof node.payload?.dueMs === "number" ? (node.payload.dueMs as number) : null;
+      const flags = computeLifecycleFlags({
+        status: fold.status,
+        dueMs,
+        lastEvidenceAtMs: node.lastSeenAtMs,
+        lastReviewedAtMs: fold.lastReviewedAtMs,
+        openedAtMs: anchorMs,
+        asOfMs,
+        staleDays
+      });
+      let candidateCount = 0;
+      let sweepDue = false;
+      if (fold.status === "open") {
+        counts.open += 1;
+        if (flags.overdue) counts.overdue += 1;
+        if (flags.stale) counts.stale += 1;
+        const sinceMs = Math.max(anchorMs ?? 0, fold.lastReviewedAtMs ?? 0);
+        candidateCount = this.memLifecycleCandidates({ claimId, chatSourceId: node.chatScope ?? "", sinceMs, anchorKeys }).length;
+        const duePassedSinceReview = dueMs != null && dueMs < asOfMs && (fold.lastReviewedAtMs == null || fold.lastReviewedAtMs < dueMs);
+        sweepDue = candidateCount > 0 || duePassedSinceReview;
+        if (sweepDue) {
+          counts.sweepDue += 1;
+        }
+      } else if (fold.status === "fulfilled") {
+        counts.fulfilled += 1;
+      } else {
+        counts.dismissed += 1;
+      }
+      if (statusFilter === "closed" ? fold.status === "open" : statusFilter !== "all" && fold.status !== statusFilter) {
+        continue;
+      }
+      const chatKey = node.chatScope ?? "";
+      facetCount.set(chatKey, (facetCount.get(chatKey) ?? 0) + 1);
+      if (!facetLabel.has(chatKey)) {
+        facetLabel.set(chatKey, (node.chatScope ? this.chats.get(node.chatScope)?.displayName ?? null : null));
+      }
+      if (options.flag === "overdue" && !flags.overdue) continue;
+      if (options.flag === "stale" && !flags.stale) continue;
+      if (options.flag === "sweep_due" && !sweepDue) continue;
+      if (options.hideOverdue && flags.overdue) continue;
+      if (options.hideStale && flags.stale) continue;
+      if (options.hideFulfilled && fold.status === "fulfilled") continue;
+      if (options.hideDismissed && fold.status === "dismissed") continue;
+      if (options.dueUpcoming && (fold.status !== "open" || dueMs == null || dueMs < asOfMs)) continue;
+      if (includeChats && !includeChats.has(chatKey)) continue;
+      if (excludeChats && excludeChats.has(chatKey)) continue;
+      const holderJid = typeof node.payload?.holderJid === "string" ? (node.payload.holderJid as string) : null;
+      const found = this.memLifecycleClaim(claimId);
+      let resolution: BrainLifecycleResolutionView | null = null;
+      if (fold.resolvingEvent) {
+        resolution = {
+          status: fold.resolvingEvent.toStatus,
+          source: fold.resolvingEvent.source,
+          atMs: fold.resolvedAtMs ?? fold.resolvingEvent.createdAtMs,
+          note: fold.resolvingEvent.note,
+          model: fold.resolvingEvent.model,
+          cites: this.memLifecycleCiteViews(fold.resolvingEvent)
+        };
+      }
+      items.push({
+        nodeId: node.id,
+        slug: node.slug,
+        kind: node.kind as "commitment" | "question",
+        claimId,
+        text: found?.claim.text ?? node.title ?? "",
+        chatSourceId: node.chatScope ?? "",
+        chatDisplayName: node.chatScope ? this.chats.get(node.chatScope)?.displayName ?? null : null,
+        holderJid,
+        holderLabel: holderJid ? this.memLifecycleLabelForJid(holderJid) : null,
+        openedAtMs: anchorMs,
+        dueMs,
+        lastEvidenceAtMs: node.lastSeenAtMs,
+        lastReviewedAtMs: fold.lastReviewedAtMs,
+        status: fold.status,
+        overdue: flags.overdue,
+        stale: flags.stale,
+        candidateCount,
+        salience: node.salience,
+        dormant: node.status === "dormant",
+        resolution
+      });
+    }
+    counts.orphanedEvents = new Set(this.lifecycleEvents.filter((event) => event.orphanedAtMs != null).map((event) => event.claimId)).size;
+    sortLifecycleItems(items, options.sort ?? "smart", statusFilter);
+    const chatFacets = [...facetCount.entries()]
+      .map(([chatSourceId, count]) => ({ chatSourceId, chatDisplayName: facetLabel.get(chatSourceId) ?? null, count }))
+      .sort((a, b) => b.count - a.count || (a.chatDisplayName ?? a.chatSourceId).localeCompare(b.chatDisplayName ?? b.chatSourceId))
+      .slice(0, 300);
+    return { items: items.slice(0, limit), counts, chatFacets, asOfMs, staleDays };
+  }
+
+  async listBrainLifecycleSweepBatches(
+    options: { chatSourceId?: string | null; claimIds?: string[]; maxNodesPerBatch?: number } = {}
+  ): Promise<BrainLifecycleSweepBatch[]> {
+    const asOfMs = Date.now();
+    const maxNodes = Math.max(1, Math.min(LIFECYCLE_SWEEP_MAX_NODES_PER_CALL, options.maxNodesPerBatch ?? LIFECYCLE_SWEEP_MAX_NODES_PER_CALL));
+    const chatFilter = options.chatSourceId ? this.canonicalJid(options.chatSourceId) ?? options.chatSourceId : null;
+    const selected = options.claimIds && options.claimIds.length > 0 ? new Set(options.claimIds) : null;
+    const dueByChat = new Map<
+      string,
+      { chatDisplayName: string | null; nodes: Array<BrainLifecycleSweepNode & { overdue: boolean; lastEvidenceAtMs: number | null }> }
+    >();
+    for (const node of this.graphNodes.values()) {
+      if ((node.kind !== "commitment" && node.kind !== "question") || node.status === "merged" || !node.chatScope) {
+        continue;
+      }
+      if (chatFilter && node.chatScope !== chatFilter) {
+        continue;
+      }
+      const claimId = node.naturalKey.slice(node.naturalKey.indexOf(":") + 1);
+      const fold = foldLifecycleEvents(this.memLifecycleEventsForClaim(claimId));
+      if (fold.status !== "open") {
+        continue;
+      }
+      if (selected && !selected.has(claimId)) {
+        continue;
+      }
+      const dueMs = typeof node.payload?.dueMs === "number" ? (node.payload.dueMs as number) : null;
+      const { anchorMs, anchorKeys } = this.memLifecycleAnchor(claimId);
+      const sinceMs = Math.max(anchorMs ?? 0, fold.lastReviewedAtMs ?? 0);
+      const candidates = this.memLifecycleCandidates({ claimId, chatSourceId: node.chatScope, sinceMs, anchorKeys });
+      const duePassedSinceReview = dueMs != null && dueMs < asOfMs && (fold.lastReviewedAtMs == null || fold.lastReviewedAtMs < dueMs);
+      // Explicit selection overrides the sweep-due skip.
+      if (!selected && candidates.length === 0 && !duePassedSinceReview) {
+        continue;
+      }
+      const holderJid = typeof node.payload?.holderJid === "string" ? (node.payload.holderJid as string) : null;
+      const found = this.memLifecycleClaim(claimId);
+      const bucket = dueByChat.get(node.chatScope) ?? {
+        chatDisplayName: this.chats.get(node.chatScope)?.displayName ?? null,
+        nodes: []
+      };
+      bucket.nodes.push({
+        nodeId: node.id,
+        claimId,
+        kind: node.kind as "commitment" | "question",
+        text: found?.claim.text ?? node.title ?? "",
+        holderLabel: holderJid ? this.memLifecycleLabelForJid(holderJid) : null,
+        openedAtMs: anchorMs,
+        dueMs,
+        candidates,
+        overdue: dueMs != null && dueMs < asOfMs,
+        lastEvidenceAtMs: node.lastSeenAtMs
+      });
+      dueByChat.set(node.chatScope, bucket);
+    }
+    const batches: BrainLifecycleSweepBatch[] = [];
+    for (const [chatSourceId, bucket] of [...dueByChat.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+      bucket.nodes.sort(compareLifecycleItems);
+      for (let start = 0; start < bucket.nodes.length; start += maxNodes) {
+        batches.push({
+          chatSourceId,
+          chatDisplayName: bucket.chatDisplayName,
+          nodes: bucket.nodes.slice(start, start + maxNodes).map(({ overdue: _overdue, lastEvidenceAtMs: _last, ...node }) => node)
+        });
+      }
+    }
+    return batches;
   }
 
   // === Knowledge graph engine (mirror of the SQLite implementation) ========
@@ -4815,6 +5589,9 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       this.memApplyEpisodeGraph(episode);
     }
     await this.syncBrainGraphSignals();
+    // Lifecycle projection: closures live outside the wiped graph state, so a
+    // rebuild re-applies folded statuses and `resolves` edges from the events.
+    this.memProjectLifecycleState();
     await this.recomputeBrainGraphSalience();
     let evidence = 0;
     for (const edge of this.graphEdges.values()) {

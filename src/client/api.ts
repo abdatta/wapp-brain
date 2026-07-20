@@ -13,6 +13,10 @@ import type {
   BrainGraphRebuildResult,
   BrainGraphRecomputeResult,
   BrainGraphStats,
+  BrainLifecycleItemDetail,
+  BrainLifecycleListResponse,
+  BrainLifecycleSort,
+  BrainReasoningEffort,
   BrainGraphUnresolvedEntity,
   BrainGraphNodeSuggestion,
   BrainModelQualityAggregate,
@@ -495,6 +499,77 @@ export function resetBrainData(): Promise<{ ok: boolean; episodesRemoved: number
 // archived identities, each row carrying the number's CURRENT resolved name.
 export function getOwnerIdentitySuggestions(query: string): Promise<OwnerIdentitySuggestion[]> {
   return request<OwnerIdentitySuggestion[]>(`/api/brain/owner/identity-suggestions?q=${encodeURIComponent(query)}`);
+}
+
+// --- Commitment lifecycle (commitment-lifecycle) ---
+
+// The L0 open-items surface: status-driven, salience-independent, flagged and
+// ordered server-side. `flag` narrows the open set to overdue/stale/sweep-due;
+// `sort` picks the ordering (default 'smart' = the pinned overdue-first order).
+export function listBrainLifecycleItems(params: {
+  status?: "open" | "fulfilled" | "dismissed" | "all" | "closed";
+  flag?: "overdue" | "stale" | "sweep_due";
+  hideOverdue?: boolean;
+  hideStale?: boolean;
+  hideFulfilled?: boolean;
+  hideDismissed?: boolean;
+  dueUpcoming?: boolean;
+  kind?: "commitment" | "question";
+  includeChats?: string[];
+  excludeChats?: string[];
+  sort?: BrainLifecycleSort;
+  chatSourceId?: string | null;
+  limit?: number;
+} = {}): Promise<BrainLifecycleListResponse> {
+  const query = new URLSearchParams();
+  if (params.status) query.set("status", params.status);
+  if (params.flag) query.set("flag", params.flag);
+  if (params.hideOverdue) query.set("hideOverdue", "true");
+  if (params.hideStale) query.set("hideStale", "true");
+  if (params.hideFulfilled) query.set("hideFulfilled", "true");
+  if (params.hideDismissed) query.set("hideDismissed", "true");
+  if (params.dueUpcoming) query.set("dueUpcoming", "true");
+  if (params.kind) query.set("kind", params.kind);
+  if (params.includeChats && params.includeChats.length > 0) query.set("includeChats", params.includeChats.join(","));
+  if (params.excludeChats && params.excludeChats.length > 0) query.set("excludeChats", params.excludeChats.join(","));
+  if (params.sort) query.set("sort", params.sort);
+  if (params.chatSourceId) query.set("chatSourceId", params.chatSourceId);
+  if (params.limit != null) query.set("limit", String(params.limit));
+  const suffix = query.toString();
+  return request<BrainLifecycleListResponse>(`/api/brain/lifecycle${suffix ? `?${suffix}` : ""}`);
+}
+
+// Full context for one item (the detail modal).
+export function getBrainLifecycleItemDetail(claimId: string): Promise<BrainLifecycleItemDetail> {
+  return request<BrainLifecycleItemDetail>(`/api/brain/lifecycle/item?claimId=${encodeURIComponent(claimId)}`);
+}
+
+// User transition (certainty-grade): close/cancel/reopen with an optional note.
+export function applyBrainLifecycleTransition(body: {
+  claimId: string;
+  action: "fulfilled" | "dismissed" | "reopened";
+  note?: string | null;
+}): Promise<{ ok: boolean; applied: number }> {
+  return request<{ ok: boolean; applied: number }>("/api/brain/lifecycle/transition", {
+    method: "POST",
+    body: JSON.stringify(body)
+  });
+}
+
+// Manual-first model closure sweep over sweep-due open items, or exactly the
+// `claimIds` selected (a specific item or a subset).
+export function startBrainLifecycleSweep(body: {
+  chatSourceId?: string | null;
+  claimIds?: string[] | null;
+  model?: string | null;
+  effort?: BrainReasoningEffort | null;
+  maxModelCalls?: number | null;
+  maxTokens?: number | null;
+}): Promise<{ ok: boolean; progress: BrainRunProgress }> {
+  return request<{ ok: boolean; progress: BrainRunProgress }>("/api/brain/lifecycle/sweep", {
+    method: "POST",
+    body: JSON.stringify(body)
+  });
 }
 
 // --- Knowledge graph (knowledge-graph-foundation) ---
