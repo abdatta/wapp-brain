@@ -11,12 +11,16 @@ import type {
   BrainEpisodeRecord,
   BrainEvalRunRecord,
   BrainGradingSample,
+  BrainGraphEdgeEvidenceView,
   BrainGraphEntityView,
+  BrainGraphNeighborhoodParams,
+  BrainGraphNeighborhoodView,
   BrainGraphRebuildResult,
   BrainGraphRecomputeResult,
   BrainGraphStats,
   BrainGraphSyncResult,
   BrainGraphUnresolvedEntity,
+  BrainGraphNodeSuggestion,
   BrainModelQualityAggregate,
   BrainLlmUsageSummary,
   BrainMediaGapImpact,
@@ -429,6 +433,21 @@ export interface ArchiveRepository {
   // Chat-scoped unresolved person entities ranked by salience — deterministic
   // backpressure for the person layer's suggestion producers, never a join key.
   listUnresolvedBrainGraphEntities(options?: { limit?: number }): Promise<BrainGraphUnresolvedEntity[]>;
+  // Typeahead for anchoring the explorer: nodes whose read-time label matches a
+  // substring, ranked by salience, each carrying a stable id so the client
+  // anchors by node id (never by an ambiguous free-text name). Excludes
+  // claim-ish kinds (commitment/question/event/fact) and merged stubs.
+  searchBrainGraphNodes(query: string, limit?: number): Promise<BrainGraphNodeSuggestion[]>;
+  // Bounded anchored neighborhood (graph-explorer): a depth-≤2 ego-graph with
+  // kind/time/salience filters and hard caps — never the whole graph. Read-time
+  // labels + same-name disambiguation; both backends return identical DTOs via
+  // the shared shaping in brain/graphQuery. Zero model calls. The reusable
+  // primitive behind the explorer UI, the deep retrieval path, and MCP.
+  getBrainGraphNeighborhood(params: BrainGraphNeighborhoodParams): Promise<BrainGraphNeighborhoodView | null>;
+  // Lazy per-edge evidence (graph-explorer): the edge's endpoint labels plus
+  // its claims/citations, each citation carrying the chat id + message id to
+  // open the thread at the exact cited message. Null when the edge is unknown.
+  getBrainGraphEdgeEvidence(edgeId: number): Promise<BrainGraphEdgeEvidenceView | null>;
   // --- Two-level person model: identities (canonical JIDs) stay immutable
   // anchors; persons are an editable membership. Connect/disconnect touch only
   // person-layer tables — never episodes, claims, citations, or archive rows.

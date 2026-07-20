@@ -1,6 +1,6 @@
 import { ChevronDown, Loader2, MessageCircle, Search } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import type { ArchiveChangeEvent, ChatListItem, MessageListItem } from "../../../shared/types";
 import { getMessageContext, listMessages } from "../../api";
 import { buildChatDeepLink, parseAnchorParam } from "../../lib/deepLinks";
@@ -208,6 +208,14 @@ export function ThreadView({ chat }: { chat: ChatListItem }) {
             {/* Search-hit stubs carry messageCount 0 (unknown); showing "0 messages" over a full thread is a lie. */}
             {chat.messageCount ? ` | ${chat.messageCount.toLocaleString()} messages` : ""}
             {chat.participantCount ? ` | ${chat.participantCount.toLocaleString()} participants` : ""}
+            {chat.sourceChatId && (
+              <>
+                {" | "}
+                <Link className="linkButton" to={`/graph?chat=${encodeURIComponent(chat.sourceChatId)}`} title="See this conversation's people and topics in the graph">
+                  view in graph
+                </Link>
+              </>
+            )}
           </p>
         </div>
         <div className="threadSearch">

@@ -6,9 +6,15 @@ import type {
   BrainGoldenSetInfo,
   BrainGradingSample,
   BrainBackfillStatus,
+  BrainGraphEdgeEvidenceView,
+  BrainGraphEntityView,
+  BrainGraphNeighborhoodParams,
+  BrainGraphNeighborhoodView,
   BrainGraphRebuildResult,
   BrainGraphRecomputeResult,
   BrainGraphStats,
+  BrainGraphUnresolvedEntity,
+  BrainGraphNodeSuggestion,
   BrainModelQualityAggregate,
   BrainOverview,
   BrainProviderName,
@@ -503,6 +509,53 @@ export function rebuildBrainGraph(): Promise<{ ok: boolean } & BrainGraphRebuild
 
 export function recomputeBrainGraph(): Promise<{ ok: boolean } & BrainGraphRecomputeResult> {
   return request<{ ok: boolean } & BrainGraphRecomputeResult>("/api/brain/graph/recompute", { method: "POST", body: "{}" });
+}
+
+// --- Graph explorer (graph-explorer) ---
+
+// Bounded anchored neighborhood — the explorer's product primitive.
+export function getBrainGraphNeighborhood(params: BrainGraphNeighborhoodParams): Promise<BrainGraphNeighborhoodView> {
+  const query = new URLSearchParams();
+  if (params.nodeId) query.set("nodeId", params.nodeId);
+  if (params.jid) query.set("jid", params.jid);
+  if (params.name) query.set("name", params.name);
+  if (params.chat) query.set("chat", params.chat);
+  if (params.depth != null) query.set("depth", String(params.depth));
+  if (params.kinds && params.kinds.length > 0) query.set("kinds", params.kinds.join(","));
+  if (params.since != null) query.set("since", String(params.since));
+  if (params.until != null) query.set("until", String(params.until));
+  if (params.minSalience != null) query.set("minSalience", String(params.minSalience));
+  if (params.includeDormant) query.set("includeDormant", "true");
+  if (params.maxNodes != null) query.set("maxNodes", String(params.maxNodes));
+  if (params.maxEdges != null) query.set("maxEdges", String(params.maxEdges));
+  return request<BrainGraphNeighborhoodView>(`/api/brain/graph/neighborhood?${query.toString()}`);
+}
+
+// Lazy per-edge evidence: claims + citations with thread-anchor coordinates.
+export function getBrainGraphEdgeEvidence(edgeId: number): Promise<BrainGraphEdgeEvidenceView> {
+  return request<BrainGraphEdgeEvidenceView>(`/api/brain/graph/edge?id=${encodeURIComponent(String(edgeId))}`);
+}
+
+export function getBrainGraphEntity(query: { nodeId?: string; jid?: string; name?: string }): Promise<BrainGraphEntityView> {
+  const params = new URLSearchParams();
+  if (query.nodeId) params.set("nodeId", query.nodeId);
+  if (query.jid) params.set("jid", query.jid);
+  if (query.name) params.set("name", query.name);
+  return request<BrainGraphEntityView>(`/api/brain/graph/entity?${params.toString()}`);
+}
+
+export function listUnresolvedBrainGraphEntities(limit = 50): Promise<BrainGraphUnresolvedEntity[]> {
+  return request<BrainGraphUnresolvedEntity[]>(`/api/brain/graph/unresolved?limit=${limit}`);
+}
+
+// Typeahead for anchoring the explorer — resolves to real node ids so a picked
+// anchor is never an ambiguous free-text name.
+export function searchBrainGraphNodes(query: string, limit = 10): Promise<BrainGraphNodeSuggestion[]> {
+  const trimmed = query.trim();
+  if (!trimmed) return Promise.resolve([]);
+  return request<BrainGraphNodeSuggestion[]>(
+    `/api/brain/graph/search?q=${encodeURIComponent(trimmed)}&limit=${limit}`
+  );
 }
 
 export function setBrainOwner(

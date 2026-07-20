@@ -11,6 +11,7 @@ const BrainPage = lazy(() => import("./pages/brain/BrainPage").then((m) => ({ de
 const BrainEvalPage = lazy(() => import("./pages/brain/BrainEvalPage").then((m) => ({ default: m.BrainEvalPage })));
 const ContactsPage = lazy(() => import("./pages/contacts/ContactsPage").then((m) => ({ default: m.ContactsPage })));
 const PeoplePage = lazy(() => import("./pages/people/PeoplePage").then((m) => ({ default: m.PeoplePage })));
+const GraphPage = lazy(() => import("./pages/graph/GraphPage").then((m) => ({ default: m.GraphPage })));
 const ImportPage = lazy(() => import("./pages/import/ImportPage").then((m) => ({ default: m.ImportPage })));
 const SettingsPage = lazy(() => import("./pages/settings/SettingsPage").then((m) => ({ default: m.SettingsPage })));
 
@@ -36,6 +37,7 @@ export function AppRoutes() {
         <Route path="brain/eval" element={<BrainEvalPage />} />
         <Route path="contacts" element={<ContactsPage />} />
         <Route path="people" element={<PeoplePage />} />
+        <Route path="graph" element={<GraphPage />} />
         <Route path="import" element={<ImportPage />} />
         <Route path="import/key" element={<ImportPage />} />
         <Route path="import/mode" element={<ImportPage />} />

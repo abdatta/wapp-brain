@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import type {
   BrainBackfillStatus,
   BrainGraphStats,
@@ -173,6 +174,9 @@ function BrainGraphSection({ running }: { running: boolean }) {
             >
               {graphBusy === "Recomputing salience" ? "Recomputing…" : "Recompute salience"}
             </button>
+            <Link className="miniButton" to="/graph" title="Open the interactive graph explorer">
+              Open explorer
+            </Link>
           </div>
         </>
       )}

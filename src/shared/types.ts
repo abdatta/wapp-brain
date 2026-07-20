@@ -2135,6 +2135,117 @@ export interface BrainGraphUnresolvedEntity {
   claimCount: number;
 }
 
+// Typeahead suggestion for anchoring the explorer: a real node id + its
+// read-time label, so the chosen anchor is unambiguous (unlike a free-text
+// name that can match several same-named nodes).
+export interface BrainGraphNodeSuggestion {
+  id: string;
+  label: string;
+  kind: BrainGraphNodeKind;
+  jid: string | null;
+}
+
+// --- Bounded neighborhood read (graph-explorer) --------------------------
+// The product primitive: an anchored ego-graph, never the whole graph. One
+// server-side answer serves the explorer UI, the deep retrieval path, and a
+// future MCP tool wrapper — meaning lives here, in shared types.
+export interface BrainGraphNeighborhoodParams {
+  // Anchor by node id (redirect-following), canonical JID, name/alias, or the
+  // source chat id of a chat node (an episode anchors on its chat).
+  nodeId?: string;
+  jid?: string;
+  name?: string;
+  chat?: string;
+  // Traversal depth from the anchor; clamped to 1..2 server-side.
+  depth?: number;
+  // Edge-kind allowlist; undefined/empty means all kinds.
+  kinds?: BrainGraphEdgeKind[];
+  // Time window over each edge's last-evidence time (ms), inclusive.
+  since?: number | null;
+  until?: number | null;
+  // Minimum node salience for neighbors (the anchor is always included).
+  minSalience?: number;
+  // Include dormant neighbors (hidden by default; dormancy never deletes).
+  includeDormant?: boolean;
+  // Hard caps, clamped to server ceilings; truncation is disclosed.
+  maxNodes?: number;
+  maxEdges?: number;
+}
+
+// Concrete filters actually applied after server-side clamping — echoed back
+// so a consumer can render "showing N of M" honestly.
+export interface BrainGraphNeighborhoodFilters {
+  depth: number;
+  kinds: BrainGraphEdgeKind[] | null;
+  since: number | null;
+  until: number | null;
+  minSalience: number;
+  includeDormant: boolean;
+  maxNodes: number;
+  maxEdges: number;
+}
+
+export interface BrainGraphNeighborhoodNode extends BrainGraphNodeRecord {
+  // Shortest number of qualifying edges from the anchor (0 = the anchor).
+  hop: number;
+}
+
+// Undirected edge in the neighborhood. `evidenceCount` drives styling weight;
+// `lastSeenAtMs` drives the time-scrub (fetched once, faded client-side).
+export interface BrainGraphNeighborhoodEdge {
+  id: number;
+  srcId: string;
+  dstId: string;
+  kind: BrainGraphEdgeKind;
+  evidenceCount: number;
+  firstSeenAtMs: number | null;
+  lastSeenAtMs: number | null;
+}
+
+export interface BrainGraphNeighborhoodView {
+  // Resolved anchor node id (after any merged-redirect hop).
+  anchorId: string;
+  redirected: boolean;
+  nodes: BrainGraphNeighborhoodNode[];
+  edges: BrainGraphNeighborhoodEdge[];
+  // True when caps or the discovery ceiling clipped the neighborhood.
+  truncated: boolean;
+  // Pre-cap totals: distinct reachable nodes, and edges among the shown nodes.
+  totalNodes: number;
+  totalEdges: number;
+  appliedFilters: BrainGraphNeighborhoodFilters;
+}
+
+// Per-edge evidence read (lazy, on selection): endpoint labels + the claims
+// and citations behind the edge, each citation carrying the coordinates to
+// open the thread at the exact cited message.
+export interface BrainGraphEdgeCitation {
+  sourceMessageKey: string;
+  sourceChatId: string | null;
+  // Numeric chat id for the thread deep link (`/chats/:id?at=<messageId>`);
+  // null when the cited chat can't be resolved. `sourceChatId` stays for
+  // display/identity.
+  chatId: number | null;
+  messageId: number | null;
+  senderSourceJid: string | null;
+  timestampMs: number | null;
+  // Present for claim-derived evidence; null for direct message evidence.
+  claimId: string | null;
+  claimKind: BrainClaimKind | null;
+  claimText: string | null;
+}
+
+export interface BrainGraphEdgeEvidenceView {
+  edgeId: number;
+  kind: BrainGraphEdgeKind;
+  src: Pick<BrainGraphNodeRecord, "id" | "kind" | "label" | "jid">;
+  dst: Pick<BrainGraphNodeRecord, "id" | "kind" | "label" | "jid">;
+  evidenceCount: number;
+  firstSeenAtMs: number | null;
+  lastSeenAtMs: number | null;
+  citations: BrainGraphEdgeCitation[];
+}
+
 export interface BrainGraphStats {
   nodeCount: number;
   edgeCount: number;

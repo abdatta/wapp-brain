@@ -32,7 +32,7 @@ import { isMaskedNumberLabel } from "./import/jid";
 import { GoogleContactsService } from "./googleContacts";
 import { getSearchReindexProgress, startSearchReindex } from "./search/reindexJob";
 import { withGuidedSetup } from "./onboarding";
-import type { ArchiveChangeEvent, LivePairingSummary, PickKind } from "../shared/types";
+import type { ArchiveChangeEvent, BrainGraphEdgeKind, LivePairingSummary, PickKind } from "../shared/types";
 import type { LiveMessageEvent } from "./live/types";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1151,6 +1151,86 @@ app.get("/api/brain/graph/entity", async (req, res) => {
 app.get("/api/brain/graph/unresolved", async (req, res) => {
   try {
     res.json(await repository.listUnresolvedBrainGraphEntities({ limit: clampNumber(req.query.limit, 1, 200, 50) }));
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+// Typeahead for anchoring the explorer: match nodes by their read-time label so
+// the client anchors by a real node id, never by an ambiguous free-text name.
+app.get("/api/brain/graph/search", async (req, res) => {
+  try {
+    const q = stringQuery(req.query.q);
+    if (!q) {
+      res.json([]);
+      return;
+    }
+    res.json(await repository.searchBrainGraphNodes(q, clampNumber(req.query.limit, 1, 25, 10)));
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+// Bounded anchored neighborhood (graph-explorer): the product primitive. A
+// depth-≤2 ego-graph with kind/time/salience filters and hard caps — never the
+// whole graph. Read-time labels, same-name disambiguation, truncation
+// disclosed. Zero model calls. All clamping lives in resolveNeighborhoodParams.
+app.get("/api/brain/graph/neighborhood", async (req, res) => {
+  try {
+    const nodeId = stringQuery(req.query.nodeId);
+    const jid = stringQuery(req.query.jid);
+    const name = stringQuery(req.query.name);
+    const chat = stringQuery(req.query.chat);
+    if (!nodeId && !jid && !name && !chat) {
+      res.status(400).json({ error: "Provide an anchor: nodeId, jid, name, or chat." });
+      return;
+    }
+    const kindsRaw = stringQuery(req.query.kinds);
+    const view = await repository.getBrainGraphNeighborhood({
+      nodeId: nodeId ?? undefined,
+      jid: jid ?? undefined,
+      name: name ?? undefined,
+      chat: chat ?? undefined,
+      depth: optionalNumberQuery(req.query.depth) ?? undefined,
+      kinds: kindsRaw
+        ? (kindsRaw
+            .split(",")
+            .map((kind) => kind.trim())
+            .filter(Boolean) as BrainGraphEdgeKind[])
+        : undefined,
+      since: optionalNumberQuery(req.query.since),
+      until: optionalNumberQuery(req.query.until),
+      minSalience: optionalNumberQuery(req.query.minSalience) ?? undefined,
+      includeDormant: booleanQuery(req.query.includeDormant),
+      maxNodes: optionalNumberQuery(req.query.maxNodes) ?? undefined,
+      maxEdges: optionalNumberQuery(req.query.maxEdges) ?? undefined
+    });
+    if (!view) {
+      res.status(404).json({ error: "No graph node matches that anchor." });
+      return;
+    }
+    res.json(view);
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+// Lazy per-edge evidence for the explorer's trust loop: the edge's claims and
+// citations, each carrying the coordinates to open the thread at the exact
+// cited message.
+app.get("/api/brain/graph/edge", async (req, res) => {
+  try {
+    const edgeId = optionalNumberQuery(req.query.id);
+    if (edgeId == null || !Number.isInteger(edgeId)) {
+      res.status(400).json({ error: "Provide a numeric edge id." });
+      return;
+    }
+    const view = await repository.getBrainGraphEdgeEvidence(edgeId);
+    if (!view) {
+      res.status(404).json({ error: "No graph edge matches that id." });
+      return;
+    }
+    res.json(view);
   } catch (error) {
     res.status(400).json({ error: publicErrorMessage(error) });
   }

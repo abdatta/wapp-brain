@@ -17,10 +17,16 @@ import type {
   BrainGradingCitation,
   BrainGradingSample,
   BrainGradingSampleClaim,
+  BrainCitationRecord,
+  BrainGraphEdgeCitation,
+  BrainGraphEdgeEvidenceView,
   BrainGraphEdgeKind,
   BrainGraphEdgeView,
   BrainGraphEntityClaim,
   BrainGraphEntityView,
+  BrainGraphNeighborhoodEdge,
+  BrainGraphNeighborhoodParams,
+  BrainGraphNeighborhoodView,
   BrainGraphNodeKind,
   BrainGraphNodeRecord,
   BrainGraphNodeStatus,
@@ -29,6 +35,7 @@ import type {
   BrainGraphStats,
   BrainGraphSyncResult,
   BrainGraphUnresolvedEntity,
+  BrainGraphNodeSuggestion,
   BrainModelQualityAggregate,
   BrainLlmUsageSummary,
   BrainMediaGapImpact,
@@ -146,6 +153,7 @@ import {
   type GraphMutations,
   type GraphNodeSpec
 } from "../brain/graph";
+import { resolveNeighborhoodParams, shapeNeighborhood, type NeighborhoodWalk } from "../brain/graphQuery";
 import { isMaskedNumberLabel, normalizeJid, phoneFromJid, resolveDisplayLabel } from "../import/jid";
 import { normalizeOwnerSelfInput } from "../identity/ownerSelf";
 import { disambiguateLabels } from "../persons/disambiguate";
@@ -5106,6 +5114,263 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       edges: edges.slice(0, 200),
       aliases: [...aliases].sort(),
       redirected
+    };
+  }
+
+  private resolveMemGraphAnchor(query: { nodeId?: string; jid?: string; name?: string; chat?: string }): { node: MemGraphNode; redirected: boolean } | null {
+    let node: MemGraphNode | undefined;
+    let redirected = false;
+    if (query.chat?.trim()) {
+      const nodeId = this.graphNodeIdByKey.get(chatNaturalKey(query.chat.trim()));
+      node = nodeId ? this.graphNodes.get(nodeId) : undefined;
+    } else if (query.nodeId) {
+      node = this.graphNodes.get(query.nodeId);
+      for (let hop = 0; node && node.status === "merged" && node.mergedInto && hop < 5; hop += 1) {
+        node = this.graphNodes.get(node.mergedInto);
+        redirected = true;
+      }
+    } else if (query.jid) {
+      const canonical = this.canonicalJid(query.jid) ?? query.jid;
+      const nodeId = this.graphNodeIdByKey.get(personJidNaturalKey(canonical));
+      node = nodeId ? this.graphNodes.get(nodeId) : undefined;
+    } else if (query.name?.trim()) {
+      const norm = query.name.trim().toLowerCase();
+      // Prefer a resolved person whose read-time label (contact display name)
+      // matches — people carry no stored title (mirror of the SQLite resolver).
+      node = [...this.graphNodes.values()]
+        .filter((candidate) => candidate.kind === "person" && candidate.jid && candidate.status !== "merged")
+        .filter((candidate) => (this.contacts.get(candidate.jid as string)?.displayName ?? "").toLowerCase() === norm)
+        .sort((a, b) => b.salience - a.salience)[0];
+      if (!node) {
+        node = [...this.graphNodes.values()]
+          .filter((candidate) => candidate.status !== "merged")
+          .filter(
+            (candidate) =>
+              (candidate.title ?? "").toLowerCase() === norm ||
+              [...(this.graphAliases.get(candidate.id)?.values() ?? [])].some((alias) => alias.alias.toLowerCase() === norm)
+          )
+          .sort((a, b) => b.salience - a.salience || b.citationCount - a.citationCount)[0];
+      }
+    }
+    if (!node || node.status === "merged") {
+      return null;
+    }
+    return { node, redirected };
+  }
+
+  async searchBrainGraphNodes(query: string, limit = 10): Promise<BrainGraphNodeSuggestion[]> {
+    const q = query.trim().toLowerCase();
+    if (!q) {
+      return [];
+    }
+    // Mirror of the SQLite typeahead: substring match on the read-time label
+    // sources, claim-ish kinds excluded, salience-ranked, id-carrying.
+    const cap = Math.max(1, Math.min(limit, 25));
+    const claimKinds = new Set(["commitment", "question", "event", "fact"]);
+    return [...this.graphNodes.values()]
+      .filter((node) => node.status !== "merged" && !claimKinds.has(node.kind))
+      .filter((node) => {
+        // Match each kind against its own label source (mirror of the SQLite
+        // resolver): persons on contact name + title fallback, chats on chat
+        // name, everything else on title.
+        const title = (node.title ?? "").toLowerCase();
+        if (node.kind === "person") {
+          const contactName = (node.jid ? this.contacts.get(node.jid)?.displayName ?? "" : "").toLowerCase();
+          return contactName.includes(q) || title.includes(q);
+        }
+        if (node.kind === "chat") {
+          // Only group chats — a DM chat folds onto its counterparty person in
+          // the neighborhood, so it would duplicate the person in suggestions.
+          if (!node.chatScope || !node.chatScope.endsWith("@g.us")) return false;
+          const chatName = (this.chats.get(node.chatScope)?.displayName ?? "").toLowerCase();
+          return chatName.includes(q);
+        }
+        return title.includes(q);
+      })
+      .sort((a, b) => b.salience - a.salience || b.citationCount - a.citationCount)
+      .slice(0, cap)
+      .map((node) => ({ id: node.id, label: this.memGraphLabel(node), kind: node.kind, jid: node.jid }));
+  }
+
+  async getBrainGraphNeighborhood(params: BrainGraphNeighborhoodParams): Promise<BrainGraphNeighborhoodView | null> {
+    const resolved = resolveNeighborhoodParams(params);
+    const anchor = this.resolveMemGraphAnchor(params);
+    if (!anchor) {
+      return null;
+    }
+    const kindSet = resolved.kinds ? new Set(resolved.kinds) : null;
+    const statusSet = new Set(resolved.statuses);
+    const edgeMatches = (edge: MemGraphEdge): boolean => {
+      if (kindSet && !kindSet.has(edge.kind)) return false;
+      if (resolved.since != null && (edge.lastSeenAtMs ?? 0) < resolved.since) return false;
+      if (resolved.until != null && (edge.lastSeenAtMs ?? 0) > resolved.until) return false;
+      return true;
+    };
+    // BFS mirror of the recursive CTE: shortest-hop reachability under the same
+    // kind/time/salience/status filters, both directions, anchor exempt.
+    const visited = new Map<string, { node: MemGraphNode; hop: number }>();
+    visited.set(anchor.node.id, { node: anchor.node, hop: 0 });
+    let frontier = [anchor.node.id];
+    for (let hop = 0; hop < resolved.depth; hop += 1) {
+      const next: string[] = [];
+      for (const nodeId of frontier) {
+        for (const edge of this.graphEdges.values()) {
+          const isSrc = edge.srcNodeId === nodeId;
+          const isDst = edge.dstNodeId === nodeId;
+          if (!isSrc && !isDst) continue;
+          if (!edgeMatches(edge)) continue;
+          const otherId = isSrc ? edge.dstNodeId : edge.srcNodeId;
+          if (visited.has(otherId)) continue;
+          const other = this.graphNodes.get(otherId);
+          if (!other || !statusSet.has(other.status) || other.status === "merged" || other.salience < resolved.minSalience) {
+            continue;
+          }
+          visited.set(otherId, { node: other, hop: hop + 1 });
+          next.push(otherId);
+        }
+      }
+      frontier = next;
+    }
+    // Deterministic discovery order + ceiling, matching the SQLite ORDER/LIMIT.
+    const ordered = [...visited.values()].sort(
+      (a, b) => a.hop - b.hop || b.node.salience - a.node.salience || (a.node.id < b.node.id ? -1 : a.node.id > b.node.id ? 1 : 0)
+    );
+    const discoveryTruncated = ordered.length > resolved.maxDiscover;
+    const nodeEntries = discoveryTruncated ? ordered.slice(0, resolved.maxDiscover) : ordered;
+    const idSet = new Set(nodeEntries.map((entry) => entry.node.id));
+
+    const edges: BrainGraphNeighborhoodEdge[] = [];
+    for (const edge of this.graphEdges.values()) {
+      if (!idSet.has(edge.srcNodeId) || !idSet.has(edge.dstNodeId) || !edgeMatches(edge)) {
+        continue;
+      }
+      edges.push({
+        id: edge.id,
+        srcId: edge.srcNodeId,
+        dstId: edge.dstNodeId,
+        kind: edge.kind,
+        evidenceCount: edge.evidence.size,
+        firstSeenAtMs: edge.firstSeenAtMs,
+        lastSeenAtMs: edge.lastSeenAtMs
+      });
+    }
+    const personKeyByJid = new Map<string, string>();
+    for (const entry of nodeEntries) {
+      if (entry.node.kind === "person" && entry.node.jid) {
+        personKeyByJid.set(entry.node.jid, this.personMembers.get(entry.node.jid)?.personId ?? entry.node.jid);
+      }
+    }
+    // All display names of the person behind each JID (every linked identity,
+    // even off-screen) — parity mirror of the SQLite alias map.
+    const membersByPerson = new Map<string, string[]>();
+    for (const [memberJid, member] of this.personMembers) {
+      const bucket = membersByPerson.get(member.personId);
+      if (bucket) bucket.push(memberJid);
+      else membersByPerson.set(member.personId, [memberJid]);
+    }
+    const personAliasesByJid = new Map<string, string[]>();
+    for (const jid of personKeyByJid.keys()) {
+      const key = personKeyByJid.get(jid) ?? jid;
+      const memberJids = !key.includes("@") ? membersByPerson.get(key) ?? [jid] : [jid];
+      personAliasesByJid.set(jid, [...new Set(memberJids.map((memberJid) => this.systemEventDisplayName(memberJid) ?? memberJid))]);
+    }
+    const ownerPersonKeys = [
+      ...new Set(this.ownerSelfJids.map((jid) => this.personMembers.get(this.canonicalJid(jid) ?? jid)?.personId ?? (this.canonicalJid(jid) ?? jid)))
+    ];
+    const ownerAllJids = new Set(this.ownerSelfJids.map((jid) => this.canonicalJid(jid) ?? jid));
+    const ownerPersonKeySet = new Set(ownerPersonKeys);
+    for (const [memberJid, member] of this.personMembers) {
+      if (ownerPersonKeySet.has(member.personId)) ownerAllJids.add(memberJid);
+    }
+    const ownerInfo =
+      this.ownerDisplayName || ownerAllJids.size > 0
+        ? { name: this.ownerDisplayName ?? null, personKeys: ownerPersonKeys, selfJids: [...ownerAllJids] }
+        : null;
+    const walk: NeighborhoodWalk = {
+      anchorId: anchor.node.id,
+      redirected: anchor.redirected,
+      discovered: nodeEntries.map((entry) => ({ record: this.memGraphNodeRecord(entry.node), hop: entry.hop })),
+      edges,
+      discoveryTruncated,
+      personKeyByJid,
+      personAliasesByJid,
+      ownerInfo
+    };
+    return shapeNeighborhood(walk, resolved);
+  }
+
+  async getBrainGraphEdgeEvidence(edgeId: number): Promise<BrainGraphEdgeEvidenceView | null> {
+    const edge = this.graphEdgesById.get(edgeId);
+    if (!edge) {
+      return null;
+    }
+    const endpoint = (nodeId: string): BrainGraphEdgeEvidenceView["src"] => {
+      const node = this.graphNodes.get(nodeId);
+      return node
+        ? { id: node.id, kind: node.kind, label: this.memGraphLabel(node), jid: node.jid }
+        : { id: nodeId, kind: "other", label: nodeId, jid: null };
+    };
+    const claimIndex = new Map<string, { kind: BrainGraphEntityClaim["kind"]; text: string; citations: BrainCitationRecord[] }>();
+    for (const episode of this.brainEpisodes.values()) {
+      for (const claim of episode.claims) {
+        claimIndex.set(claim.id, { kind: claim.kind, text: claim.text, citations: claim.citations });
+      }
+    }
+    const orderedEvidence = [...edge.evidence.entries()].sort(
+      (a, b) => (b[1].observedAtMs ?? 0) - (a[1].observedAtMs ?? 0) || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)
+    );
+    const citations: BrainGraphEdgeCitation[] = [];
+    const seen = new Set<string>();
+    const LIMIT = 100;
+    for (const [, ev] of orderedEvidence) {
+      if (citations.length >= LIMIT) break;
+      if (ev.claimId) {
+        const claim = claimIndex.get(ev.claimId);
+        const cites = claim ? [...claim.citations].sort((a, b) => (b.timestampMs ?? 0) - (a.timestampMs ?? 0)) : [];
+        for (const cite of cites) {
+          if (citations.length >= LIMIT) break;
+          const key = `${ev.claimId}:${cite.sourceMessageKey}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          citations.push({
+            sourceMessageKey: cite.sourceMessageKey,
+            sourceChatId: cite.sourceChatId ?? null,
+            chatId: cite.sourceChatId ? this.chats.get(cite.sourceChatId)?.id ?? null : null,
+            messageId: cite.messageId ?? null,
+            senderSourceJid: cite.senderSourceJid ?? null,
+            timestampMs: cite.timestampMs ?? null,
+            claimId: ev.claimId,
+            claimKind: claim?.kind ?? null,
+            claimText: claim?.text ?? null
+          });
+        }
+      } else if (ev.sourceMessageKey) {
+        const key = `msg:${ev.sourceMessageKey}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const message = this.messages.get(ev.sourceMessageKey);
+        citations.push({
+          sourceMessageKey: ev.sourceMessageKey,
+          sourceChatId: message?.chatSourceId ?? null,
+          chatId: message?.chatSourceId ? this.chats.get(message.chatSourceId)?.id ?? null : null,
+          messageId: message?.id ?? null,
+          senderSourceJid: message?.senderSourceJid ?? null,
+          timestampMs: message?.timestampMs ?? ev.observedAtMs ?? null,
+          claimId: null,
+          claimKind: null,
+          claimText: null
+        });
+      }
+    }
+    return {
+      edgeId: edge.id,
+      kind: edge.kind,
+      src: endpoint(edge.srcNodeId),
+      dst: endpoint(edge.dstNodeId),
+      evidenceCount: edge.evidence.size,
+      firstSeenAtMs: edge.firstSeenAtMs,
+      lastSeenAtMs: edge.lastSeenAtMs,
+      citations
     };
   }
 

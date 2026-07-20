@@ -546,6 +546,25 @@ async function main(): Promise<void> {
   if (command === "brain-graph") {
     const { localServerListening } = await import("./brain/eval");
     const action = stringArg(args._) ?? "stats";
+    const neighborhoodParams: import("../shared/types").BrainGraphNeighborhoodParams = {
+      jid: stringArg(args.jid),
+      name: stringArg(args.name),
+      nodeId: stringArg(args.node),
+      chat: stringArg(args.chat),
+      depth: numberArg(args.depth),
+      kinds: stringArg(args.kinds)
+        ? (stringArg(args.kinds)!
+            .split(",")
+            .map((kind) => kind.trim())
+            .filter(Boolean) as import("../shared/types").BrainGraphEdgeKind[])
+        : undefined,
+      since: numberArg(args.since),
+      until: numberArg(args.until),
+      minSalience: typeof args["min-salience"] === "string" ? Number(args["min-salience"]) : undefined,
+      includeDormant: args["include-dormant"] === true || args["include-dormant"] === "true",
+      maxNodes: numberArg(args["max-nodes"]),
+      maxEdges: numberArg(args["max-edges"])
+    };
     const serverBase = `http://${config.app.host}:${config.app.port}`;
     const serverUp = await localServerListening(serverBase);
     const viaServer = async (path: string, method: "GET" | "POST"): Promise<unknown> => {
@@ -568,6 +587,21 @@ async function main(): Promise<void> {
         if (stringArg(args.name)) query.set("name", stringArg(args.name)!);
         if (stringArg(args.node)) query.set("nodeId", stringArg(args.node)!);
         console.log(JSON.stringify(await viaServer(`/api/brain/graph/entity?${query}`, "GET"), null, 2));
+      } else if (action === "neighborhood") {
+        const query = new URLSearchParams();
+        if (neighborhoodParams.jid) query.set("jid", neighborhoodParams.jid);
+        if (neighborhoodParams.name) query.set("name", neighborhoodParams.name);
+        if (neighborhoodParams.nodeId) query.set("nodeId", neighborhoodParams.nodeId);
+        if (neighborhoodParams.chat) query.set("chat", neighborhoodParams.chat);
+        if (neighborhoodParams.depth != null) query.set("depth", String(neighborhoodParams.depth));
+        if (neighborhoodParams.kinds?.length) query.set("kinds", neighborhoodParams.kinds.join(","));
+        if (neighborhoodParams.since != null) query.set("since", String(neighborhoodParams.since));
+        if (neighborhoodParams.until != null) query.set("until", String(neighborhoodParams.until));
+        if (neighborhoodParams.minSalience != null) query.set("minSalience", String(neighborhoodParams.minSalience));
+        if (neighborhoodParams.includeDormant) query.set("includeDormant", "true");
+        if (neighborhoodParams.maxNodes != null) query.set("maxNodes", String(neighborhoodParams.maxNodes));
+        if (neighborhoodParams.maxEdges != null) query.set("maxEdges", String(neighborhoodParams.maxEdges));
+        printNeighborhood((await viaServer(`/api/brain/graph/neighborhood?${query}`, "GET")) as import("../shared/types").BrainGraphNeighborhoodView);
       } else if (action === "unresolved") {
         console.log(JSON.stringify(await viaServer("/api/brain/graph/unresolved", "GET"), null, 2));
       } else {
@@ -599,6 +633,8 @@ async function main(): Promise<void> {
           return;
         }
         console.log(JSON.stringify(view, null, 2));
+      } else if (action === "neighborhood") {
+        printNeighborhood(await repository.getBrainGraphNeighborhood(neighborhoodParams));
       } else if (action === "unresolved") {
         console.log(JSON.stringify(await repository.listUnresolvedBrainGraphEntities({ limit: numberArg(args.limit) ?? 50 }), null, 2));
       } else {
@@ -1172,6 +1208,35 @@ function displayPath(filePath: string): string {
   return relative && !relative.startsWith("..") ? relative : filePath;
 }
 
+// Compact neighborhood summary for headless verification (graph-explorer): the
+// same repository method the HTTP route uses, so CLI and API can't diverge.
+function printNeighborhood(view: import("../shared/types").BrainGraphNeighborhoodView | null): void {
+  if (!view) {
+    console.error("No graph node matches that anchor (pass --jid, --name, or --node).");
+    process.exitCode = 1;
+    return;
+  }
+  const filters = view.appliedFilters;
+  console.log(
+    `Anchor ${view.anchorId}${view.redirected ? " (redirected)" : ""} — depth ${filters.depth}, kinds ${
+      filters.kinds ? filters.kinds.join(",") : "all"
+    }, ${filters.includeDormant ? "incl dormant" : "active only"}, min salience ${filters.minSalience}`
+  );
+  console.log(`Nodes ${view.nodes.length}/${view.totalNodes}   Edges ${view.edges.length}/${view.totalEdges}${view.truncated ? "   [truncated]" : ""}`);
+  const kindCounts = new Map<string, number>();
+  for (const edge of view.edges) {
+    kindCounts.set(edge.kind, (kindCounts.get(edge.kind) ?? 0) + 1);
+  }
+  console.log(`Edge kinds: ${[...kindCounts.entries()].map(([kind, count]) => `${kind}=${count}`).join("  ") || "(none)"}`);
+  console.log("Nodes:");
+  for (const node of view.nodes.slice(0, 20)) {
+    console.log(`  hop${node.hop} [${node.kind}] ${node.label}  salience ${node.salience.toFixed(2)}${node.status !== "active" ? ` (${node.status})` : ""}`);
+  }
+  if (view.nodes.length > 20) {
+    console.log(`  … ${view.nodes.length - 20} more`);
+  }
+}
+
 function parseArgs(values: string[]): Args {
   const args: Args = {};
   for (let index = 0; index < values.length; index += 1) {
@@ -1229,6 +1294,7 @@ function printHelp(): void {
   tsx src/server/cli.ts live-unlink
   tsx src/server/cli.ts brain-eval [--init] [--gate] [--baseline <runId>] [--notes <text>] [--json]
   tsx src/server/cli.ts brain-graph [stats|rebuild|recompute|entity|unresolved] [--jid <jid>] [--name <name>] [--node <id>]
+  tsx src/server/cli.ts brain-graph neighborhood [--jid|--name|--node <anchor>] [--depth 1|2] [--kinds a,b] [--since <ms>] [--until <ms>] [--min-salience <n>] [--include-dormant] [--max-nodes <n>] [--max-edges <n>]
   tsx src/server/cli.ts brain-backfill [start|status|cancel] [--rate <calls/hour>] [--daily <calls/day>] [--max-calls N] [--max-tokens N] [--max-chats N] [--concurrency 1-6] [--strict] [--extractive] [--provider codex|claude-cli] [--model <model>]
   tsx src/server/cli.ts set-contact-name --jid <sourceJid> --name "<display name>"
   tsx src/server/cli.ts persons-scan [--connect-only]

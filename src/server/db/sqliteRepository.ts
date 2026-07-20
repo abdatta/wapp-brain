@@ -21,8 +21,13 @@ import type {
   BrainGradingSampleClaim,
   BrainGraphEdgeKind,
   BrainGraphEdgeView,
+  BrainGraphEdgeCitation,
+  BrainGraphEdgeEvidenceView,
   BrainGraphEntityClaim,
   BrainGraphEntityView,
+  BrainGraphNeighborhoodEdge,
+  BrainGraphNeighborhoodParams,
+  BrainGraphNeighborhoodView,
   BrainGraphNodeKind,
   BrainGraphNodeRecord,
   BrainGraphNodeStatus,
@@ -31,6 +36,7 @@ import type {
   BrainGraphStats,
   BrainGraphSyncResult,
   BrainGraphUnresolvedEntity,
+  BrainGraphNodeSuggestion,
   BrainModelQualityAggregate,
   BrainLlmUsageSummary,
   BrainRunSummary,
@@ -162,6 +168,7 @@ import {
   type GraphMutations,
   type GraphNodeSpec
 } from "../brain/graph";
+import { resolveNeighborhoodParams, shapeNeighborhood, type NeighborhoodWalk } from "../brain/graphQuery";
 import { PublicError } from "../privacy";
 import { termAliasSeedRows } from "../search/aliasSeed";
 import {
@@ -5720,6 +5727,314 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       edges,
       aliases: aliasRows.map((alias) => alias.alias),
       redirected
+    };
+  }
+
+  // Anchor resolution shared by the graph reads: node id (following merged
+  // redirect stubs, bounded), canonical JID, or exact title/alias. Returns null
+  // for an unresolved or still-merged anchor.
+  private resolveGraphAnchor(query: { nodeId?: string; jid?: string; name?: string; chat?: string }): { row: GraphNodeRow; redirected: boolean } | null {
+    const selectById = this.db.prepare(`SELECT * FROM brain_nodes WHERE id = ?`);
+    let row: GraphNodeRow | undefined;
+    let redirected = false;
+    if (query.chat?.trim()) {
+      row = this.db.prepare(`SELECT * FROM brain_nodes WHERE natural_key = ?`).get(chatNaturalKey(query.chat.trim())) as GraphNodeRow | undefined;
+    } else if (query.nodeId) {
+      row = selectById.get(query.nodeId) as GraphNodeRow | undefined;
+      for (let hop = 0; row && row.status === "merged" && row.merged_into && hop < 5; hop += 1) {
+        row = selectById.get(row.merged_into) as GraphNodeRow | undefined;
+        redirected = true;
+      }
+    } else if (query.jid) {
+      const canonical = this.canonicalJid(query.jid) ?? query.jid;
+      row = this.db.prepare(`SELECT * FROM brain_nodes WHERE natural_key = ?`).get(personJidNaturalKey(canonical)) as GraphNodeRow | undefined;
+    } else if (query.name?.trim()) {
+      const norm = query.name.trim().toLowerCase();
+      // Prefer a RESOLVED person whose read-time label matches the name: people
+      // carry no stored title (their name resolves from contacts), so a title
+      // match alone skips them and lands on an unresolved same-name mention.
+      row = this.db
+        .prepare(
+          `SELECT n.* FROM brain_nodes n JOIN contacts c ON c.source_jid = n.jid
+           WHERE n.kind = 'person' AND n.status != 'merged' AND lower(c.display_name) = ?
+           ORDER BY n.salience DESC LIMIT 1`
+        )
+        .get(norm) as GraphNodeRow | undefined;
+      if (!row) {
+        row = this.db
+          .prepare(`SELECT * FROM brain_nodes WHERE status != 'merged' AND lower(COALESCE(title, '')) = ? ORDER BY salience DESC, citation_count DESC LIMIT 1`)
+          .get(norm) as GraphNodeRow | undefined;
+      }
+      if (!row) {
+        row = this.db
+          .prepare(
+            `SELECT n.* FROM brain_nodes n JOIN brain_node_aliases a ON a.node_id = n.id
+             WHERE n.status != 'merged' AND lower(a.alias) = ? ORDER BY n.salience DESC LIMIT 1`
+          )
+          .get(norm) as GraphNodeRow | undefined;
+      }
+    }
+    if (!row || row.status === "merged") {
+      return null;
+    }
+    return { row, redirected };
+  }
+
+  async searchBrainGraphNodes(query: string, limit = 10): Promise<BrainGraphNodeSuggestion[]> {
+    const q = query.trim().toLowerCase();
+    if (!q) {
+      return [];
+    }
+    // Substring match on the read-time label sources — contact name for
+    // persons, chat name for chats, title for everything else — so the dropdown
+    // matches what the user sees. Leading-wildcard LIKE scans brain_nodes, which
+    // is fine for a debounced, limit-capped typeahead. Escape LIKE wildcards so
+    // a literal "%" in the query can't match everything.
+    const like = `%${q.replace(/[\\%_]/g, (m) => `\\${m}`)}%`;
+    const cap = Math.max(1, Math.min(limit, 25));
+    // Match each kind against ITS OWN label source only — persons on the contact
+    // name (falling back to the title so unresolved name-nodes still surface),
+    // chats on the chat name, everything else on the title. A blanket match
+    // would leak nodes merely SCOPED to a matching chat (e.g. a topic in a chat
+    // named "Swati" surfacing for the query "swati"). DM chats (chat_scope not a
+    // group @g.us) are excluded: the neighborhood folds a 1:1 chat onto its
+    // counterparty person, so offering both "Swati (person)" and "Swati (chat)"
+    // would be a duplicate — only the person (reachable by the same name) stays.
+    const rows = this.db
+      .prepare(
+        `SELECT n.* FROM brain_nodes n
+         LEFT JOIN contacts c ON c.source_jid = n.jid
+         LEFT JOIN chats ch ON ch.source_chat_id = n.chat_scope
+         WHERE n.status != 'merged'
+           AND n.kind NOT IN ('commitment', 'question', 'event', 'fact')
+           AND (
+             (n.kind = 'person'
+               AND (lower(COALESCE(c.display_name, '')) LIKE ? ESCAPE '\\'
+                    OR lower(COALESCE(n.title, '')) LIKE ? ESCAPE '\\'))
+             OR (n.kind = 'chat' AND n.chat_scope LIKE '%@g.us'
+                 AND lower(COALESCE(ch.display_name, '')) LIKE ? ESCAPE '\\')
+             OR (n.kind NOT IN ('person', 'chat') AND lower(COALESCE(n.title, '')) LIKE ? ESCAPE '\\')
+           )
+         ORDER BY n.salience DESC, n.citation_count DESC
+         LIMIT ?`
+      )
+      .all(like, like, like, like, cap) as GraphNodeRow[];
+    return rows.map((row) => {
+      const record = this.graphNodeRowToRecord(row);
+      return { id: record.id, label: record.label, kind: record.kind, jid: record.jid };
+    });
+  }
+
+  async getBrainGraphNeighborhood(params: BrainGraphNeighborhoodParams): Promise<BrainGraphNeighborhoodView | null> {
+    const resolved = resolveNeighborhoodParams(params);
+    const anchor = this.resolveGraphAnchor(params);
+    if (!anchor) {
+      return null;
+    }
+    const anchorId = anchor.row.id;
+    const statusPlaceholders = resolved.statuses.map(() => "?").join(",");
+    const kindClause = resolved.kinds ? ` AND e.kind IN (${resolved.kinds.map(() => "?").join(",")})` : "";
+    const sinceClause = resolved.since != null ? " AND e.last_seen_at_ms >= ?" : "";
+    const untilClause = resolved.until != null ? " AND e.last_seen_at_ms <= ?" : "";
+    // Recursive discovery: expand BOTH directions (edges are stored directional
+    // but most kinds are logically undirected; `related_to` is normalized
+    // src<dst), push kind/time/salience/status filters into the walk (index-
+    // served via idx_brain_edges_src/dst), and deterministically keep the
+    // closest, most-salient rows under the discovery ceiling. The anchor
+    // (hop 0) is exempt from the neighbor filters — it was explicitly asked for.
+    const discoverySql = `
+      WITH RECURSIVE reach(node_id, hop) AS (
+        SELECT ?, 0
+        UNION
+        SELECT CASE WHEN e.src_node_id = r.node_id THEN e.dst_node_id ELSE e.src_node_id END, r.hop + 1
+        FROM reach r
+        JOIN brain_edges e ON (e.src_node_id = r.node_id OR e.dst_node_id = r.node_id)
+        JOIN brain_nodes n ON n.id = (CASE WHEN e.src_node_id = r.node_id THEN e.dst_node_id ELSE e.src_node_id END)
+        WHERE r.hop < ?
+          AND n.status IN (${statusPlaceholders})
+          AND n.salience >= ?${kindClause}${sinceClause}${untilClause}
+      )
+      SELECT n2.*, MIN(r.hop) AS __hop
+      FROM reach r JOIN brain_nodes n2 ON n2.id = r.node_id
+      GROUP BY r.node_id
+      ORDER BY __hop ASC, n2.salience DESC, r.node_id ASC
+      LIMIT ?`;
+    const discoverArgs: unknown[] = [anchorId, resolved.depth, ...resolved.statuses, resolved.minSalience];
+    if (resolved.kinds) discoverArgs.push(...resolved.kinds);
+    if (resolved.since != null) discoverArgs.push(resolved.since);
+    if (resolved.until != null) discoverArgs.push(resolved.until);
+    discoverArgs.push(resolved.maxDiscover + 1);
+    const discoveredRows = this.db.prepare(discoverySql).all(...discoverArgs) as Array<GraphNodeRow & { __hop: number }>;
+    const discoveryTruncated = discoveredRows.length > resolved.maxDiscover;
+    const nodeRows = discoveryTruncated ? discoveredRows.slice(0, resolved.maxDiscover) : discoveredRows;
+
+    const ids = nodeRows.map((row) => row.id);
+    const edges: BrainGraphNeighborhoodEdge[] = [];
+    if (ids.length > 0) {
+      const idPlaceholders = ids.map(() => "?").join(",");
+      const edgeKindClause = resolved.kinds ? ` AND kind IN (${resolved.kinds.map(() => "?").join(",")})` : "";
+      const edgeSinceClause = resolved.since != null ? " AND last_seen_at_ms >= ?" : "";
+      const edgeUntilClause = resolved.until != null ? " AND last_seen_at_ms <= ?" : "";
+      const edgeArgs: unknown[] = [...ids, ...ids];
+      if (resolved.kinds) edgeArgs.push(...resolved.kinds);
+      if (resolved.since != null) edgeArgs.push(resolved.since);
+      if (resolved.until != null) edgeArgs.push(resolved.until);
+      const edgeRows = this.db
+        .prepare(
+          `SELECT id, src_node_id, dst_node_id, kind, evidence_count, first_seen_at_ms, last_seen_at_ms
+           FROM brain_edges
+           WHERE src_node_id IN (${idPlaceholders}) AND dst_node_id IN (${idPlaceholders})${edgeKindClause}${edgeSinceClause}${edgeUntilClause}`
+        )
+        .all(...edgeArgs) as Array<{
+        id: number;
+        src_node_id: string;
+        dst_node_id: string;
+        kind: BrainGraphEdgeKind;
+        evidence_count: number;
+        first_seen_at_ms: number | null;
+        last_seen_at_ms: number | null;
+      }>;
+      for (const edge of edgeRows) {
+        edges.push({
+          id: edge.id,
+          srcId: edge.src_node_id,
+          dstId: edge.dst_node_id,
+          kind: edge.kind,
+          evidenceCount: Number(edge.evidence_count ?? 0),
+          firstSeenAtMs: edge.first_seen_at_ms,
+          lastSeenAtMs: edge.last_seen_at_ms
+        });
+      }
+    }
+    const personJids = nodeRows.filter((row) => row.kind === "person" && row.jid).map((row) => row.jid as string);
+    const personKeyByJid = this.personKeysSync(personJids);
+    // Every display name of the person behind each JID (all linked identities,
+    // even off-screen) — so an unresolved written name can fold onto a person
+    // whose matching name is a linked alias.
+    const personAliasesByJid = new Map<string, string[]>();
+    const membersByPerson = new Map<string, string[]>();
+    for (const personId of new Set([...personKeyByJid.values()].filter((key) => !key.includes("@")))) {
+      membersByPerson.set(
+        personId,
+        (this.db.prepare(`SELECT identity_jid FROM person_members WHERE person_id = ?`).all(personId) as Array<{ identity_jid: string }>).map(
+          (row) => row.identity_jid
+        )
+      );
+    }
+    for (const jid of personJids) {
+      const key = personKeyByJid.get(jid) ?? jid;
+      const memberJids = !key.includes("@") ? membersByPerson.get(key) ?? [jid] : [jid];
+      personAliasesByJid.set(jid, [...new Set(memberJids.map((memberJid) => this.labelForJid(memberJid)))]);
+    }
+    const ownerName = this.readOwnerNameSync();
+    const ownerSelfJids = this.readOwnerSelfJids();
+    const ownerPersonKeys = ownerSelfJids.length > 0 ? [...new Set(this.personKeysSync(ownerSelfJids).values())] : [];
+    const ownerAllJids = new Set(ownerSelfJids);
+    for (const personKey of ownerPersonKeys) {
+      if (!personKey.includes("@")) {
+        for (const row of this.db.prepare(`SELECT identity_jid FROM person_members WHERE person_id = ?`).all(personKey) as Array<{ identity_jid: string }>) {
+          ownerAllJids.add(row.identity_jid);
+        }
+      }
+    }
+    const ownerInfo =
+      ownerName || ownerAllJids.size > 0 ? { name: ownerName ?? null, personKeys: ownerPersonKeys, selfJids: [...ownerAllJids] } : null;
+    const walk: NeighborhoodWalk = {
+      anchorId,
+      redirected: anchor.redirected,
+      discovered: nodeRows.map((row) => ({ record: this.graphNodeRowToRecord(row), hop: Number(row.__hop) })),
+      edges,
+      discoveryTruncated,
+      personKeyByJid,
+      personAliasesByJid,
+      ownerInfo
+    };
+    return shapeNeighborhood(walk, resolved);
+  }
+
+  async getBrainGraphEdgeEvidence(edgeId: number): Promise<BrainGraphEdgeEvidenceView | null> {
+    const edge = this.db.prepare(`SELECT * FROM brain_edges WHERE id = ?`).get(edgeId) as
+      | { id: number; src_node_id: string; dst_node_id: string; kind: BrainGraphEdgeKind; evidence_count: number; first_seen_at_ms: number | null; last_seen_at_ms: number | null }
+      | undefined;
+    if (!edge) {
+      return null;
+    }
+    const selectById = this.db.prepare(`SELECT * FROM brain_nodes WHERE id = ?`);
+    const endpoint = (nodeId: string): BrainGraphEdgeEvidenceView["src"] => {
+      const row = selectById.get(nodeId) as GraphNodeRow | undefined;
+      return row
+        ? { id: row.id, kind: row.kind, label: this.graphLabelForNodeRow(row), jid: row.jid }
+        : { id: nodeId, kind: "other", label: nodeId, jid: null };
+    };
+    const evidenceRows = this.db
+      .prepare(`SELECT claim_id, source_message_key, source_ref, observed_at_ms FROM brain_edge_evidence WHERE edge_id = ? ORDER BY observed_at_ms DESC, evidence_key ASC`)
+      .all(edge.id) as Array<{ claim_id: string | null; source_message_key: string | null; source_ref: string | null; observed_at_ms: number | null }>;
+    const claimStmt = this.db.prepare(`SELECT kind, text FROM brain_claims WHERE id = ?`);
+    const claimCitesStmt = this.db.prepare(
+      `SELECT bc.source_message_key, bc.source_chat_id, bc.message_id, bc.sender_source_jid, bc.timestamp_ms, ch.id AS chat_numeric_id
+       FROM brain_citations bc LEFT JOIN chats ch ON ch.source_chat_id = bc.source_chat_id
+       WHERE bc.claim_id = ? ORDER BY bc.timestamp_ms DESC, bc.id ASC`
+    );
+    const msgStmt = this.db.prepare(
+      `SELECT m.id AS messageId, c.id AS chatNumericId, c.source_chat_id AS sourceChatId, m.sender_source_jid AS senderSourceJid, m.timestamp_ms AS timestampMs
+       FROM messages m JOIN chats c ON c.id = m.chat_id WHERE m.source_message_key = ?`
+    );
+    const citations: BrainGraphEdgeCitation[] = [];
+    const seen = new Set<string>();
+    const LIMIT = 100;
+    for (const ev of evidenceRows) {
+      if (citations.length >= LIMIT) break;
+      if (ev.claim_id) {
+        const claim = claimStmt.get(ev.claim_id) as { kind: BrainGraphEntityClaim["kind"]; text: string } | undefined;
+        const cites = claimCitesStmt.all(ev.claim_id) as Array<{ source_message_key: string; source_chat_id: string | null; message_id: number | null; sender_source_jid: string | null; timestamp_ms: number | null; chat_numeric_id: number | null }>;
+        for (const cite of cites) {
+          if (citations.length >= LIMIT) break;
+          const key = `${ev.claim_id}:${cite.source_message_key}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          citations.push({
+            sourceMessageKey: cite.source_message_key,
+            sourceChatId: cite.source_chat_id ?? null,
+            chatId: cite.chat_numeric_id ?? null,
+            messageId: cite.message_id ?? null,
+            senderSourceJid: cite.sender_source_jid ?? null,
+            timestampMs: cite.timestamp_ms ?? null,
+            claimId: ev.claim_id,
+            claimKind: claim?.kind ?? null,
+            claimText: claim?.text ?? null
+          });
+        }
+      } else if (ev.source_message_key) {
+        const key = `msg:${ev.source_message_key}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const message = msgStmt.get(ev.source_message_key) as
+          | { messageId: number | null; chatNumericId: number | null; sourceChatId: string | null; senderSourceJid: string | null; timestampMs: number | null }
+          | undefined;
+        citations.push({
+          sourceMessageKey: ev.source_message_key,
+          sourceChatId: message?.sourceChatId ?? null,
+          chatId: message?.chatNumericId ?? null,
+          messageId: message?.messageId ?? null,
+          senderSourceJid: message?.senderSourceJid ?? null,
+          timestampMs: message?.timestampMs ?? ev.observed_at_ms ?? null,
+          claimId: null,
+          claimKind: null,
+          claimText: null
+        });
+      }
+      // Pure-signal evidence (source_ref only, e.g. a vCard sync) counts toward
+      // evidenceCount but is not thread-linkable, so it is not listed here.
+    }
+    return {
+      edgeId: edge.id,
+      kind: edge.kind,
+      src: endpoint(edge.src_node_id),
+      dst: endpoint(edge.dst_node_id),
+      evidenceCount: Number(edge.evidence_count ?? 0),
+      firstSeenAtMs: edge.first_seen_at_ms,
+      lastSeenAtMs: edge.last_seen_at_ms,
+      citations
     };
   }
 

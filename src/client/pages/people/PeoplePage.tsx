@@ -344,6 +344,11 @@ function DebtCard({ item, busy, onRename }: { item: BrainResolutionDebtIdentity;
         <li className="muted">
           Referred to by number in {item.episodeCount.toLocaleString()} episode(s) · {item.messageCount.toLocaleString()} messages behind them.
         </li>
+        <li>
+          <Link className="linkButton" to={`/graph?jid=${encodeURIComponent(item.jid)}`}>
+            View in graph
+          </Link>
+        </li>
       </ul>
       <form
         className="personRenameForm"
