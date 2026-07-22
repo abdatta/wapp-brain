@@ -806,7 +806,19 @@ describe("vault file naming", () => {
 
   it("composes episode and page names with a stable id", () => {
     const episode = { id: "2796c25e-b6d3-44b0-a6f3-3937f23015ae", startAtMs: Date.UTC(2014, 6, 21, 14, 35), chatSourceId: "x@g.us", chatDisplayName: "A03 BATCH FIITJEE" };
-    expect(episodeFileBase(episode)).toBe("2014-07-21 A03 BATCH FIITJEE 2796c25e");
+    expect(episodeFileBase(episode)).toBe("A03 BATCH FIITJEE 2014-07-21 2796c25e");
+    // The label leads so a flat folder groups a chat's episodes; the date sorts
+    // them within that group. Both properties are the point of the ordering.
+    const series = [
+      { ...episode, id: "aaaaaaaa-0000-0000-0000-000000000000", startAtMs: Date.UTC(2015, 0, 2) },
+      { ...episode, id: "bbbbbbbb-0000-0000-0000-000000000000", startAtMs: Date.UTC(2014, 6, 21), chatDisplayName: "Zebra Chat" },
+      { ...episode, id: "cccccccc-0000-0000-0000-000000000000", startAtMs: Date.UTC(2014, 6, 21) }
+    ].map(episodeFileBase);
+    expect([...series].sort()).toEqual([
+      "A03 BATCH FIITJEE 2014-07-21 cccccccc",
+      "A03 BATCH FIITJEE 2015-01-02 aaaaaaaa",
+      "Zebra Chat 2014-07-21 bbbbbbbb"
+    ]);
     // "Supratik" names 7 different chats in the real archive, so the slug is
     // not decoration — it is what makes the name unique.
     expect(docFileBase("Supratik", "person-919088460418")).toBe("Supratik (person-919088460418)");
@@ -1173,11 +1185,12 @@ describe("reset, repair, and projection", () => {
       expect(fs.existsSync(pagePath)).toBe(true);
       await projectBrainOverview(repository);
       expect(fs.existsSync(path.join(tempDir, "overview.md"))).toBe(true);
-      // Episodes: date first for one readable timeline, chat name, short id.
+      // Episodes: chat name first so a chat's episodes group, then the date,
+      // then the short id.
       await repository.updateBrainEpisodeMarkdown(episode.id, "# Episode\n\n- Riya fact. ^claim-1");
       await projectBrainEpisodes(repository);
       const episodeFiles = fs.readdirSync(path.join(tempDir, "episodes"));
-      expect(episodeFiles).toEqual([`${new Date(base).toISOString().slice(0, 10)} Chat ${CHAT} ${episode.id.slice(0, 8)}.md`]);
+      expect(episodeFiles).toEqual([`Chat ${CHAT} ${new Date(base).toISOString().slice(0, 10)} ${episode.id.slice(0, 8)}.md`]);
       // The page's wikilink must resolve to that exact file — the two names
       // come from one definition precisely so this can never drift.
       const page = fs.readFileSync(pagePath, "utf8");

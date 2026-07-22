@@ -124,7 +124,7 @@ Projected file names SHALL be readable in Obsidian, where the file name is the n
 
 #### Scenario: Names read as titles
 - **WHEN** episodes and pages project to the vault
-- **THEN** episode files lead with the date and the chat's name, page files lead with the entity's name, and each ends with the stable id that makes it unique
+- **THEN** episode files lead with the chat's name then the date — so a flat folder groups a chat's episodes and sorts them chronologically within that group — page files lead with the entity's name, and each ends with the stable id that makes it unique
 
 #### Scenario: A rename leaves no duplicate and no dangling link
 - **WHEN** a chat or contact is renamed and the projection re-runs

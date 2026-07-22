@@ -62,8 +62,10 @@ export function episodeShortId(episodeId: string): string {
   return episodeId.slice(0, 8);
 }
 
-// `2014-07-21 A03 BATCH FIITJEE 2796c25e` — date first so the folder reads as
-// one timeline, name second, id last where truncation eats it harmlessly.
+// `A03 BATCH FIITJEE 2014-07-21 2796c25e` — chat label first so a flat,
+// alphabetically-sorted folder groups every episode of a chat together; the
+// ISO date second so they read as that chat's timeline; the id last, where
+// name truncation eats it harmlessly.
 export function episodeFileBase(episode: {
   id: string;
   startAtMs: number;
@@ -72,7 +74,7 @@ export function episodeFileBase(episode: {
 }): string {
   const day = new Date(episode.startAtMs).toISOString().slice(0, 10);
   const label = sanitizeVaultLabel(episode.chatDisplayName, chatFallbackLabel(episode.chatSourceId));
-  return `${day} ${label} ${episodeShortId(episode.id)}`;
+  return `${label} ${day} ${episodeShortId(episode.id)}`;
 }
 
 // `Supratik (person-919088460418)` — the slug is immutable and already path
