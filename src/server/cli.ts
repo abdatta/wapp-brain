@@ -438,6 +438,138 @@ async function main(): Promise<void> {
     }
   }
 
+  // Semantic docs (semantic-rollups): `brain-docs` lists docs + dueness
+  // (--due, --kind, --json); `brain-docs show --doc <id>` prints one doc's
+  // rendered markdown; `brain-docs rollback --doc <id> [--to N]` restores a
+  // prior revision mechanically; `brain-docs project` rebuilds the vault
+  // projection (zero model calls); `brain-docs rollup [--doc id | --node id |
+  // --max-docs N] [--provider …] [--model …] [--effort …] [--max-model-calls N]
+  // [--max-tokens N]` runs the strong-tier consolidation (run with the server
+  // STOPPED — SQLite is single-writer).
+  if (command === "brain-docs") {
+    const action = stringArg(args._) ?? "list";
+    const repository = createArchiveRepository();
+    try {
+      if (action === "show") {
+        const docId = stringArg(args.doc);
+        if (!docId) {
+          throw new Error("Usage: brain-docs show --doc <docId>");
+        }
+        const detail = await repository.getBrainDoc(docId);
+        if (!detail) {
+          console.error(`No such doc: ${docId}`);
+          process.exitCode = 1;
+          return;
+        }
+        if (args.json) {
+          console.log(JSON.stringify(detail, null, 2));
+          return;
+        }
+        console.log(detail.markdown ?? `(no revision yet — ${detail.due ? `due: ${detail.dueReasons.join(", ")}` : "not due"})`);
+        return;
+      }
+      if (action === "rollback") {
+        const docId = stringArg(args.doc);
+        if (!docId) {
+          throw new Error("Usage: brain-docs rollback --doc <docId> [--to <revision>]");
+        }
+        const to = numberArg(args.to);
+        const detail = await repository.rollbackBrainDoc(docId, to == null ? null : to);
+        const { projectBrainDocs, projectBrainOverview } = await import("./brain/projection");
+        await projectBrainDocs(repository, { docIds: [docId] }).catch(() => undefined);
+        await projectBrainOverview(repository).catch(() => undefined);
+        console.log(
+          detail?.current
+            ? `Rolled ${docId} back to revision ${detail.current.revision}; page re-rendered.`
+            : `Unrolled ${docId}: no current page. Revisions are retained; the next rollup generates from scratch.`
+        );
+        return;
+      }
+      if (action === "project") {
+        const { rebuildBrainProjection } = await import("./brain/projection");
+        const result = await rebuildBrainProjection(repository);
+        console.log(
+          `Projection rebuilt: ${result.episodesWritten} episode file(s) restored, ${result.written} page(s) written, ` +
+            `${result.unchanged} unchanged, ${result.removed} orphan(s) removed.`
+        );
+        return;
+      }
+      if (action === "rollup") {
+        const { enableBrainProvider, setBrainProviderModel } = await import("./brain/provider");
+        const provider = stringArg(args.provider);
+        const model = stringArg(args.model);
+        if (provider === "claude-cli" || provider === "codex") {
+          enableBrainProvider(provider);
+          if (model) {
+            setBrainProviderModel(provider, model);
+          }
+        }
+        const { startBrainRollupRun, getBrainRunProgress } = await import("./brain/runJob");
+        const effortRaw = stringArg(args.effort);
+        const started = startBrainRollupRun(repository, {
+          docId: stringArg(args.doc) ?? null,
+          nodeId: stringArg(args.node) ?? null,
+          maxDocs: numberArg(args["max-docs"]) ?? null,
+          model: model ?? null,
+          effort:
+            effortRaw === "none" || effortRaw === "low" || effortRaw === "medium" || effortRaw === "high" || effortRaw === "xhigh" || effortRaw === "max"
+              ? effortRaw
+              : null,
+          maxModelCalls: numberArg(args["max-model-calls"]) ?? null,
+          maxTokens: numberArg(args["max-tokens"]) ?? null
+        });
+        if (!started.started) {
+          console.error(started.refusal ?? "Could not start the rollup run.");
+          process.exitCode = 1;
+          return;
+        }
+        console.log("Rollup run started…");
+        while (getBrainRunProgress().state === "running") {
+          await new Promise((resolve) => setTimeout(resolve, 500));
+        }
+        const final = getBrainRunProgress();
+        const counters = final.rollup;
+        console.log(
+          `Rollup ${final.state}: ${counters?.docsCommitted ?? 0}/${counters?.docsPlanned ?? 0} doc(s) committed, ` +
+            `${counters?.docsRejected ?? 0} rejected, ${counters?.resolutionsApplied ?? 0} resolution(s), ` +
+            `${counters?.contradictionsFlagged ?? 0} contradiction flag(s), ${final.modelCalls} model call(s).${final.error ? ` ${final.error}` : ""}`
+        );
+        if (final.state === "failed") {
+          process.exitCode = 1;
+        }
+        return;
+      }
+      // Default: list.
+      const kindRaw = stringArg(args.kind);
+      const viewRaw = stringArg(args.view) ?? (args.due ? "due" : undefined);
+      const response = await repository.listBrainDocs({
+        kind: kindRaw === "entity" || kindRaw === "topic" || kindRaw === "chat" ? kindRaw : undefined,
+        view:
+          viewRaw === "pages" || viewRaw === "due" || viewRaw === "candidates" || viewRaw === "issues" || viewRaw === "all"
+            ? viewRaw
+            : undefined,
+        limit: numberArg(args.limit) ?? 50
+      });
+      if (args.json) {
+        console.log(JSON.stringify(response, null, 2));
+        return;
+      }
+      console.log(
+        `${response.counts.docs} doc(s), ${response.counts.due} due, ${response.counts.candidates} candidate(s), ${response.counts.issues} issue(s):`
+      );
+      for (const item of response.items) {
+        const revision = item.revision != null ? `rev ${item.revision}` : "no page yet";
+        const due = item.due ? ` DUE(${item.dueReasons.join(",")})` : "";
+        console.log(
+          `  ${item.kind.padEnd(6)} ${item.docId.slice(0, 44).padEnd(44)} ${revision}${due} — ${item.eligibleClaims} claim(s), ${item.openLifecycleItems} open item(s)${item.issueCount > 0 ? `, ${item.issueCount} issue(s)` : ""}`
+        );
+      }
+      return;
+    } finally {
+      await repository.close?.();
+    }
+  }
+
   // Regenerate stale episodes (contract v2): current episodes that are
   // extractive-generated or carry a stale extraction_version are re-derived
   // from their stored windows under the current contract; old rows become

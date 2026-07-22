@@ -527,6 +527,10 @@ describe("brain eval harness", () => {
   it("eval tables survive the contract-shape rebuild that drops every derived brain table (sqlite)", async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), "wapp-eval-rebuild-"));
     const dbPath = path.join(tempDir, "archive.sqlite");
+    // Point the vault at the temp dir BEFORE opening the repository: the
+    // rebuild guard deletes projected episode files from config.brain.rootDir,
+    // and the default is the user's real workdir.
+    const restoreVault = configureBrain({ rootDir: tempDir });
     let repository: SqliteArchiveRepository | null = new SqliteArchiveRepository(dbPath);
     try {
       await repository.insertBrainEvalRun(syntheticRun({}));
@@ -534,6 +538,9 @@ describe("brain eval harness", () => {
       repository = null;
       // Regress brain_episodes to its pre-contract-v2 shape so the rebuild
       // guard fires on next open and drops the whole derived brain set.
+      // The guard also deletes every .md under config.brain.rootDir/episodes —
+      // WITHOUT the isolation below that is the user's real Obsidian vault,
+      // and `npm test` silently wipes their projected episodes every run.
       const raw = new Database(dbPath);
       raw.exec(`DROP TABLE IF EXISTS brain_media_gaps; DROP TABLE IF EXISTS brain_episode_signal_anchors;
         DROP TABLE IF EXISTS brain_validation_issues; DROP TABLE IF EXISTS brain_episode_topics; DROP TABLE IF EXISTS brain_topics;
@@ -548,6 +555,7 @@ describe("brain eval harness", () => {
       expect(await repository.countRegenerableBrainEpisodes(EXTRACTION_VERSION)).toBe(0);
     } finally {
       await repository?.close?.();
+      restoreVault();
       await rm(tempDir, { recursive: true, force: true });
     }
   });

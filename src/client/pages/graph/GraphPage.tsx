@@ -845,6 +845,15 @@ export function GraphPage() {
   };
 
   const anchorNode = view?.nodes.find((node) => node.hop === 0) ?? null;
+  // Which doc id (if any) the anchored node's page lives under — claim-ish
+  // node kinds (commitment/question/event/fact) have no pages.
+  const anchorDocId = (() => {
+    if (!anchorNode) return null;
+    if (["person", "org", "place", "project", "other"].includes(anchorNode.kind)) return `entity:${anchorNode.slug}`;
+    if (anchorNode.kind === "topic") return `topic:${anchorNode.slug}`;
+    if (anchorNode.kind === "chat") return `chat:${anchorNode.slug}`;
+    return null;
+  })();
 
   return (
     <div className="graphPage">
@@ -857,6 +866,18 @@ export function GraphPage() {
               anchored on <strong>{anchorNode.label}</strong>
               {view?.redirected && <span className="badge tipChip" data-tip="This id was merged into another; you're seeing the survivor."> redirected</span>}
             </span>
+          )}
+          {anchorNode && anchorDocId && (
+            // The graph↔pages loop (semantic-rollups): a node with a page-kind
+            // opens its dossier; the doc page links back "View in graph".
+            <button
+              type="button"
+              className="chip"
+              onClick={() => navigate(`/brain/pages/${encodeURIComponent(anchorDocId)}`)}
+              title="Open this node's consolidated page (dossier)"
+            >
+              Open page
+            </button>
           )}
         </div>
         <AnchorSearch onSelect={reanchor} />

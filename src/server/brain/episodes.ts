@@ -28,6 +28,7 @@ import { config } from "../config";
 import type { ArchiveRepository } from "../db/repository";
 import { PublicError, publicErrorMessage } from "../privacy";
 import { generateStructured, getBrainProviderStatus, type BrainTokenUsage } from "./provider";
+import { episodeFileBase, episodeFileMatchesId } from "./vaultNames";
 
 // Contract version stamped on every committed episode (model AND extractive).
 // BUMP on any change to: the prompt text below, the JSON contract shape,
@@ -1096,28 +1097,25 @@ export function episodeMarkdown(record: BrainEpisodeRecord): string {
 export function projectEpisodeFile(record: BrainEpisodeRecord): void {
   const dir = path.join(config.brain.rootDir, "episodes");
   fs.mkdirSync(dir, { recursive: true });
-  const slug = `${new Date(record.startAtMs).toISOString().slice(0, 10)}-${record.chatSourceId.replace(/[^A-Za-z0-9]/g, "").slice(0, 12)}-${record.id.slice(0, 8)}`;
-  const filePath = path.join(dir, `${slug}.md`);
+  const filePath = path.join(dir, `${episodeFileBase(record)}.md`);
   const tempPath = `${filePath}.tmp`;
   fs.writeFileSync(tempPath, record.markdown, "utf8");
   fs.renameSync(tempPath, filePath);
 }
 
-// Remove the projected files for reset episodes (files are named …-<id8>.md).
+// Remove the projected files for reset episodes. Matches on the episode's
+// short id anywhere in the name, so a file written under an older naming
+// convention (or before a chat rename) is still recognized as that episode's.
 export function deleteProjectedEpisodeFiles(episodeIds: string[]): number {
   const dir = path.join(config.brain.rootDir, "episodes");
   if (episodeIds.length === 0 || !fs.existsSync(dir)) {
     return 0;
   }
-  const suffixes = new Set(episodeIds.map((id) => `-${id.slice(0, 8)}.md`));
   let removed = 0;
   for (const file of fs.readdirSync(dir)) {
-    for (const suffix of suffixes) {
-      if (file.endsWith(suffix)) {
-        fs.rmSync(path.join(dir, file), { force: true });
-        removed += 1;
-        break;
-      }
+    if (episodeIds.some((id) => episodeFileMatchesId(file, id))) {
+      fs.rmSync(path.join(dir, file), { force: true });
+      removed += 1;
     }
   }
   return removed;

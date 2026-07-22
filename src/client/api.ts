@@ -1,6 +1,9 @@
 import type {
   BrainClaimGradeRecord,
   BrainClaimGradeValue,
+  BrainDocDetail,
+  BrainDocsListResponse,
+  BrainDocsListView,
   BrainEvalGateVerdict,
   BrainEvalRunRecord,
   BrainGoldenSetInfo,
@@ -23,7 +26,10 @@ import type {
   BrainOverview,
   BrainProviderName,
   BrainProviderStatus,
+  BrainRunEffects,
+  BrainRunListItem,
   BrainRunProgress,
+  BrainRunSummary,
   ChatListItem,
   ChatListOptions,
   ImportJobSummary,
@@ -452,6 +458,21 @@ export function startBrainRun(body: {
   return request<{ ok: boolean; progress: BrainRunProgress }>("/api/brain/runs", { method: "POST", body: JSON.stringify(body) });
 }
 
+// Run history and the per-run audit (what a run durably changed, including
+// effects outside the artifact it was asked to produce).
+export function listBrainRuns(params: { kind?: string; docId?: string; limit?: number } = {}): Promise<{ runs: BrainRunListItem[] }> {
+  const query = new URLSearchParams();
+  if (params.kind) query.set("kind", params.kind);
+  if (params.docId) query.set("doc", params.docId);
+  if (params.limit != null) query.set("limit", String(params.limit));
+  const suffix = query.toString();
+  return request<{ runs: BrainRunListItem[] }>(`/api/brain/runs${suffix ? `?${suffix}` : ""}`);
+}
+
+export function getBrainRunEffects(runId: string): Promise<BrainRunEffects> {
+  return request<BrainRunEffects>(`/api/brain/runs/${encodeURIComponent(runId)}/effects`);
+}
+
 export function getBrainRunProgress(): Promise<BrainRunProgress> {
   return request<BrainRunProgress>("/api/brain/runs/current");
 }
@@ -570,6 +591,57 @@ export function startBrainLifecycleSweep(body: {
     method: "POST",
     body: JSON.stringify(body)
   });
+}
+
+// --- Semantic docs (semantic-rollups) ---
+
+// Docs list: existing docs AND page-eligible nodes without a doc yet, with
+// deterministic dueness and counts computed server-side.
+export function listBrainDocs(
+  params: { kind?: "entity" | "topic" | "chat"; view?: BrainDocsListView; limit?: number } = {}
+): Promise<BrainDocsListResponse> {
+  const query = new URLSearchParams();
+  if (params.kind) query.set("kind", params.kind);
+  if (params.view && params.view !== "all") query.set("view", params.view);
+  if (params.limit != null) query.set("limit", String(params.limit));
+  const suffix = query.toString();
+  return request<BrainDocsListResponse>(`/api/brain/docs${suffix ? `?${suffix}` : ""}`);
+}
+
+// One doc resolved for display (rendered markdown + structured sections with
+// thread coordinates + history + issues). Follows merged redirects.
+export function getBrainDoc(docId: string): Promise<BrainDocDetail> {
+  return request<BrainDocDetail>(`/api/brain/docs/${encodeURIComponent(docId)}`);
+}
+
+// Mechanical rollback to a prior revision; the page file re-renders.
+export function rollbackBrainDoc(docId: string, toRevision?: number | null): Promise<BrainDocDetail> {
+  return request<BrainDocDetail>(`/api/brain/docs/${encodeURIComponent(docId)}/rollback`, {
+    method: "POST",
+    body: JSON.stringify(toRevision != null ? { toRevision } : {})
+  });
+}
+
+// Manual-first semantic rollup run: one doc, a list, or the top-K due docs.
+export function startBrainRollupRun(body: {
+  docId?: string | null;
+  nodeId?: string | null;
+  docIds?: string[] | null;
+  maxDocs?: number | null;
+  model?: string | null;
+  effort?: BrainReasoningEffort | null;
+  maxModelCalls?: number | null;
+  maxTokens?: number | null;
+}): Promise<{ ok: boolean; progress: BrainRunProgress }> {
+  return request<{ ok: boolean; progress: BrainRunProgress }>("/api/brain/rollups/run", {
+    method: "POST",
+    body: JSON.stringify(body)
+  });
+}
+
+// Rebuild the deterministic vault projection (pages + overview) — zero model calls.
+export function rebuildBrainProjection(): Promise<{ written: number; unchanged: number; removed: number }> {
+  return request<{ written: number; unchanged: number; removed: number }>("/api/brain/project", { method: "POST" });
 }
 
 // --- Knowledge graph (knowledge-graph-foundation) ---

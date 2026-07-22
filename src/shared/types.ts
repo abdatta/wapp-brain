@@ -1368,7 +1368,7 @@ export interface MessageContextWindow {
 
 export type BrainTaskKind = "episode" | "regenerate" | "rollup" | "overview" | "merge_adjudicate" | "reindex" | "project_pages";
 export type BrainTaskStatus = "pending" | "running" | "done" | "failed";
-export type BrainRunKind = "nightly" | "catchup" | "manual" | "backfill" | "regenerate" | "lifecycle";
+export type BrainRunKind = "nightly" | "catchup" | "manual" | "backfill" | "regenerate" | "lifecycle" | "rollup";
 export type BrainRunStatus = "running" | "completed" | "failed" | "interrupted" | "budget_exceeded";
 
 export interface BrainTaskInput {
@@ -1425,6 +1425,87 @@ export interface BrainRunSummary {
   timezone: string | null;
   totals: Record<string, number> | null;
   errorMessage: string | null;
+}
+
+// --- Run audit (semantic-rollups) -------------------------------------------
+// Every table a run can durably touch already carries its run_id, so "what did
+// this run actually change?" is answerable as a pure read. This matters most
+// for effects OUTSIDE the artifact the run was asked to produce — a rollup is
+// asked for a page but may also close commitments and supersede claims, and
+// that must be auditable rather than folded invisibly into a counter.
+
+export interface BrainRunEffectLifecycle {
+  eventId: number;
+  claimId: string;
+  // Read-time resolved item text (never a stored title).
+  itemText: string;
+  // Whether the claim still exists. Regeneration can remove one out from under
+  // a past run's event, and an item that is gone has nothing to open or undo.
+  itemExists: boolean;
+  kind: "commitment" | "question" | null;
+  toStatus: BrainLifecycleTransitionStatus;
+  source: BrainLifecycleSource;
+  model: string | null;
+  note: string | null;
+  atMs: number;
+  chatSourceId: string | null;
+  chatDisplayName: string | null;
+  cites: BrainLifecycleCiteView[];
+  // The item's status NOW — a later event (or a user reopen) may have moved
+  // it on, so the audit never implies the change is still in force.
+  currentStatus: BrainLifecycleStatus;
+}
+
+export interface BrainRunEffectRevision {
+  docId: string;
+  title: string;
+  revision: number;
+  status: BrainDocRevisionStatus;
+  statementCount: number;
+  referencedClaimCount: number;
+  // Claim-level supersession this revision declared (durable, outside the page).
+  supersededClaims: Array<{ claimId: string; byClaimId: string | null }>;
+  errors: string[] | null;
+  // Whether this revision is still the doc's current one.
+  isCurrent: boolean;
+}
+
+export interface BrainRunEffects {
+  run: BrainRunSummary;
+  lifecycle: BrainRunEffectLifecycle[];
+  revisions: BrainRunEffectRevision[];
+  supersessionCount: number;
+  episodesCommitted: number;
+  issues: BrainValidationIssueRecord[];
+  asOfMs: number;
+}
+
+// Effect counts carried by every run-history row, so "did this run change
+// anything besides the artifact it was asked for?" is answerable by reading
+// the list — never only after opening the run.
+export interface BrainRunEffectCounts {
+  lifecycleChanges: number;
+  pagesWritten: number;
+  pagesRefused: number;
+  claimsSuperseded: number;
+  episodesCommitted: number;
+  issues: number;
+}
+
+// What a run did to ONE page — present only when the history is scoped to a
+// single doc, which is how a page answers "show my runs".
+export interface BrainRunDocEffect {
+  revision: number;
+  status: BrainDocRevisionStatus;
+  isCurrent: boolean;
+  statementCount: number;
+  errors: string[] | null;
+}
+
+export interface BrainRunListItem {
+  run: BrainRunSummary;
+  effects: BrainRunEffectCounts;
+  docEffect: BrainRunDocEffect | null;
 }
 
 export interface BrainLlmUsageSummary {
@@ -1669,6 +1750,8 @@ export interface BrainEpisodeRecord {
   markdown: string;
   generator: BrainEpisodeGenerator;
   model: string | null;
+  // The run that committed this episode — run attribution for the audit.
+  runId: string | null;
   status: "current" | "superseded" | "stale" | "compressed";
   fallbackReason: string | null;
   attemptedModel: string | null;
@@ -1727,6 +1810,8 @@ export interface BrainValidationIssueInput {
   chatSourceId?: string | null;
   episodeId?: string | null;
   claimSequence?: number | null;
+  // semantic-rollups: issues raised by/about a doc revision anchor here.
+  docId?: string | null;
   code: string;
   severity: BrainValidationSeverity;
   detail?: string | null;
@@ -1738,6 +1823,7 @@ export interface BrainValidationIssueRecord {
   chatSourceId: string | null;
   episodeId: string | null;
   claimSequence: number | null;
+  docId: string | null;
   code: string;
   severity: BrainValidationSeverity;
   detail: string | null;
@@ -1930,9 +2016,9 @@ export interface BrainRunProgress {
   state: "idle" | "running" | "completed" | "failed" | "budget_exceeded" | "interrupted";
   runId: string | null;
   // Which run flavor is executing: manual assimilation, historical backfill,
-  // regeneration, or a lifecycle closure sweep. Null until the first run of
-  // the process.
-  kind: "manual" | "backfill" | "regenerate" | "lifecycle" | null;
+  // regeneration, a lifecycle closure sweep, or a semantic rollup run. Null
+  // until the first run of the process.
+  kind: "manual" | "backfill" | "regenerate" | "lifecycle" | "rollup" | null;
   // Pending episode tasks in the durable queue, refreshed per task completion
   // during a backfill run (null for run kinds that do not drain the queue).
   queuedTasks: number | null;
@@ -1962,6 +2048,9 @@ export interface BrainRunProgress {
   // Closure-sweep counters (kind 'lifecycle' only): what the sweep offered and
   // what the model resolved, so the run surface reads in lifecycle terms.
   lifecycle?: BrainLifecycleSweepProgress | null;
+  // Rollup counters (kind 'rollup' only): docs planned/committed/rejected plus
+  // embedded-closure and contradiction-flag tallies.
+  rollup?: BrainRollupProgress | null;
 }
 
 export interface BrainLifecycleSweepProgress {
@@ -1971,6 +2060,17 @@ export interface BrainLifecycleSweepProgress {
   stillOpen: number;
   // Calls whose response failed validation twice — nodes stayed open.
   failedCalls: number;
+}
+
+// Live counters for a semantic rollup run (kind 'rollup'), folded into
+// BrainRunProgress the way the lifecycle sweep's counters are.
+export interface BrainRollupProgress {
+  docsPlanned: number;
+  docsCommitted: number;
+  docsRejected: number;
+  resolutionsApplied: number;
+  contradictionsFlagged: number;
+  currentDoc: string | null;
 }
 
 // --- Historical backfill (historical-backfill) ---
@@ -2861,4 +2961,272 @@ export interface ArchiveChangeEvent {
   messageCount: number;
   contactCount: number;
   updatedAt: string;
+}
+
+// --- Semantic consolidation (semantic-rollups) -------------------------------
+// The semantic tier: entity/topic/chat docs consolidated from episode claims
+// by a strong-tier model call that returns STRUCTURED STATEMENTS (never a
+// document — markdown is a deterministic render). Revisions are retained; the
+// regression guard is exact set accounting over claim refs; supersession is
+// declared in revisions (durable truth) and projected onto claims.
+
+export type BrainDocKind = "entity" | "topic" | "chat";
+export type BrainDocStatus = "active" | "merged";
+export type BrainDocRevisionStatus = "current" | "superseded" | "rejected";
+export type BrainDocDropReason =
+  | "superseded"
+  | "stale"
+  | "out_of_scope"
+  // Mechanical annotation, never the model's: the claim no longer exists in
+  // storage (its episode regenerated/superseded) — auto-declared by the guard.
+  | "claim_deleted";
+
+// One consolidated statement: prose bound to the claim ids it represents.
+// Statement text follows the same substitutable-label discipline as episode
+// prose (identity repair sweeps it deterministically).
+export interface BrainDocStatement {
+  text: string;
+  claimIds: string[];
+}
+
+export interface BrainDocSection {
+  title: string;
+  statements: BrainDocStatement[];
+}
+
+export interface BrainDocDrop {
+  claimId: string;
+  reason: BrainDocDropReason;
+  // For reason='superseded': the newer fed claim that replaces it.
+  byClaimId: string | null;
+}
+
+export interface BrainDocRevisionRecord {
+  id: number;
+  docId: string;
+  revision: number;
+  status: BrainDocRevisionStatus;
+  sections: BrainDocSection[];
+  drops: BrainDocDrop[];
+  // The audit: exactly which claim ids the model call saw.
+  fedClaimIds: string[];
+  inputStats: {
+    claimCount: number;
+    tokenEstimate: number;
+    overflow: boolean;
+    tiersEngaged: string[];
+  };
+  // Lifecycle transitions applied atomically with this revision (event ids).
+  resolutionEventIds: number[];
+  // Rejected revisions retain their refusal for audit.
+  errors: string[] | null;
+  model: string | null;
+  effort: string | null;
+  runId: string | null;
+  promptVersion: number;
+  createdAtMs: number;
+}
+
+export interface BrainDocRecord {
+  docId: string;
+  kind: BrainDocKind;
+  nodeId: string | null;
+  slug: string | null;
+  status: BrainDocStatus;
+  mergedInto: string | null;
+  currentRevisionId: number | null;
+  lastRollupAtMs: number | null;
+  createdAtMs: number;
+}
+
+// Why a doc is due — deterministic conditions only, all recomputable.
+export type BrainDocDueReason = "never_rolled" | "new_claims" | "claims_deleted" | "lifecycle_changed" | "merged_scope";
+
+// One row on the docs list: existing docs AND page-eligible nodes without a
+// doc yet (candidates the user can roll on demand). Meaning lives server-side.
+export interface BrainDocListItem {
+  docId: string;
+  kind: BrainDocKind;
+  nodeId: string;
+  slug: string;
+  // Read-time resolved label (person aggregation aware) — never stored title.
+  title: string;
+  status: BrainDocStatus;
+  mergedInto: string | null;
+  revision: number | null;
+  lastRollupAtMs: number | null;
+  eligibleClaims: number;
+  newClaimsSinceRollup: number;
+  due: boolean;
+  dueReasons: BrainDocDueReason[];
+  salience: number;
+  openLifecycleItems: number;
+  issueCount: number;
+}
+
+// Every count chip on the docs list is a view you can actually open — a count
+// you cannot click is a dead end when the list runs to hundreds of rows.
+export type BrainDocsListView = "all" | "pages" | "due" | "candidates" | "issues";
+
+export interface BrainDocsListResponse {
+  items: BrainDocListItem[];
+  counts: {
+    docs: number;
+    due: number;
+    candidates: number;
+    issues: number;
+  };
+  asOfMs: number;
+}
+
+// A statement resolved for display: claim refs joined to their citations so
+// the client can deep-link into threads without a second query.
+export interface BrainDocStatementView {
+  text: string;
+  claims: Array<{
+    claimId: string;
+    // Dead refs render honestly (claim deleted upstream since this revision).
+    exists: boolean;
+    episodeId: string | null;
+    citations: Array<{
+      sourceMessageKey: string;
+      chatId: number | null;
+      messageId: number | null;
+      timestampMs: number | null;
+    }>;
+  }>;
+}
+
+export interface BrainDocSectionView {
+  title: string;
+  statements: BrainDocStatementView[];
+}
+
+export interface BrainDocRevisionSummary {
+  id: number;
+  revision: number;
+  status: BrainDocRevisionStatus;
+  statementCount: number;
+  referencedClaimCount: number;
+  fedClaimCount: number;
+  dropCount: number;
+  drops: BrainDocDrop[];
+  resolutionCount: number;
+  errors: string[] | null;
+  model: string | null;
+  effort: string | null;
+  runId: string | null;
+  promptVersion: number;
+  createdAtMs: number;
+}
+
+export interface BrainDocDetail {
+  doc: BrainDocRecord;
+  title: string;
+  // Resolved through a merged redirect when the doc's node merged away.
+  redirected: boolean;
+  current: BrainDocRevisionRecord | null;
+  sections: BrainDocSectionView[];
+  // Rendered markdown (the projection's exact content) for preview surfaces.
+  markdown: string | null;
+  history: BrainDocRevisionSummary[];
+  issues: BrainValidationIssueRecord[];
+  due: boolean;
+  dueReasons: BrainDocDueReason[];
+  asOfMs: number;
+}
+
+// --- Rollup input (deterministic selection with persisted audit) ------------
+
+export interface BrainRollupInputClaim {
+  claimId: string;
+  kind: BrainClaimKind;
+  text: string;
+  confidence: BrainClaimConfidence;
+  eventAtMs: number | null;
+  validUntilMs: number | null;
+  episodeId: string;
+  episodeStartAtMs: number;
+  episodeEndAtMs: number;
+  chatSourceId: string;
+  chatDisplayName: string | null;
+  citations: Array<{ sourceMessageKey: string; timestampMs: number | null; senderJid: string | null }>;
+  // Lifecycle join for commitment/question claims: folded status + due, so
+  // open items render as page content (they are content, never hints).
+  lifecycleStatus: BrainLifecycleStatus | null;
+  lifecycleDueMs: number | null;
+}
+
+// A detected likely-conflict pair (recall + verify only, never a prompt hint).
+export interface BrainConflictPair {
+  claimIdA: string;
+  claimIdB: string;
+  claimKind: BrainClaimKind;
+  // Shared entity that paired them (JID when both anchored, else name).
+  via: string;
+}
+
+export interface BrainRollupInput {
+  docId: string;
+  kind: BrainDocKind;
+  nodeId: string;
+  slug: string;
+  title: string;
+  // Prior revision's accounting (null on first rollup): referenced claim ids
+  // and the revision number — the guard's baseline. Prior PROSE never rides.
+  prior: { revisionId: number; revision: number; referencedClaimIds: string[] } | null;
+  claims: BrainRollupInputClaim[];
+  conflictPairs: BrainConflictPair[];
+  stats: {
+    eligibleClaims: number;
+    fedClaims: number;
+    tokenEstimate: number;
+    overflow: boolean;
+    tiersEngaged: string[];
+  };
+}
+
+// The validated model response, resolved from prompt-local aliases to ids —
+// what the committer applies.
+export interface BrainRollupRevisionInput {
+  docId: string;
+  kind: BrainDocKind;
+  nodeId: string;
+  slug: string;
+  sections: BrainDocSection[];
+  drops: BrainDocDrop[];
+  // Lifecycle resolutions embedded in the rollup call (commitment-tracking's
+  // verbatim fragment), already resolved to claim ids + cite message keys.
+  resolutions: BrainLifecycleTransitionInput[];
+  // Closed world for the lifecycle writer's re-check: per lifecycle claim, the
+  // input's citation keys as candidates (postdating validated by the writer).
+  allowedCitesByClaim: Map<string, BrainLifecycleCandidate[]>;
+  fedClaimIds: string[];
+  inputStats: BrainDocRevisionRecord["inputStats"];
+  model: string | null;
+  effort: string | null;
+  runId: string | null;
+  promptVersion: number;
+}
+
+// Rolling back to revision 0 UNROLLS a page: the doc returns to "eligible,
+// never rolled" so the next rollup generates from scratch instead of revising
+// — without destroying anything. Every revision stays retained and restorable,
+// which is why this replaces a hard delete: the system's promise is that no
+// consolidation is ever lost, only made non-current.
+export const BRAIN_DOC_REVISION_NONE = 0;
+
+export interface BrainDocCommitResult {
+  record: BrainDocRevisionRecord;
+  // Post-write verification: residual same-kind contradictions among the
+  // revision's referenced claims, recorded as warning issues.
+  contradictions: BrainConflictPair[];
+}
+
+export interface BrainRollupRunProgress {
+  docsPlanned: number;
+  docsCommitted: number;
+  docsRejected: number;
+  resolutionsApplied: number;
+  contradictionsFlagged: number;
 }

@@ -12,6 +12,23 @@ import type {
   BrainClaimEntityRecord,
   BrainClaimGradeRecord,
   BrainClaimGradeValue,
+  BrainConflictPair,
+  BrainDocCommitResult,
+  BrainDocDetail,
+  BrainDocDueReason,
+  BrainDocKind,
+  BrainDocListItem,
+  BrainDocRecord,
+  BrainDocRevisionRecord,
+  BrainDocRevisionSummary,
+  BrainDocSection,
+  BrainDocSectionView,
+  BrainDocStatementView,
+  BrainDocsListResponse,
+  BrainDocsListView,
+  BrainRollupInput,
+  BrainRollupInputClaim,
+  BrainRollupRevisionInput,
   BrainEpisodeGenerator,
   BrainEpisodeInput,
   BrainEpisodeRecord,
@@ -54,6 +71,13 @@ import type {
   BrainLifecycleTransitionInput,
   BrainModelQualityAggregate,
   BrainLlmUsageSummary,
+  BrainRunDocEffect,
+  BrainRunEffectCounts,
+  BrainRunEffectLifecycle,
+  BrainRunEffectRevision,
+  BrainRunEffects,
+  BrainRunKind,
+  BrainRunListItem,
   BrainRunSummary,
   BrainStatusSummary,
   BrainTaskInput,
@@ -174,6 +198,7 @@ import {
   deriveEpisodeGraph,
   engagementFactorFromAggregates,
   graphDormancyThreshold,
+  normalizeGraphName,
   parseGraphPayload,
   personJidNaturalKey,
   slugForGraphNode,
@@ -183,6 +208,20 @@ import {
   type GraphMutations,
   type GraphNodeSpec
 } from "../brain/graph";
+import { BRAIN_DOC_REVISION_NONE } from "../../shared/types";
+import {
+  detectConflictPairs,
+  docIdFor,
+  renderDocMarkdown,
+  rollupDueNewClaims,
+  rollupMinClaims,
+  rollupStaleDropShare,
+  runRollupGuard,
+  type ConflictClaimFacts,
+  type DocRenderClaimMeta,
+  type DocRenderContext,
+  type OverviewRenderData
+} from "../brain/rollups";
 import {
   compareLifecycleItems,
   computeLifecycleFlags,
@@ -196,6 +235,7 @@ import {
   type LifecycleFold
 } from "../brain/lifecycle";
 import { resolveNeighborhoodParams, shapeNeighborhood, type NeighborhoodWalk } from "../brain/graphQuery";
+import { episodeFileBase } from "../brain/vaultNames";
 import { PublicError } from "../privacy";
 import { termAliasSeedRows } from "../search/aliasSeed";
 import {
@@ -670,8 +710,9 @@ function rowToMediaAsset(row: SqliteMediaAssetRow): MediaAssetRecord {
 }
 
 // Run kinds mirror BrainRunKind; 'lifecycle' (commitment-lifecycle) is the
-// closure sweep. The CHECK migrates via copy-rename like the other kind CHECKs.
-const BRAIN_RUN_KINDS = ["nightly", "catchup", "manual", "backfill", "regenerate", "lifecycle"] as const;
+// closure sweep; 'rollup' (semantic-rollups) is the semantic consolidation
+// run. The CHECK migrates via copy-rename like the other kind CHECKs.
+const BRAIN_RUN_KINDS = ["nightly", "catchup", "manual", "backfill", "regenerate", "lifecycle", "rollup"] as const;
 
 // Lifecycle transition statuses; 'dismissed' replaced the former 'cancelled'
 // (one "not-done / off-my-list" terminal). The CHECK migrates via copy-rename.
@@ -1459,6 +1500,10 @@ const schemaStatements = [
     event_at_ms INTEGER NULL,
     valid_until_ms INTEGER NULL,
     confidence TEXT NOT NULL DEFAULT 'stated' CHECK (confidence IN ('stated','hedged','reported')),
+    -- Declared supersession PROJECTION (semantic-rollups): the doc revision is
+    -- the durable truth; this column is the cheap retrieval/input predicate.
+    -- SET NULL when the superseding claim's episode regenerates away.
+    superseded_by_claim_id TEXT NULL REFERENCES brain_claims(id) ON DELETE SET NULL,
     FOREIGN KEY (episode_id) REFERENCES brain_episodes(id) ON DELETE CASCADE
   )`,
 
@@ -1526,6 +1571,8 @@ const schemaStatements = [
     chat_source_id TEXT NULL,
     episode_id TEXT NULL,
     claim_sequence INTEGER NULL,
+    -- semantic-rollups: issues raised by/about a doc revision anchor here.
+    doc_id TEXT NULL,
     code TEXT NOT NULL,
     severity TEXT NOT NULL CHECK (severity IN ('info','warning','error')),
     detail TEXT NULL,
@@ -1695,6 +1742,56 @@ const schemaStatements = [
     FOREIGN KEY (event_id) REFERENCES brain_lifecycle_events(id) ON DELETE CASCADE
   ) WITHOUT ROWID`,
 
+  // --- Semantic consolidation (semantic-rollups) ---
+  // Doc identity: one row per entity/topic/chat page, keyed by the doc id
+  // ('<kind>:<slug>' — the node's immutable slug is the projection/URL
+  // currency). current_revision_id has no FK on purpose (write-order: the
+  // revision row lands first, then the pointer flips).
+  `CREATE TABLE IF NOT EXISTS brain_docs (
+    doc_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('entity','topic','chat')),
+    node_id TEXT NULL,
+    slug TEXT NULL,
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','merged')),
+    merged_into TEXT NULL,
+    current_revision_id INTEGER NULL,
+    last_rollup_at_ms INTEGER NULL,
+    created_at_ms INTEGER NOT NULL
+  )`,
+
+  // Retained revisions: the durable truth of every consolidation — statements
+  // with claim refs, declared drops, the fed-claim audit, applied resolutions,
+  // and (for rejected revisions) the refusal's errors. Nothing here is ever
+  // silently rewritten; rollback flips the current pointer.
+  `CREATE TABLE IF NOT EXISTS brain_doc_revisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    doc_id TEXT NOT NULL REFERENCES brain_docs(doc_id),
+    revision INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('current','superseded','rejected')),
+    sections_json TEXT NOT NULL,
+    drops_json TEXT NOT NULL,
+    fed_claim_ids_json TEXT NOT NULL,
+    input_stats_json TEXT NOT NULL,
+    resolutions_json TEXT NOT NULL,
+    errors_json TEXT NULL,
+    model TEXT NULL,
+    effort TEXT NULL,
+    run_id TEXT NULL,
+    prompt_version INTEGER NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    UNIQUE (doc_id, revision)
+  )`,
+
+  // Referenced (cited-by-statements) claim refs per revision. Deliberately NO
+  // claim FK: a dangling ref is the dueness signal that upstream regeneration
+  // moved this doc's ground truth — a cascade would erase exactly that
+  // evidence. Revision deletion cascades normally.
+  `CREATE TABLE IF NOT EXISTS brain_doc_revision_claims (
+    revision_id INTEGER NOT NULL REFERENCES brain_doc_revisions(id) ON DELETE CASCADE,
+    claim_id TEXT NOT NULL,
+    PRIMARY KEY (revision_id, claim_id)
+  ) WITHOUT ROWID`,
+
   // --- Two-level person model ---
   // Identities (canonical JIDs) are the immutable anchors; a person is an
   // editable grouping over them. A person row exists only while it has two or
@@ -1841,6 +1938,21 @@ const schemaStatements = [
   `CREATE INDEX IF NOT EXISTS idx_brain_edge_evidence_claim ON brain_edge_evidence (claim_id)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_node_claims_claim ON brain_node_claims (claim_id)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_lifecycle_events_claim ON brain_lifecycle_events (claim_id, id)`,
+  // Semantic-consolidation indexes: revision walks per doc and "which docs
+  // cite claim X" (staleness/dueness). The superseded-claims partial index is
+  // created in migrateAdditiveColumns — the column may not exist yet here on a
+  // pre-rollups archive (schemaStatements run before the additive ALTERs).
+  `CREATE INDEX IF NOT EXISTS idx_brain_doc_revisions_doc ON brain_doc_revisions (doc_id, revision DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_brain_doc_revision_claims_claim ON brain_doc_revision_claims (claim_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_brain_docs_node ON brain_docs (node_id)`,
+  // Run-audit indexes: the history list reads per-run effect counts for a whole
+  // page of runs at once, so every effect table must be reachable BY run — a
+  // scan of brain_episodes (9.4k wide markdown rows on the real archive) per
+  // listing is exactly the per-row cost this surface must not pay.
+  `CREATE INDEX IF NOT EXISTS idx_brain_lifecycle_events_run ON brain_lifecycle_events (run_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_brain_doc_revisions_run ON brain_doc_revisions (run_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_brain_episodes_run ON brain_episodes (run_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_brain_issues_run ON brain_validation_issues (run_id)`,
   // Candidate-producer indexes (commitment-lifecycle): reactions by target
   // message, pointer replies by their quoted id, and NULL-jid entity names —
   // the closure-candidate sweep over thousands of open nodes must be index
@@ -3259,6 +3371,240 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     return row ? rowToBrainRun(row) : null;
   }
 
+  async listBrainRuns(options?: { kind?: BrainRunKind; docId?: string; limit?: number }): Promise<BrainRunListItem[]> {
+    const params: unknown[] = [];
+    const clauses: string[] = [];
+    if (options?.kind) {
+      clauses.push("kind = ?");
+      params.push(options.kind);
+    }
+    if (options?.docId) {
+      // A run "touched this page" if it wrote a revision of it — including a
+      // REFUSED one, which is part of the page's honest history — or raised an
+      // issue against it. A run that died before either leaves no trace to
+      // scope by, which the surface says out loud rather than implying none ran.
+      clauses.push(
+        `(id IN (SELECT run_id FROM brain_doc_revisions WHERE doc_id = ? AND run_id IS NOT NULL)
+          OR id IN (SELECT run_id FROM brain_validation_issues WHERE doc_id = ? AND run_id IS NOT NULL))`
+      );
+      params.push(options.docId, options.docId);
+    }
+    params.push(options?.limit ?? 50);
+    const runs = (
+      this.db
+        .prepare(`SELECT * FROM brain_runs ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""} ORDER BY started_at DESC LIMIT ?`)
+        .all(...params) as SqliteBrainRunRow[]
+    ).map(rowToBrainRun);
+    return this.attachBrainRunEffectCounts(runs, options?.docId ?? null);
+  }
+
+  // Effect counts for a whole page of runs in four grouped reads (never one
+  // query per run — that is the shape that wedges on the real archive).
+  private attachBrainRunEffectCounts(runs: BrainRunSummary[], docId: string | null): BrainRunListItem[] {
+    if (runs.length === 0) {
+      return [];
+    }
+    const runIds = runs.map((run) => run.id);
+    const slots = runIds.map(() => "?").join(",");
+    const countBy = (sql: string): Map<string, number> => {
+      const counts = new Map<string, number>();
+      for (const row of this.db.prepare(sql).all(...runIds) as Array<{ runId: string | null; n: number }>) {
+        if (row.runId) {
+          counts.set(row.runId, Number(row.n));
+        }
+      }
+      return counts;
+    };
+    const lifecycleCounts = countBy(
+      `SELECT run_id AS runId, COUNT(*) AS n FROM brain_lifecycle_events WHERE run_id IN (${slots}) GROUP BY run_id`
+    );
+    const episodeCounts = countBy(`SELECT run_id AS runId, COUNT(*) AS n FROM brain_episodes WHERE run_id IN (${slots}) GROUP BY run_id`);
+    const issueCounts = countBy(
+      `SELECT run_id AS runId, COUNT(*) AS n FROM brain_validation_issues WHERE run_id IN (${slots}) GROUP BY run_id`
+    );
+    // Revisions carry two effects at once: the page write itself, and the
+    // claim supersession it declared (durable, and outside the page).
+    const revisionRows = this.db
+      .prepare(
+        `SELECT run_id AS runId, doc_id AS docId, id, revision, status, drops_json AS dropsJson, errors_json AS errorsJson
+         FROM brain_doc_revisions WHERE run_id IN (${slots})`
+      )
+      .all(...runIds) as Array<{
+      runId: string | null;
+      docId: string;
+      id: number;
+      revision: number;
+      status: BrainDocRevisionRecord["status"];
+      dropsJson: string;
+      errorsJson: string | null;
+    }>;
+    const currentRevisionId = docId ? this.docRowTx(docId)?.current_revision_id ?? null : null;
+    // sections_json is the heavy column; parse it only for the scoped doc's own
+    // revisions, where the list shows the statement count.
+    const statementCountStmt = docId
+      ? this.db.prepare(`SELECT sections_json AS sectionsJson FROM brain_doc_revisions WHERE id = ?`)
+      : null;
+    const effects = new Map<string, BrainRunEffectCounts>();
+    const docEffects = new Map<string, BrainRunDocEffect>();
+    for (const row of revisionRows) {
+      if (!row.runId) {
+        continue;
+      }
+      const bucket = effects.get(row.runId) ?? {
+        lifecycleChanges: 0,
+        pagesWritten: 0,
+        pagesRefused: 0,
+        claimsSuperseded: 0,
+        episodesCommitted: 0,
+        issues: 0
+      };
+      if (row.status === "rejected") {
+        bucket.pagesRefused += 1;
+      } else {
+        bucket.pagesWritten += 1;
+      }
+      bucket.claimsSuperseded += (JSON.parse(row.dropsJson) as BrainDocRevisionRecord["drops"]).filter(
+        (drop) => drop.reason === "superseded"
+      ).length;
+      effects.set(row.runId, bucket);
+      if (docId && row.docId === docId) {
+        const sections = JSON.parse(
+          (statementCountStmt?.get(row.id) as { sectionsJson: string } | undefined)?.sectionsJson ?? "[]"
+        ) as BrainDocRevisionRecord["sections"];
+        docEffects.set(row.runId, {
+          revision: row.revision,
+          status: row.status,
+          isCurrent: currentRevisionId != null && currentRevisionId === row.id,
+          statementCount: sections.reduce((sum, section) => sum + section.statements.length, 0),
+          errors: row.errorsJson ? (JSON.parse(row.errorsJson) as string[]) : null
+        });
+      }
+    }
+    return runs.map((run) => {
+      const bucket = effects.get(run.id);
+      return {
+        run,
+        effects: {
+          lifecycleChanges: lifecycleCounts.get(run.id) ?? 0,
+          pagesWritten: bucket?.pagesWritten ?? 0,
+          pagesRefused: bucket?.pagesRefused ?? 0,
+          claimsSuperseded: bucket?.claimsSuperseded ?? 0,
+          episodesCommitted: episodeCounts.get(run.id) ?? 0,
+          issues: issueCounts.get(run.id) ?? 0
+        },
+        docEffect: docEffects.get(run.id) ?? null
+      };
+    });
+  }
+
+  // The run audit: every durable change attributable to one run. Reads only —
+  // each effect table already carries run_id, so nothing new had to be stored.
+  async getBrainRunEffects(runId: string): Promise<BrainRunEffects | null> {
+    const run = await this.getBrainRun(runId);
+    if (!run) {
+      return null;
+    }
+    // Lifecycle transitions this run wrote (the effect most easily missed:
+    // a rollup was asked for a page, but may also have closed commitments).
+    const eventRows = this.db
+      .prepare(`SELECT id FROM brain_lifecycle_events WHERE run_id = ? ORDER BY id ASC`)
+      .all(runId) as Array<{ id: number }>;
+    const eventIds = new Set(eventRows.map((row) => row.id));
+    const lifecycle: BrainRunEffectLifecycle[] = [];
+    if (eventIds.size > 0) {
+      const claimIds = (
+        this.db
+          .prepare(`SELECT DISTINCT claim_id AS claimId FROM brain_lifecycle_events WHERE run_id = ?`)
+          .all(runId) as Array<{ claimId: string }>
+      ).map((row) => row.claimId);
+      const eventsByClaim = this.loadLifecycleEventsTx(claimIds);
+      const claimTextStmt = this.db.prepare(`SELECT text FROM brain_claims WHERE id = ?`);
+      for (const claimId of claimIds) {
+        const events = eventsByClaim.get(claimId) ?? [];
+        // Status NOW, so the audit never implies a change is still in force.
+        const currentStatus = foldLifecycleEvents(events).status;
+        const node = this.lifecycleNodeRowForClaimTx(claimId);
+        const chatSourceId = node?.chat_scope ?? null;
+        const chatDisplayName = chatSourceId
+          ? ((this.db.prepare(`SELECT display_name AS name FROM chats WHERE source_chat_id = ?`).get(chatSourceId) as
+              | { name: string | null }
+              | undefined)?.name ?? null)
+          : null;
+        const claimRow = claimTextStmt.get(claimId) as { text: string } | undefined;
+        for (const event of events) {
+          if (!eventIds.has(event.id)) {
+            continue;
+          }
+          lifecycle.push({
+            eventId: event.id,
+            claimId,
+            itemText: claimRow?.text ?? node?.title ?? "(claim no longer exists)",
+            itemExists: claimRow != null,
+            kind: node?.kind === "commitment" || node?.kind === "question" ? node.kind : null,
+            toStatus: event.toStatus,
+            source: event.source,
+            model: event.model,
+            note: event.note,
+            atMs: event.createdAtMs,
+            chatSourceId,
+            chatDisplayName,
+            cites: this.lifecycleCiteViewsTx(event),
+            currentStatus
+          });
+        }
+      }
+      lifecycle.sort((a, b) => a.eventId - b.eventId);
+    }
+    // Doc revisions committed by this run, with the supersession they declared.
+    const revisionRows = this.db
+      .prepare(`SELECT * FROM brain_doc_revisions WHERE run_id = ? ORDER BY id ASC`)
+      .all(runId) as DocRevisionRow[];
+    const revisions: BrainRunEffectRevision[] = [];
+    let supersessionCount = 0;
+    for (const row of revisionRows) {
+      const record = this.mapDocRevisionRow(row);
+      const referenced = new Set<string>();
+      for (const section of record.sections) {
+        for (const statement of section.statements) {
+          for (const claimId of statement.claimIds) {
+            referenced.add(claimId);
+          }
+        }
+      }
+      const supersededClaims = record.drops
+        .filter((drop) => drop.reason === "superseded")
+        .map((drop) => ({ claimId: drop.claimId, byClaimId: drop.byClaimId }));
+      supersessionCount += supersededClaims.length;
+      const docRow = this.docRowTx(record.docId);
+      const nodeRow = docRow?.node_id
+        ? (this.db.prepare(`SELECT * FROM brain_nodes WHERE id = ?`).get(docRow.node_id) as GraphNodeRow | undefined)
+        : undefined;
+      revisions.push({
+        docId: record.docId,
+        title: nodeRow ? this.graphLabelForNodeRow(nodeRow) : docRow?.slug ?? record.docId,
+        revision: record.revision,
+        status: record.status,
+        statementCount: record.sections.reduce((sum, section) => sum + section.statements.length, 0),
+        referencedClaimCount: referenced.size,
+        supersededClaims,
+        errors: record.errors,
+        isCurrent: docRow?.current_revision_id === record.id
+      });
+    }
+    const episodesCommitted = Number(
+      (this.db.prepare(`SELECT COUNT(*) AS n FROM brain_episodes WHERE run_id = ?`).get(runId) as { n: number }).n
+    );
+    return {
+      run,
+      lifecycle,
+      revisions,
+      supersessionCount,
+      episodesCommitted,
+      issues: await this.listBrainValidationIssues({ runId, limit: 200 }),
+      asOfMs: Date.now()
+    };
+  }
+
   async completeBrainRun(runId: string, totals: Record<string, number>): Promise<void> {
     this.db
       .prepare(`UPDATE brain_runs SET status = 'completed', finished_at = ?, totals_json = ? WHERE id = ?`)
@@ -3521,6 +3867,12 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         // claims and are not covered by the per-episode deletes above.
         this.db.prepare(`DELETE FROM brain_lifecycle_event_cites`).run();
         this.db.prepare(`DELETE FROM brain_lifecycle_events`).run();
+        // Semantic docs are derived-of-derived whose re-derivation costs model
+        // spend (same class as episodes): a FULL reset wipes them. A scoped
+        // reset leaves docs standing — their dead refs make them due, honestly.
+        this.db.prepare(`DELETE FROM brain_doc_revision_claims`).run();
+        this.db.prepare(`DELETE FROM brain_doc_revisions`).run();
+        this.db.prepare(`DELETE FROM brain_docs`).run();
       }
       watermarks = Number(
         (chat
@@ -3681,6 +4033,30 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     return committed[0]!;
   }
 
+  async listBrainEpisodeProjections(options?: {
+    limit?: number;
+    offset?: number;
+  }): Promise<Array<{ id: string; chatSourceId: string; chatDisplayName: string | null; startAtMs: number; markdown: string }>> {
+    return (
+      this.db
+        .prepare(
+          `SELECT e.id AS id, e.chat_source_id AS chatSourceId, c.display_name AS chatDisplayName,
+                  e.start_at_ms AS startAtMs, e.markdown AS markdown
+           FROM brain_episodes e
+           LEFT JOIN chats c ON c.source_chat_id = e.chat_source_id
+           WHERE e.status = 'current' AND e.markdown <> ''
+           ORDER BY e.start_at_ms ASC, e.id ASC LIMIT ? OFFSET ?`
+        )
+        .all(options?.limit ?? 1000, options?.offset ?? 0) as Array<{
+        id: string;
+        chatSourceId: string;
+        chatDisplayName: string | null;
+        startAtMs: number;
+        markdown: string;
+      }>
+    ).map((row) => ({ ...row, startAtMs: Number(row.startAtMs) }));
+  }
+
   async updateBrainEpisodeMarkdown(episodeId: string, markdown: string): Promise<void> {
     this.db.prepare(`UPDATE brain_episodes SET markdown = ? WHERE id = ?`).run(markdown, episodeId);
   }
@@ -3755,6 +4131,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       summary: String(row.summary),
       markdown: String(row.markdown),
       generator: row.generator as BrainEpisodeRecord["generator"],
+      runId: (row.run_id as string | null) ?? null,
       model: (row.model as string | null) ?? null,
       status: row.status as BrainEpisodeRecord["status"],
       fallbackReason: (row.fallback_reason as string | null) ?? null,
@@ -4233,8 +4610,8 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       return;
     }
     const insert = this.db.prepare(
-      `INSERT INTO brain_validation_issues (run_id, chat_source_id, episode_id, claim_sequence, code, severity, detail)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO brain_validation_issues (run_id, chat_source_id, episode_id, claim_sequence, doc_id, code, severity, detail)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
     );
     const transaction = this.db.transaction(() => {
       for (const issue of issues) {
@@ -4243,6 +4620,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
           issue.chatSourceId ?? null,
           issue.episodeId ?? null,
           issue.claimSequence ?? null,
+          issue.docId ?? null,
           issue.code,
           issue.severity,
           issue.detail ?? null
@@ -4252,12 +4630,23 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     transaction();
   }
 
-  async listBrainValidationIssues(options?: { episodeId?: string | null; limit?: number }): Promise<BrainValidationIssueRecord[]> {
+  async listBrainValidationIssues(options?: {
+    episodeId?: string | null;
+    docId?: string | null;
+    runId?: string | null;
+    limit?: number;
+  }): Promise<BrainValidationIssueRecord[]> {
     const params: unknown[] = [];
     let where = "";
     if (options?.episodeId) {
       where = "WHERE episode_id = ?";
       params.push(options.episodeId);
+    } else if (options?.docId) {
+      where = "WHERE doc_id = ?";
+      params.push(options.docId);
+    } else if (options?.runId) {
+      where = "WHERE run_id = ?";
+      params.push(options.runId);
     }
     params.push(options?.limit ?? 100);
     const rows = this.db
@@ -4269,6 +4658,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       chatSourceId: (row.chat_source_id as string | null) ?? null,
       episodeId: (row.episode_id as string | null) ?? null,
       claimSequence: row.claim_sequence == null ? null : Number(row.claim_sequence),
+      docId: (row.doc_id as string | null) ?? null,
       code: String(row.code),
       severity: row.severity as BrainValidationIssueRecord["severity"],
       detail: (row.detail as string | null) ?? null,
@@ -6746,6 +7136,107 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     return rekeyedClaims;
   }
 
+  // The sync transaction core of the ONE lifecycle writer. Extracted so
+  // semantic-rollups' revision commit can apply resolutions INSIDE its own
+  // transaction (better-sqlite3 transaction callbacks are sync); the public
+  // method below wraps it for standalone callers. One validation path, one
+  // write path — no second writer exists (design §L8).
+  private applyBrainLifecycleTransitionsCoreTx(
+    transitions: BrainLifecycleTransitionInput[],
+    context: {
+      source: BrainLifecycleSource;
+      runId?: string | null;
+      model?: string | null;
+      allowedCitesByClaim?: Map<string, BrainLifecycleCandidate[]>;
+    }
+  ): number[] {
+    const eventIds: number[] = [];
+    // Validate EVERYTHING first (collect-all), apply nothing on any error.
+    const errors: string[] = [];
+    const prepared: Array<{
+      input: BrainLifecycleTransitionInput;
+      cites: Array<{ sourceMessageKey: string; timestampMs: number | null; resolvingClaimId: string | null; actorJid: string | null }>;
+    }> = [];
+    for (const input of transitions) {
+      const node = this.lifecycleNodeRowForClaimTx(input.claimId);
+      if (!node) {
+        errors.push(`claim ${input.claimId} has no open commitment/question node`);
+        continue;
+      }
+      const fold = foldLifecycleEvents(this.loadLifecycleEventsTx([input.claimId]).get(input.claimId) ?? []);
+      const { anchorMs } = this.lifecycleAnchorTx(input.claimId);
+      const allowed = context.allowedCitesByClaim?.get(input.claimId) ?? null;
+      const allowedByKey = allowed ? new Map(allowed.map((candidate) => [candidate.sourceMessageKey, candidate])) : null;
+      const cites: Array<{ sourceMessageKey: string; timestampMs: number | null; resolvingClaimId: string | null; actorJid: string | null }> = [];
+      for (const key of input.cites ?? []) {
+        const candidate = allowedByKey?.get(key);
+        if (candidate) {
+          cites.push({
+            sourceMessageKey: key,
+            timestampMs: candidate.timestampMs,
+            resolvingClaimId: candidate.claimId,
+            actorJid: candidate.senderJid
+          });
+        } else {
+          // No offered-candidate metadata (user cites): resolve what the
+          // archive knows; closed-world validation below rejects model cites.
+          const message = this.db
+            .prepare(`SELECT timestamp_ms AS ts, sender_source_jid AS senderJid FROM messages WHERE source_message_key = ?`)
+            .get(key) as { ts: number | null; senderJid: string | null } | undefined;
+          cites.push({ sourceMessageKey: key, timestampMs: message?.ts ?? null, resolvingClaimId: null, actorJid: message?.senderJid ?? null });
+        }
+      }
+      const violations = validateLifecycleTransition({
+        toStatus: input.toStatus,
+        source: context.source,
+        currentStatus: fold.status,
+        cites,
+        anchorMs,
+        allowedKeys: context.source === "model" ? new Set(allowedByKey?.keys() ?? []) : null
+      });
+      for (const violation of violations) {
+        errors.push(`claim ${input.claimId}: ${violation}`);
+      }
+      prepared.push({ input, cites });
+    }
+    if (errors.length > 0) {
+      throw new PublicError("BRAIN_LIFECYCLE_INVALID", `Lifecycle transition rejected: ${errors.join("; ")}`);
+    }
+    const insertEvent = this.db.prepare(
+      `INSERT INTO brain_lifecycle_events (claim_id, to_status, source, evidence_at_ms, note, run_id, model, created_at_ms)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+    const insertCite = this.db.prepare(
+      `INSERT OR IGNORE INTO brain_lifecycle_event_cites (event_id, source_message_key, resolving_claim_id, actor_jid, timestamp_ms)
+       VALUES (?, ?, ?, ?, ?)`
+    );
+    const now = Date.now();
+    for (const entry of prepared) {
+      const citeTimestamps = entry.cites.map((cite) => cite.timestampMs).filter((ts): ts is number => ts != null);
+      const evidenceAtMs = citeTimestamps.length > 0 ? Math.max(...citeTimestamps) : null;
+      const eventId = Number(
+        insertEvent.run(
+          entry.input.claimId,
+          entry.input.toStatus,
+          context.source,
+          evidenceAtMs,
+          entry.input.note?.trim() || null,
+          context.runId ?? null,
+          context.model ?? null,
+          now
+        ).lastInsertRowid
+      );
+      eventIds.push(eventId);
+      for (const cite of entry.cites) {
+        insertCite.run(eventId, cite.sourceMessageKey, cite.resolvingClaimId, cite.actorJid, cite.timestampMs);
+      }
+    }
+    for (const entry of prepared) {
+      this.projectLifecycleClaimTx(entry.input.claimId);
+    }
+    return eventIds;
+  }
+
   async applyBrainLifecycleTransitions(
     transitions: BrainLifecycleTransitionInput[],
     context: {
@@ -6758,91 +7249,9 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     if (transitions.length === 0) {
       return { applied: 0, events: [] };
     }
-    const eventIds: number[] = [];
+    let eventIds: number[] = [];
     const transaction = this.db.transaction(() => {
-      // Validate EVERYTHING first (collect-all), apply nothing on any error.
-      const errors: string[] = [];
-      const prepared: Array<{
-        input: BrainLifecycleTransitionInput;
-        cites: Array<{ sourceMessageKey: string; timestampMs: number | null; resolvingClaimId: string | null; actorJid: string | null }>;
-      }> = [];
-      for (const input of transitions) {
-        const node = this.lifecycleNodeRowForClaimTx(input.claimId);
-        if (!node) {
-          errors.push(`claim ${input.claimId} has no open commitment/question node`);
-          continue;
-        }
-        const fold = foldLifecycleEvents(this.loadLifecycleEventsTx([input.claimId]).get(input.claimId) ?? []);
-        const { anchorMs } = this.lifecycleAnchorTx(input.claimId);
-        const allowed = context.allowedCitesByClaim?.get(input.claimId) ?? null;
-        const allowedByKey = allowed ? new Map(allowed.map((candidate) => [candidate.sourceMessageKey, candidate])) : null;
-        const cites: Array<{ sourceMessageKey: string; timestampMs: number | null; resolvingClaimId: string | null; actorJid: string | null }> = [];
-        for (const key of input.cites ?? []) {
-          const candidate = allowedByKey?.get(key);
-          if (candidate) {
-            cites.push({
-              sourceMessageKey: key,
-              timestampMs: candidate.timestampMs,
-              resolvingClaimId: candidate.claimId,
-              actorJid: candidate.senderJid
-            });
-          } else {
-            // No offered-candidate metadata (user cites): resolve what the
-            // archive knows; closed-world validation below rejects model cites.
-            const message = this.db
-              .prepare(`SELECT timestamp_ms AS ts, sender_source_jid AS senderJid FROM messages WHERE source_message_key = ?`)
-              .get(key) as { ts: number | null; senderJid: string | null } | undefined;
-            cites.push({ sourceMessageKey: key, timestampMs: message?.ts ?? null, resolvingClaimId: null, actorJid: message?.senderJid ?? null });
-          }
-        }
-        const violations = validateLifecycleTransition({
-          toStatus: input.toStatus,
-          source: context.source,
-          currentStatus: fold.status,
-          cites,
-          anchorMs,
-          allowedKeys: context.source === "model" ? new Set(allowedByKey?.keys() ?? []) : null
-        });
-        for (const violation of violations) {
-          errors.push(`claim ${input.claimId}: ${violation}`);
-        }
-        prepared.push({ input, cites });
-      }
-      if (errors.length > 0) {
-        throw new PublicError("BRAIN_LIFECYCLE_INVALID", `Lifecycle transition rejected: ${errors.join("; ")}`);
-      }
-      const insertEvent = this.db.prepare(
-        `INSERT INTO brain_lifecycle_events (claim_id, to_status, source, evidence_at_ms, note, run_id, model, created_at_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-      );
-      const insertCite = this.db.prepare(
-        `INSERT OR IGNORE INTO brain_lifecycle_event_cites (event_id, source_message_key, resolving_claim_id, actor_jid, timestamp_ms)
-         VALUES (?, ?, ?, ?, ?)`
-      );
-      const now = Date.now();
-      for (const entry of prepared) {
-        const citeTimestamps = entry.cites.map((cite) => cite.timestampMs).filter((ts): ts is number => ts != null);
-        const evidenceAtMs = citeTimestamps.length > 0 ? Math.max(...citeTimestamps) : null;
-        const eventId = Number(
-          insertEvent.run(
-            entry.input.claimId,
-            entry.input.toStatus,
-            context.source,
-            evidenceAtMs,
-            entry.input.note?.trim() || null,
-            context.runId ?? null,
-            context.model ?? null,
-            now
-          ).lastInsertRowid
-        );
-        eventIds.push(eventId);
-        for (const cite of entry.cites) {
-          insertCite.run(eventId, cite.sourceMessageKey, cite.resolvingClaimId, cite.actorJid, cite.timestampMs);
-        }
-      }
-      for (const entry of prepared) {
-        this.projectLifecycleClaimTx(entry.input.claimId);
-      }
+      eventIds = this.applyBrainLifecycleTransitionsCoreTx(transitions, context);
     });
     transaction();
     this.invalidateBrainStatusCache();
@@ -7264,6 +7673,1297 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       }
     }
     return batches;
+  }
+
+  // === Semantic consolidation (semantic-rollups) ===========================
+  // Docs are derived-of-derived: consolidated from current model-generated
+  // claims by a strong-tier call that returns structured statements. The
+  // repository owns data assembly and the transactional commit; ALL contract
+  // semantics (selection, guard, conflict pairing, rendering) live in the
+  // shared pure module brain/rollups.ts so both backends agree by construction.
+
+  // Which doc kind a node can anchor; claim-ish kinds never get pages.
+  private docKindForNodeRow(row: GraphNodeRow): BrainDocKind | null {
+    if (row.kind === "person" || row.kind === "org" || row.kind === "place" || row.kind === "project" || row.kind === "other") {
+      return "entity";
+    }
+    if (row.kind === "topic") {
+      return "topic";
+    }
+    if (row.kind === "chat") {
+      return "chat";
+    }
+    return null;
+  }
+
+  // Resolve a rollup/doc target to its node row, following merged redirects.
+  private resolveDocTargetNodeTx(target: { docId?: string | null; nodeId?: string | null }): { row: GraphNodeRow; redirected: boolean } | null {
+    let row: GraphNodeRow | undefined;
+    if (target.nodeId) {
+      row = this.db.prepare(`SELECT * FROM brain_nodes WHERE id = ?`).get(target.nodeId) as GraphNodeRow | undefined;
+    } else if (target.docId) {
+      const separator = target.docId.indexOf(":");
+      const slug = separator >= 0 ? target.docId.slice(separator + 1) : target.docId;
+      row = this.db.prepare(`SELECT * FROM brain_nodes WHERE slug = ?`).get(slug) as GraphNodeRow | undefined;
+    }
+    let redirected = false;
+    for (let hop = 0; row && row.status === "merged" && row.merged_into && hop < 5; hop += 1) {
+      row = this.db.prepare(`SELECT * FROM brain_nodes WHERE id = ?`).get(row.merged_into) as GraphNodeRow | undefined;
+      redirected = true;
+    }
+    if (!row || !this.docKindForNodeRow(row)) {
+      return null;
+    }
+    return { row, redirected };
+  }
+
+  // Person docs aggregate via membership at read time (sync form of the
+  // entity view's join): the doc's scope nodes are the person's member nodes.
+  private docScopeNodeIdsTx(row: GraphNodeRow): string[] {
+    if (row.kind !== "person" || !row.jid) {
+      return [row.id];
+    }
+    const membership = this.personMembershipTx(row.jid);
+    if (!membership) {
+      return [row.id];
+    }
+    const members = this.db
+      .prepare(`SELECT identity_jid AS jid FROM person_members WHERE person_id = ?`)
+      .all(membership.personId) as Array<{ jid: string }>;
+    const ids = new Set<string>([row.id]);
+    for (const member of members) {
+      const canonical = this.canonicalJid(member.jid) ?? member.jid;
+      const memberRow = this.db.prepare(`SELECT id, status FROM brain_nodes WHERE natural_key = ?`).get(personJidNaturalKey(canonical)) as
+        | { id: string; status: string }
+        | undefined;
+      if (memberRow && memberRow.status !== "merged") {
+        ids.add(memberRow.id);
+      }
+    }
+    return [...ids];
+  }
+
+  // The doc's eligible claim-id universe. Entity docs read brain_node_claims
+  // (membership-aggregated); topic docs read `about`-edge evidence (topic
+  // nodes carry no claim links); chat docs read the chat's episodes directly.
+  // Filters (current episode, model generator, not superseded) apply in the
+  // hydration join — this method only resolves SCOPE.
+  private docScopeClaimIdsTx(kind: BrainDocKind, row: GraphNodeRow): string[] {
+    if (kind === "entity") {
+      const nodeIds = this.docScopeNodeIdsTx(row);
+      const placeholders = nodeIds.map(() => "?").join(",");
+      return (
+        this.db
+          .prepare(`SELECT DISTINCT claim_id AS claimId FROM brain_node_claims WHERE node_id IN (${placeholders})`)
+          .all(...nodeIds) as Array<{ claimId: string }>
+      ).map((entry) => entry.claimId);
+    }
+    if (kind === "topic") {
+      return (
+        this.db
+          .prepare(
+            `SELECT DISTINCT ev.claim_id AS claimId
+             FROM brain_edges e
+             JOIN brain_edge_evidence ev ON ev.edge_id = e.id AND ev.claim_id IS NOT NULL
+             WHERE e.kind = 'about' AND (e.dst_node_id = ? OR e.src_node_id = ?)`
+          )
+          .all(row.id, row.id) as Array<{ claimId: string }>
+      ).map((entry) => entry.claimId);
+    }
+    const chatSourceId = row.chat_scope ?? (row.natural_key.startsWith("chat:") ? row.natural_key.slice(5) : null);
+    if (!chatSourceId) {
+      return [];
+    }
+    return (
+      this.db
+        .prepare(
+          `SELECT c.id AS claimId FROM brain_claims c JOIN brain_episodes e ON e.id = c.episode_id WHERE e.chat_source_id = ?`
+        )
+        .all(chatSourceId) as Array<{ claimId: string }>
+    ).map((entry) => entry.claimId);
+  }
+
+  // Hydrate scope claim ids into rollup input claims: eligibility filters
+  // (current episode, model generator, not superseded), episode windows,
+  // citations, and the lifecycle fold for commitment/question claims.
+  private hydrateRollupClaimsTx(claimIds: string[]): BrainRollupInputClaim[] {
+    const claims: BrainRollupInputClaim[] = [];
+    if (claimIds.length === 0) {
+      return claims;
+    }
+    const rows: Array<{
+      id: string;
+      kind: BrainRollupInputClaim["kind"];
+      text: string;
+      confidence: BrainRollupInputClaim["confidence"];
+      eventAtMs: number | null;
+      validUntilMs: number | null;
+      episodeId: string;
+      episodeStartAtMs: number;
+      episodeEndAtMs: number;
+      chatSourceId: string;
+      chatDisplayName: string | null;
+    }> = [];
+    for (let index = 0; index < claimIds.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = claimIds.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      const placeholders = batch.map(() => "?").join(",");
+      rows.push(
+        ...(this.db
+          .prepare(
+            `SELECT c.id AS id, c.kind AS kind, c.text AS text, c.confidence AS confidence,
+                    c.event_at_ms AS eventAtMs, c.valid_until_ms AS validUntilMs,
+                    e.id AS episodeId, e.start_at_ms AS episodeStartAtMs, e.end_at_ms AS episodeEndAtMs,
+                    e.chat_source_id AS chatSourceId, ch.display_name AS chatDisplayName
+             FROM brain_claims c
+             JOIN brain_episodes e ON e.id = c.episode_id AND e.status = 'current' AND e.generator = 'model'
+             LEFT JOIN chats ch ON ch.source_chat_id = e.chat_source_id
+             WHERE c.id IN (${placeholders}) AND c.superseded_by_claim_id IS NULL`
+          )
+          .all(...batch) as typeof rows)
+      );
+    }
+    const eligibleIds = rows.map((row) => row.id);
+    const citationsByClaim = new Map<string, BrainRollupInputClaim["citations"]>();
+    for (let index = 0; index < eligibleIds.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = eligibleIds.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      const placeholders = batch.map(() => "?").join(",");
+      const citationRows = this.db
+        .prepare(
+          `SELECT claim_id AS claimId, source_message_key AS sourceMessageKey, timestamp_ms AS timestampMs, sender_source_jid AS senderJid
+           FROM brain_citations WHERE claim_id IN (${placeholders})`
+        )
+        .all(...batch) as Array<{ claimId: string; sourceMessageKey: string; timestampMs: number | null; senderJid: string | null }>;
+      for (const citation of citationRows) {
+        const list = citationsByClaim.get(citation.claimId) ?? [];
+        list.push({ sourceMessageKey: citation.sourceMessageKey, timestampMs: citation.timestampMs, senderJid: citation.senderJid });
+        citationsByClaim.set(citation.claimId, list);
+      }
+    }
+    const lifecycleIds = rows.filter((row) => row.kind === "commitment" || row.kind === "question").map((row) => row.id);
+    const eventsByClaim = this.loadLifecycleEventsTx(lifecycleIds);
+    for (const row of rows) {
+      let lifecycleStatus: BrainLifecycleStatus | null = null;
+      let lifecycleDueMs: number | null = null;
+      if (row.kind === "commitment" || row.kind === "question") {
+        lifecycleStatus = foldLifecycleEvents(eventsByClaim.get(row.id) ?? []).status;
+        lifecycleDueMs = row.validUntilMs ?? row.eventAtMs;
+      }
+      claims.push({
+        claimId: row.id,
+        kind: row.kind,
+        text: row.text,
+        confidence: row.confidence,
+        eventAtMs: row.eventAtMs,
+        validUntilMs: row.validUntilMs,
+        episodeId: row.episodeId,
+        episodeStartAtMs: Number(row.episodeStartAtMs),
+        episodeEndAtMs: Number(row.episodeEndAtMs),
+        chatSourceId: row.chatSourceId,
+        chatDisplayName: row.chatDisplayName,
+        citations: citationsByClaim.get(row.id) ?? [],
+        lifecycleStatus,
+        lifecycleDueMs
+      });
+    }
+    return claims;
+  }
+
+  // Conflict facts for the shared detector: entity anchors per claim (JID
+  // where resolved, else normalized name), bulk.
+  private conflictFactsTx(claims: BrainRollupInputClaim[]): ConflictClaimFacts[] {
+    const byId = new Map(claims.map((claim) => [claim.claimId, claim]));
+    const entityKeysByClaim = new Map<string, string[]>();
+    const ids = [...byId.keys()];
+    for (let index = 0; index < ids.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = ids.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      const placeholders = batch.map(() => "?").join(",");
+      const rows = this.db
+        .prepare(`SELECT claim_id AS claimId, name, jid FROM brain_claim_entities WHERE claim_id IN (${placeholders})`)
+        .all(...batch) as Array<{ claimId: string; name: string; jid: string | null }>;
+      for (const row of rows) {
+        const key = row.jid ?? normalizeGraphName(row.name);
+        const list = entityKeysByClaim.get(row.claimId) ?? [];
+        if (!list.includes(key)) {
+          list.push(key);
+        }
+        entityKeysByClaim.set(row.claimId, list);
+      }
+    }
+    return [...byId.values()].map((claim) => ({
+      claimId: claim.claimId,
+      kind: claim.kind,
+      episodeId: claim.episodeId,
+      episodeEndAtMs: claim.episodeEndAtMs,
+      entityKeys: entityKeysByClaim.get(claim.claimId) ?? [],
+      supersededBy: null
+    }));
+  }
+
+  private docRowTx(docId: string): BrainDocRow | undefined {
+    return this.db.prepare(`SELECT * FROM brain_docs WHERE doc_id = ?`).get(docId) as BrainDocRow | undefined;
+  }
+
+  private currentRevisionRefsTx(doc: BrainDocRow | undefined): { revisionId: number; revision: number; referencedClaimIds: string[] } | null {
+    if (!doc?.current_revision_id) {
+      return null;
+    }
+    const revision = this.db
+      .prepare(`SELECT id, revision FROM brain_doc_revisions WHERE id = ?`)
+      .get(doc.current_revision_id) as { id: number; revision: number } | undefined;
+    if (!revision) {
+      return null;
+    }
+    const refs = (
+      this.db.prepare(`SELECT claim_id AS claimId FROM brain_doc_revision_claims WHERE revision_id = ?`).all(revision.id) as Array<{
+        claimId: string;
+      }>
+    ).map((entry) => entry.claimId);
+    return { revisionId: revision.id, revision: revision.revision, referencedClaimIds: refs };
+  }
+
+  async getBrainRollupInput(target: { docId?: string | null; nodeId?: string | null }): Promise<BrainRollupInput | null> {
+    const resolved = this.resolveDocTargetNodeTx(target);
+    if (!resolved) {
+      return null;
+    }
+    const { row } = resolved;
+    const kind = this.docKindForNodeRow(row)!;
+    const docId = docIdFor(kind, row.slug);
+    const scopeIds = this.docScopeClaimIdsTx(kind, row);
+    const claims = this.hydrateRollupClaimsTx(scopeIds);
+    const conflictPairs = detectConflictPairs(this.conflictFactsTx(claims));
+    const prior = this.currentRevisionRefsTx(this.docRowTx(docId));
+    return {
+      docId,
+      kind,
+      nodeId: row.id,
+      slug: row.slug,
+      title: this.graphLabelForNodeRow(row),
+      prior,
+      claims,
+      conflictPairs,
+      stats: { eligibleClaims: claims.length, fedClaims: 0, tokenEstimate: 0, overflow: false, tiersEngaged: [] }
+    };
+  }
+
+  private mapDocRow(row: BrainDocRow): BrainDocRecord {
+    return {
+      docId: row.doc_id,
+      kind: row.kind,
+      nodeId: row.node_id,
+      slug: row.slug,
+      status: row.status,
+      mergedInto: row.merged_into,
+      currentRevisionId: row.current_revision_id,
+      lastRollupAtMs: row.last_rollup_at_ms,
+      createdAtMs: row.created_at_ms
+    };
+  }
+
+  private mapDocRevisionRow(row: DocRevisionRow): BrainDocRevisionRecord {
+    const resolutions = JSON.parse(row.resolutions_json ?? "{}") as { eventIds?: number[] };
+    return {
+      id: row.id,
+      docId: row.doc_id,
+      revision: row.revision,
+      status: row.status,
+      sections: JSON.parse(row.sections_json) as BrainDocRevisionRecord["sections"],
+      drops: JSON.parse(row.drops_json) as BrainDocRevisionRecord["drops"],
+      fedClaimIds: JSON.parse(row.fed_claim_ids_json) as string[],
+      inputStats: JSON.parse(row.input_stats_json) as BrainDocRevisionRecord["inputStats"],
+      resolutionEventIds: resolutions.eventIds ?? [],
+      errors: row.errors_json ? (JSON.parse(row.errors_json) as string[]) : null,
+      model: row.model,
+      effort: row.effort,
+      runId: row.run_id,
+      promptVersion: row.prompt_version,
+      createdAtMs: row.created_at_ms
+    };
+  }
+
+  // Transactional revision commit — the ONE write path for successful rollups:
+  // guard re-check, lifecycle resolutions through the shared writer core,
+  // revision + junction insert, prior flip, supersession projection, doc
+  // pointer update, stale-share/contradiction issues. Everything or nothing.
+  async commitBrainDocRevision(input: BrainRollupRevisionInput): Promise<BrainDocCommitResult> {
+    let committed: BrainDocRevisionRecord | null = null;
+    let contradictions: BrainConflictPair[] = [];
+    const transaction = this.db.transaction(() => {
+      const now = Date.now();
+      let doc = this.docRowTx(input.docId);
+      if (!doc) {
+        this.db
+          .prepare(
+            `INSERT INTO brain_docs (doc_id, kind, node_id, slug, status, current_revision_id, last_rollup_at_ms, created_at_ms)
+             VALUES (?, ?, ?, ?, 'active', NULL, NULL, ?)`
+          )
+          .run(input.docId, input.kind, input.nodeId, input.slug, now);
+        doc = this.docRowTx(input.docId)!;
+      }
+      const prior = this.currentRevisionRefsTx(doc);
+      const newReferenced = new Set<string>();
+      for (const section of input.sections) {
+        for (const statement of section.statements) {
+          for (const claimId of statement.claimIds) {
+            newReferenced.add(claimId);
+          }
+        }
+      }
+      const fedSet = new Set(input.fedClaimIds);
+      for (const claimId of newReferenced) {
+        if (!fedSet.has(claimId)) {
+          throw new PublicError("BRAIN_ROLLUP_INVALID", `Revision references claim ${claimId} that was not fed to the call.`);
+        }
+      }
+      // The guard's current-claims universe: prior refs still alive as claims
+      // of CURRENT episodes (supersession projection does not "kill" a claim).
+      const priorRefs = prior?.referencedClaimIds ?? [];
+      const currentClaimIds = new Set<string>();
+      for (let index = 0; index < priorRefs.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+        const batch = priorRefs.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+        const placeholders = batch.map(() => "?").join(",");
+        const liveRows = this.db
+          .prepare(
+            `SELECT c.id AS id FROM brain_claims c JOIN brain_episodes e ON e.id = c.episode_id AND e.status = 'current' WHERE c.id IN (${placeholders})`
+          )
+          .all(...batch) as Array<{ id: string }>;
+        for (const live of liveRows) {
+          currentClaimIds.add(live.id);
+        }
+      }
+      const guard = runRollupGuard({
+        priorReferencedClaimIds: priorRefs,
+        newReferencedClaimIds: [...newReferenced],
+        currentClaimIds,
+        declaredDrops: input.drops,
+        fedClaimIds: fedSet
+      });
+      if (guard.errors.length > 0) {
+        throw new PublicError("BRAIN_ROLLUP_GUARD", `Regression guard refused the revision: ${guard.errors.join("; ")}`);
+      }
+      // Lifecycle resolutions apply INSIDE this transaction through the one
+      // writer core — its independent re-validation is the §L8 guarantee.
+      const eventIds =
+        input.resolutions.length > 0
+          ? this.applyBrainLifecycleTransitionsCoreTx(input.resolutions, {
+              source: "model",
+              runId: input.runId,
+              model: input.model,
+              allowedCitesByClaim: input.allowedCitesByClaim
+            })
+          : [];
+      // Number PAST every retained revision — rejected attempts occupy numbers
+      // too (found live: a rejected rev 1 collided with the next commit's
+      // UNIQUE(doc_id, revision)). The guard baseline stays the CURRENT
+      // revision; only numbering counts the whole retained history.
+      const maxRevisionRow = this.db
+        .prepare(`SELECT MAX(revision) AS maxRevision FROM brain_doc_revisions WHERE doc_id = ?`)
+        .get(input.docId) as { maxRevision: number | null };
+      const revisionNumber = Math.max(maxRevisionRow.maxRevision ?? 0, prior?.revision ?? 0) + 1;
+      const revisionId = Number(
+        this.db
+          .prepare(
+            `INSERT INTO brain_doc_revisions
+             (doc_id, revision, status, sections_json, drops_json, fed_claim_ids_json, input_stats_json, resolutions_json, errors_json, model, effort, run_id, prompt_version, created_at_ms)
+             VALUES (?, ?, 'current', ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)`
+          )
+          .run(
+            input.docId,
+            revisionNumber,
+            JSON.stringify(input.sections),
+            JSON.stringify(guard.effectiveDrops),
+            JSON.stringify(input.fedClaimIds),
+            JSON.stringify(input.inputStats),
+            JSON.stringify({ resolutions: input.resolutions.map((entry) => ({ claimId: entry.claimId, toStatus: entry.toStatus })), eventIds }),
+            input.model,
+            input.effort,
+            input.runId,
+            input.promptVersion,
+            now
+          ).lastInsertRowid
+      );
+      const insertRef = this.db.prepare(`INSERT OR IGNORE INTO brain_doc_revision_claims (revision_id, claim_id) VALUES (?, ?)`);
+      for (const claimId of newReferenced) {
+        insertRef.run(revisionId, claimId);
+      }
+      if (prior) {
+        this.db.prepare(`UPDATE brain_doc_revisions SET status = 'superseded' WHERE id = ?`).run(prior.revisionId);
+      }
+      // Supersession PROJECTION (revisions are the durable truth).
+      const project = this.db.prepare(`UPDATE brain_claims SET superseded_by_claim_id = ? WHERE id = ?`);
+      for (const drop of guard.effectiveDrops) {
+        if (drop.reason === "superseded" && drop.byClaimId) {
+          project.run(drop.byClaimId, drop.claimId);
+        }
+      }
+      this.db
+        .prepare(`UPDATE brain_docs SET current_revision_id = ?, last_rollup_at_ms = ?, status = 'active', merged_into = NULL WHERE doc_id = ?`)
+        .run(revisionId, now, input.docId);
+      // Post-write verification (recall+verify, never suggest): residual
+      // same-kind contradictions among the REFERENCED claims — flag only.
+      const referencedClaims = this.hydrateRollupClaimsTx([...newReferenced]);
+      contradictions = detectConflictPairs(this.conflictFactsTx(referencedClaims)).filter(
+        (pair) => newReferenced.has(pair.claimIdA) && newReferenced.has(pair.claimIdB)
+      );
+      const insertIssue = this.db.prepare(
+        `INSERT INTO brain_validation_issues (run_id, chat_source_id, episode_id, claim_sequence, doc_id, code, severity, detail)
+         VALUES (?, NULL, NULL, NULL, ?, ?, ?, ?)`
+      );
+      for (const pair of contradictions) {
+        insertIssue.run(
+          input.runId,
+          input.docId,
+          "rollup_contradiction",
+          "warning",
+          `Revision ${revisionNumber} keeps likely-conflicting ${pair.claimKind} claims ${pair.claimIdA} and ${pair.claimIdB} (via ${pair.via}) with neither superseding the other.`
+        );
+      }
+      if ((prior?.referencedClaimIds.length ?? 0) > 0 && guard.staleShare > rollupStaleDropShare()) {
+        insertIssue.run(
+          input.runId,
+          input.docId,
+          "rollup_stale_shed",
+          "info",
+          `Revision ${revisionNumber} dropped ${Math.round(guard.staleShare * 100)}% of the prior revision's claims as stale/out-of-scope — allowed, recorded, never invisible.`
+        );
+      }
+      committed = this.mapDocRevisionRow(
+        this.db.prepare(`SELECT * FROM brain_doc_revisions WHERE id = ?`).get(revisionId) as DocRevisionRow
+      );
+    });
+    transaction();
+    this.invalidateBrainStatusCache();
+    return { record: committed!, contradictions };
+  }
+
+  // A twice-failed call's rejected revision: retained with its errors for
+  // audit, prior revision untouched, error-severity issue recorded. No
+  // extractive fallback exists for pages, by design.
+  async rejectBrainDocRevision(input: {
+    docId: string;
+    kind: BrainDocKind;
+    nodeId: string;
+    slug: string;
+    errors: string[];
+    fedClaimIds: string[];
+    inputStats: BrainDocRevisionRecord["inputStats"];
+    model: string | null;
+    effort: string | null;
+    runId: string | null;
+    promptVersion: number;
+  }): Promise<void> {
+    const transaction = this.db.transaction(() => {
+      const now = Date.now();
+      let doc = this.docRowTx(input.docId);
+      if (!doc) {
+        this.db
+          .prepare(
+            `INSERT INTO brain_docs (doc_id, kind, node_id, slug, status, current_revision_id, last_rollup_at_ms, created_at_ms)
+             VALUES (?, ?, ?, ?, 'active', NULL, NULL, ?)`
+          )
+          .run(input.docId, input.kind, input.nodeId, input.slug, now);
+        doc = this.docRowTx(input.docId)!;
+      }
+      const maxRevision = this.db
+        .prepare(`SELECT MAX(revision) AS maxRevision FROM brain_doc_revisions WHERE doc_id = ?`)
+        .get(input.docId) as { maxRevision: number | null };
+      this.db
+        .prepare(
+          `INSERT INTO brain_doc_revisions
+           (doc_id, revision, status, sections_json, drops_json, fed_claim_ids_json, input_stats_json, resolutions_json, errors_json, model, effort, run_id, prompt_version, created_at_ms)
+           VALUES (?, ?, 'rejected', '[]', '[]', ?, ?, '{}', ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          input.docId,
+          (maxRevision.maxRevision ?? 0) + 1,
+          JSON.stringify(input.fedClaimIds),
+          JSON.stringify(input.inputStats),
+          JSON.stringify(input.errors),
+          input.model,
+          input.effort,
+          input.runId,
+          input.promptVersion,
+          now
+        );
+      this.db
+        .prepare(
+          `INSERT INTO brain_validation_issues (run_id, chat_source_id, episode_id, claim_sequence, doc_id, code, severity, detail)
+           VALUES (?, NULL, NULL, NULL, ?, 'rollup_rejected', 'error', ?)`
+        )
+        .run(input.runId, input.docId, `Rollup response failed validation twice; prior revision stays current. Errors: ${input.errors.join("; ")}`);
+    });
+    transaction();
+  }
+
+  // Mechanical rollback: flip the current pointer to a prior revision and
+  // re-derive this doc's supersession projections from the surviving revision
+  // chain. Zero model calls; the action is recorded visibly.
+  async rollbackBrainDoc(docId: string, toRevision?: number | null): Promise<BrainDocDetail | null> {
+    const transaction = this.db.transaction(() => {
+      const doc = this.docRowTx(docId);
+      if (!doc) {
+        throw new PublicError("BRAIN_DOC_NO_REVISION", `Doc ${docId} does not exist.`);
+      }
+      // An UNROLLED doc has no current revision — and must still be restorable
+      // by explicit revision number, or "nothing is ever lost" would be false.
+      const current = doc.current_revision_id
+        ? (this.db.prepare(`SELECT id, revision FROM brain_doc_revisions WHERE id = ?`).get(doc.current_revision_id) as {
+            id: number;
+            revision: number;
+          })
+        : null;
+      // Revision 0 is the state BEFORE any page existed: unroll. The doc keeps
+      // every revision (restorable) but goes back to "eligible, never rolled",
+      // so the next rollup generates from scratch instead of revising. This is
+      // why no hard delete exists — nothing is ever destroyed, only un-currented.
+      const unroll = toRevision === BRAIN_DOC_REVISION_NONE;
+      if (!current && !unroll && toRevision == null) {
+        throw new PublicError("BRAIN_DOC_NO_REVISION", `Doc ${docId} has no current revision to roll back; name a revision to restore.`);
+      }
+      if (!current && unroll) {
+        throw new PublicError("BRAIN_DOC_NO_REVISION", `Doc ${docId} is already unrolled.`);
+      }
+      const target = unroll
+        ? null
+        : toRevision
+          ? (this.db
+              .prepare(`SELECT id, revision, status FROM brain_doc_revisions WHERE doc_id = ? AND revision = ?`)
+              .get(docId, toRevision) as { id: number; revision: number; status: string } | undefined)
+          : (this.db
+              .prepare(
+                `SELECT id, revision, status FROM brain_doc_revisions WHERE doc_id = ? AND revision < ? AND status = 'superseded' ORDER BY revision DESC LIMIT 1`
+              )
+              .get(docId, current!.revision) as { id: number; revision: number; status: string } | undefined);
+      if (!unroll && (!target || target.id === current?.id)) {
+        throw new PublicError("BRAIN_DOC_NO_TARGET", `Doc ${docId} has no prior revision${toRevision ? ` numbered ${toRevision}` : ""} to restore.`);
+      }
+      if (target?.status === "rejected") {
+        throw new PublicError("BRAIN_DOC_BAD_TARGET", `Revision ${target.revision} was rejected and cannot become current.`);
+      }
+      if (current) {
+        this.db.prepare(`UPDATE brain_doc_revisions SET status = 'superseded' WHERE id = ?`).run(current.id);
+      }
+      if (target) {
+        this.db.prepare(`UPDATE brain_doc_revisions SET status = 'current' WHERE id = ?`).run(target.id);
+        // Restoring onto an unrolled doc must also restore its rollup stamp,
+        // or dueness would keep reading 'never_rolled' with a page present.
+        this.db
+          .prepare(
+            `UPDATE brain_docs SET current_revision_id = ?, last_rollup_at_ms = COALESCE(last_rollup_at_ms, (SELECT created_at_ms FROM brain_doc_revisions WHERE id = ?)) WHERE doc_id = ?`
+          )
+          .run(target.id, target.id, docId);
+      } else {
+        // last_rollup_at_ms clears with the pointer so dueness reads
+        // 'never_rolled' and the row lists as an eligible candidate again.
+        this.db.prepare(`UPDATE brain_docs SET current_revision_id = NULL, last_rollup_at_ms = NULL WHERE doc_id = ?`).run(docId);
+      }
+      // Re-derive supersession projections from this doc's surviving chain:
+      // clear everything any of its revisions ever declared, then re-apply
+      // declarations from revisions ≤ target in order. (A claim superseded by
+      // ANOTHER doc's declaration is re-projected by that doc's own next
+      // rollup; cross-doc supersession of one claim is a rare, benign race.)
+      const revisionRows = this.db
+        .prepare(`SELECT id, revision, drops_json FROM brain_doc_revisions WHERE doc_id = ? AND status != 'rejected' ORDER BY revision ASC`)
+        .all(docId) as Array<{ id: number; revision: number; drops_json: string }>;
+      const clear = this.db.prepare(`UPDATE brain_claims SET superseded_by_claim_id = NULL WHERE id = ?`);
+      const project = this.db.prepare(`UPDATE brain_claims SET superseded_by_claim_id = ? WHERE id = ?`);
+      for (const revisionRow of revisionRows) {
+        for (const drop of JSON.parse(revisionRow.drops_json) as BrainDocRevisionRecord["drops"]) {
+          if (drop.reason === "superseded") {
+            clear.run(drop.claimId);
+          }
+        }
+      }
+      for (const revisionRow of revisionRows) {
+        // Unroll keeps no declarations at all (target revision 0).
+        if (revisionRow.revision > (target?.revision ?? 0)) {
+          continue;
+        }
+        for (const drop of JSON.parse(revisionRow.drops_json) as BrainDocRevisionRecord["drops"]) {
+          if (drop.reason === "superseded" && drop.byClaimId) {
+            project.run(drop.byClaimId, drop.claimId);
+          }
+        }
+      }
+      this.db
+        .prepare(
+          `INSERT INTO brain_validation_issues (run_id, chat_source_id, episode_id, claim_sequence, doc_id, code, severity, detail)
+           VALUES (NULL, NULL, NULL, NULL, ?, 'rollup_rollback', 'info', ?)`
+        )
+        .run(
+          docId,
+          target
+            ? `Rolled back from revision ${current?.revision ?? "none"} to revision ${target.revision}.`
+            : `Unrolled from revision ${current?.revision ?? "none"}: the page returns to eligible-but-never-rolled. Every revision is retained and restorable; the next rollup generates from scratch.`
+        );
+    });
+    transaction();
+    this.invalidateBrainStatusCache();
+    return this.getBrainDoc(docId);
+  }
+
+  // Per-doc dueness: deterministic conditions only, each recomputable. The
+  // scope claim work reuses the same resolvers as input assembly.
+  private docDuenessTx(
+    doc: BrainDocRow,
+    row: GraphNodeRow | undefined
+  ): { due: boolean; dueReasons: BrainDocDueReason[]; eligibleClaims: number; newClaims: number; openItems: number } {
+    const reasons: BrainDocDueReason[] = [];
+    if (!row) {
+      return { due: false, dueReasons: reasons, eligibleClaims: 0, newClaims: 0, openItems: 0 };
+    }
+    if (row.status === "merged" || doc.status === "merged") {
+      reasons.push("merged_scope");
+    }
+    const kind = doc.kind;
+    const scopeIds = this.docScopeClaimIdsTx(kind, row);
+    const claims = this.hydrateRollupClaimsTx(scopeIds);
+    const eligibleClaims = claims.length;
+    const lastRollup = doc.last_rollup_at_ms;
+    let newClaims = 0;
+    if (lastRollup == null) {
+      if (eligibleClaims >= rollupMinClaims()) {
+        reasons.push("never_rolled");
+      }
+      newClaims = eligibleClaims;
+    } else {
+      const lastRollupIso = new Date(lastRollup).toISOString();
+      const episodeIds = [...new Set(claims.map((claim) => claim.episodeId))];
+      const newEpisodes = new Set<string>();
+      for (let index = 0; index < episodeIds.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+        const batch = episodeIds.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+        const placeholders = batch.map(() => "?").join(",");
+        const rows = this.db
+          .prepare(`SELECT id FROM brain_episodes WHERE id IN (${placeholders}) AND created_at > ?`)
+          .all(...batch, lastRollupIso) as Array<{ id: string }>;
+        for (const entry of rows) {
+          newEpisodes.add(entry.id);
+        }
+      }
+      newClaims = claims.filter((claim) => newEpisodes.has(claim.episodeId)).length;
+      if (newClaims >= rollupDueNewClaims()) {
+        reasons.push("new_claims");
+      }
+      const refs = this.currentRevisionRefsTx(doc)?.referencedClaimIds ?? [];
+      if (refs.length > 0) {
+        const aliveRefs = new Set<string>();
+        for (let index = 0; index < refs.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+          const batch = refs.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+          const placeholders = batch.map(() => "?").join(",");
+          const rows = this.db
+            .prepare(
+              `SELECT c.id AS id FROM brain_claims c JOIN brain_episodes e ON e.id = c.episode_id AND e.status = 'current' WHERE c.id IN (${placeholders})`
+            )
+            .all(...batch) as Array<{ id: string }>;
+          for (const entry of rows) {
+            aliveRefs.add(entry.id);
+          }
+        }
+        if (aliveRefs.size < refs.length) {
+          reasons.push("claims_deleted");
+        }
+        // Lifecycle churn since the last rollup on the page's own claims —
+        // excluding the events the CURRENT revision itself applied (they land
+        // milliseconds after the rollup stamp and must not self-trigger).
+        const ownEvents = doc.current_revision_id
+          ? new Set(
+              this.mapDocRevisionRow(
+                this.db.prepare(`SELECT * FROM brain_doc_revisions WHERE id = ?`).get(doc.current_revision_id) as DocRevisionRow
+              ).resolutionEventIds
+            )
+          : new Set<number>();
+        let lifecycleChanged = false;
+        for (let index = 0; index < refs.length && !lifecycleChanged; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+          const batch = refs.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+          const placeholders = batch.map(() => "?").join(",");
+          const hits = this.db
+            .prepare(
+              `SELECT id FROM brain_lifecycle_events WHERE claim_id IN (${placeholders}) AND created_at_ms > ? AND orphaned_at_ms IS NULL LIMIT 8`
+            )
+            .all(...batch, lastRollup) as Array<{ id: number }>;
+          if (hits.some((hit) => !ownEvents.has(hit.id))) {
+            lifecycleChanged = true;
+          }
+        }
+        if (lifecycleChanged) {
+          reasons.push("lifecycle_changed");
+        }
+      }
+    }
+    const openItems = claims.filter((claim) => claim.lifecycleStatus === "open").length;
+    return { due: reasons.length > 0, dueReasons: reasons, eligibleClaims, newClaims, openItems };
+  }
+
+  // Page-eligible nodes WITHOUT a doc yet, per kind, in three bulk queries —
+  // never a per-node probe (the wedge lesson). Person candidates dedupe by
+  // membership so one human never lists twice.
+  private docCandidateRowsTx(): Array<{ nodeId: string; claimCount: number }> {
+    const floor = rollupMinClaims();
+    const results = new Map<string, number>();
+    const entityRows = this.db
+      .prepare(
+        `SELECT nc.node_id AS nodeId, COUNT(DISTINCT nc.claim_id) AS claimCount
+         FROM brain_node_claims nc
+         JOIN brain_nodes n ON n.id = nc.node_id AND n.status = 'active' AND n.kind IN ('person','org','place','project','other')
+         JOIN brain_claims c ON c.id = nc.claim_id AND c.superseded_by_claim_id IS NULL
+         JOIN brain_episodes e ON e.id = c.episode_id AND e.status = 'current' AND e.generator = 'model'
+         LEFT JOIN brain_docs d ON d.node_id = nc.node_id
+         WHERE d.doc_id IS NULL
+         GROUP BY nc.node_id HAVING COUNT(DISTINCT nc.claim_id) >= ?`
+      )
+      .all(floor) as Array<{ nodeId: string; claimCount: number }>;
+    const topicRows = this.db
+      .prepare(
+        `SELECT eg.dst_node_id AS nodeId, COUNT(DISTINCT ev.claim_id) AS claimCount
+         FROM brain_edges eg
+         JOIN brain_nodes n ON n.id = eg.dst_node_id AND n.status = 'active' AND n.kind = 'topic'
+         JOIN brain_edge_evidence ev ON ev.edge_id = eg.id AND ev.claim_id IS NOT NULL
+         JOIN brain_claims c ON c.id = ev.claim_id AND c.superseded_by_claim_id IS NULL
+         JOIN brain_episodes e ON e.id = c.episode_id AND e.status = 'current' AND e.generator = 'model'
+         LEFT JOIN brain_docs d ON d.node_id = eg.dst_node_id
+         WHERE eg.kind = 'about' AND d.doc_id IS NULL
+         GROUP BY eg.dst_node_id HAVING COUNT(DISTINCT ev.claim_id) >= ?`
+      )
+      .all(floor) as Array<{ nodeId: string; claimCount: number }>;
+    const chatRows = this.db
+      .prepare(
+        `SELECT n.id AS nodeId, COUNT(c.id) AS claimCount
+         FROM brain_nodes n
+         JOIN brain_episodes e ON e.chat_source_id = n.chat_scope AND e.status = 'current' AND e.generator = 'model'
+         JOIN brain_claims c ON c.episode_id = e.id AND c.superseded_by_claim_id IS NULL
+         LEFT JOIN brain_docs d ON d.node_id = n.id
+         WHERE n.kind = 'chat' AND n.status = 'active' AND d.doc_id IS NULL
+         GROUP BY n.id HAVING COUNT(c.id) >= ?`
+      )
+      .all(floor) as Array<{ nodeId: string; claimCount: number }>;
+    for (const entry of [...entityRows, ...topicRows, ...chatRows]) {
+      results.set(entry.nodeId, Math.max(results.get(entry.nodeId) ?? 0, Number(entry.claimCount)));
+    }
+    // Person dedupe: among member nodes of one person, keep the highest count.
+    const nodeIds = [...results.keys()];
+    const jidByNode = new Map<string, string>();
+    for (let index = 0; index < nodeIds.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = nodeIds.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      const placeholders = batch.map(() => "?").join(",");
+      const rows = this.db
+        .prepare(`SELECT id, jid FROM brain_nodes WHERE id IN (${placeholders}) AND kind = 'person' AND jid IS NOT NULL`)
+        .all(...batch) as Array<{ id: string; jid: string }>;
+      for (const entry of rows) {
+        jidByNode.set(entry.id, entry.jid);
+      }
+    }
+    const byPerson = new Map<string, { nodeId: string; claimCount: number }>();
+    const out: Array<{ nodeId: string; claimCount: number }> = [];
+    for (const [nodeId, claimCount] of results) {
+      const jid = jidByNode.get(nodeId);
+      if (!jid) {
+        out.push({ nodeId, claimCount });
+        continue;
+      }
+      const personKey = this.personMembershipTx(jid)?.personId ?? jid;
+      const existing = byPerson.get(personKey);
+      if (!existing || claimCount > existing.claimCount) {
+        byPerson.set(personKey, { nodeId, claimCount });
+      }
+    }
+    out.push(...byPerson.values());
+    return out;
+  }
+
+  async listBrainDocs(options?: { kind?: BrainDocKind; view?: BrainDocsListView; limit?: number }): Promise<BrainDocsListResponse> {
+    const asOfMs = Date.now();
+    const items: BrainDocListItem[] = [];
+    const issueCounts = new Map<string, number>(
+      (
+        this.db
+          .prepare(`SELECT doc_id AS docId, COUNT(*) AS n FROM brain_validation_issues WHERE doc_id IS NOT NULL GROUP BY doc_id`)
+          .all() as Array<{ docId: string; n: number }>
+      ).map((row) => [row.docId, Number(row.n)])
+    );
+    const docRows = this.db.prepare(`SELECT * FROM brain_docs`).all() as BrainDocRow[];
+    for (const docRow of docRows) {
+      const nodeRow = docRow.node_id
+        ? (this.db.prepare(`SELECT * FROM brain_nodes WHERE id = ?`).get(docRow.node_id) as GraphNodeRow | undefined)
+        : undefined;
+      const dueness = this.docDuenessTx(docRow, nodeRow);
+      const currentRevision = docRow.current_revision_id
+        ? (this.db.prepare(`SELECT revision FROM brain_doc_revisions WHERE id = ?`).get(docRow.current_revision_id) as
+            | { revision: number }
+            | undefined)
+        : undefined;
+      items.push({
+        docId: docRow.doc_id,
+        kind: docRow.kind,
+        nodeId: docRow.node_id ?? "",
+        slug: docRow.slug ?? "",
+        title: nodeRow ? this.graphLabelForNodeRow(nodeRow) : docRow.slug ?? docRow.doc_id,
+        status: nodeRow?.status === "merged" ? "merged" : docRow.status,
+        mergedInto: docRow.merged_into,
+        revision: currentRevision?.revision ?? null,
+        lastRollupAtMs: docRow.last_rollup_at_ms,
+        eligibleClaims: dueness.eligibleClaims,
+        newClaimsSinceRollup: dueness.newClaims,
+        due: dueness.due,
+        dueReasons: dueness.dueReasons,
+        salience: Number(nodeRow?.salience ?? 0),
+        openLifecycleItems: dueness.openItems,
+        issueCount: issueCounts.get(docRow.doc_id) ?? 0
+      });
+    }
+    const candidates = this.docCandidateRowsTx();
+    let candidateCount = 0;
+    for (const candidate of candidates) {
+      const nodeRow = this.db.prepare(`SELECT * FROM brain_nodes WHERE id = ?`).get(candidate.nodeId) as GraphNodeRow | undefined;
+      if (!nodeRow) {
+        continue;
+      }
+      const kind = this.docKindForNodeRow(nodeRow);
+      if (!kind) {
+        continue;
+      }
+      candidateCount += 1;
+      items.push({
+        docId: docIdFor(kind, nodeRow.slug),
+        kind,
+        nodeId: nodeRow.id,
+        slug: nodeRow.slug,
+        title: this.graphLabelForNodeRow(nodeRow),
+        status: "active",
+        mergedInto: null,
+        revision: null,
+        lastRollupAtMs: null,
+        eligibleClaims: candidate.claimCount,
+        newClaimsSinceRollup: candidate.claimCount,
+        due: true,
+        dueReasons: ["never_rolled"],
+        salience: Number(nodeRow.salience ?? 0),
+        openLifecycleItems: 0,
+        issueCount: 0
+      });
+    }
+    let filtered = items;
+    if (options?.kind) {
+      filtered = filtered.filter((item) => item.kind === options.kind);
+    }
+    // Each count chip is a view: pages you have, work that is due, nodes
+    // eligible without a page yet, and docs carrying validation issues.
+    switch (options?.view) {
+      case 'pages':
+        filtered = filtered.filter((item) => item.revision != null);
+        break;
+      case 'due':
+        filtered = filtered.filter((item) => item.due);
+        break;
+      case 'candidates':
+        filtered = filtered.filter((item) => item.revision == null);
+        break;
+      case 'issues':
+        filtered = filtered.filter((item) => item.issueCount > 0);
+        break;
+      default:
+        break;
+    }
+    filtered.sort((a, b) => {
+      if (a.due !== b.due) return a.due ? -1 : 1;
+      if (a.salience !== b.salience) return b.salience - a.salience;
+      return a.docId < b.docId ? -1 : 1;
+    });
+    const limited = filtered.slice(0, options?.limit ?? 200);
+    return {
+      items: limited,
+      counts: {
+        // A doc row with no current revision (unrolled) is not a page.
+        docs: items.filter((item) => item.revision != null).length,
+        due: items.filter((item) => item.due).length,
+        candidates: candidateCount,
+        issues: [...issueCounts.values()].reduce((sum, count) => sum + count, 0)
+      },
+      asOfMs
+    };
+  }
+
+  // Render-context assembly for one doc revision: claim metadata (episode
+  // files + anchors + citation keys), aliases, member labels, Related links.
+  private docRenderContextTx(doc: BrainDocRow, nodeRow: GraphNodeRow, revision: BrainDocRevisionRecord): DocRenderContext {
+    const referenced = new Set<string>();
+    for (const section of revision.sections) {
+      for (const statement of section.statements) {
+        for (const claimId of statement.claimIds) {
+          referenced.add(claimId);
+        }
+      }
+    }
+    const claimMeta = new Map<string, DocRenderClaimMeta>();
+    const ids = [...referenced];
+    for (let index = 0; index < ids.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = ids.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      const placeholders = batch.map(() => "?").join(",");
+      const rows = this.db
+        .prepare(
+          `SELECT c.id AS id, c.sequence AS sequence, e.id AS episodeId, e.status AS episodeStatus,
+                  e.start_at_ms AS startAtMs, e.chat_source_id AS chatSourceId, ch.display_name AS chatDisplayName
+           FROM brain_claims c
+           JOIN brain_episodes e ON e.id = c.episode_id
+           LEFT JOIN chats ch ON ch.source_chat_id = e.chat_source_id
+           WHERE c.id IN (${placeholders})`
+        )
+        .all(...batch) as Array<{
+        id: string;
+        sequence: number;
+        episodeId: string;
+        episodeStatus: string;
+        startAtMs: number;
+        chatSourceId: string;
+        chatDisplayName: string | null;
+      }>;
+      for (const row of rows) {
+        // Must match the projected file name exactly or the wikilink dangles —
+        // hence the one shared definition.
+        const fileSlug = episodeFileBase({
+          id: row.episodeId,
+          startAtMs: Number(row.startAtMs),
+          chatSourceId: row.chatSourceId,
+          chatDisplayName: row.chatDisplayName
+        });
+        claimMeta.set(row.id, {
+          exists: row.episodeStatus === "current",
+          episodeId: row.episodeId,
+          episodeFile: fileSlug,
+          // sequence is 1-based at commit (index + 1) and the episode markdown
+          // anchors are ^claim-<1-based position> — they line up exactly.
+          episodeClaimIndex: Number(row.sequence),
+          citationKeys: []
+        });
+      }
+      const citationRows = this.db
+        .prepare(`SELECT claim_id AS claimId, source_message_key AS key FROM brain_citations WHERE claim_id IN (${placeholders})`)
+        .all(...batch) as Array<{ claimId: string; key: string }>;
+      for (const citation of citationRows) {
+        claimMeta.get(citation.claimId)?.citationKeys.push(citation.key);
+      }
+    }
+    for (const claimId of referenced) {
+      if (!claimMeta.has(claimId)) {
+        claimMeta.set(claimId, { exists: false, episodeId: null, episodeFile: null, episodeClaimIndex: null, citationKeys: [] });
+      }
+    }
+    const aliases = (
+      this.db.prepare(`SELECT alias FROM brain_node_aliases WHERE node_id = ? ORDER BY alias LIMIT 12`).all(nodeRow.id) as Array<{
+        alias: string;
+      }>
+    ).map((row) => row.alias);
+    const memberLabels: string[] = [];
+    if (nodeRow.kind === "person" && nodeRow.jid) {
+      for (const scopeNodeId of this.docScopeNodeIdsTx(nodeRow)) {
+        const member = this.db.prepare(`SELECT * FROM brain_nodes WHERE id = ?`).get(scopeNodeId) as GraphNodeRow | undefined;
+        if (member) {
+          const label = this.graphLabelForNodeRow(member);
+          if (!memberLabels.includes(label)) {
+            memberLabels.push(label);
+          }
+        }
+      }
+    }
+    // Related: strongest edges whose other endpoint has a doc — deterministic
+    // structural links only, prose is never parsed.
+    const relatedRows = this.db
+      .prepare(
+        `SELECT n.kind AS kind, n.slug AS slug, n.id AS id
+         FROM brain_edges eg
+         JOIN brain_nodes n ON n.id = CASE WHEN eg.src_node_id = ? THEN eg.dst_node_id ELSE eg.src_node_id END
+         JOIN brain_docs d ON d.node_id = n.id
+         WHERE (eg.src_node_id = ? OR eg.dst_node_id = ?) AND n.status = 'active'
+         ORDER BY eg.weight DESC LIMIT 8`
+      )
+      .all(nodeRow.id, nodeRow.id, nodeRow.id) as Array<{ kind: GraphNodeRow["kind"]; slug: string; id: string }>;
+    const related: DocRenderContext["related"] = [];
+    for (const entry of relatedRows) {
+      const relatedRow = this.db.prepare(`SELECT * FROM brain_nodes WHERE id = ?`).get(entry.id) as GraphNodeRow | undefined;
+      const relatedKind = relatedRow ? this.docKindForNodeRow(relatedRow) : null;
+      if (relatedRow && relatedKind && !related.some((existing) => existing.slug === relatedRow.slug)) {
+        related.push({ kind: relatedKind, slug: relatedRow.slug, title: this.graphLabelForNodeRow(relatedRow) });
+      }
+    }
+    return {
+      docId: doc.doc_id,
+      kind: doc.kind,
+      slug: doc.slug ?? nodeRow.slug,
+      nodeId: nodeRow.id,
+      title: this.graphLabelForNodeRow(nodeRow),
+      revision: revision.revision,
+      updatedAtMs: revision.createdAtMs,
+      aliases,
+      memberLabels,
+      claimMeta,
+      related,
+      mergedIntoDoc: null
+    };
+  }
+
+  async getBrainDoc(docId: string): Promise<BrainDocDetail | null> {
+    let docRow = this.docRowTx(docId);
+    let redirected = false;
+    // A doc whose node merged resolves through the survivor's doc (and the
+    // doc row lazily records the merge so the projection can render a stub).
+    if (docRow?.node_id) {
+      const nodeRow = this.db.prepare(`SELECT * FROM brain_nodes WHERE id = ?`).get(docRow.node_id) as GraphNodeRow | undefined;
+      if (nodeRow?.status === "merged" && nodeRow.merged_into) {
+        const survivor = this.resolveDocTargetNodeTx({ nodeId: nodeRow.merged_into });
+        if (survivor) {
+          const survivorKind = this.docKindForNodeRow(survivor.row)!;
+          const survivorDocId = docIdFor(survivorKind, survivor.row.slug);
+          if (survivorDocId !== docId) {
+            this.db.prepare(`UPDATE brain_docs SET status = 'merged', merged_into = ? WHERE doc_id = ?`).run(survivorDocId, docId);
+            const survivorDoc = await this.getBrainDoc(survivorDocId);
+            if (survivorDoc) {
+              return { ...survivorDoc, redirected: true };
+            }
+          }
+        }
+      }
+    }
+    if (!docRow) {
+      // Candidate docs (no revision yet) still answer: resolve via the node.
+      const resolved = this.resolveDocTargetNodeTx({ docId });
+      if (!resolved) {
+        return null;
+      }
+      redirected = resolved.redirected;
+      const kind = this.docKindForNodeRow(resolved.row)!;
+      const resolvedDocId = docIdFor(kind, resolved.row.slug);
+      docRow = this.docRowTx(resolvedDocId);
+      if (!docRow) {
+        const dueness = this.docDuenessTx(
+          {
+            doc_id: resolvedDocId,
+            kind,
+            node_id: resolved.row.id,
+            slug: resolved.row.slug,
+            status: "active",
+            merged_into: null,
+            current_revision_id: null,
+            last_rollup_at_ms: null,
+            created_at_ms: Date.now()
+          },
+          resolved.row
+        );
+        return {
+          doc: {
+            docId: resolvedDocId,
+            kind,
+            nodeId: resolved.row.id,
+            slug: resolved.row.slug,
+            status: "active",
+            mergedInto: null,
+            currentRevisionId: null,
+            lastRollupAtMs: null,
+            createdAtMs: Date.now()
+          },
+          title: this.graphLabelForNodeRow(resolved.row),
+          redirected,
+          current: null,
+          sections: [],
+          markdown: null,
+          history: [],
+          issues: await this.listBrainValidationIssues({ docId: resolvedDocId, limit: 50 }),
+          due: dueness.due,
+          dueReasons: dueness.dueReasons,
+          asOfMs: Date.now()
+        };
+      }
+    }
+    const nodeRow = docRow.node_id
+      ? (this.db.prepare(`SELECT * FROM brain_nodes WHERE id = ?`).get(docRow.node_id) as GraphNodeRow | undefined)
+      : undefined;
+    const current = docRow.current_revision_id
+      ? this.mapDocRevisionRow(this.db.prepare(`SELECT * FROM brain_doc_revisions WHERE id = ?`).get(docRow.current_revision_id) as DocRevisionRow)
+      : null;
+    const sections: BrainDocSectionView[] = [];
+    let markdown: string | null = null;
+    if (current && nodeRow) {
+      const context = this.docRenderContextTx(docRow, nodeRow, current);
+      markdown = renderDocMarkdown(context, current.sections);
+      const messageStmt = this.db.prepare(
+        `SELECT m.id AS messageId, ch.id AS chatId, m.timestamp_ms AS ts FROM messages m JOIN chats ch ON ch.id = m.chat_id WHERE m.source_message_key = ?`
+      );
+      for (const section of current.sections) {
+        const statements: BrainDocStatementView[] = [];
+        for (const statement of section.statements) {
+          statements.push({
+            text: statement.text,
+            claims: statement.claimIds.map((claimId) => {
+              const meta = context.claimMeta.get(claimId);
+              return {
+                claimId,
+                exists: meta?.exists ?? false,
+                episodeId: meta?.episodeId ?? null,
+                citations: (meta?.citationKeys ?? []).map((key) => {
+                  const message = messageStmt.get(key) as { messageId: number; chatId: number; ts: number | null } | undefined;
+                  return {
+                    sourceMessageKey: key,
+                    chatId: message?.chatId ?? null,
+                    messageId: message?.messageId ?? null,
+                    timestampMs: message?.ts ?? null
+                  };
+                })
+              };
+            })
+          });
+        }
+        sections.push({ title: section.title, statements });
+      }
+    }
+    const historyRows = this.db
+      .prepare(`SELECT * FROM brain_doc_revisions WHERE doc_id = ? ORDER BY revision DESC LIMIT 50`)
+      .all(docRow.doc_id) as DocRevisionRow[];
+    const history: BrainDocRevisionSummary[] = historyRows.map((row) => {
+      const record = this.mapDocRevisionRow(row);
+      const referenced = new Set<string>();
+      for (const section of record.sections) {
+        for (const statement of section.statements) {
+          for (const claimId of statement.claimIds) {
+            referenced.add(claimId);
+          }
+        }
+      }
+      return {
+        id: record.id,
+        revision: record.revision,
+        status: record.status,
+        statementCount: record.sections.reduce((sum, section) => sum + section.statements.length, 0),
+        referencedClaimCount: referenced.size,
+        fedClaimCount: record.fedClaimIds.length,
+        dropCount: record.drops.length,
+        drops: record.drops,
+        resolutionCount: record.resolutionEventIds.length,
+        errors: record.errors,
+        model: record.model,
+        effort: record.effort,
+        runId: record.runId,
+        promptVersion: record.promptVersion,
+        createdAtMs: record.createdAtMs
+      };
+    });
+    const dueness = nodeRow
+      ? this.docDuenessTx(docRow, nodeRow)
+      : { due: false, dueReasons: [] as BrainDocDueReason[], eligibleClaims: 0, newClaims: 0, openItems: 0 };
+    return {
+      doc: this.mapDocRow(docRow),
+      title: nodeRow ? this.graphLabelForNodeRow(nodeRow) : docRow.slug ?? docRow.doc_id,
+      redirected,
+      current,
+      sections,
+      markdown,
+      history,
+      issues: await this.listBrainValidationIssues({ docId: docRow.doc_id, limit: 50 }),
+      due: dueness.due,
+      dueReasons: dueness.dueReasons,
+      asOfMs: Date.now()
+    };
+  }
+
+  // Everything the deterministic projector needs, for every projectable doc.
+  async listBrainDocsForProjection(): Promise<Array<{ context: DocRenderContext; sections: BrainDocSection[] }>> {
+    const out: Array<{ context: DocRenderContext; sections: BrainDocSection[] }> = [];
+    const docRows = this.db.prepare(`SELECT * FROM brain_docs`).all() as BrainDocRow[];
+    for (const docRow of docRows) {
+      const nodeRow = docRow.node_id
+        ? (this.db.prepare(`SELECT * FROM brain_nodes WHERE id = ?`).get(docRow.node_id) as GraphNodeRow | undefined)
+        : undefined;
+      if (!nodeRow) {
+        continue;
+      }
+      const merged = nodeRow.status === "merged" || docRow.status === "merged";
+      if (merged) {
+        let mergedIntoDoc: DocRenderContext["mergedIntoDoc"] = null;
+        const survivor = nodeRow.merged_into ? this.resolveDocTargetNodeTx({ nodeId: nodeRow.merged_into }) : null;
+        if (survivor) {
+          const survivorKind = this.docKindForNodeRow(survivor.row)!;
+          mergedIntoDoc = { slug: survivor.row.slug, kind: survivorKind, title: this.graphLabelForNodeRow(survivor.row) };
+        }
+        out.push({
+          context: {
+            docId: docRow.doc_id,
+            kind: docRow.kind,
+            slug: docRow.slug ?? nodeRow.slug,
+            nodeId: nodeRow.id,
+            title: this.graphLabelForNodeRow(nodeRow),
+            revision: 0,
+            updatedAtMs: docRow.last_rollup_at_ms ?? docRow.created_at_ms,
+            aliases: [],
+            memberLabels: [],
+            claimMeta: new Map(),
+            related: [],
+            mergedIntoDoc
+          },
+          sections: []
+        });
+        continue;
+      }
+      if (!docRow.current_revision_id) {
+        continue;
+      }
+      const revision = this.mapDocRevisionRow(
+        this.db.prepare(`SELECT * FROM brain_doc_revisions WHERE id = ?`).get(docRow.current_revision_id) as DocRevisionRow
+      );
+      out.push({ context: this.docRenderContextTx(docRow, nodeRow, revision), sections: revision.sections });
+    }
+    return out;
+  }
+
+  // Deterministic overview data — every field derivable, zero model calls.
+  async getBrainOverviewData(): Promise<OverviewRenderData> {
+    const backfill = await this.getBrainBackfillStats();
+    const pending = Math.max(0, backfill.totalVisibleMessages - backfill.assimilatedVisibleMessages);
+    const coveragePercent =
+      backfill.totalVisibleMessages > 0
+        ? Math.round(((backfill.totalVisibleMessages - pending) / backfill.totalVisibleMessages) * 1000) / 10
+        : 100;
+    const docs = await this.listBrainDocs({ limit: 10_000 });
+    const lifecycle = await this.listBrainLifecycleItems({ status: "open", sort: "smart", limit: 6 });
+    const topRows = this.db
+      .prepare(
+        `SELECT n.*, d.doc_id AS docId FROM brain_nodes n
+         LEFT JOIN brain_docs d ON d.node_id = n.id
+         WHERE n.status = 'active' AND n.kind IN ('person','topic','org','chat','project')
+         ORDER BY n.salience DESC LIMIT 10`
+      )
+      .all() as Array<GraphNodeRow & { docId: string | null }>;
+    const issues = await this.getBrainValidationIssueSummary();
+    const latestRunRow = this.db
+      .prepare(`SELECT kind, status, finished_at FROM brain_runs ORDER BY started_at DESC LIMIT 1`)
+      .get() as { kind: string; status: string; finished_at: string | null } | undefined;
+    return {
+      generatedAtMs: Date.now(),
+      coveragePercent,
+      totalVisibleMessages: backfill.totalVisibleMessages,
+      assimilatedVisibleMessages: backfill.assimilatedVisibleMessages,
+      docsTotal: docs.counts.docs,
+      docsDue: docs.counts.due,
+      docCandidates: docs.counts.candidates,
+      openItems: lifecycle.counts.open,
+      overdueItems: lifecycle.counts.overdue,
+      staleItems: lifecycle.counts.stale,
+      soonestDue: lifecycle.items
+        .slice(0, 6)
+        .map((item) => ({ text: item.text, dueMs: item.dueMs, chatLabel: item.chatDisplayName })),
+      topEntities: topRows.map((row) => {
+        const kind = this.docKindForNodeRow(row) ?? "entity";
+        return {
+          title: this.graphLabelForNodeRow(row),
+          kind,
+          slug: row.slug,
+          salience: Number(row.salience ?? 0),
+          hasDoc: Boolean(row.docId)
+        };
+      }),
+      issueCount: issues.error + issues.warning + issues.info,
+      orphanedResolutions: Number(
+        (this.db.prepare(`SELECT COUNT(*) AS n FROM brain_lifecycle_events WHERE orphaned_at_ms IS NOT NULL`).get() as { n: number }).n
+      ),
+      lastRunLine: latestRunRow ? `${latestRunRow.kind} ${latestRunRow.status}${latestRunRow.finished_at ? ` at ${latestRunRow.finished_at}` : ""}` : null,
+      providerLine: null
+    };
   }
 
   // === Two-level person model =============================================
@@ -8461,6 +10161,61 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         projectEpisodeFile({ ...record, markdown });
       } catch {
         // Projection to the vault is best-effort; the database is the source of truth.
+      }
+    }
+    // Semantic-rollups: statement prose inherits the same substitutable-label
+    // discipline as claims — sweep CURRENT doc revisions with the same
+    // token→label substitutions and re-render affected files. Zero model
+    // calls; superseded revisions keep their as-written labels (history).
+    const docSubs: Array<{ token: string; label: string }> = [];
+    for (const jid of candidates) {
+      const token = numberLabelFromJid(jid);
+      if (!token.startsWith("+") && !token.startsWith("lid:")) {
+        continue;
+      }
+      const label = this.resolveCurrentLabelForJid(jid);
+      if (label && label !== token) {
+        docSubs.push({ token, label });
+      }
+    }
+    if (docSubs.length > 0) {
+      const revisionRows = this.db
+        .prepare(`SELECT id, doc_id, sections_json FROM brain_doc_revisions WHERE status = 'current'`)
+        .all() as Array<{ id: number; doc_id: string; sections_json: string }>;
+      const updateRevision = this.db.prepare(`UPDATE brain_doc_revisions SET sections_json = ? WHERE id = ?`);
+      const repairedDocIds: string[] = [];
+      for (const revisionRow of revisionRows) {
+        const sections = parseJson(revisionRow.sections_json) as Array<{ title: string; statements: Array<{ text: string; claimIds: string[] }> }> | null;
+        if (!sections) {
+          continue;
+        }
+        let changed = false;
+        for (const section of sections) {
+          for (const statement of section.statements) {
+            let text = statement.text;
+            for (const sub of docSubs) {
+              const before = text;
+              text = substituteParticipantToken(text, sub.token, sub.label);
+              if (text !== before) {
+                tokensSubstituted += 1;
+                changed = true;
+              }
+            }
+            statement.text = text;
+          }
+        }
+        if (changed) {
+          updateRevision.run(stringifyJson(sections), revisionRow.id);
+          repairedDocIds.push(revisionRow.doc_id);
+        }
+      }
+      if (repairedDocIds.length > 0) {
+        try {
+          const { projectBrainDocs } = await import("../brain/projection");
+          await projectBrainDocs(this, { docIds: repairedDocIds });
+        } catch {
+          // Vault projection is best-effort; the database is the source of truth.
+        }
       }
     }
     if (options?.enqueueRegeneration === true && repairedIds.length > 0) {
@@ -12230,7 +13985,15 @@ function migrateAdditiveColumns(db: Database.Database): void {
     // retrieval-hardening: sender label split out of resolved_text, plus the
     // low-weight context stratum (orphaned quote snapshots, link previews).
     { table: "messages", column: "resolved_sender", ddl: "ALTER TABLE messages ADD COLUMN resolved_sender TEXT NULL" },
-    { table: "messages", column: "resolved_context", ddl: "ALTER TABLE messages ADD COLUMN resolved_context TEXT NULL" }
+    { table: "messages", column: "resolved_context", ddl: "ALTER TABLE messages ADD COLUMN resolved_context TEXT NULL" },
+    // semantic-rollups: supersession projection on claims (revisions are the
+    // durable truth) and the doc anchor for rollup validation issues.
+    {
+      table: "brain_claims",
+      column: "superseded_by_claim_id",
+      ddl: "ALTER TABLE brain_claims ADD COLUMN superseded_by_claim_id TEXT NULL REFERENCES brain_claims(id) ON DELETE SET NULL"
+    },
+    { table: "brain_validation_issues", column: "doc_id", ddl: "ALTER TABLE brain_validation_issues ADD COLUMN doc_id TEXT NULL" }
   ];
   for (const addition of additions) {
     const columns = db.prepare(`SELECT name FROM pragma_table_info(?)`).all(addition.table) as Array<{ name: string }>;
@@ -12238,6 +14001,14 @@ function migrateAdditiveColumns(db: Database.Database): void {
       db.exec(addition.ddl);
     }
   }
+  // Created here (not in schemaStatements) because on a pre-rollups archive the
+  // column above lands only after the base DDL already ran.
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_brain_claims_superseded ON brain_claims (superseded_by_claim_id) WHERE superseded_by_claim_id IS NOT NULL`
+  );
+  // Same reason: doc_id lands by ALTER above, so its index cannot live in
+  // schemaStatements. Scoping run history to one page reads issues by doc.
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_brain_issues_doc ON brain_validation_issues (doc_id) WHERE doc_id IS NOT NULL`);
 }
 
 // Signal capture originally stored one winning source on each canonical row.
@@ -13018,6 +14789,37 @@ interface GraphNodeRow {
   engagement_factor: number;
   first_seen_at_ms: number | null;
   last_seen_at_ms: number | null;
+}
+
+// Semantic-consolidation row shapes (semantic-rollups).
+interface BrainDocRow {
+  doc_id: string;
+  kind: BrainDocKind;
+  node_id: string | null;
+  slug: string | null;
+  status: "active" | "merged";
+  merged_into: string | null;
+  current_revision_id: number | null;
+  last_rollup_at_ms: number | null;
+  created_at_ms: number;
+}
+
+interface DocRevisionRow {
+  id: number;
+  doc_id: string;
+  revision: number;
+  status: "current" | "superseded" | "rejected";
+  sections_json: string;
+  drops_json: string;
+  fed_claim_ids_json: string;
+  input_stats_json: string;
+  resolutions_json: string;
+  errors_json: string | null;
+  model: string | null;
+  effort: string | null;
+  run_id: string | null;
+  prompt_version: number;
+  created_at_ms: number;
 }
 
 function isLidFormJid(jid: string): boolean {

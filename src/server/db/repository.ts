@@ -6,6 +6,15 @@ import type {
   BrainChatBacklogItem,
   BrainClaimGradeRecord,
   BrainClaimGradeValue,
+  BrainDocCommitResult,
+  BrainDocDetail,
+  BrainDocKind,
+  BrainDocRevisionRecord,
+  BrainDocSection,
+  BrainDocsListResponse,
+  BrainDocsListView,
+  BrainRollupInput,
+  BrainRollupRevisionInput,
   BrainEpisodeGenerator,
   BrainEpisodeInput,
   BrainEpisodeRecord,
@@ -35,6 +44,9 @@ import type {
   BrainMediaGapImpact,
   BrainMediaGapSummary,
   BrainResolutionDebtSummary,
+  BrainRunEffects,
+  BrainRunKind,
+  BrainRunListItem,
   BrainRunSummary,
   BrainStatusSummary,
   BrainTaskInput,
@@ -113,6 +125,7 @@ import type {
   PersonSuggestionRecord,
   PersonSuggestionStatus
 } from "../../shared/types";
+import type { DocRenderContext, OverviewRenderData } from "../brain/rollups";
 
 export interface ArchiveRepository {
   createRestorePoint(label: string): Promise<ArchiveRestorePoint>;
@@ -329,6 +342,16 @@ export interface ArchiveRepository {
   reconcileBrainRuns(): Promise<number>;
   startBrainRun(kind: BrainRunSummary["kind"], timezone?: string | null): Promise<string>;
   getBrainRun(runId: string): Promise<BrainRunSummary | null>;
+  // Run history — brain runs were write-only from the UI's perspective until
+  // the audit surface needed them. Every row carries its effect counts, and
+  // `docId` scopes the history to the runs that touched one page (the shape a
+  // page's own "run history" asks for).
+  listBrainRuns(options?: { kind?: BrainRunKind; docId?: string; limit?: number }): Promise<BrainRunListItem[]>;
+  // The run audit: every durable change attributable to one run, especially
+  // effects OUTSIDE the artifact it was asked to produce (a rollup writes a
+  // page, but may also close commitments and supersede claims). Pure read —
+  // every effect table already carries run_id.
+  getBrainRunEffects(runId: string): Promise<BrainRunEffects | null>;
   completeBrainRun(runId: string, totals: Record<string, number>): Promise<void>;
   failBrainRun(
     runId: string,
@@ -361,6 +384,15 @@ export interface ArchiveRepository {
   // re-assimilates from scratch. Returns removed episode ids for file cleanup.
   resetBrainDerivedData(options?: { chatSourceId?: string | null }): Promise<{ episodeIds: string[]; watermarks: number }>;
   commitBrainEpisode(episode: BrainEpisodeInput): Promise<BrainEpisodeRecord>;
+  // Lean projection read: just what projectEpisodeFile needs, for CURRENT
+  // episodes. The vault is a pure projection of stored markdown, so this makes
+  // it fully rebuildable after a wipe — no model calls, no claim hydration.
+  // chatDisplayName is resolved at READ time — the projected file name carries
+  // it, so a renamed chat re-projects under its new name.
+  listBrainEpisodeProjections(options?: {
+    limit?: number;
+    offset?: number;
+  }): Promise<Array<{ id: string; chatSourceId: string; chatDisplayName: string | null; startAtMs: number; markdown: string }>>;
   // Rendered markdown references committed claim ids, so it lands post-commit.
   updateBrainEpisodeMarkdown(episodeId: string, markdown: string): Promise<void>;
   listBrainEpisodes(options: {
@@ -411,7 +443,7 @@ export interface ArchiveRepository {
   markBrainEpisodeSuperseded(episodeId: string): Promise<void>;
   // Contract-v2 quality signals: flag rows never block a commit.
   recordBrainValidationIssues(issues: BrainValidationIssueInput[]): Promise<void>;
-  listBrainValidationIssues(options?: { episodeId?: string | null; limit?: number }): Promise<BrainValidationIssueRecord[]>;
+  listBrainValidationIssues(options?: { episodeId?: string | null; docId?: string | null; runId?: string | null; limit?: number }): Promise<BrainValidationIssueRecord[]>;
   getBrainValidationIssueSummary(): Promise<BrainValidationIssueSummary>;
   // Topic vocabulary offer: existing topic titles, this chat's most-used first,
   // then global by usage, deduped and capped.
@@ -516,6 +548,51 @@ export interface ArchiveRepository {
     claimIds?: string[];
     maxNodesPerBatch?: number;
   }): Promise<BrainLifecycleSweepBatch[]>;
+  // --- Semantic consolidation (semantic-rollups): docs are structured
+  // statement revisions consolidated from current model-generated claims; the
+  // markdown page is a deterministic render. Contract semantics (selection,
+  // guard, conflict pairing, rendering) live in brain/rollups.ts and are
+  // shared by both backends — parity by construction.
+  // Assemble a rollup call's input: the doc's full eligible claim set
+  // (person docs membership-aggregated; extractive and superseded claims
+  // excluded), detected conflict pairs (recall + verify only, never a prompt
+  // hint), and the prior revision's claim-ref accounting. Zero model calls.
+  getBrainRollupInput(target: { docId?: string | null; nodeId?: string | null }): Promise<BrainRollupInput | null>;
+  // The ONE transactional write path for a successful rollup: exact-guard
+  // re-check, lifecycle resolutions through the shared writer core, revision +
+  // refs insert, prior flip, supersession projection, post-write contradiction
+  // flags. Throws PublicError (guard/validation) applying NOTHING on refusal.
+  commitBrainDocRevision(input: BrainRollupRevisionInput): Promise<BrainDocCommitResult>;
+  // A twice-failed call's rejected revision: retained with its errors, prior
+  // revision untouched, error-severity issue recorded. No fallback for pages.
+  rejectBrainDocRevision(input: {
+    docId: string;
+    kind: BrainDocKind;
+    nodeId: string;
+    slug: string;
+    errors: string[];
+    fedClaimIds: string[];
+    inputStats: BrainDocRevisionRecord["inputStats"];
+    model: string | null;
+    effort: string | null;
+    runId: string | null;
+    promptVersion: number;
+  }): Promise<void>;
+  // Mechanical rollback: flip current to a prior revision, re-derive this
+  // doc's supersession projections, record the action. Zero model calls.
+  rollbackBrainDoc(docId: string, toRevision?: number | null): Promise<BrainDocDetail | null>;
+  // Docs list: existing docs AND page-eligible nodes without a doc yet, with
+  // deterministic dueness reasons and counts. Meaning lives server-side.
+  listBrainDocs(options?: { kind?: BrainDocKind; view?: BrainDocsListView; limit?: number }): Promise<BrainDocsListResponse>;
+  // One doc resolved for display: rendered markdown + structured sections with
+  // thread coordinates, revision history, issues, dueness. Follows merged
+  // redirects (a merged doc answers with its survivor, flagged redirected).
+  getBrainDoc(docId: string): Promise<BrainDocDetail | null>;
+  // Everything the deterministic projector needs for every projectable doc
+  // (current revisions + merged stubs), assembled server-side.
+  listBrainDocsForProjection(): Promise<Array<{ context: DocRenderContext; sections: BrainDocSection[] }>>;
+  // Deterministic overview data — every field derivable, zero model calls.
+  getBrainOverviewData(): Promise<OverviewRenderData>;
   // --- Two-level person model: identities (canonical JIDs) stay immutable
   // anchors; persons are an editable membership. Connect/disconnect touch only
   // person-layer tables — never episodes, claims, citations, or archive rows.

@@ -202,6 +202,20 @@ function BrainGraphSection({ running }: { running: boolean }) {
             <Link className="miniButton" to="/brain/commitments" title="Review open commitments/questions, close them manually, or run the closure sweep">
               Commitments
             </Link>
+            <Link
+              className="miniButton"
+              to="/brain/pages"
+              title="Consolidated entity/topic/chat dossiers — cited pages with declared drops, retained revisions, and mechanical rollback"
+            >
+              Pages
+            </Link>
+            <Link
+              className="miniButton"
+              to="/brain/runs"
+              title="Run history and per-run audit: what each run durably changed, including commitments closed and claims superseded alongside a page"
+            >
+              Runs
+            </Link>
           </div>
         </>
       )}

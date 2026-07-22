@@ -33,7 +33,7 @@ import { isMaskedNumberLabel } from "./import/jid";
 import { GoogleContactsService } from "./googleContacts";
 import { getSearchReindexProgress, startSearchReindex } from "./search/reindexJob";
 import { withGuidedSetup } from "./onboarding";
-import type { ArchiveChangeEvent, BrainGraphEdgeKind, BrainLifecycleSort, LivePairingSummary, PickKind } from "../shared/types";
+import type { ArchiveChangeEvent, BrainGraphEdgeKind, BrainLifecycleSort, BrainRunKind, LivePairingSummary, PickKind } from "../shared/types";
 import type { LiveMessageEvent } from "./live/types";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1050,6 +1050,39 @@ app.get("/api/brain/runs/current", async (_req, res) => {
 // A specific run object (manual or scheduled) by id — the durable record with
 // its final status and totals, for polling a run after the in-memory progress
 // has rolled over to the next one.
+// Run history + the per-run audit. `effects` answers "what did this run
+// durably change?" — especially outside the artifact it was asked to produce.
+// `doc` scopes the history to one page: the runs that wrote (or were refused
+// writing) a revision of it, or raised an issue against it.
+app.get("/api/brain/runs", async (req, res) => {
+  try {
+    const kindRaw = stringQuery(req.query.kind);
+    const kinds = ["nightly", "catchup", "manual", "backfill", "regenerate", "lifecycle", "rollup"];
+    res.json({
+      runs: await repository.listBrainRuns({
+        kind: kindRaw && kinds.includes(kindRaw) ? (kindRaw as BrainRunKind) : undefined,
+        docId: stringQuery(req.query.doc) || undefined,
+        limit: clampNumber(req.query.limit, 1, 500, 50)
+      })
+    });
+  } catch (error) {
+    res.status(500).json({ error: publicErrorMessage(error) });
+  }
+});
+
+app.get("/api/brain/runs/:id/effects", async (req, res) => {
+  try {
+    const effects = await repository.getBrainRunEffects(String(req.params.id));
+    if (!effects) {
+      res.status(404).json({ error: "No such run." });
+      return;
+    }
+    res.json(effects);
+  } catch (error) {
+    res.status(500).json({ error: publicErrorMessage(error) });
+  }
+});
+
 app.get("/api/brain/runs/:id", async (req, res) => {
   try {
     const run = await repository.getBrainRun(req.params.id);
@@ -1386,6 +1419,114 @@ app.post("/api/brain/lifecycle/sweep", async (req, res) => {
     res.json({ ok: true, progress: result.progress });
   } catch (error) {
     res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+// --- Semantic docs (semantic-rollups): list, detail, rollback, rollup run.
+// Meaning lives server-side — the UI/CLI/MCP render the same DTOs.
+
+app.get("/api/brain/docs", async (req, res) => {
+  try {
+    const kindRaw = stringQuery(req.query.kind);
+    const kind = kindRaw === "entity" || kindRaw === "topic" || kindRaw === "chat" ? kindRaw : undefined;
+    const viewRaw = stringQuery(req.query.view);
+    const view =
+      viewRaw === "pages" || viewRaw === "due" || viewRaw === "candidates" || viewRaw === "issues" || viewRaw === "all"
+        ? viewRaw
+        : undefined;
+    const response = await repository.listBrainDocs({
+      kind,
+      view,
+      limit: clampNumber(req.query.limit, 1, 2000, 200)
+    });
+    res.json(response);
+  } catch (error) {
+    res.status(500).json({ error: publicErrorMessage(error) });
+  }
+});
+
+// Doc ids contain a colon (entity:<slug>) — they travel as one path segment.
+app.get("/api/brain/docs/:docId", async (req, res) => {
+  try {
+    const detail = await repository.getBrainDoc(String(req.params.docId));
+    if (!detail) {
+      res.status(404).json({ error: "No such doc (and no page-eligible node under that id)." });
+      return;
+    }
+    res.json(detail);
+  } catch (error) {
+    res.status(500).json({ error: publicErrorMessage(error) });
+  }
+});
+
+app.post("/api/brain/docs/:docId/rollback", async (req, res) => {
+  try {
+    // 0 is a MEANINGFUL target here (unroll to no page), so it cannot share a
+    // sentinel with "absent" — parse it explicitly rather than via clampNumber.
+    const raw = req.body?.toRevision;
+    const parsed = typeof raw === "number" && Number.isInteger(raw) && raw >= 0 && raw <= 1_000_000 ? raw : null;
+    const detail = await repository.rollbackBrainDoc(String(req.params.docId), parsed);
+    // Re-render the restored page + overview deterministically.
+    const { projectBrainDocs, projectBrainOverview } = await import("./brain/projection");
+    await projectBrainDocs(repository, { docIds: [String(req.params.docId)] }).catch(() => undefined);
+    await projectBrainOverview(repository).catch(() => undefined);
+    broadcastArchiveChanged({ source: "manual", chatSourceIds: [], messageCount: 0, contactCount: 0 });
+    res.json(detail);
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+// Manual-first semantic rollup run: consolidate one doc, a list, or the top-K
+// due docs. Strong-tier judgment — fixed high effort unless overridden.
+app.post("/api/brain/rollups/run", async (req, res) => {
+  try {
+    const { startBrainRollupRun } = await import("./brain/runJob");
+    const effortRaw = typeof req.body?.effort === "string" ? req.body.effort : null;
+    const effort =
+      effortRaw === "none" || effortRaw === "low" || effortRaw === "medium" || effortRaw === "high" || effortRaw === "xhigh" || effortRaw === "max"
+        ? effortRaw
+        : null;
+    const maxModelCalls = clampNumber(req.body?.maxModelCalls, 1, 1000, 0);
+    const maxTokens = clampNumber(req.body?.maxTokens, 1000, 100_000_000, 0);
+    const maxDocs = clampNumber(req.body?.maxDocs, 1, 200, 0);
+    const docIds = Array.isArray(req.body?.docIds)
+      ? (req.body.docIds as unknown[]).filter((id): id is string => typeof id === "string").slice(0, 200)
+      : null;
+    const result = startBrainRollupRun(
+      repository,
+      {
+        docId: typeof req.body?.docId === "string" ? req.body.docId : null,
+        nodeId: typeof req.body?.nodeId === "string" ? req.body.nodeId : null,
+        docIds: docIds && docIds.length > 0 ? docIds : null,
+        maxDocs: maxDocs > 0 ? maxDocs : null,
+        model: typeof req.body?.model === "string" ? req.body.model : null,
+        effort,
+        maxModelCalls: maxModelCalls > 0 ? maxModelCalls : null,
+        maxTokens: maxTokens > 0 ? maxTokens : null
+      },
+      () => {
+        broadcastArchiveChanged({ source: "manual", chatSourceIds: [], messageCount: 0, contactCount: 0 });
+      }
+    );
+    if (!result.started) {
+      res.status(409).json({ error: result.refusal ?? "The rollup run could not start.", progress: result.progress });
+      return;
+    }
+    res.json({ ok: true, progress: result.progress });
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+// Rebuild the deterministic vault projection (pages + overview). Zero model
+// calls; idempotent; sweeps orphaned page files.
+app.post("/api/brain/project", async (_req, res) => {
+  try {
+    const { rebuildBrainProjection } = await import("./brain/projection");
+    res.json(await rebuildBrainProjection(repository));
+  } catch (error) {
+    res.status(500).json({ error: publicErrorMessage(error) });
   }
 });
 

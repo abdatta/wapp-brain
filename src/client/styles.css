@@ -5288,6 +5288,28 @@ button.fileButton:disabled {
   background: rgba(79, 156, 255, 0.22);
   border-color: rgba(79, 156, 255, 0.6);
 }
+/* A disabled chip must LOOK disabled: without this it keeps cursor:pointer and
+   full contrast, so an inert button reads as clickable (found while a rollup
+   run was in flight and every other Roll up button silently ignored clicks). */
+.chip:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+/* Doc-page loading: a section heading above shimmering statement rows. */
+.docSkelHeading {
+  height: 18px;
+  width: 180px;
+  margin-bottom: 14px;
+}
+/* The row whose page is being consolidated right now — not a button. */
+.lifecycleRunningChip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: default;
+  border-color: rgba(79, 156, 255, 0.6);
+  background: rgba(79, 156, 255, 0.16);
+}
 .kindChip {
   display: inline-flex;
   align-items: center;

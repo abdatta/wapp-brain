@@ -9,6 +9,7 @@ import type {
   BrainChatBacklogItem,
   BrainLifecycleSweepProgress,
   BrainReasoningEffort,
+  BrainRollupProgress,
   BrainRunProgress
 } from "../../shared/types";
 import { config } from "../config";
@@ -17,6 +18,15 @@ import { PublicError, publicErrorMessage } from "../privacy";
 import { buildEvidencePacks, EXTRACTION_VERSION, generateEpisodeForPack } from "./episodes";
 import { buildLifecycleSweepPrompt, parseLifecycleSweepResponse, type LifecycleSweepResolution } from "./lifecycle";
 import { generateStructured, getBrainProviderStatus } from "./provider";
+import {
+  buildRollupPrompt,
+  parseRollupResponse,
+  ROLLUP_CALL_TIMEOUT_MS,
+  ROLLUP_PROMPT_VERSION,
+  rollupInputTokenBudget,
+  selectRollupClaims
+} from "./rollups";
+import { projectBrainDocs, projectBrainOverview } from "./projection";
 import { auditCatchup, drainBrainTasks } from "./scheduler";
 
 // Backfill fallback canary (historical-backfill H5): the warning fires only
@@ -54,7 +64,8 @@ const progress: BrainRunProgress = {
   startedAt: null,
   finishedAt: null,
   error: null,
-  lifecycle: null
+  lifecycle: null,
+  rollup: null
 };
 
 // Cooperative cancellation: the run loop checks this between chats. A cancel
@@ -185,6 +196,7 @@ export function startBrainRun(
   progress.finishedAt = null;
   progress.error = null;
   progress.lifecycle = null;
+  progress.rollup = null;
   void executeRun(repository, request, beforeAssimilation)
     .then(async (outcome) => {
       // Graph maintenance after every terminal run that committed episodes:
@@ -201,6 +213,13 @@ export function startBrainRun(
           );
         } catch (error) {
           console.warn(`[brain] post-run graph maintenance failed: ${publicErrorMessage(error)}`);
+        }
+        // Overview refresh (semantic-rollups R11): deterministic, zero model
+        // calls — the vault homepage stays fresh after every committing run.
+        try {
+          await projectBrainOverview(repository);
+        } catch (error) {
+          console.warn(`[brain] overview projection failed: ${publicErrorMessage(error)}`);
         }
       }
       progress.state = outcome;
@@ -745,6 +764,7 @@ export function startBrainLifecycleSweep(
   progress.finishedAt = null;
   progress.error = null;
   progress.lifecycle = { nodesOffered: 0, fulfilled: 0, dismissed: 0, stillOpen: 0, failedCalls: 0 };
+  progress.rollup = null;
   void executeLifecycleSweep(repository, request)
     .then((outcome) => {
       progress.state = outcome;
@@ -937,6 +957,291 @@ async function executeLifecycleSweep(
         runId,
         "interrupted",
         `Provider ${progress.provider}${progress.model ? `/${progress.model}` : ""} became unavailable mid-sweep; applied transitions are kept, remaining sweep-due nodes stay open. Probe/recover the provider, then sweep again.`,
+        totals
+      );
+      return "interrupted";
+    }
+    if (budgetStop) {
+      await repository.failBrainRun(runId, "budget_exceeded", budgetStop, totals);
+      return "budget_exceeded";
+    }
+    await repository.completeBrainRun(runId, totals);
+    return "completed";
+  } catch (error) {
+    await repository.failBrainRun(runId, "failed", publicErrorMessage(error)).catch(() => undefined);
+    throw error;
+  }
+}
+
+// --- Semantic rollup run (semantic-rollups) ---------------------------------
+// One strong-tier HIGH-effort call per due doc: assemble input (feed-more,
+// overflow quotas), consolidate to structured statements, validate with
+// mechanical salvage + collect-all + one retry, commit through the exact-guard
+// transactional writer (lifecycle resolutions embedded), project the file.
+// NO fallback: a twice-failed call leaves the prior revision current with a
+// rejected revision + visible issue — an extractive page would be laundered
+// authority at the semantic tier.
+
+export interface BrainRollupRunRequest {
+  // Scope: one doc/node, an explicit doc list, or the top-K due docs.
+  docId?: string | null;
+  nodeId?: string | null;
+  docIds?: string[] | null;
+  maxDocs?: number | null;
+  model?: string | null;
+  // Rollup-class judgment runs at HIGH reasoning effort by default (the same
+  // stance as the closure sweep). Overridable per call for the CLI/API.
+  effort?: BrainReasoningEffort | null;
+  maxModelCalls?: number | null;
+  maxTokens?: number | null;
+}
+
+export function startBrainRollupRun(
+  repository: ArchiveRepository,
+  request: BrainRollupRunRequest,
+  onDone?: (result: { ok: boolean }) => void
+): { started: boolean; progress: BrainRunProgress; refusal?: string } {
+  if (progress.state === "running") {
+    return { started: false, progress: getBrainRunProgress(), refusal: "A brain run is already in progress." };
+  }
+  const provider = getBrainProviderStatus();
+  if (!provider.modelBacked || !provider.enabled || provider.sessionMissing) {
+    return { started: false, progress: getBrainRunProgress(), refusal: provider.message };
+  }
+  if (provider.degraded) {
+    return {
+      started: false,
+      progress: getBrainRunProgress(),
+      refusal: `${provider.message} Probe the provider before rolling up.`
+    };
+  }
+  progress.state = "running";
+  cancelRequested = false;
+  progress.runId = null;
+  progress.kind = "rollup";
+  progress.queuedTasks = null;
+  progress.estimatedEpisodes = null;
+  progress.mode = "model";
+  progress.provider = provider.provider;
+  progress.model = request.model?.trim() || provider.model;
+  progress.processedChats = 0;
+  progress.totalChats = 0;
+  progress.currentChat = null;
+  progress.tokensUsed = 0;
+  progress.episodesCommitted = 0;
+  progress.extractiveEpisodes = 0;
+  progress.claimsCommitted = 0;
+  progress.modelCalls = 0;
+  progress.startedAt = new Date().toISOString();
+  progress.finishedAt = null;
+  progress.error = null;
+  progress.lifecycle = null;
+  progress.rollup = { docsPlanned: 0, docsCommitted: 0, docsRejected: 0, resolutionsApplied: 0, contradictionsFlagged: 0, currentDoc: null };
+  void executeRollupRun(repository, request)
+    .then((outcome) => {
+      progress.state = outcome;
+      progress.finishedAt = new Date().toISOString();
+      const counters = progress.rollup!;
+      console.log(
+        `[brain] rollup run ${outcome}: ${counters.docsCommitted}/${counters.docsPlanned} doc(s) committed, ` +
+          `${counters.docsRejected} rejected, ${counters.resolutionsApplied} resolution(s) applied, ` +
+          `${counters.contradictionsFlagged} contradiction flag(s), ${progress.modelCalls} model call(s)`
+      );
+      onDone?.({ ok: outcome === "completed" });
+    })
+    .catch((error) => {
+      progress.state = "failed";
+      progress.error = publicErrorMessage(error);
+      progress.finishedAt = new Date().toISOString();
+      console.error(`[brain] rollup run FAILED: ${progress.error}`);
+      onDone?.({ ok: false });
+    });
+  return { started: true, progress: getBrainRunProgress() };
+}
+
+async function executeRollupRun(
+  repository: ArchiveRepository,
+  request: BrainRollupRunRequest
+): Promise<"completed" | "budget_exceeded" | "interrupted"> {
+  const runId = await repository.startBrainRun("rollup");
+  progress.runId = runId;
+  const counters: BrainRollupProgress = progress.rollup!;
+  try {
+    // Resolve the target doc list: explicit target(s), or the due set ranked
+    // by salience — an unscoped rollup run is STRUCTURALLY bounded by top-K.
+    let targets: Array<{ docId?: string | null; nodeId?: string | null }> = [];
+    if (request.docId || request.nodeId) {
+      targets = [{ docId: request.docId ?? null, nodeId: request.nodeId ?? null }];
+    } else if (request.docIds && request.docIds.length > 0) {
+      targets = request.docIds.map((docId) => ({ docId }));
+    } else {
+      const maxDocs = Math.max(1, Math.min(request.maxDocs ?? 10, request.maxModelCalls ?? Number.MAX_SAFE_INTEGER));
+      const due = await repository.listBrainDocs({ view: "due", limit: maxDocs });
+      targets = due.items.filter((item) => item.status !== "merged").map((item) => ({ nodeId: item.nodeId }));
+    }
+    counters.docsPlanned = targets.length;
+    const effort = request.effort ?? "high";
+    console.log(
+      `[brain] rollup run started (${progress.provider}/${progress.model ?? "default"}, effort ${effort}) — ${targets.length} doc(s) planned` +
+        (request.maxModelCalls != null ? `, ≤${request.maxModelCalls} call(s)` : "") +
+        (request.maxTokens != null ? `, ≤${request.maxTokens.toLocaleString()} tokens` : "")
+    );
+    let budgetStop: string | null = null;
+    let cancelled = false;
+    let providerDegraded = false;
+    for (const target of targets) {
+      if (cancelRequested) {
+        cancelled = true;
+        break;
+      }
+      // Provider health FIRST (the degradation guard): stop cleanly rather
+      // than burn retries against a dead provider.
+      if (getBrainProviderStatus().degraded) {
+        providerDegraded = true;
+        break;
+      }
+      const usedToday = await repository.getBrainLlmUsage({ day: utcDayString() });
+      if (usedToday.calls >= config.brain.maxCallsPerDay) {
+        budgetStop = `Daily model-call budget (${config.brain.maxCallsPerDay}) was reached; remaining due docs stay due.`;
+        break;
+      }
+      if (request.maxModelCalls != null && progress.modelCalls >= request.maxModelCalls) {
+        budgetStop = `Model-call ceiling for this run (${request.maxModelCalls} call(s)) was reached; remaining due docs stay due.`;
+        break;
+      }
+      if (request.maxTokens != null && request.maxTokens > 0 && progress.tokensUsed >= request.maxTokens) {
+        budgetStop = `Token budget for this run (${request.maxTokens.toLocaleString()} tokens) was reached; remaining due docs stay due.`;
+        break;
+      }
+      const input = await repository.getBrainRollupInput(target);
+      if (!input) {
+        console.warn(`[brain] rollup: target ${target.docId ?? target.nodeId} resolved to no page-eligible node; skipped`);
+        continue;
+      }
+      counters.currentDoc = input.title;
+      progress.currentChat = input.title;
+      if (input.claims.length === 0) {
+        console.warn(`[brain] rollup: ${input.docId} has no eligible claims; skipped`);
+        continue;
+      }
+      const selection = selectRollupClaims(input.claims, input.conflictPairs, input.prior?.referencedClaimIds ?? [], rollupInputTokenBudget());
+      const inputStats = {
+        claimCount: selection.stats.claimCount,
+        tokenEstimate: selection.stats.tokenEstimate,
+        overflow: selection.stats.overflow,
+        tiersEngaged: selection.stats.tiersEngaged
+      };
+      const prompt = buildRollupPrompt(input, selection.fed, Date.now());
+      const fedClaimIds = selection.fed.map((claim) => claim.claimId);
+      let committedThisDoc = false;
+      let lastErrors: string[] = [];
+      for (let attempt = 0; attempt < 2 && !committedThisDoc; attempt += 1) {
+        const user =
+          attempt === 0
+            ? prompt.user
+            : `${prompt.user}\n\nYour previous response had these problems — fix ALL of them and respond again with the complete JSON:\n${lastErrors.map((error) => `- ${error}`).join("\n")}`;
+        const result = await generateStructured({
+          system: prompt.system,
+          user,
+          maxOutputTokens: prompt.maxOutputTokens,
+          model: progress.model,
+          effort,
+          // Dossier-sized synthesis outlives the episode-tuned default.
+          timeoutMs: ROLLUP_CALL_TIMEOUT_MS
+        });
+        progress.modelCalls += 1;
+        progress.tokensUsed += result.usage.inputTokens + result.usage.outputTokens;
+        await repository.recordBrainLlmUsage({
+          purpose: "rollup",
+          provider: `${progress.provider}/${progress.model ?? "default"}`,
+          inputTokens: result.usage.inputTokens,
+          outputTokens: result.usage.outputTokens,
+          estimated: result.usage.estimated ?? false
+        });
+        const parsed = parseRollupResponse(result.json, prompt);
+        if (parsed.errors.length > 0) {
+          lastErrors = parsed.errors;
+          continue;
+        }
+        try {
+          const commit = await repository.commitBrainDocRevision({
+            docId: input.docId,
+            kind: input.kind,
+            nodeId: input.nodeId,
+            slug: input.slug,
+            sections: parsed.sections,
+            drops: parsed.drops,
+            resolutions: parsed.resolutions,
+            allowedCitesByClaim: parsed.allowedCitesByClaim,
+            fedClaimIds,
+            inputStats,
+            model: progress.model,
+            effort,
+            runId,
+            promptVersion: ROLLUP_PROMPT_VERSION
+          });
+          committedThisDoc = true;
+          counters.docsCommitted += 1;
+          counters.resolutionsApplied += commit.record.resolutionEventIds.length;
+          counters.contradictionsFlagged += commit.contradictions.length;
+          // Project the committed page immediately (deterministic, cheap);
+          // a failure here never masks the commit.
+          try {
+            await projectBrainDocs(repository, { docIds: [input.docId] });
+          } catch (error) {
+            console.warn(`[brain] rollup projection failed for ${input.docId}: ${publicErrorMessage(error)}`);
+          }
+        } catch (error) {
+          // Guard/validation refusal from the committer counts against the
+          // same single retry as parse errors (one contract, one retry).
+          lastErrors = [publicErrorMessage(error)];
+        }
+      }
+      if (!committedThisDoc) {
+        counters.docsRejected += 1;
+        await repository.rejectBrainDocRevision({
+          docId: input.docId,
+          kind: input.kind,
+          nodeId: input.nodeId,
+          slug: input.slug,
+          errors: lastErrors,
+          fedClaimIds,
+          inputStats,
+          model: progress.model,
+          effort,
+          runId,
+          promptVersion: ROLLUP_PROMPT_VERSION
+        });
+        console.warn(`[brain] rollup: ${input.docId} refused after retry — prior revision stays current. Errors: ${lastErrors.join("; ")}`);
+      }
+      progress.processedChats += 1;
+      // Yield between docs so ingestion and HTTP stay responsive.
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    // Overview refresh at run end: deterministic, zero model calls.
+    try {
+      await projectBrainOverview(repository);
+    } catch (error) {
+      console.warn(`[brain] overview projection failed: ${publicErrorMessage(error)}`);
+    }
+    const totals = {
+      docsPlanned: counters.docsPlanned,
+      docsCommitted: counters.docsCommitted,
+      docsRejected: counters.docsRejected,
+      resolutionsApplied: counters.resolutionsApplied,
+      contradictionsFlagged: counters.contradictionsFlagged,
+      modelCalls: progress.modelCalls,
+      tokens: progress.tokensUsed
+    };
+    if (cancelled) {
+      await repository.failBrainRun(runId, "interrupted", "Rollup run cancelled; committed revisions are kept, remaining due docs stay due.", totals);
+      return "interrupted";
+    }
+    if (providerDegraded) {
+      await repository.failBrainRun(
+        runId,
+        "interrupted",
+        `Provider ${progress.provider}${progress.model ? `/${progress.model}` : ""} became unavailable mid-run; committed revisions are kept, remaining due docs stay due. Probe/recover the provider, then run again.`,
         totals
       );
       return "interrupted";

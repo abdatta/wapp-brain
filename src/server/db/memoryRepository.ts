@@ -10,6 +10,22 @@ import type {
   BrainChatBacklogItem,
   BrainClaimGradeRecord,
   BrainClaimGradeValue,
+  BrainConflictPair,
+  BrainDocCommitResult,
+  BrainDocDetail,
+  BrainDocDueReason,
+  BrainDocKind,
+  BrainDocListItem,
+  BrainDocRecord,
+  BrainDocRevisionRecord,
+  BrainDocSection,
+  BrainDocSectionView,
+  BrainDocStatementView,
+  BrainDocsListResponse,
+  BrainDocsListView,
+  BrainRollupInput,
+  BrainRollupInputClaim,
+  BrainRollupRevisionInput,
   BrainEpisodeGenerator,
   BrainEpisodeInput,
   BrainEpisodeRecord,
@@ -57,6 +73,11 @@ import type {
   BrainMediaGapSummary,
   BrainResolutionDebtIdentity,
   BrainResolutionDebtSummary,
+  BrainRunEffectLifecycle,
+  BrainRunEffectRevision,
+  BrainRunEffects,
+  BrainRunKind,
+  BrainRunListItem,
   BrainRunSummary,
   BrainStatusSummary,
   BrainTaskInput,
@@ -160,6 +181,7 @@ import {
   deriveEpisodeGraph,
   engagementFactorFromAggregates,
   graphDormancyThreshold,
+  normalizeGraphName,
   personJidNaturalKey,
   slugForGraphNode,
   type EpisodeGraphContext,
@@ -168,6 +190,20 @@ import {
   type GraphMutations,
   type GraphNodeSpec
 } from "../brain/graph";
+import { BRAIN_DOC_REVISION_NONE } from "../../shared/types";
+import {
+  detectConflictPairs,
+  docIdFor,
+  renderDocMarkdown,
+  rollupDueNewClaims,
+  rollupMinClaims,
+  rollupStaleDropShare,
+  runRollupGuard,
+  type ConflictClaimFacts,
+  type DocRenderClaimMeta,
+  type DocRenderContext,
+  type OverviewRenderData
+} from "../brain/rollups";
 import {
   compareLifecycleItems,
   computeLifecycleFlags,
@@ -181,6 +217,7 @@ import {
   type LifecycleFold
 } from "../brain/lifecycle";
 import { resolveNeighborhoodParams, shapeNeighborhood, type NeighborhoodWalk } from "../brain/graphQuery";
+import { episodeFileBase } from "../brain/vaultNames";
 import { isMaskedNumberLabel, normalizeJid, phoneFromJid, resolveDisplayLabel } from "../import/jid";
 import { normalizeOwnerSelfInput } from "../identity/ownerSelf";
 import { disambiguateLabels } from "../persons/disambiguate";
@@ -339,6 +376,13 @@ export class MemoryArchiveRepository implements ArchiveRepository {
   // claim id, exactly like brain_lifecycle_events + cites in SQLite.
   private lifecycleEvents: BrainLifecycleEventRecord[] = [];
   private lifecycleEventSeq = 1;
+  // Semantic consolidation (mirror of brain_docs / brain_doc_revisions /
+  // brain_doc_revision_claims + the claims supersession projection column).
+  private brainDocs = new Map<string, BrainDocRecord>();
+  private brainDocRevisions = new Map<number, BrainDocRevisionRecord>();
+  private brainDocRevisionRefs = new Map<number, Set<string>>();
+  private brainDocRevisionSeq = 1;
+  private claimSupersededBy = new Map<string, string>();
   private editRevisions = new Map<string, MessageEditRevisionRecord[]>();
   private nextMediaQueueId = 1;
   private nextMediaAssetId = 1;
@@ -897,6 +941,38 @@ export class MemoryArchiveRepository implements ArchiveRepository {
         episode.markdown = episodeMarkdown(episode);
         episodesRepaired += 1;
         tokensSubstituted += count;
+      }
+    }
+    // Semantic-rollups: sweep CURRENT doc revisions' statement text with the
+    // same token→label substitutions (mirror of the SQLite sweep). Superseded
+    // revisions keep their as-written labels (history).
+    const docSubs: Array<{ token: string; label: string }> = [];
+    for (const jid of candidates) {
+      const token = numberLabelFromJid(jid);
+      if (!token.startsWith("+") && !token.startsWith("lid:")) {
+        continue;
+      }
+      const label = this.resolveCurrentLabelForJid(jid);
+      if (label && label !== token) {
+        docSubs.push({ token, label });
+      }
+    }
+    if (docSubs.length > 0) {
+      for (const revision of this.brainDocRevisions.values()) {
+        if (revision.status !== "current") {
+          continue;
+        }
+        for (const section of revision.sections) {
+          for (const statement of section.statements) {
+            for (const sub of docSubs) {
+              const before = statement.text;
+              statement.text = substituteParticipantToken(statement.text, sub.token, sub.label);
+              if (statement.text !== before) {
+                tokensSubstituted += 1;
+              }
+            }
+          }
+        }
       }
     }
     return { episodesRepaired, tokensSubstituted };
@@ -3925,6 +4001,122 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     return run ? structuredClone(run) : null;
   }
 
+  async listBrainRuns(options?: { kind?: BrainRunKind; docId?: string; limit?: number }): Promise<BrainRunListItem[]> {
+    // Mirror of the SQLite scope: a run touched this page if it wrote a
+    // revision of it (refusals included) or raised an issue against it.
+    const scoped = options?.docId
+      ? new Set<string>([
+          ...[...this.brainDocRevisions.values()].filter((revision) => revision.docId === options.docId && revision.runId).map((revision) => revision.runId!),
+          ...this.brainIssues.filter((issue) => issue.docId === options.docId && issue.runId).map((issue) => issue.runId!)
+        ])
+      : null;
+    const runs = structuredClone(
+      [...this.brainRuns.values()]
+        .filter((run) => (!options?.kind || run.kind === options.kind) && (!scoped || scoped.has(run.id)))
+        .sort((a, b) => (a.startedAt < b.startedAt ? 1 : a.startedAt > b.startedAt ? -1 : 0))
+        .slice(0, options?.limit ?? 50)
+    );
+    return runs.map((run) => {
+      const revisions = [...this.brainDocRevisions.values()].filter((revision) => revision.runId === run.id);
+      const own = options?.docId ? revisions.find((revision) => revision.docId === options.docId) : undefined;
+      const doc = own ? this.brainDocs.get(own.docId) : undefined;
+      return {
+        run,
+        effects: {
+          lifecycleChanges: this.lifecycleEvents.filter((event) => event.runId === run.id).length,
+          pagesWritten: revisions.filter((revision) => revision.status !== "rejected").length,
+          pagesRefused: revisions.filter((revision) => revision.status === "rejected").length,
+          claimsSuperseded: revisions.reduce(
+            (sum, revision) => sum + revision.drops.filter((drop) => drop.reason === "superseded").length,
+            0
+          ),
+          episodesCommitted: [...this.brainEpisodes.values()].filter((episode) => episode.runId === run.id).length,
+          issues: this.brainIssues.filter((issue) => issue.runId === run.id).length
+        },
+        docEffect: own
+          ? {
+              revision: own.revision,
+              status: own.status,
+              isCurrent: doc?.currentRevisionId === own.id,
+              statementCount: own.sections.reduce((sum, section) => sum + section.statements.length, 0),
+              errors: own.errors ? [...own.errors] : null
+            }
+          : null
+      };
+    });
+  }
+
+  // Mirror of the SQLite run audit: every durable change attributable to one
+  // run, read back through the same run_id stamps.
+  async getBrainRunEffects(runId: string): Promise<BrainRunEffects | null> {
+    const run = await this.getBrainRun(runId);
+    if (!run) {
+      return null;
+    }
+    const runEvents = this.lifecycleEvents.filter((event) => event.runId === runId);
+    const lifecycle: BrainRunEffectLifecycle[] = [];
+    for (const event of runEvents) {
+      const node = this.memLifecycleNodeForClaim(event.claimId);
+      const found = this.memLifecycleClaim(event.claimId);
+      const chatSourceId = node?.chatScope ?? null;
+      lifecycle.push({
+        eventId: event.id,
+        claimId: event.claimId,
+        itemText: found?.claim.text ?? node?.title ?? "(claim no longer exists)",
+        itemExists: found != null,
+        kind: node?.kind === "commitment" || node?.kind === "question" ? node.kind : null,
+        toStatus: event.toStatus,
+        source: event.source,
+        model: event.model,
+        note: event.note,
+        atMs: event.createdAtMs,
+        chatSourceId,
+        chatDisplayName: chatSourceId ? this.chats.get(chatSourceId)?.displayName ?? null : null,
+        cites: this.memLifecycleCiteViews(event),
+        currentStatus: foldLifecycleEvents(this.memLifecycleEventsForClaim(event.claimId)).status
+      });
+    }
+    lifecycle.sort((a, b) => a.eventId - b.eventId);
+    const revisions: BrainRunEffectRevision[] = [];
+    let supersessionCount = 0;
+    for (const record of [...this.brainDocRevisions.values()].filter((revision) => revision.runId === runId).sort((a, b) => a.id - b.id)) {
+      const referenced = new Set<string>();
+      for (const section of record.sections) {
+        for (const statement of section.statements) {
+          for (const claimId of statement.claimIds) {
+            referenced.add(claimId);
+          }
+        }
+      }
+      const supersededClaims = record.drops
+        .filter((drop) => drop.reason === "superseded")
+        .map((drop) => ({ claimId: drop.claimId, byClaimId: drop.byClaimId }));
+      supersessionCount += supersededClaims.length;
+      const doc = this.brainDocs.get(record.docId);
+      const node = doc?.nodeId ? this.graphNodes.get(doc.nodeId) : undefined;
+      revisions.push({
+        docId: record.docId,
+        title: node ? this.memDocNodeLabel(node) : doc?.slug ?? record.docId,
+        revision: record.revision,
+        status: record.status,
+        statementCount: record.sections.reduce((sum, section) => sum + section.statements.length, 0),
+        referencedClaimCount: referenced.size,
+        supersededClaims,
+        errors: record.errors ? [...record.errors] : null,
+        isCurrent: doc?.currentRevisionId === record.id
+      });
+    }
+    return {
+      run,
+      lifecycle,
+      revisions,
+      supersessionCount,
+      episodesCommitted: [...this.brainEpisodes.values()].filter((episode) => episode.runId === runId).length,
+      issues: await this.listBrainValidationIssues({ runId, limit: 200 }),
+      asOfMs: Date.now()
+    };
+  }
+
   async failBrainRun(
     runId: string,
     status: "failed" | "interrupted" | "budget_exceeded",
@@ -4099,6 +4291,13 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       // Full reset: issues and the topic vocabulary go too — a clean slate.
       this.brainIssues = [];
       this.brainTopics.clear();
+      // Semantic docs are derived-of-derived (model spend to re-derive): a
+      // FULL reset wipes them; a scoped reset leaves docs standing — their
+      // dead refs make them due, honestly. Mirrors the SQLite deletes.
+      this.brainDocs.clear();
+      this.brainDocRevisions.clear();
+      this.brainDocRevisionRefs.clear();
+      this.claimSupersededBy.clear();
     }
     return { episodeIds, watermarks };
   }
@@ -4133,6 +4332,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       markdown: episode.markdown,
       generator: episode.generator,
       model: episode.model,
+      runId: episode.runId ?? null,
       status: "current",
       fallbackReason: episode.fallbackReason ?? null,
       attemptedModel: episode.attemptedModel ?? null,
@@ -4572,7 +4772,10 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     return rekeyed;
   }
 
-  async applyBrainLifecycleTransitions(
+  // The sync core of the ONE lifecycle writer (mirror of the SQLite Tx core):
+  // semantic-rollups' revision commit applies resolutions through this exact
+  // path so the two write callers can never diverge.
+  private memApplyLifecycleTransitionsCore(
     transitions: BrainLifecycleTransitionInput[],
     context: {
       source: BrainLifecycleSource;
@@ -4580,10 +4783,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       model?: string | null;
       allowedCitesByClaim?: Map<string, BrainLifecycleCandidate[]>;
     }
-  ): Promise<BrainLifecycleApplyResult> {
-    if (transitions.length === 0) {
-      return { applied: 0, events: [] };
-    }
+  ): BrainLifecycleEventRecord[] {
     const errors: string[] = [];
     const prepared: Array<{
       input: BrainLifecycleTransitionInput;
@@ -4658,6 +4858,22 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     for (const entry of prepared) {
       this.memProjectLifecycleClaim(entry.input.claimId);
     }
+    return created;
+  }
+
+  async applyBrainLifecycleTransitions(
+    transitions: BrainLifecycleTransitionInput[],
+    context: {
+      source: BrainLifecycleSource;
+      runId?: string | null;
+      model?: string | null;
+      allowedCitesByClaim?: Map<string, BrainLifecycleCandidate[]>;
+    }
+  ): Promise<BrainLifecycleApplyResult> {
+    if (transitions.length === 0) {
+      return { applied: 0, events: [] };
+    }
+    const created = this.memApplyLifecycleTransitionsCore(transitions, context);
     return { applied: created.length, events: structuredClone(created) };
   }
 
@@ -4955,6 +5171,974 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       }
     }
     return batches;
+  }
+
+  // === Semantic consolidation (mirror of the SQLite implementation) ========
+  // Same contract semantics via the shared pure module (brain/rollups.ts);
+  // only the data access differs. Doc-comment parity with sqliteRepository.
+
+  private memDocKindForNode(node: MemGraphNode): BrainDocKind | null {
+    if (node.kind === "person" || node.kind === "org" || node.kind === "place" || node.kind === "project" || node.kind === "other") {
+      return "entity";
+    }
+    if (node.kind === "topic") {
+      return "topic";
+    }
+    if (node.kind === "chat") {
+      return "chat";
+    }
+    return null;
+  }
+
+  private memResolveDocTargetNode(target: { docId?: string | null; nodeId?: string | null }): { node: MemGraphNode; redirected: boolean } | null {
+    let node: MemGraphNode | undefined;
+    if (target.nodeId) {
+      node = this.graphNodes.get(target.nodeId);
+    } else if (target.docId) {
+      const separator = target.docId.indexOf(":");
+      const slug = separator >= 0 ? target.docId.slice(separator + 1) : target.docId;
+      node = [...this.graphNodes.values()].find((candidate) => candidate.slug === slug);
+    }
+    let redirected = false;
+    for (let hop = 0; node && node.status === "merged" && node.mergedInto && hop < 5; hop += 1) {
+      node = this.graphNodes.get(node.mergedInto);
+      redirected = true;
+    }
+    if (!node || !this.memDocKindForNode(node)) {
+      return null;
+    }
+    return { node, redirected };
+  }
+
+  private memDocNodeLabel(node: MemGraphNode): string {
+    if (node.kind === "person" && node.jid) {
+      return this.memLifecycleLabelForJid(node.jid);
+    }
+    if (node.kind === "chat" && node.chatScope) {
+      return this.chats.get(node.chatScope)?.displayName?.trim() || node.chatScope;
+    }
+    return node.title?.trim() || node.slug;
+  }
+
+  private memDocScopeNodeIds(node: MemGraphNode): string[] {
+    if (node.kind !== "person" || !node.jid) {
+      return [node.id];
+    }
+    const membership = this.personMembers.get(this.canonicalJid(node.jid) ?? node.jid);
+    if (!membership) {
+      return [node.id];
+    }
+    const ids = new Set<string>([node.id]);
+    for (const [jid, member] of this.personMembers) {
+      if (member.personId !== membership.personId) {
+        continue;
+      }
+      const canonical = this.canonicalJid(jid) ?? jid;
+      const memberNodeId = this.graphNodeIdByKey.get(personJidNaturalKey(canonical));
+      const memberNode = memberNodeId ? this.graphNodes.get(memberNodeId) : undefined;
+      if (memberNode && memberNode.status !== "merged") {
+        ids.add(memberNode.id);
+      }
+    }
+    return [...ids];
+  }
+
+  private memDocScopeClaimIds(kind: BrainDocKind, node: MemGraphNode): string[] {
+    if (kind === "entity") {
+      const ids = new Set<string>();
+      for (const nodeId of this.memDocScopeNodeIds(node)) {
+        for (const claimId of this.graphNodeClaims.get(nodeId) ?? []) {
+          ids.add(claimId);
+        }
+      }
+      return [...ids];
+    }
+    if (kind === "topic") {
+      const ids = new Set<string>();
+      for (const edge of this.graphEdges.values()) {
+        if (edge.kind !== "about" || (edge.dstNodeId !== node.id && edge.srcNodeId !== node.id)) {
+          continue;
+        }
+        for (const evidence of edge.evidence.values()) {
+          if (evidence.claimId) {
+            ids.add(evidence.claimId);
+          }
+        }
+      }
+      return [...ids];
+    }
+    const chatSourceId = node.chatScope ?? (node.naturalKey.startsWith("chat:") ? node.naturalKey.slice(5) : null);
+    if (!chatSourceId) {
+      return [];
+    }
+    const ids: string[] = [];
+    for (const episode of this.brainEpisodes.values()) {
+      if (episode.chatSourceId !== chatSourceId) {
+        continue;
+      }
+      for (const claim of episode.claims) {
+        ids.push(claim.id);
+      }
+    }
+    return ids;
+  }
+
+  private memHydrateRollupClaims(claimIds: string[]): BrainRollupInputClaim[] {
+    const wanted = new Set(claimIds);
+    const claims: BrainRollupInputClaim[] = [];
+    for (const episode of this.brainEpisodes.values()) {
+      if (episode.status !== "current" || episode.generator !== "model") {
+        continue;
+      }
+      for (const claim of episode.claims) {
+        if (!wanted.has(claim.id) || this.claimSupersededBy.has(claim.id)) {
+          continue;
+        }
+        let lifecycleStatus: BrainLifecycleStatus | null = null;
+        let lifecycleDueMs: number | null = null;
+        if (claim.kind === "commitment" || claim.kind === "question") {
+          lifecycleStatus = foldLifecycleEvents(this.memLifecycleEventsForClaim(claim.id)).status;
+          lifecycleDueMs = claim.validUntilMs ?? claim.eventAtMs;
+        }
+        claims.push({
+          claimId: claim.id,
+          kind: claim.kind,
+          text: claim.text,
+          confidence: claim.confidence,
+          eventAtMs: claim.eventAtMs,
+          validUntilMs: claim.validUntilMs,
+          episodeId: episode.id,
+          episodeStartAtMs: episode.startAtMs,
+          episodeEndAtMs: episode.endAtMs,
+          chatSourceId: episode.chatSourceId,
+          chatDisplayName: this.chats.get(episode.chatSourceId)?.displayName ?? null,
+          citations: claim.citations.map((citation) => ({
+            sourceMessageKey: citation.sourceMessageKey,
+            timestampMs: citation.timestampMs ?? null,
+            senderJid: citation.senderSourceJid ?? null
+          })),
+          lifecycleStatus,
+          lifecycleDueMs
+        });
+      }
+    }
+    return claims;
+  }
+
+  private memConflictFacts(claims: BrainRollupInputClaim[]): ConflictClaimFacts[] {
+    return claims.map((claim) => {
+      const found = this.memLifecycleClaim(claim.claimId);
+      const keys: string[] = [];
+      for (const entity of found?.claim.entities ?? []) {
+        const key = entity.jid ?? normalizeGraphName(entity.name);
+        if (!keys.includes(key)) {
+          keys.push(key);
+        }
+      }
+      return {
+        claimId: claim.claimId,
+        kind: claim.kind,
+        episodeId: claim.episodeId,
+        episodeEndAtMs: claim.episodeEndAtMs,
+        entityKeys: keys,
+        supersededBy: null
+      };
+    });
+  }
+
+  private memCurrentRevisionRefs(doc: BrainDocRecord | undefined): { revisionId: number; revision: number; referencedClaimIds: string[] } | null {
+    if (!doc?.currentRevisionId) {
+      return null;
+    }
+    const revision = this.brainDocRevisions.get(doc.currentRevisionId);
+    if (!revision) {
+      return null;
+    }
+    return {
+      revisionId: revision.id,
+      revision: revision.revision,
+      referencedClaimIds: [...(this.brainDocRevisionRefs.get(revision.id) ?? [])]
+    };
+  }
+
+  async getBrainRollupInput(target: { docId?: string | null; nodeId?: string | null }): Promise<BrainRollupInput | null> {
+    const resolved = this.memResolveDocTargetNode(target);
+    if (!resolved) {
+      return null;
+    }
+    const { node } = resolved;
+    const kind = this.memDocKindForNode(node)!;
+    const docId = docIdFor(kind, node.slug);
+    const claims = this.memHydrateRollupClaims(this.memDocScopeClaimIds(kind, node));
+    return {
+      docId,
+      kind,
+      nodeId: node.id,
+      slug: node.slug,
+      title: this.memDocNodeLabel(node),
+      prior: this.memCurrentRevisionRefs(this.brainDocs.get(docId)),
+      claims,
+      conflictPairs: detectConflictPairs(this.memConflictFacts(claims)),
+      stats: { eligibleClaims: claims.length, fedClaims: 0, tokenEstimate: 0, overflow: false, tiersEngaged: [] }
+    };
+  }
+
+  async commitBrainDocRevision(input: BrainRollupRevisionInput): Promise<BrainDocCommitResult> {
+    const now = Date.now();
+    let doc = this.brainDocs.get(input.docId);
+    if (!doc) {
+      doc = {
+        docId: input.docId,
+        kind: input.kind,
+        nodeId: input.nodeId,
+        slug: input.slug,
+        status: "active",
+        mergedInto: null,
+        currentRevisionId: null,
+        lastRollupAtMs: null,
+        createdAtMs: now
+      };
+      this.brainDocs.set(input.docId, doc);
+    }
+    const prior = this.memCurrentRevisionRefs(doc);
+    const newReferenced = new Set<string>();
+    for (const section of input.sections) {
+      for (const statement of section.statements) {
+        for (const claimId of statement.claimIds) {
+          newReferenced.add(claimId);
+        }
+      }
+    }
+    const fedSet = new Set(input.fedClaimIds);
+    for (const claimId of newReferenced) {
+      if (!fedSet.has(claimId)) {
+        throw new PublicError("BRAIN_ROLLUP_INVALID", `Revision references claim ${claimId} that was not fed to the call.`);
+      }
+    }
+    const currentClaimIds = new Set<string>();
+    for (const claimId of prior?.referencedClaimIds ?? []) {
+      const found = this.memLifecycleClaim(claimId);
+      if (found && found.episode.status === "current") {
+        currentClaimIds.add(claimId);
+      }
+    }
+    const guard = runRollupGuard({
+      priorReferencedClaimIds: prior?.referencedClaimIds ?? [],
+      newReferencedClaimIds: [...newReferenced],
+      currentClaimIds,
+      declaredDrops: input.drops,
+      fedClaimIds: fedSet
+    });
+    if (guard.errors.length > 0) {
+      throw new PublicError("BRAIN_ROLLUP_GUARD", `Regression guard refused the revision: ${guard.errors.join("; ")}`);
+    }
+    const eventIds =
+      input.resolutions.length > 0
+        ? this.memApplyLifecycleTransitionsCore(input.resolutions, {
+            source: "model",
+            runId: input.runId,
+            model: input.model,
+            allowedCitesByClaim: input.allowedCitesByClaim
+          }).map((event) => event.id)
+        : [];
+    // Number PAST every retained revision — rejected attempts occupy numbers
+    // too (mirror of the SQLite fix; UNIQUE(doc_id, revision) semantics).
+    const maxRevision = Math.max(
+      0,
+      ...[...this.brainDocRevisions.values()].filter((revision) => revision.docId === input.docId).map((revision) => revision.revision)
+    );
+    const revisionNumber = Math.max(maxRevision, prior?.revision ?? 0) + 1;
+    const record: BrainDocRevisionRecord = {
+      id: this.brainDocRevisionSeq++,
+      docId: input.docId,
+      revision: revisionNumber,
+      status: "current",
+      sections: structuredClone(input.sections),
+      drops: structuredClone(guard.effectiveDrops),
+      fedClaimIds: [...input.fedClaimIds],
+      inputStats: { ...input.inputStats },
+      resolutionEventIds: eventIds,
+      errors: null,
+      model: input.model,
+      effort: input.effort,
+      runId: input.runId,
+      promptVersion: input.promptVersion,
+      createdAtMs: now
+    };
+    this.brainDocRevisions.set(record.id, record);
+    this.brainDocRevisionRefs.set(record.id, new Set(newReferenced));
+    if (prior) {
+      const priorRecord = this.brainDocRevisions.get(prior.revisionId);
+      if (priorRecord) {
+        priorRecord.status = "superseded";
+      }
+    }
+    for (const drop of guard.effectiveDrops) {
+      if (drop.reason === "superseded" && drop.byClaimId) {
+        this.claimSupersededBy.set(drop.claimId, drop.byClaimId);
+      }
+    }
+    doc.currentRevisionId = record.id;
+    doc.lastRollupAtMs = now;
+    doc.status = "active";
+    doc.mergedInto = null;
+    const referencedClaims = this.memHydrateRollupClaims([...newReferenced]);
+    const contradictions = detectConflictPairs(this.memConflictFacts(referencedClaims)).filter(
+      (pair) => newReferenced.has(pair.claimIdA) && newReferenced.has(pair.claimIdB)
+    );
+    for (const pair of contradictions) {
+      await this.recordBrainValidationIssues([
+        {
+          runId: input.runId,
+          docId: input.docId,
+          code: "rollup_contradiction",
+          severity: "warning",
+          detail: `Revision ${revisionNumber} keeps likely-conflicting ${pair.claimKind} claims ${pair.claimIdA} and ${pair.claimIdB} (via ${pair.via}) with neither superseding the other.`
+        }
+      ]);
+    }
+    if ((prior?.referencedClaimIds.length ?? 0) > 0 && guard.staleShare > rollupStaleDropShare()) {
+      await this.recordBrainValidationIssues([
+        {
+          runId: input.runId,
+          docId: input.docId,
+          code: "rollup_stale_shed",
+          severity: "info",
+          detail: `Revision ${revisionNumber} dropped ${Math.round(guard.staleShare * 100)}% of the prior revision's claims as stale/out-of-scope — allowed, recorded, never invisible.`
+        }
+      ]);
+    }
+    return { record: structuredClone(record), contradictions };
+  }
+
+  async rejectBrainDocRevision(input: {
+    docId: string;
+    kind: BrainDocKind;
+    nodeId: string;
+    slug: string;
+    errors: string[];
+    fedClaimIds: string[];
+    inputStats: BrainDocRevisionRecord["inputStats"];
+    model: string | null;
+    effort: string | null;
+    runId: string | null;
+    promptVersion: number;
+  }): Promise<void> {
+    const now = Date.now();
+    if (!this.brainDocs.has(input.docId)) {
+      this.brainDocs.set(input.docId, {
+        docId: input.docId,
+        kind: input.kind,
+        nodeId: input.nodeId,
+        slug: input.slug,
+        status: "active",
+        mergedInto: null,
+        currentRevisionId: null,
+        lastRollupAtMs: null,
+        createdAtMs: now
+      });
+    }
+    const maxRevision = Math.max(
+      0,
+      ...[...this.brainDocRevisions.values()].filter((revision) => revision.docId === input.docId).map((revision) => revision.revision)
+    );
+    const record: BrainDocRevisionRecord = {
+      id: this.brainDocRevisionSeq++,
+      docId: input.docId,
+      revision: maxRevision + 1,
+      status: "rejected",
+      sections: [],
+      drops: [],
+      fedClaimIds: [...input.fedClaimIds],
+      inputStats: { ...input.inputStats },
+      resolutionEventIds: [],
+      errors: [...input.errors],
+      model: input.model,
+      effort: input.effort,
+      runId: input.runId,
+      promptVersion: input.promptVersion,
+      createdAtMs: now
+    };
+    this.brainDocRevisions.set(record.id, record);
+    await this.recordBrainValidationIssues([
+      {
+        runId: input.runId,
+        docId: input.docId,
+        code: "rollup_rejected",
+        severity: "error",
+        detail: `Rollup response failed validation twice; prior revision stays current. Errors: ${input.errors.join("; ")}`
+      }
+    ]);
+  }
+
+  async rollbackBrainDoc(docId: string, toRevision?: number | null): Promise<BrainDocDetail | null> {
+    const doc = this.brainDocs.get(docId);
+    if (!doc) {
+      throw new PublicError("BRAIN_DOC_NO_REVISION", `Doc ${docId} does not exist.`);
+    }
+    // An UNROLLED doc has no current revision — and must still be restorable
+    // by explicit revision number (mirror of the SQLite note).
+    const current = doc.currentRevisionId ? this.brainDocRevisions.get(doc.currentRevisionId) ?? null : null;
+    const docRevisions = [...this.brainDocRevisions.values()].filter((revision) => revision.docId === docId);
+    // Revision 0 = unroll to the state before any page existed (see the SQLite
+    // implementation's note: retention is why no hard delete exists).
+    const unroll = toRevision === BRAIN_DOC_REVISION_NONE;
+    if (!current && !unroll && toRevision == null) {
+      throw new PublicError("BRAIN_DOC_NO_REVISION", `Doc ${docId} has no current revision to roll back; name a revision to restore.`);
+    }
+    if (!current && unroll) {
+      throw new PublicError("BRAIN_DOC_NO_REVISION", `Doc ${docId} is already unrolled.`);
+    }
+    const target = unroll
+      ? undefined
+      : toRevision
+        ? docRevisions.find((revision) => revision.revision === toRevision)
+        : docRevisions
+            .filter((revision) => revision.revision < current!.revision && revision.status === "superseded")
+            .sort((a, b) => b.revision - a.revision)[0];
+    if (!unroll && (!target || target.id === current?.id)) {
+      throw new PublicError("BRAIN_DOC_NO_TARGET", `Doc ${docId} has no prior revision${toRevision ? ` numbered ${toRevision}` : ""} to restore.`);
+    }
+    if (target?.status === "rejected") {
+      throw new PublicError("BRAIN_DOC_BAD_TARGET", `Revision ${target.revision} was rejected and cannot become current.`);
+    }
+    if (current) {
+      current.status = "superseded";
+    }
+    if (target) {
+      target.status = "current";
+      doc.currentRevisionId = target.id;
+      // Restoring onto an unrolled doc restores its rollup stamp too.
+      doc.lastRollupAtMs = doc.lastRollupAtMs ?? target.createdAtMs;
+    } else {
+      doc.currentRevisionId = null;
+      doc.lastRollupAtMs = null;
+    }
+    // Re-derive this doc's supersession projections from the surviving chain.
+    for (const revision of docRevisions) {
+      if (revision.status === "rejected") {
+        continue;
+      }
+      for (const drop of revision.drops) {
+        if (drop.reason === "superseded") {
+          this.claimSupersededBy.delete(drop.claimId);
+        }
+      }
+    }
+    for (const revision of [...docRevisions].sort((a, b) => a.revision - b.revision)) {
+      if (revision.status === "rejected" || revision.revision > (target?.revision ?? 0)) {
+        continue;
+      }
+      for (const drop of revision.drops) {
+        if (drop.reason === "superseded" && drop.byClaimId) {
+          this.claimSupersededBy.set(drop.claimId, drop.byClaimId);
+        }
+      }
+    }
+    await this.recordBrainValidationIssues([
+      {
+        docId,
+        code: "rollup_rollback",
+        severity: "info",
+        detail: target
+          ? `Rolled back from revision ${current?.revision ?? "none"} to revision ${target.revision}.`
+          : `Unrolled from revision ${current?.revision ?? "none"}: the page returns to eligible-but-never-rolled. Every revision is retained and restorable; the next rollup generates from scratch.`
+      }
+    ]);
+    return this.getBrainDoc(docId);
+  }
+
+  private memDocDueness(
+    doc: BrainDocRecord,
+    node: MemGraphNode | undefined
+  ): { due: boolean; dueReasons: BrainDocDueReason[]; eligibleClaims: number; newClaims: number; openItems: number } {
+    const reasons: BrainDocDueReason[] = [];
+    if (!node) {
+      return { due: false, dueReasons: reasons, eligibleClaims: 0, newClaims: 0, openItems: 0 };
+    }
+    if (node.status === "merged" || doc.status === "merged") {
+      reasons.push("merged_scope");
+    }
+    const claims = this.memHydrateRollupClaims(this.memDocScopeClaimIds(doc.kind, node));
+    const eligibleClaims = claims.length;
+    let newClaims = 0;
+    if (doc.lastRollupAtMs == null) {
+      if (eligibleClaims >= rollupMinClaims()) {
+        reasons.push("never_rolled");
+      }
+      newClaims = eligibleClaims;
+    } else {
+      const lastRollupIso = new Date(doc.lastRollupAtMs).toISOString();
+      newClaims = claims.filter((claim) => {
+        const episode = this.brainEpisodes.get(claim.episodeId);
+        return episode != null && episode.createdAt > lastRollupIso;
+      }).length;
+      if (newClaims >= rollupDueNewClaims()) {
+        reasons.push("new_claims");
+      }
+      const refs = this.memCurrentRevisionRefs(doc)?.referencedClaimIds ?? [];
+      if (refs.length > 0) {
+        const alive = refs.filter((claimId) => {
+          const found = this.memLifecycleClaim(claimId);
+          return found != null && found.episode.status === "current";
+        });
+        if (alive.length < refs.length) {
+          reasons.push("claims_deleted");
+        }
+        const refSet = new Set(refs);
+        // Exclude the events the CURRENT revision itself applied — they land
+        // milliseconds after the rollup stamp and must not self-trigger.
+        const ownEvents = new Set(
+          doc.currentRevisionId ? this.brainDocRevisions.get(doc.currentRevisionId)?.resolutionEventIds ?? [] : []
+        );
+        if (
+          this.lifecycleEvents.some(
+            (event) =>
+              refSet.has(event.claimId) &&
+              event.orphanedAtMs == null &&
+              event.createdAtMs > (doc.lastRollupAtMs ?? 0) &&
+              !ownEvents.has(event.id)
+          )
+        ) {
+          reasons.push("lifecycle_changed");
+        }
+      }
+    }
+    const openItems = claims.filter((claim) => claim.lifecycleStatus === "open").length;
+    return { due: reasons.length > 0, dueReasons: reasons, eligibleClaims, newClaims, openItems };
+  }
+
+  async listBrainDocs(options?: { kind?: BrainDocKind; view?: BrainDocsListView; limit?: number }): Promise<BrainDocsListResponse> {
+    const asOfMs = Date.now();
+    const items: BrainDocListItem[] = [];
+    const issueCounts = new Map<string, number>();
+    for (const issue of this.brainIssues) {
+      if (issue.docId) {
+        issueCounts.set(issue.docId, (issueCounts.get(issue.docId) ?? 0) + 1);
+      }
+    }
+    for (const doc of this.brainDocs.values()) {
+      const node = doc.nodeId ? this.graphNodes.get(doc.nodeId) : undefined;
+      const dueness = this.memDocDueness(doc, node);
+      const currentRevision = doc.currentRevisionId ? this.brainDocRevisions.get(doc.currentRevisionId) : undefined;
+      items.push({
+        docId: doc.docId,
+        kind: doc.kind,
+        nodeId: doc.nodeId ?? "",
+        slug: doc.slug ?? "",
+        title: node ? this.memDocNodeLabel(node) : doc.slug ?? doc.docId,
+        status: node?.status === "merged" ? "merged" : doc.status,
+        mergedInto: doc.mergedInto,
+        revision: currentRevision?.revision ?? null,
+        lastRollupAtMs: doc.lastRollupAtMs,
+        eligibleClaims: dueness.eligibleClaims,
+        newClaimsSinceRollup: dueness.newClaims,
+        due: dueness.due,
+        dueReasons: dueness.dueReasons,
+        salience: node?.salience ?? 0,
+        openLifecycleItems: dueness.openItems,
+        issueCount: issueCounts.get(doc.docId) ?? 0
+      });
+    }
+    // Candidates: page-eligible nodes without a doc, person-deduped.
+    const floor = rollupMinClaims();
+    const candidateByPerson = new Map<string, { node: MemGraphNode; claimCount: number }>();
+    const candidates: Array<{ node: MemGraphNode; claimCount: number }> = [];
+    for (const node of this.graphNodes.values()) {
+      const kind = this.memDocKindForNode(node);
+      if (!kind || node.status !== "active") {
+        continue;
+      }
+      if ([...this.brainDocs.values()].some((doc) => doc.nodeId === node.id)) {
+        continue;
+      }
+      const claimCount = this.memHydrateRollupClaims(this.memDocScopeClaimIds(kind, node)).length;
+      if (claimCount < floor) {
+        continue;
+      }
+      if (node.kind === "person" && node.jid) {
+        const personKey = this.personMembers.get(this.canonicalJid(node.jid) ?? node.jid)?.personId ?? node.jid;
+        const existing = candidateByPerson.get(personKey);
+        if (!existing || claimCount > existing.claimCount) {
+          candidateByPerson.set(personKey, { node, claimCount });
+        }
+        continue;
+      }
+      candidates.push({ node, claimCount });
+    }
+    candidates.push(...candidateByPerson.values());
+    let candidateCount = 0;
+    for (const candidate of candidates) {
+      const kind = this.memDocKindForNode(candidate.node)!;
+      candidateCount += 1;
+      items.push({
+        docId: docIdFor(kind, candidate.node.slug),
+        kind,
+        nodeId: candidate.node.id,
+        slug: candidate.node.slug,
+        title: this.memDocNodeLabel(candidate.node),
+        status: "active",
+        mergedInto: null,
+        revision: null,
+        lastRollupAtMs: null,
+        eligibleClaims: candidate.claimCount,
+        newClaimsSinceRollup: candidate.claimCount,
+        due: true,
+        dueReasons: ["never_rolled"],
+        salience: candidate.node.salience,
+        openLifecycleItems: 0,
+        issueCount: 0
+      });
+    }
+    let filtered = items;
+    if (options?.kind) {
+      filtered = filtered.filter((item) => item.kind === options.kind);
+    }
+    // Each count chip is a view: pages you have, work that is due, nodes
+    // eligible without a page yet, and docs carrying validation issues.
+    switch (options?.view) {
+      case 'pages':
+        filtered = filtered.filter((item) => item.revision != null);
+        break;
+      case 'due':
+        filtered = filtered.filter((item) => item.due);
+        break;
+      case 'candidates':
+        filtered = filtered.filter((item) => item.revision == null);
+        break;
+      case 'issues':
+        filtered = filtered.filter((item) => item.issueCount > 0);
+        break;
+      default:
+        break;
+    }
+    filtered.sort((a, b) => {
+      if (a.due !== b.due) return a.due ? -1 : 1;
+      if (a.salience !== b.salience) return b.salience - a.salience;
+      return a.docId < b.docId ? -1 : 1;
+    });
+    return {
+      items: filtered.slice(0, options?.limit ?? 200),
+      counts: {
+        // A doc row with no current revision (unrolled) is not a page.
+        docs: items.filter((item) => item.revision != null).length,
+        due: items.filter((item) => item.due).length,
+        candidates: candidateCount,
+        issues: [...issueCounts.values()].reduce((sum, count) => sum + count, 0)
+      },
+      asOfMs
+    };
+  }
+
+  private memDocRenderContext(doc: BrainDocRecord, node: MemGraphNode, revision: BrainDocRevisionRecord): DocRenderContext {
+    const referenced = new Set<string>();
+    for (const section of revision.sections) {
+      for (const statement of section.statements) {
+        for (const claimId of statement.claimIds) {
+          referenced.add(claimId);
+        }
+      }
+    }
+    const claimMeta = new Map<string, DocRenderClaimMeta>();
+    for (const claimId of referenced) {
+      const found = this.memLifecycleClaim(claimId);
+      if (!found) {
+        claimMeta.set(claimId, { exists: false, episodeId: null, episodeFile: null, episodeClaimIndex: null, citationKeys: [] });
+        continue;
+      }
+      // Must match the projected file name exactly or the wikilink dangles.
+      const fileSlug = episodeFileBase({
+        id: found.episode.id,
+        startAtMs: found.episode.startAtMs,
+        chatSourceId: found.episode.chatSourceId,
+        chatDisplayName: this.chats.get(found.episode.chatSourceId)?.displayName ?? null
+      });
+      claimMeta.set(claimId, {
+        exists: found.episode.status === "current",
+        episodeId: found.episode.id,
+        episodeFile: fileSlug,
+        episodeClaimIndex: found.episode.claims.findIndex((claim) => claim.id === claimId) + 1,
+        citationKeys: found.claim.citations.map((citation) => citation.sourceMessageKey)
+      });
+    }
+    const aliases = [...(this.graphAliases.get(node.id)?.values() ?? [])].map((entry) => entry.alias).sort().slice(0, 12);
+    const memberLabels: string[] = [];
+    if (node.kind === "person" && node.jid) {
+      for (const scopeNodeId of this.memDocScopeNodeIds(node)) {
+        const member = this.graphNodes.get(scopeNodeId);
+        if (member) {
+          const label = this.memDocNodeLabel(member);
+          if (!memberLabels.includes(label)) {
+            memberLabels.push(label);
+          }
+        }
+      }
+    }
+    const related: DocRenderContext["related"] = [];
+    const adjacent = [...this.graphEdges.values()]
+      .filter((edge) => edge.srcNodeId === node.id || edge.dstNodeId === node.id)
+      .sort((a, b) => b.evidence.size - a.evidence.size);
+    for (const edge of adjacent) {
+      const otherId = edge.srcNodeId === node.id ? edge.dstNodeId : edge.srcNodeId;
+      const other = this.graphNodes.get(otherId);
+      const otherKind = other ? this.memDocKindForNode(other) : null;
+      if (!other || !otherKind || other.status !== "active") {
+        continue;
+      }
+      if (![...this.brainDocs.values()].some((candidate) => candidate.nodeId === other.id)) {
+        continue;
+      }
+      if (!related.some((entry) => entry.slug === other.slug)) {
+        related.push({ kind: otherKind, slug: other.slug, title: this.memDocNodeLabel(other) });
+      }
+      if (related.length >= 8) {
+        break;
+      }
+    }
+    return {
+      docId: doc.docId,
+      kind: doc.kind,
+      slug: doc.slug ?? node.slug,
+      nodeId: node.id,
+      title: this.memDocNodeLabel(node),
+      revision: revision.revision,
+      updatedAtMs: revision.createdAtMs,
+      aliases,
+      memberLabels,
+      claimMeta,
+      related,
+      mergedIntoDoc: null
+    };
+  }
+
+  async getBrainDoc(docId: string): Promise<BrainDocDetail | null> {
+    let doc = this.brainDocs.get(docId);
+    let redirected = false;
+    if (doc?.nodeId) {
+      const node = this.graphNodes.get(doc.nodeId);
+      if (node?.status === "merged" && node.mergedInto) {
+        const survivor = this.memResolveDocTargetNode({ nodeId: node.mergedInto });
+        if (survivor) {
+          const survivorDocId = docIdFor(this.memDocKindForNode(survivor.node)!, survivor.node.slug);
+          if (survivorDocId !== docId) {
+            doc.status = "merged";
+            doc.mergedInto = survivorDocId;
+            const survivorDoc = await this.getBrainDoc(survivorDocId);
+            if (survivorDoc) {
+              return { ...survivorDoc, redirected: true };
+            }
+          }
+        }
+      }
+    }
+    if (!doc) {
+      const resolved = this.memResolveDocTargetNode({ docId });
+      if (!resolved) {
+        return null;
+      }
+      redirected = resolved.redirected;
+      const kind = this.memDocKindForNode(resolved.node)!;
+      const resolvedDocId = docIdFor(kind, resolved.node.slug);
+      doc = this.brainDocs.get(resolvedDocId);
+      if (!doc) {
+        const synthetic: BrainDocRecord = {
+          docId: resolvedDocId,
+          kind,
+          nodeId: resolved.node.id,
+          slug: resolved.node.slug,
+          status: "active",
+          mergedInto: null,
+          currentRevisionId: null,
+          lastRollupAtMs: null,
+          createdAtMs: Date.now()
+        };
+        const dueness = this.memDocDueness(synthetic, resolved.node);
+        return {
+          doc: synthetic,
+          title: this.memDocNodeLabel(resolved.node),
+          redirected,
+          current: null,
+          sections: [],
+          markdown: null,
+          history: [],
+          issues: await this.listBrainValidationIssues({ docId: resolvedDocId, limit: 50 }),
+          due: dueness.due,
+          dueReasons: dueness.dueReasons,
+          asOfMs: Date.now()
+        };
+      }
+    }
+    const node = doc.nodeId ? this.graphNodes.get(doc.nodeId) : undefined;
+    const current = doc.currentRevisionId ? this.brainDocRevisions.get(doc.currentRevisionId) ?? null : null;
+    const sections: BrainDocSectionView[] = [];
+    let markdown: string | null = null;
+    if (current && node) {
+      const context = this.memDocRenderContext(doc, node, current);
+      markdown = renderDocMarkdown(context, current.sections);
+      for (const section of current.sections) {
+        const statements: BrainDocStatementView[] = [];
+        for (const statement of section.statements) {
+          statements.push({
+            text: statement.text,
+            claims: statement.claimIds.map((claimId) => {
+              const meta = context.claimMeta.get(claimId);
+              return {
+                claimId,
+                exists: meta?.exists ?? false,
+                episodeId: meta?.episodeId ?? null,
+                citations: (meta?.citationKeys ?? []).map((key) => {
+                  const message = [...this.messages.values()].find((entry) => entry.sourceMessageKey === key);
+                  const chat = message ? this.chats.get(message.chatSourceId) : undefined;
+                  return {
+                    sourceMessageKey: key,
+                    chatId: chat?.id ?? null,
+                    messageId: message?.id ?? null,
+                    timestampMs: message?.timestampMs ?? null
+                  };
+                })
+              };
+            })
+          });
+        }
+        sections.push({ title: section.title, statements });
+      }
+    }
+    const history = [...this.brainDocRevisions.values()]
+      .filter((revision) => revision.docId === doc!.docId)
+      .sort((a, b) => b.revision - a.revision)
+      .slice(0, 50)
+      .map((revision) => {
+        const referenced = new Set<string>();
+        for (const section of revision.sections) {
+          for (const statement of section.statements) {
+            for (const claimId of statement.claimIds) {
+              referenced.add(claimId);
+            }
+          }
+        }
+        return {
+          id: revision.id,
+          revision: revision.revision,
+          status: revision.status,
+          statementCount: revision.sections.reduce((sum, section) => sum + section.statements.length, 0),
+          referencedClaimCount: referenced.size,
+          fedClaimCount: revision.fedClaimIds.length,
+          dropCount: revision.drops.length,
+          drops: structuredClone(revision.drops),
+          resolutionCount: revision.resolutionEventIds.length,
+          errors: revision.errors ? [...revision.errors] : null,
+          model: revision.model,
+          effort: revision.effort,
+          runId: revision.runId,
+          promptVersion: revision.promptVersion,
+          createdAtMs: revision.createdAtMs
+        };
+      });
+    const dueness = node
+      ? this.memDocDueness(doc, node)
+      : { due: false, dueReasons: [] as BrainDocDueReason[], eligibleClaims: 0, newClaims: 0, openItems: 0 };
+    return {
+      doc: structuredClone(doc),
+      title: node ? this.memDocNodeLabel(node) : doc.slug ?? doc.docId,
+      redirected,
+      current: current ? structuredClone(current) : null,
+      sections,
+      markdown,
+      history,
+      issues: await this.listBrainValidationIssues({ docId: doc.docId, limit: 50 }),
+      due: dueness.due,
+      dueReasons: dueness.dueReasons,
+      asOfMs: Date.now()
+    };
+  }
+
+  async listBrainDocsForProjection(): Promise<Array<{ context: DocRenderContext; sections: BrainDocSection[] }>> {
+    const out: Array<{ context: DocRenderContext; sections: BrainDocSection[] }> = [];
+    for (const doc of this.brainDocs.values()) {
+      const node = doc.nodeId ? this.graphNodes.get(doc.nodeId) : undefined;
+      if (!node) {
+        continue;
+      }
+      const merged = node.status === "merged" || doc.status === "merged";
+      if (merged) {
+        let mergedIntoDoc: DocRenderContext["mergedIntoDoc"] = null;
+        const survivor = node.mergedInto ? this.memResolveDocTargetNode({ nodeId: node.mergedInto }) : null;
+        if (survivor) {
+          mergedIntoDoc = {
+            slug: survivor.node.slug,
+            kind: this.memDocKindForNode(survivor.node)!,
+            title: this.memDocNodeLabel(survivor.node)
+          };
+        }
+        out.push({
+          context: {
+            docId: doc.docId,
+            kind: doc.kind,
+            slug: doc.slug ?? node.slug,
+            nodeId: node.id,
+            title: this.memDocNodeLabel(node),
+            revision: 0,
+            updatedAtMs: doc.lastRollupAtMs ?? doc.createdAtMs,
+            aliases: [],
+            memberLabels: [],
+            claimMeta: new Map(),
+            related: [],
+            mergedIntoDoc
+          },
+          sections: []
+        });
+        continue;
+      }
+      if (!doc.currentRevisionId) {
+        continue;
+      }
+      const revision = this.brainDocRevisions.get(doc.currentRevisionId);
+      if (revision) {
+        out.push({ context: this.memDocRenderContext(doc, node, revision), sections: structuredClone(revision.sections) });
+      }
+    }
+    return out;
+  }
+
+  async getBrainOverviewData(): Promise<OverviewRenderData> {
+    const backfill = await this.getBrainBackfillStats();
+    const pending = Math.max(0, backfill.totalVisibleMessages - backfill.assimilatedVisibleMessages);
+    const coveragePercent =
+      backfill.totalVisibleMessages > 0
+        ? Math.round(((backfill.totalVisibleMessages - pending) / backfill.totalVisibleMessages) * 1000) / 10
+        : 100;
+    const docs = await this.listBrainDocs({ limit: 10_000 });
+    const lifecycle = await this.listBrainLifecycleItems({ status: "open", sort: "smart", limit: 6 });
+    const summary = await this.getBrainValidationIssueSummary();
+    const top = [...this.graphNodes.values()]
+      .filter((node) => node.status === "active" && ["person", "topic", "org", "chat", "project"].includes(node.kind))
+      .sort((a, b) => b.salience - a.salience)
+      .slice(0, 10);
+    const latestRun = [...this.brainRuns.values()].sort((a, b) => (a.startedAt < b.startedAt ? 1 : -1))[0] ?? null;
+    return {
+      generatedAtMs: Date.now(),
+      coveragePercent,
+      totalVisibleMessages: backfill.totalVisibleMessages,
+      assimilatedVisibleMessages: backfill.assimilatedVisibleMessages,
+      docsTotal: docs.counts.docs,
+      docsDue: docs.counts.due,
+      docCandidates: docs.counts.candidates,
+      openItems: lifecycle.counts.open,
+      overdueItems: lifecycle.counts.overdue,
+      staleItems: lifecycle.counts.stale,
+      soonestDue: lifecycle.items.slice(0, 6).map((item) => ({ text: item.text, dueMs: item.dueMs, chatLabel: item.chatDisplayName })),
+      topEntities: top.map((node) => ({
+        title: this.memDocNodeLabel(node),
+        kind: this.memDocKindForNode(node) ?? "entity",
+        slug: node.slug,
+        salience: node.salience,
+        hasDoc: [...this.brainDocs.values()].some((doc) => doc.nodeId === node.id)
+      })),
+      issueCount: summary.error + summary.warning + summary.info,
+      orphanedResolutions: this.lifecycleEvents.filter((event) => event.orphanedAtMs != null).length,
+      lastRunLine: latestRun ? `${latestRun.kind} ${latestRun.status}${latestRun.finishedAt ? ` at ${latestRun.finishedAt}` : ""}` : null,
+      providerLine: null
+    };
   }
 
   // === Knowledge graph engine (mirror of the SQLite implementation) ========
@@ -6418,6 +7602,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
         chatSourceId: issue.chatSourceId ?? null,
         episodeId: issue.episodeId ?? null,
         claimSequence: issue.claimSequence ?? null,
+        docId: issue.docId ?? null,
         code: issue.code,
         severity: issue.severity,
         detail: issue.detail ?? null,
@@ -6426,10 +7611,17 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     }
   }
 
-  async listBrainValidationIssues(options?: { episodeId?: string | null; limit?: number }): Promise<BrainValidationIssueRecord[]> {
+  async listBrainValidationIssues(options?: {
+    episodeId?: string | null;
+    docId?: string | null;
+    runId?: string | null;
+    limit?: number;
+  }): Promise<BrainValidationIssueRecord[]> {
     return structuredClone(
       [...this.brainIssues]
         .filter((issue) => !options?.episodeId || issue.episodeId === options.episodeId)
+        .filter((issue) => !options?.docId || issue.docId === options.docId)
+        .filter((issue) => !options?.runId || issue.runId === options.runId)
         .reverse()
         .slice(0, options?.limit ?? 100)
     );
@@ -6469,6 +7661,24 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       }
     }
     return titles;
+  }
+
+  async listBrainEpisodeProjections(options?: {
+    limit?: number;
+    offset?: number;
+  }): Promise<Array<{ id: string; chatSourceId: string; chatDisplayName: string | null; startAtMs: number; markdown: string }>> {
+    return [...this.brainEpisodes.values()]
+      .filter((episode) => episode.status === "current" && episode.markdown !== "")
+      .sort((a, b) => a.startAtMs - b.startAtMs || (a.id < b.id ? -1 : 1))
+      .slice(options?.offset ?? 0, (options?.offset ?? 0) + (options?.limit ?? 1000))
+      .map((episode) => ({
+        id: episode.id,
+        chatSourceId: episode.chatSourceId,
+        // Read-time, so a chat renamed since commit projects under its new name.
+        chatDisplayName: this.chats.get(episode.chatSourceId)?.displayName ?? null,
+        startAtMs: episode.startAtMs,
+        markdown: episode.markdown
+      }));
   }
 
   async updateBrainEpisodeMarkdown(episodeId: string, markdown: string): Promise<void> {
