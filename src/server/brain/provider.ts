@@ -167,6 +167,23 @@ export function getBrainProviderStatus(): BrainProviderStatus {
   };
 }
 
+// The MEASURED reason a provider latched degraded: its consecutive-failure
+// count plus the actual last error from health tracking — not a guess. Run
+// interrupt messages embed this so an operator sees the real cause (e.g.
+// `API Error 400: {"detail":"Bad Request"}`, a timeout, or a genuine
+// usage-limit envelope) instead of a hardcoded "usage limit, outage, or auth"
+// triad that was never inspected. Returns "" when the provider is not currently
+// degraded (health has since cleared), so callers can fall back to a generic
+// phrase.
+export function brainProviderDegradationReason(): string {
+  const { health } = getBrainProviderStatus();
+  if (!health.degradedSince) {
+    return "";
+  }
+  const failures = `${health.consecutiveFailures} consecutive failure(s)`;
+  return health.lastError ? `${failures}; last error: ${health.lastError}` : failures;
+}
+
 // A stored OAuth session is a hard precondition for codex calls: without one
 // the client's connect() would start an INTERACTIVE login flow inside the
 // server (observed blocking the event loop). Login is a CLI-only action.

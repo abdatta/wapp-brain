@@ -58,11 +58,11 @@ Providers that send archive-derived content off the local process (including the
 - **THEN** other providers remain disabled until individually enabled
 
 ### Requirement: Provider Health And Degradation
-The system SHALL track consecutive provider failures, and after a configured threshold SHALL enter a visible degraded state (extractive-only) recording the degradation start time, surface it in brain status and doctor output, raise an alert through the operational alerting channel, and probe for recovery; degradation SHALL never be silent.
+The system SHALL track consecutive provider failures, and after a configured threshold SHALL enter a visible degraded state (extractive-only) recording the degradation start time, the consecutive-failure count, and the actual last error, surface it in brain status and doctor output, raise an alert through the operational alerting channel, and probe for recovery; degradation SHALL never be silent. The recorded last error SHALL be available to run-interrupt messages so they name the true measured cause rather than a hardcoded guess.
 
 #### Scenario: CLI breaks mid-week
 - **WHEN** the claude-cli provider fails three consecutive calls
-- **THEN** subsequent tasks use the extractive fallback, status shows degraded-since, and an alert is raised
+- **THEN** subsequent tasks use the extractive fallback, status shows degraded-since with the recorded last error, and an alert is raised
 
 #### Scenario: Provider recovers
 - **WHEN** a degraded provider's health probe succeeds

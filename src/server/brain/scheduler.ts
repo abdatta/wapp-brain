@@ -20,7 +20,7 @@ import { config } from "../config";
 import type { ArchiveRepository } from "../db/repository";
 import { publicErrorMessage } from "../privacy";
 import { buildEvidencePacks, generateEpisodeForPack, regenerateEpisode } from "./episodes";
-import { getBrainProviderStatus } from "./provider";
+import { brainProviderDegradationReason, getBrainProviderStatus } from "./provider";
 
 // A busy chat must be quiet this long before its intra-day volume episode fires,
 // so an episode never splits an in-progress exchange.
@@ -215,10 +215,15 @@ export interface DrainResult {
   // Per-run ceilings (backfill): distinct named stops for the run record.
   callBudgetExceeded: boolean;
   tokenBudgetExceeded: boolean;
-  // The provider health-tracker latched degraded mid-drain (usage limit,
-  // outage, auth) — the drain stopped rather than mass-committing extractive
-  // placeholders. Remaining work stays pending; resume after recovery.
+  // The provider health-tracker latched degraded mid-drain — the drain stopped
+  // rather than mass-committing extractive placeholders. Remaining work stays
+  // pending; resume after recovery.
   providerDegraded: boolean;
+  // The MEASURED degradation reason captured at latch time (consecutive-failure
+  // count + real last error), so the run message names the true cause even if a
+  // late in-flight success clears provider health before the message is built.
+  // Empty string unless providerDegraded is true.
+  providerDegradationReason: string;
 }
 
 // Hooks a drain hands to task execution: `record` centralizes accounting
@@ -331,6 +336,7 @@ export async function drainBrainTasks(repository: ArchiveRepository, options: Dr
   let callBudgetExceeded = false;
   let tokenBudgetExceeded = false;
   let providerDegraded = false;
+  let providerDegradationReason = "";
   let claimed = 0;
   const inFlight = new Set<Promise<void>>();
   const chatLanes = new Map<string, Promise<void>>();
@@ -378,6 +384,10 @@ export async function drainBrainTasks(repository: ArchiveRepository, options: Dr
     // halts new claims — the remaining queue stays pending for a clean resume.
     if (getBrainProviderStatus().degraded) {
       providerDegraded = true;
+      // Capture the real reason NOW, at latch time: an in-flight call settling
+      // after this can clear provider health before the caller builds its
+      // interrupt message.
+      providerDegradationReason = brainProviderDegradationReason();
       return true;
     }
     if (options.maxModelCalls != null && counters.modelCalls >= options.maxModelCalls) {
@@ -476,7 +486,7 @@ export async function drainBrainTasks(repository: ArchiveRepository, options: Dr
   if (fatalError) {
     throw fatalError;
   }
-  return { ...counters, dailyExceeded, rateLimited, callBudgetExceeded, tokenBudgetExceeded, providerDegraded };
+  return { ...counters, dailyExceeded, rateLimited, callBudgetExceeded, tokenBudgetExceeded, providerDegraded, providerDegradationReason };
 }
 
 export interface BrainPassResult extends Partial<DrainResult> {
@@ -554,7 +564,7 @@ export async function runBrainMaintenancePass(
       await repository.failBrainRun(
         runId,
         "interrupted",
-        `Provider ${provider.provider} went unavailable mid-pass (usage limit, outage, or auth); ${result.episodes} episode(s) committed, remaining work stays pending until the provider recovers.`,
+        `Provider ${provider.provider} went unavailable mid-pass (${result.providerDegradationReason || "usage limit, outage, or auth"}); ${result.episodes} episode(s) committed, remaining work stays pending until the provider recovers.`,
         totals
       );
     } else if (result.dailyExceeded) {

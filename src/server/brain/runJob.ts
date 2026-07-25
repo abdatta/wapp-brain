@@ -17,7 +17,7 @@ import type { ArchiveRepository } from "../db/repository";
 import { PublicError, publicErrorMessage } from "../privacy";
 import { buildEvidencePacks, EXTRACTION_VERSION, generateEpisodeForPack } from "./episodes";
 import { buildLifecycleSweepPrompt, parseLifecycleSweepResponse, type LifecycleSweepResolution } from "./lifecycle";
-import { generateStructured, getBrainProviderStatus } from "./provider";
+import { brainProviderDegradationReason, generateStructured, getBrainProviderStatus } from "./provider";
 import {
   buildRollupPrompt,
   parseRollupResponse,
@@ -271,6 +271,7 @@ async function executeRun(
     let cancelled = false;
     // Provider went unavailable mid-run: stop rather than commit placeholders.
     let providerDegraded = false;
+    let providerDegradedReason = "";
     // Chats that actually produced an episode vs. windows merely visited — the
     // honest chat count, so "12 chats for 3 episodes" can't happen.
     let chatsProduced = 0;
@@ -295,6 +296,7 @@ async function executeRun(
           // of committing extractive placeholders over the rest of the backlog.
           if (getBrainProviderStatus().degraded) {
             providerDegraded = true;
+            providerDegradedReason = brainProviderDegradationReason();
             break;
           }
           const usedToday = await repository.getBrainLlmUsage({ day: utcDayString() });
@@ -367,7 +369,7 @@ async function executeRun(
       await repository.failBrainRun(
         runId,
         "interrupted",
-        `Provider ${progress.provider}${progress.model ? `/${progress.model}` : ""} became unavailable mid-run (usage limit, outage, or auth); ${progress.episodesCommitted.toLocaleString()} episode(s) committed, remaining backlog stays pending. Probe/recover the provider (or switch), then run again.`,
+        `Provider ${progress.provider}${progress.model ? `/${progress.model}` : ""} became unavailable mid-run (${providerDegradedReason || "usage limit, outage, or auth"}); ${progress.episodesCommitted.toLocaleString()} episode(s) committed, remaining backlog stays pending. Probe/recover the provider (or switch), then run again.`,
         totals
       );
       return "interrupted";
@@ -490,7 +492,7 @@ async function executeRegenerateRun(
       await repository.failBrainRun(
         runId,
         "interrupted",
-        `Provider ${progress.provider}${progress.model ? `/${progress.model}` : ""} became unavailable mid-regeneration (usage limit, outage, or auth); ${result.episodes.toLocaleString()} replacement(s) committed, remaining regenerate tasks stay pending. Probe/recover the provider (or switch), then re-run the sweep.`,
+        `Provider ${progress.provider}${progress.model ? `/${progress.model}` : ""} became unavailable mid-regeneration (${result.providerDegradationReason || "usage limit, outage, or auth"}); ${result.episodes.toLocaleString()} replacement(s) committed, remaining regenerate tasks stay pending. Probe/recover the provider (or switch), then re-run the sweep.`,
         totals
       );
       return "interrupted";
@@ -665,7 +667,7 @@ async function executeBackfillRun(
       await repository.failBrainRun(
         runId,
         "interrupted",
-        `Provider ${progress.provider}${progress.model ? `/${progress.model}` : ""} became unavailable mid-run (usage limit, outage, or auth). The run stopped to avoid filling coverage with extractive placeholders — ${result.episodes.toLocaleString()} episode(s) committed, ${progress.queuedTasks?.toLocaleString() ?? "the remaining"} task(s) still pending. Probe/recover the provider (or switch providers in the Run console), then resume the backfill.`,
+        `Provider ${progress.provider}${progress.model ? `/${progress.model}` : ""} became unavailable mid-run (${result.providerDegradationReason || "usage limit, outage, or auth"}). The run stopped to avoid filling coverage with extractive placeholders — ${result.episodes.toLocaleString()} episode(s) committed, ${progress.queuedTasks?.toLocaleString() ?? "the remaining"} task(s) still pending. Probe/recover the provider (or switch providers in the Run console), then resume the backfill.`,
         totals
       );
       return "interrupted";
@@ -812,6 +814,7 @@ async function executeLifecycleSweep(
     let budgetStop: string | null = null;
     let cancelled = false;
     let providerDegraded = false;
+    let providerDegradedReason = "";
     const processedChats = new Set<string>();
     for (const batch of batches) {
       if (cancelRequested) {
@@ -820,6 +823,7 @@ async function executeLifecycleSweep(
       }
       if (getBrainProviderStatus().degraded) {
         providerDegraded = true;
+        providerDegradedReason = brainProviderDegradationReason();
         break;
       }
       const usedToday = await repository.getBrainLlmUsage({ day: utcDayString() });
@@ -956,7 +960,7 @@ async function executeLifecycleSweep(
       await repository.failBrainRun(
         runId,
         "interrupted",
-        `Provider ${progress.provider}${progress.model ? `/${progress.model}` : ""} became unavailable mid-sweep; applied transitions are kept, remaining sweep-due nodes stay open. Probe/recover the provider, then sweep again.`,
+        `Provider ${progress.provider}${progress.model ? `/${progress.model}` : ""} became unavailable mid-sweep${providerDegradedReason ? ` (${providerDegradedReason})` : ""}; applied transitions are kept, remaining sweep-due nodes stay open. Probe/recover the provider, then sweep again.`,
         totals
       );
       return "interrupted";
@@ -1089,6 +1093,7 @@ async function executeRollupRun(
     let budgetStop: string | null = null;
     let cancelled = false;
     let providerDegraded = false;
+    let providerDegradedReason = "";
     for (const target of targets) {
       if (cancelRequested) {
         cancelled = true;
@@ -1098,6 +1103,7 @@ async function executeRollupRun(
       // than burn retries against a dead provider.
       if (getBrainProviderStatus().degraded) {
         providerDegraded = true;
+        providerDegradedReason = brainProviderDegradationReason();
         break;
       }
       const usedToday = await repository.getBrainLlmUsage({ day: utcDayString() });
@@ -1241,7 +1247,7 @@ async function executeRollupRun(
       await repository.failBrainRun(
         runId,
         "interrupted",
-        `Provider ${progress.provider}${progress.model ? `/${progress.model}` : ""} became unavailable mid-run; committed revisions are kept, remaining due docs stay due. Probe/recover the provider, then run again.`,
+        `Provider ${progress.provider}${progress.model ? `/${progress.model}` : ""} became unavailable mid-run${providerDegradedReason ? ` (${providerDegradedReason})` : ""}; committed revisions are kept, remaining due docs stay due. Probe/recover the provider, then run again.`,
         totals
       );
       return "interrupted";
