@@ -202,6 +202,13 @@ export interface DrainResult {
   episodes: number;
   // Of episodes, how many fell back to extractive placeholders.
   extractive: number;
+  // Of those, how many fell back because the provider deterministically refused
+  // the pack's prompt (a 400-class rejection) rather than because generation or
+  // validation failed. These are quarantined: the drain keeps going, and the
+  // provider is NOT treated as unavailable.
+  quarantined: number;
+  // The first quarantine reason seen, for the run outcome. Null when none.
+  quarantineReason: string | null;
   claims: number;
   modelCalls: number;
   // Accumulated input+output tokens across this drain's model calls.
@@ -330,7 +337,8 @@ export async function drainBrainTasks(repository: ArchiveRepository, options: Dr
   const workers = Math.max(1, Math.min(6, Math.floor(options.concurrency ?? 1)));
   const hourlyCap = options.callsPerHour ?? config.brain.maxCallsPerHour;
   const dailyCap = options.callsPerDay ?? config.brain.maxCallsPerDay;
-  const counters = { episodes: 0, extractive: 0, claims: 0, modelCalls: 0, tokensUsed: 0, tasksDone: 0, chatsProduced: 0 };
+  const counters = { episodes: 0, extractive: 0, claims: 0, modelCalls: 0, tokensUsed: 0, tasksDone: 0, chatsProduced: 0, quarantined: 0 };
+  let quarantineReason: string | null = null;
   let dailyExceeded = false;
   let rateLimited = false;
   let callBudgetExceeded = false;
@@ -350,6 +358,13 @@ export async function drainBrainTasks(repository: ArchiveRepository, options: Dr
     counters.episodes += 1;
     if (result.fellBackToExtractive) {
       counters.extractive += 1;
+    }
+    if (result.providerRejection) {
+      // Quarantined, not a provider failure: the provider answered and refused
+      // this pack. Counted separately so a systematic rejection is visible in
+      // the run outcome instead of hiding behind an apparently successful run.
+      counters.quarantined += 1;
+      quarantineReason = quarantineReason ?? result.providerRejection;
     }
     counters.claims += result.episode.claims.length;
     let tokens = 0;
@@ -486,7 +501,16 @@ export async function drainBrainTasks(repository: ArchiveRepository, options: Dr
   if (fatalError) {
     throw fatalError;
   }
-  return { ...counters, dailyExceeded, rateLimited, callBudgetExceeded, tokenBudgetExceeded, providerDegraded, providerDegradationReason };
+  return {
+    ...counters,
+    quarantineReason,
+    dailyExceeded,
+    rateLimited,
+    callBudgetExceeded,
+    tokenBudgetExceeded,
+    providerDegraded,
+    providerDegradationReason
+  };
 }
 
 export interface BrainPassResult extends Partial<DrainResult> {
@@ -558,8 +582,14 @@ export async function runBrainMaintenancePass(
       chats: result.chatsProduced,
       chatsVisited: result.tasksDone,
       modelCalls: result.modelCalls,
+      quarantined: result.quarantined,
       skippedForBudget: result.dailyExceeded ? (await repository.getBrainTaskSummary()).pending : 0
     };
+    if (result.quarantined > 0) {
+      console.warn(
+        `[brain] maintenance pass: ${result.quarantined.toLocaleString()} pack(s) quarantined — provider refused them deterministically. First reason: ${result.quarantineReason ?? "unknown"}`
+      );
+    }
     if (result.providerDegraded) {
       await repository.failBrainRun(
         runId,

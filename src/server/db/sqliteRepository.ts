@@ -236,7 +236,9 @@ import {
 } from "../brain/lifecycle";
 import { resolveNeighborhoodParams, shapeNeighborhood, type NeighborhoodWalk } from "../brain/graphQuery";
 import { episodeFileBase } from "../brain/vaultNames";
+import { MAX_QUOTED_SNIPPET_CHARS } from "../brain/episodes";
 import { PublicError } from "../privacy";
+import { truncateOnGraphemeBoundary } from "../text";
 import { termAliasSeedRows } from "../search/aliasSeed";
 import {
   attachAliasVariants,
@@ -7277,7 +7279,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       const message = messageStmt.get(cite.sourceMessageKey) as
         | { messageId: number; chatId: number; ts: number | null; text: string | null }
         | undefined;
-      const snippet = message?.text ? (message.text.length > 160 ? `${message.text.slice(0, 159)}…` : message.text) : null;
+      const snippet = message?.text ? truncateOnGraphemeBoundary(message.text, 160, "…") : null;
       return {
         sourceMessageKey: cite.sourceMessageKey,
         chatId: message?.chatId ?? null,
@@ -7564,7 +7566,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       messageId: cite.messageId ?? null,
       timestampMs: cite.ts ?? null,
       senderLabel: cite.senderJid ? this.lifecycleActorLabelTx(cite.senderJid === "me" ? "me" : this.canonicalJid(cite.senderJid) ?? cite.senderJid) : null,
-      snippet: cite.text ? (cite.text.length > 200 ? `${cite.text.slice(0, 199)}…` : cite.text) : null
+      snippet: cite.text ? truncateOnGraphemeBoundary(cite.text, 200, "…") : null
     }));
     // Thread coordinates for each candidate's message, for click-through.
     const coordStmt = this.db.prepare(
@@ -13446,7 +13448,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         const label = isSelf
           ? ownerName
           : row.sender_display_name?.trim() || displayPhoneFromJid(row.sender_source_jid) || "someone";
-        const snippet = (row.text ?? "").trim().slice(0, 80);
+        const snippet = truncateOnGraphemeBoundary((row.text ?? "").trim(), MAX_QUOTED_SNIPPET_CHARS);
         result.set(row.quoted_id, { senderLabel: label, snippet });
       }
     }
@@ -14641,7 +14643,12 @@ function pickSnippet(row: SqliteSearchRow): string {
       return candidate;
     }
   }
-  return row.snip_body?.trim() || row.snip_caption?.trim() || row.snip_resolved?.trim() || (row.body ?? "").slice(0, 160);
+  return (
+    row.snip_body?.trim() ||
+    row.snip_caption?.trim() ||
+    row.snip_resolved?.trim() ||
+    truncateOnGraphemeBoundary(row.body ?? "", 160)
+  );
 }
 
 // Derived search text for one message: resolved body/caption (mentions as
@@ -14926,7 +14933,7 @@ function archiveSignalObservationFromRow(row: Record<string, unknown>): import("
 
 function safeVcardFileName(candidate: string | null, cardIndex: number): string {
   const base = (candidate ?? `contact-${cardIndex + 1}`).replace(/[\\/:*?"<>|\u0000-\u001F]+/g, " ").replace(/\s+/g, " ").trim();
-  const withoutExtension = base.replace(/\.vcf$/i, "").slice(0, 120).trim();
+  const withoutExtension = truncateOnGraphemeBoundary(base.replace(/\.vcf$/i, ""), 120).trim();
   return `${withoutExtension || `contact-${cardIndex + 1}`}.vcf`;
 }
 

@@ -23,7 +23,8 @@ import fs from "node:fs";
 import path from "node:path";
 import type { BrainProviderHealth, BrainProviderName, BrainProviderStatus, BrainReasoningEffort } from "../../shared/types";
 import { config } from "../config";
-import { PublicError, publicErrorMessage } from "../privacy";
+import { PublicError, publicErrorMessage, redactForDisplay } from "../privacy";
+import { toWellFormedText } from "../text";
 
 export type { BrainProviderHealth, BrainProviderName, BrainProviderStatus, BrainReasoningEffort } from "../../shared/types";
 
@@ -46,6 +47,10 @@ export interface BrainGenerationRequest {
   system: string;
   user: string;
   maxOutputTokens: number;
+  // Diagnostic label for the call site (e.g. "episode", "rollup"). Never sent to
+  // a provider; used only so a well-formedness repair names which builder
+  // produced malformed text.
+  purpose?: string;
   // Per-call model override; defaults to the user's persisted selection.
   model?: string | null;
   // Per-call reasoning-effort override for providers with an effort knob
@@ -96,6 +101,45 @@ interface BrainProviderFileState {
 
 const DEFAULT_TIMEOUT_MS = 180_000;
 const MAX_OUTPUT_BYTES = 4_000_000;
+
+// Statuses where the provider is reachable and refusing THIS payload: the
+// request is malformed, oversized, or unprocessable. Deliberately excludes 401
+// and 403 (auth — the provider is refusing US, not this payload) and 429 (usage
+// limit — the same payload succeeds later). Those stay transient, so they still
+// count toward degradation as before.
+const DETERMINISTIC_REJECTION_STATUSES = new Set([400, 413, 422]);
+
+// A failure that is deterministic in the request: retrying byte-identical input
+// cannot succeed, and the provider proved it is alive by answering at all.
+// Callers quarantine the offending work instead of treating the provider as
+// unavailable.
+export class BrainProviderRejection extends PublicError {
+  public readonly httpStatus: number;
+
+  constructor(httpStatus: number, safeMessage: string) {
+    super("BRAIN_PROVIDER_REJECTED_REQUEST", safeMessage);
+    this.name = "BrainProviderRejection";
+    this.httpStatus = httpStatus;
+  }
+}
+
+export function isDeterministicRejection(error: unknown): error is BrainProviderRejection {
+  return error instanceof BrainProviderRejection;
+}
+
+// Maps an adapter failure onto the taxonomy. `status` is whatever the adapter
+// could observe (a parsed `API Error <status>` prefix, or the CLI envelope's
+// api_error_status); null means the adapter saw no status and the failure stays
+// transient by default — an unknown failure must never be assumed permanent.
+export function classifyProviderFailure(status: number | null, error: unknown, detail: string): unknown {
+  if (status == null || !DETERMINISTIC_REJECTION_STATUSES.has(status)) {
+    return error;
+  }
+  return new BrainProviderRejection(
+    status,
+    `The model provider rejected this request (HTTP ${status}) and will reject it identically on retry: ${detail}`
+  );
+}
 
 const emptyHealth = (): BrainProviderHealth => ({
   consecutiveFailures: 0,
@@ -308,10 +352,43 @@ export async function probeBrainProvider(): Promise<{ ok: boolean; status: Brain
   }
 }
 
+// Well-formedness guard: no request leaves this process carrying an unpaired
+// surrogate, whichever builder produced the text. Fixing the known truncation
+// sites fixes today's defect; this makes the class unrepresentable, because
+// rollup, lifecycle, and any future prompt builder all funnel through here.
+//
+// A correct builder never trips this, so a repair is a DEFECT SIGNAL, not
+// routine operation — it is logged loudly. Per the provider privacy contract the
+// log carries the call's purpose and counts only, never prompt content.
+export function wellFormedRequest(request: BrainGenerationRequest): BrainGenerationRequest {
+  const system = toWellFormedText(request.system);
+  const user = toWellFormedText(request.user);
+  if (system === request.system && user === request.user) {
+    return request;
+  }
+  // Replacement is 1:1 in code units, so differing positions count the repairs.
+  const repaired = countDifferences(request.system, system) + countDifferences(request.user, user);
+  console.error(
+    `[brain] prompt well-formedness guard repaired ${repaired} unpaired surrogate(s) in a ${request.purpose ?? "unlabelled"} call — a prompt builder emitted malformed text`
+  );
+  return { ...request, system, user };
+}
+
+function countDifferences(before: string, after: string): number {
+  let count = 0;
+  for (let index = 0; index < before.length; index += 1) {
+    if (before[index] !== after[index]) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
 async function generateWithHealthTracking(
   provider: Exclude<BrainProviderName, "extractive">,
-  request: BrainGenerationRequest
+  rawRequest: BrainGenerationRequest
 ): Promise<BrainGenerationResult> {
+  const request = wellFormedRequest(rawRequest);
   const model = sanitizeModel(request.model?.trim() || selectedModel(readState(), provider));
   try {
     const result =
@@ -319,7 +396,14 @@ async function generateWithHealthTracking(
     recordSuccess();
     return result;
   } catch (error) {
-    recordFailure(error);
+    // A deterministic rejection proves the provider is reachable and answering
+    // — it refused this payload. Counting it as a health failure latches a
+    // HEALTHY provider as degraded and halts the whole run over content it will
+    // never accept. Health tracks availability; this is not an availability
+    // signal, so it is deliberately left out of it.
+    if (!isDeterministicRejection(error)) {
+      recordFailure(error);
+    }
     throw error;
   }
 }
@@ -401,7 +485,11 @@ async function generateWithClaudeCli(request: BrainGenerationRequest, model: str
     // it short and pass it through so the failure explains itself.
     const reason = typeof envelope.result === "string" ? envelope.result.slice(0, 200) : `subtype ${envelope.subtype ?? "unknown"}`;
     const status = envelope.api_error_status ? ` (HTTP ${envelope.api_error_status})` : "";
-    throw new PublicError("BRAIN_CLI_ERROR", `The Claude CLI reported an error${status}: ${reason}`);
+    throw classifyProviderFailure(
+      envelope.api_error_status ?? null,
+      new PublicError("BRAIN_CLI_ERROR", `The Claude CLI reported an error${status}: ${reason}`),
+      reason
+    );
   }
   return {
     json: parseModelJson(envelope.result),
@@ -423,18 +511,32 @@ async function generateWithCodex(request: BrainGenerationRequest, model: string)
   }
   const timeoutMs = request.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const client = await withTimeout(loadCodexClient(), timeoutMs, "BRAIN_CODEX_TIMEOUT", "The Codex client did not connect in time.");
-  const response = (await withTimeout(
-    client.sendMessage(request.user, {
-      model,
-      instructions: `${request.system}\nRespond with ONLY the requested JSON object — no prose, no markdown fences.`,
-      reasoning: { effort: request.effort ?? DEFAULT_CODEX_REASONING_EFFORT, summary: "auto" },
-      text: { verbosity: "low" },
-      store: false
-    }),
-    timeoutMs,
-    "BRAIN_CODEX_TIMEOUT",
-    `The Codex model did not answer within ${Math.round(timeoutMs / 1000)}s.`
-  )) as { content?: string; usage?: { input_tokens?: number; output_tokens?: number } };
+  let response: { content?: string; usage?: { input_tokens?: number; output_tokens?: number } };
+  try {
+    response = (await withTimeout(
+      client.sendMessage(request.user, {
+        model,
+        instructions: `${request.system}\nRespond with ONLY the requested JSON object — no prose, no markdown fences.`,
+        reasoning: { effort: request.effort ?? DEFAULT_CODEX_REASONING_EFFORT, summary: "auto" },
+        text: { verbosity: "low" },
+        store: false
+      }),
+      timeoutMs,
+      "BRAIN_CODEX_TIMEOUT",
+      `The Codex model did not answer within ${Math.round(timeoutMs / 1000)}s.`
+    )) as { content?: string; usage?: { input_tokens?: number; output_tokens?: number } };
+  } catch (error) {
+    // The client surfaces HTTP failures as `API Error <status>: <body>`. The
+    // body is a provider diagnostic, never archive content, but it is redacted
+    // and bounded on the way out regardless.
+    const raw = error instanceof Error ? error.message : "";
+    const status = /API Error (\d{3})/.exec(raw);
+    throw classifyProviderFailure(
+      status ? Number(status[1]) : null,
+      error,
+      redactForDisplay(raw).slice(0, 200)
+    );
+  }
   if (typeof response?.content !== "string") {
     throw new PublicError("BRAIN_CODEX_BAD_RESPONSE", "The Codex client returned no readable content.");
   }

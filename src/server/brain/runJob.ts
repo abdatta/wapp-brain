@@ -477,8 +477,10 @@ async function executeRegenerateRun(
       chatsVisited: result.tasksDone,
       modelCalls: result.modelCalls,
       tokens: result.tokensUsed,
+      quarantined: result.quarantined,
       skippedForBudget: result.dailyExceeded || result.rateLimited ? Math.max(0, stale.length - result.tasksDone) : 0
     };
+    reportQuarantine(result, "regeneration");
     if (cancelRequested) {
       await repository.failBrainRun(
         runId,
@@ -637,6 +639,7 @@ async function executeBackfillRun(
     // actually sees (the finally-reclaim stays as the crash-path safety net).
     await repository.resetInFlightBrainTasks(0).catch(() => undefined);
     progress.queuedTasks = (await repository.getBrainTaskSummary()).pending;
+    reportQuarantine(result, "backfill");
     const totals: Record<string, number> = {
       episodes: result.episodes,
       extractive: result.extractive,
@@ -645,6 +648,7 @@ async function executeBackfillRun(
       chatsVisited: result.tasksDone,
       modelCalls: result.modelCalls,
       tokens: result.tokensUsed,
+      quarantined: result.quarantined,
       queuedAtStart,
       queuedRemaining: progress.queuedTasks,
       concurrency,
@@ -1315,6 +1319,19 @@ export async function getBrainBackfillStatus(repository: ArchiveRepository): Pro
     },
     sweepableExtractive: stats.sweepableExtractive
   };
+}
+
+// Quarantined packs are recorded as a count in the run totals (which the run
+// console renders) and, per pack, as the episode's `fallback_reason`. This
+// announces the same fact on the server console at run end so a systematic
+// rejection can never hide behind an otherwise-successful run.
+function reportQuarantine(result: { quarantined: number; quarantineReason: string | null }, label: string): void {
+  if (result.quarantined <= 0) {
+    return;
+  }
+  console.warn(
+    `[brain] ${label}: ${result.quarantined.toLocaleString()} pack(s) quarantined — the provider refused them deterministically and they will be refused identically on retry. First reason: ${result.quarantineReason ?? "unknown"}`
+  );
 }
 
 function clampInt(value: number, min: number, max: number): number {

@@ -27,7 +27,14 @@ import type {
 import { config } from "../config";
 import type { ArchiveRepository } from "../db/repository";
 import { PublicError, publicErrorMessage } from "../privacy";
-import { generateStructured, getBrainProviderStatus, type BrainTokenUsage } from "./provider";
+import { truncateOnGraphemeBoundary } from "../text";
+import {
+  generateStructured,
+  getBrainProviderStatus,
+  isDeterministicRejection,
+  type BrainProviderRejection,
+  type BrainTokenUsage
+} from "./provider";
 import { episodeFileBase, episodeFileMatchesId } from "./vaultNames";
 
 // Contract version stamped on every committed episode (model AND extractive).
@@ -435,11 +442,16 @@ function maxOutputTokensForCap(claimCap: number): number {
 const MAX_REACTIONS_PER_LINE = 8;
 const MAX_SIGNAL_ANNOTATIONS_PER_LINE = 8;
 const MAX_SIGNAL_TEXT_CHARS = 320;
+// Quoted-reply referent preview length. Shared with the out-of-pack resolution
+// in the repository so both halves of "↳ replying to …" render identically.
+export const MAX_QUOTED_SNIPPET_CHARS = 80;
 
 function boundedSignalText(value: string | null | undefined, limit = MAX_SIGNAL_TEXT_CHARS): string {
   if (!value) return "";
   const flattened = value.replace(/[\r\n\t]+/g, " ").replace(/\s+/g, " ").trim();
-  return flattened.length > limit ? `${flattened.slice(0, Math.max(0, limit - 1))}…` : flattened;
+  // Grapheme-safe: a bound that lands inside an emoji or an Indic cluster cuts
+  // back to the boundary instead of emitting an unpaired surrogate.
+  return truncateOnGraphemeBoundary(flattened, limit, "…");
 }
 
 // Structured annotations are attached to their owning message alias. They are
@@ -511,7 +523,7 @@ function packPromptLines(
       inPackByQuotedId.set(message.sourceMessageId, {
         alias: `m${index + 1}`,
         sender: labeler.sender(message),
-        snippet: (message.text ?? "").trim().slice(0, 80)
+        snippet: truncateOnGraphemeBoundary((message.text ?? "").trim(), MAX_QUOTED_SNIPPET_CHARS)
       });
     }
   });
@@ -1144,6 +1156,10 @@ export interface EpisodeGenerationResult {
   episode: BrainEpisodeRecord;
   usage: BrainTokenUsage | null;
   fellBackToExtractive: boolean;
+  // Set when the provider deterministically refused this pack's prompt. The
+  // placeholder still commits so coverage stays honest, but the drain counts it
+  // as quarantined rather than as evidence the provider is failing.
+  providerRejection: string | null;
 }
 
 // Assemble the v2 user prompt: legend, fenced continuity context, topic offer,
@@ -1234,6 +1250,8 @@ export async function generateEpisodeForPack(
   let generator: "model" | "extractive" = options.generator;
   let fellBack = false;
   let fallbackReason: string | null = null;
+  // Non-null once the provider refuses this pack's prompt deterministically.
+  let rejected: BrainProviderRejection | null = null;
   // Media-gap rows (D13): resolved from the accepted model payload; extractive
   // episodes record none (the signal is a model-emitted inference).
   let mediaGaps: BrainMediaGapRecord[] = [];
@@ -1281,7 +1299,8 @@ export async function generateEpisodeForPack(
           system: EPISODE_SYSTEM,
           user: prompt,
           maxOutputTokens: maxOutputTokensForCap(claimCap),
-          model: options.model ?? null
+          model: options.model ?? null,
+          purpose: "episode"
         });
         usage = result.usage;
         const { payload, capTruncated } = normalizeModelEpisode(result.json, claimCap);
@@ -1295,6 +1314,14 @@ export async function generateEpisodeForPack(
         validated = validateModelEpisode(payload, keyByAlias);
       } catch (error) {
         attemptErrors = error instanceof EpisodeValidationError ? error.errors : [publicErrorMessage(error)];
+        // A deterministic rejection is a property of THIS payload: the retry
+        // would resend byte-identical text and be refused identically. Burning
+        // the attempt doubles the damage — it was how five bad packs produced
+        // ten consecutive failures and tripped the degradation guard.
+        if (isDeterministicRejection(error)) {
+          rejected = error;
+          break;
+        }
         // Provider-unavailable classes should not burn a retry on the same
         // failure; fall through to extractive immediately.
         if (error instanceof PublicError && !(error instanceof EpisodeValidationError) && error.message.includes("provider")) {
@@ -1402,7 +1429,12 @@ export async function generateEpisodeForPack(
   } catch (error) {
     console.warn(`[brain] episode file projection failed: ${publicErrorMessage(error)}`);
   }
-  return { episode: committed, usage, fellBackToExtractive: fellBack };
+  return {
+    episode: committed,
+    usage,
+    fellBackToExtractive: fellBack,
+    providerRejection: rejected ? publicErrorMessage(rejected) : null
+  };
 }
 
 // --- Regeneration (D10): re-derive an episode's stored window under the

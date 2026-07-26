@@ -9,6 +9,7 @@
 
 import crypto from "node:crypto";
 import type { BrainGraphEdgeKind, BrainGraphNodeKind } from "../../shared/types";
+import { truncateOnGraphemeBoundary } from "../text";
 
 export const GRAPH_NODE_KINDS: readonly BrainGraphNodeKind[] = [
   "person",
@@ -85,6 +86,9 @@ export function slugForGraphNode(kind: BrainGraphNodeKind, seed: string, natural
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
+    // Exempt from grapheme-safe truncation: the replace above has already
+    // reduced this to `[a-z0-9-]`, so no multi-unit cluster can survive to be
+    // split here.
     .slice(0, 48)
     .replace(/-+$/g, "");
   const base = cleaned ? `${kind}-${cleaned}` : `${kind}-${shortHash(naturalKey)}`;
@@ -588,7 +592,9 @@ function ensureNode(mutations: GraphMutations, spec: GraphNodeSpec): void {
 
 function truncateTitle(text: string): string {
   const clean = text.trim().replace(/\s+/g, " ");
-  return clean.length > 140 ? `${clean.slice(0, 139)}…` : clean;
+  // Grapheme-safe: node titles are archive-derived text that reaches both the UI
+  // and rollup prompts, so a mid-emoji cut here is the same defect class.
+  return truncateOnGraphemeBoundary(clean, 140, "…");
 }
 
 // Bounded engagement factor from read-rate: 1.0 (no data) to 1.25 (fully read
