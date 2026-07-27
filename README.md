@@ -131,6 +131,37 @@ npm run cleanup
 
 The local UI also has **Clean Temp Files** in the status panel. Cleanup only removes the app-managed decrypted working directory and reports counts, not file names.
 
+## Demo Mode
+
+Explore the full app with zero real data and zero external calls:
+
+```powershell
+npm run build
+npm run demo
+```
+
+Open [http://127.0.0.1:3610](http://127.0.0.1:3610).
+
+The first run provisions an isolated demo workspace at `.wapp-brain-demo/` — it generates a curated synthetic WhatsApp backup (fictional contacts, group planning chats, reactions, quoted replies, link previews, an edited message, media placeholders), imports it through the real importer, runs a zero-model extractive brain pass, and builds the search index. Subsequent runs reuse the provisioned workspace.
+
+Guarantees:
+
+- A demo process derives **every** path from the demo workspace and ignores `WAPP_WORK_DIR` / `ARCHIVE_DB_PATH` overrides — it cannot read or write your real `.wapp-brain/`.
+- Live sync pairing, Google Contacts OAuth, and model-backed providers are refused server-side; the UI shows them disabled with an explanation and a persistent amber **Demo data** badge.
+- The demo server defaults to port **3610** so it can run beside the real server on 3600.
+
+Maintenance commands:
+
+```powershell
+npm run demo:status
+```
+
+```powershell
+npm run demo:reset
+```
+
+`demo:status` prints the provisioned counts; `demo:reset` deletes only the demo workspace (pass `-- --yes` to skip the confirmation prompt).
+
 ## Run The Local UI
 
 Development mode:

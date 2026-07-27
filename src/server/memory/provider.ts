@@ -36,7 +36,16 @@ export async function getMemoryProviderStatus(): Promise<MemoryProviderStatus> {
   };
 }
 
+// Demo instances never opt into a remote provider; the refusal lives here so
+// the HTTP route and the CLI both inherit it.
+function assertNotDemo(): void {
+  if (config.demo) {
+    throw new Error("This is a demo instance with synthetic data — remote providers are disabled.");
+  }
+}
+
 export async function enableCodexProvider(): Promise<MemoryProviderStatus> {
+  assertNotDemo();
   writeProviderFile({ provider: "codex", remoteModelEnabled: true });
   return getMemoryProviderStatus();
 }
@@ -47,6 +56,7 @@ export async function disableRemoteMemoryProvider(): Promise<MemoryProviderStatu
 }
 
 export async function connectCodexProvider(): Promise<MemoryProviderStatus> {
+  assertNotDemo();
   const clientModule = await importCodexClient();
   const Client = clientModule.GPTOAuthClient as new (options: { storagePath: string }) => { connect: () => Promise<unknown> };
   fs.mkdirSync(path.dirname(config.memory.codexSessionPath), { recursive: true });

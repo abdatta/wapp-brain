@@ -36,6 +36,7 @@ fixtures/generated/
 outputs/
 .wapp-brain/
 .wapp-brain/memory/
+.wapp-brain-demo/
 .second-brain/
 tmp/
 temp/

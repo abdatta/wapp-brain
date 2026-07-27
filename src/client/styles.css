@@ -117,6 +117,21 @@ h1 {
   font-size: 13px;
 }
 
+/* Demo instances must be unmistakable at a glance: an amber pill beside the
+   local badge, visible on every surface. */
+.demoBadge {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 34px;
+  padding: 0 10px;
+  border-radius: 8px;
+  background: #33270f;
+  color: #f0ce7c;
+  font-size: 13px;
+  font-weight: 600;
+}
+
 .iconButton {
   width: 38px;
   height: 38px;

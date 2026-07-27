@@ -39,6 +39,7 @@ import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 
 import type { MouseEvent as ReactMouseEvent, ReactNode, RefObject } from "react";
 import { Link } from "react-router-dom";
 import { parseInlineSegments, parseWhatsAppBlocks, type InlineSegment } from "./whatsappFormat";
+import { useStatus } from "./state/StatusContext";
 import type {
   ArchiveChangeEvent,
   BackupDetectionManifest,
@@ -335,7 +336,16 @@ function GoogleContactsPanel({ status, busy, onSync, onDisconnect }: {
   onSync: () => void;
   onDisconnect: () => void;
 }) {
+  const demo = Boolean(useStatus().status?.demo);
   const last = status?.lastSync;
+  if (demo) {
+    return (
+      <section className="importPanel">
+        <div className="panelTitle"><Users size={16} /><span>Google Contacts</span></div>
+        <p className="muted">Demo instance: Google Contacts is disabled. This workspace only ever holds synthetic sample data, so there is nothing real to enrich.</p>
+      </section>
+    );
+  }
   return (
     <section className="importPanel">
       <div className="panelTitle"><Users size={16} /><span>Google Contacts</span></div>
@@ -385,6 +395,22 @@ function LivePanel({
   const live = status?.live;
   const [livePanelOpen, setLivePanelOpen] = useState(true);
   const setup = status?.setup;
+  // Demo instances never open a live connection; the panel says so instead of
+  // offering link/resume actions that the server would refuse anyway.
+  if (status?.demo) {
+    return (
+      <section className="livePanel">
+        <div className="panelTitle">
+          <Signal size={16} />
+          <span>Live Sync</span>
+        </div>
+        <p className="muted">
+          Demo instance: live sync is disabled. Pairing a real WhatsApp account is only available outside demo mode — this
+          workspace holds synthetic sample data and makes no external connections.
+        </p>
+      </section>
+    );
+  }
   const state = setup?.state ?? "empty_archive";
   const baselineReady = Boolean(live?.baseline.ready);
   const hasLiveSession = Boolean(live?.session && live.session.status !== "not_configured");
@@ -855,6 +881,7 @@ function RunConsoleModal({
   onStartRegenerate: (body: { model?: string | null; maxMessages?: number | null; callsPerDay?: number | null }) => Promise<boolean>;
   suggest: (query: string) => Promise<OwnerIdentitySuggestion[]>;
 }) {
+  const demo = Boolean(useStatus().status?.demo);
   const provider = overview?.provider ?? null;
   const ownerName = overview?.ownerName ?? "";
   const [name, setName] = useState(ownerName);
@@ -1284,9 +1311,10 @@ function RunConsoleModal({
             </div>
           )}
           <div className="runConsoleGrid">
-            <label className="runConsoleField">
-              <span>Provider</span>
+            <label className="runConsoleField" title={demo ? "Demo instance: model providers are disabled — runs are extractive-only." : undefined}>
+              <span>Provider{demo ? " (demo: extractive only)" : ""}</span>
               <select
+                disabled={demo}
                 value={provider?.provider ?? "extractive"}
                 onChange={(event) => {
                   const value = event.target.value as BrainProviderName;
@@ -1302,10 +1330,10 @@ function RunConsoleModal({
                 <option value="codex">codex (GPT OAuth)</option>
               </select>
             </label>
-            <label className="runConsoleField" title={!modelBacked ? "Extractive mode makes no model calls." : undefined}>
+            <label className="runConsoleField" title={demo ? "Demo instance: model providers are disabled." : !modelBacked ? "Extractive mode makes no model calls." : undefined}>
               <span>Model{provider?.reasoningEffort ? ` · effort ${provider.reasoningEffort}` : ""}</span>
               <select
-                disabled={!modelBacked}
+                disabled={!modelBacked || demo}
                 value={provider?.model ?? modelOptions[0] ?? ""}
                 onChange={(event) =>
                   provider &&

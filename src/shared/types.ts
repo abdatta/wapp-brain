@@ -527,6 +527,11 @@ export interface StatusSummary {
   // True when the local server can open a native OS file/folder dialog (Windows
   // today); the import wizard shows "Browse…" only when this is true.
   pickerAvailable?: boolean;
+  // Demo instance marker: the server runs against the isolated synthetic demo
+  // workspace. The shell shows a persistent badge and renders external actions
+  // (pairing, Google, model providers) disabled with an explanation.
+  demo?: boolean;
+  demoWorkspacePath?: string | null;
 }
 
 export interface GuidedSetupSummary {

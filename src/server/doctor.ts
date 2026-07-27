@@ -30,6 +30,7 @@ const requiredIgnorePatterns = [
   "exports/",
   ".wapp-brain/",
   ".wapp-brain/memory/",
+  ".wapp-brain-demo/",
   ".second-brain/"
 ];
 

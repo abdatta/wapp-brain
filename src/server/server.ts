@@ -55,9 +55,21 @@ let livePairing: LivePairingSummary = idlePairing();
 let archiveEventId = 0;
 const archiveEventClients = new Set<Response>();
 
+// Demo instances make no external calls: the endpoints that would start one
+// (live pairing, Google OAuth, provider enablement) refuse with this stable
+// shape, which the client explains instead of ever letting the user hit it.
+const demoStatusFields = { demo: config.demo, demoWorkspacePath: config.demo ? path.resolve(config.workDir) : null };
+function refuseInDemo(res: Response): boolean {
+  if (!config.demo) {
+    return false;
+  }
+  res.status(409).json({ ok: false, demo: true, error: "This is a demo instance with synthetic data — external connections are disabled." });
+  return true;
+}
+
 app.get("/api/status", async (_req, res) => {
   try {
-    res.json({ ...withGuidedSetup(await repository.getStatus()), pickerAvailable: isPickerAvailable() });
+    res.json({ ...withGuidedSetup(await repository.getStatus()), pickerAvailable: isPickerAvailable(), ...demoStatusFields });
   } catch {
     res.json({
       ...withGuidedSetup({
@@ -71,7 +83,8 @@ app.get("/api/status", async (_req, res) => {
         latestImport: null,
         latestWarnings: []
       }),
-      pickerAvailable: isPickerAvailable()
+      pickerAvailable: isPickerAvailable(),
+      ...demoStatusFields
     });
   }
 });
@@ -82,11 +95,13 @@ app.get("/api/google-contacts/status", async (_req, res) => {
 });
 
 app.get("/api/google-contacts/oauth/start", (_req, res) => {
+  if (refuseInDemo(res)) return;
   try { res.redirect(googleContacts.createAuthorizationUrl()); }
   catch (error) { res.redirect(`/?googleContacts=error&message=${encodeURIComponent(publicErrorMessage(error))}`); }
 });
 
 app.get("/api/google-contacts/oauth/callback", async (req, res) => {
+  if (refuseInDemo(res)) return;
   try {
     await googleContacts.handleCallback(typeof req.query.code === "string" ? req.query.code : "", typeof req.query.state === "string" ? req.query.state : "");
     res.redirect("/?googleContacts=connected");
@@ -96,6 +111,7 @@ app.get("/api/google-contacts/oauth/callback", async (req, res) => {
 });
 
 app.post("/api/google-contacts/sync", async (_req, res) => {
+  if (refuseInDemo(res)) return;
   try {
     const result = await googleContacts.sync(repository);
     if (result.improvedNames > 0) broadcastArchiveChanged({ source: "manual", chatSourceIds: [], messageCount: 0, contactCount: result.improvedNames });
@@ -412,6 +428,7 @@ app.get("/api/live/gaps", async (_req, res) => {
 });
 
 app.post("/api/live/gaps/:id/retry", async (req, res) => {
+  if (refuseInDemo(res)) return;
   try {
     const id = Number(req.params.id);
     if (!Number.isInteger(id) || id <= 0) {
@@ -426,6 +443,7 @@ app.post("/api/live/gaps/:id/retry", async (req, res) => {
 });
 
 app.post("/api/live/unlink", async (_req, res) => {
+  if (refuseInDemo(res)) return;
   try {
     await stopActiveMaintainer();
     const options = liveOptionsFromConfig();
@@ -439,6 +457,7 @@ app.post("/api/live/unlink", async (_req, res) => {
 });
 
 app.post("/api/live/stop", async (_req, res) => {
+  if (refuseInDemo(res)) return;
   try {
     await stopActiveMaintainer();
     const options = liveOptionsFromConfig();
@@ -450,6 +469,7 @@ app.post("/api/live/stop", async (_req, res) => {
 });
 
 app.post("/api/live/link", async (req, res) => {
+  if (refuseInDemo(res)) return;
   try {
     await assertLiveBaselineExists(repository, config.live.maxBackfillPerChatDays);
     const phoneNumber = typeof req.body?.phoneNumber === "string" && req.body.phoneNumber.trim() ? req.body.phoneNumber.trim() : null;
@@ -474,6 +494,7 @@ app.post("/api/live/link", async (req, res) => {
 });
 
 app.post("/api/live/resume", async (_req, res) => {
+  if (refuseInDemo(res)) return;
   try {
     // Resume never requires a fresh baseline: long downtime is represented as
     // honest gaps/uncertainty by the evidence-based audit instead of a refusal.
@@ -581,6 +602,7 @@ app.post("/api/memory/validate", async (_req, res) => {
 });
 
 app.post("/api/memory/provider/enable-codex", async (_req, res) => {
+  if (refuseInDemo(res)) return;
   try {
     res.json(await enableCodexProvider());
   } catch (error) {
@@ -1573,6 +1595,9 @@ app.post("/api/brain/provider", async (req, res) => {
       await import("./brain/provider");
     const action = typeof req.body?.action === "string" ? req.body.action : "";
     const provider = req.body?.provider === "claude-cli" || req.body?.provider === "codex" ? req.body.provider : null;
+    if ((action === "enable" || action === "set-model") && refuseInDemo(res)) {
+      return;
+    }
     if (action === "enable" && provider) {
       res.json({ ok: true, provider: enableBrainProvider(provider) });
     } else if (action === "disable") {

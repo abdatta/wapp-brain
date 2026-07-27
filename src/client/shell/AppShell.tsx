@@ -1,4 +1,4 @@
-import { Loader2, MessageCircle, Moon, RefreshCcw, ShieldCheck } from "lucide-react";
+import { FlaskConical, Loader2, MessageCircle, RefreshCcw, ShieldCheck } from "lucide-react";
 import { Suspense, useEffect } from "react";
 import { Outlet, useLocation, useNavigate } from "react-router-dom";
 import { PairingModal } from "../panels";
@@ -18,8 +18,14 @@ import { ToastHost } from "./ToastHost";
 export function AppShell() {
   const navigate = useNavigate();
   const location = useLocation();
-  const { refreshStatus, pairing, pairingOpen, closePairing, openLink } = useStatus();
+  const { status, refreshStatus, pairing, pairingOpen, closePairing, openLink } = useStatus();
   const { setNotice, setError } = useToast();
+  const demo = Boolean(status?.demo);
+
+  // Even a bare browser tab must be identifiable as demo vs real.
+  useEffect(() => {
+    document.title = demo ? "Wapp Brain — Demo" : "Wapp Brain";
+  }, [demo]);
 
   // Handle the Google OAuth callback landing (server redirects to
   // `/?googleContacts=...`). Surface the outcome as a toast and route to the
@@ -42,20 +48,23 @@ export function AppShell() {
           </div>
           <div>
             <h1>Wapp Brain</h1>
-            <p>Local WhatsApp archive</p>
+            <p>{demo ? "Synthetic demo archive" : "Local WhatsApp archive"}</p>
           </div>
         </div>
         <NavRail />
         <div className="topActions">
+          {demo && (
+            <span className="demoBadge" title={`Synthetic demo data — the real workspace is untouched.${status?.demoWorkspacePath ? ` Workspace: ${status.demoWorkspacePath}` : ""}`}>
+              <FlaskConical size={16} />
+              Demo data
+            </span>
+          )}
           <span className="localBadge">
             <ShieldCheck size={16} />
             127.0.0.1
           </span>
           <button className="iconButton" onClick={() => void refreshStatus()} title="Refresh status" aria-label="Refresh status">
             <RefreshCcw size={18} />
-          </button>
-          <button className="iconButton mutedIcon" title="Local dark theme" aria-label="Local dark theme">
-            <Moon size={18} />
           </button>
         </div>
       </header>

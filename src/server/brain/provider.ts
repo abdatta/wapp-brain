@@ -253,7 +253,17 @@ function sanitizeModel(model: string): string {
   return trimmed;
 }
 
+// Demo instances are extractive-only by contract: enabling or selecting a
+// model-backed provider is refused at this layer so every caller (HTTP route,
+// CLI, future code) inherits the guarantee.
+function assertNotDemo(): void {
+  if (config.demo) {
+    throw new PublicError("DEMO_MODE", "This is a demo instance with synthetic data — model-backed providers are disabled.");
+  }
+}
+
 export function setBrainProviderModel(provider: Exclude<BrainProviderName, "extractive">, model: string): BrainProviderStatus {
+  assertNotDemo();
   const clean = sanitizeModel(model);
   const state = readState();
   state.model = { ...state.model, [provider]: clean };
@@ -262,6 +272,7 @@ export function setBrainProviderModel(provider: Exclude<BrainProviderName, "extr
 }
 
 export function enableBrainProvider(provider: Exclude<BrainProviderName, "extractive">): BrainProviderStatus {
+  assertNotDemo();
   const state = readState();
   state.provider = provider;
   state.enabled = { ...state.enabled, [provider]: true };

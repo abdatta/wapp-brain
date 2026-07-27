@@ -4,6 +4,37 @@ import { z } from "zod";
 
 dotenv.config({ quiet: true });
 
+// Demo mode (`WAPP_DEMO=1`) pivots every path the app owns into an isolated
+// demo workspace and forbids external side effects. It is resolved BEFORE
+// schema parsing so path-bearing overrides can be dropped outright: a demo
+// process must be incapable of touching the real workspace no matter what the
+// environment says. Port stays overridable — only its default moves, so a demo
+// instance can run beside the real server.
+const DEMO_WORK_DIR = ".wapp-brain-demo";
+const DEMO_IGNORED_ENV = ["WAPP_WORK_DIR", "ARCHIVE_DB_PATH", "WAPP_MEMORY_DIR", "WAPP_MEMORY_CODEX_SESSION_PATH"] as const;
+const demoMode = process.env.WAPP_DEMO === "1" || process.env.WAPP_DEMO === "true";
+const env: NodeJS.ProcessEnv = { ...process.env };
+if (demoMode) {
+  // WAPP_DEMO_DIR is the one demo-path knob (tests and relocations); it must
+  // never collide with the real workspace — neither the env-configured one
+  // nor the default — or the isolation guarantee would be an env var away
+  // from meaningless.
+  const demoDir = env.WAPP_DEMO_DIR?.trim() || DEMO_WORK_DIR;
+  const realWorkDirs = [env.WAPP_WORK_DIR ?? ".wapp-brain", ".wapp-brain"];
+  if (realWorkDirs.some((realDir) => path.resolve(demoDir) === path.resolve(realDir))) {
+    throw new Error(`WAPP_DEMO_DIR must not point at the real workspace (${demoDir}).`);
+  }
+  for (const key of DEMO_IGNORED_ENV) {
+    delete env[key];
+  }
+  env.WAPP_WORK_DIR = demoDir;
+  env.WAPP_BRAIN_PROVIDER = "extractive";
+  env.WAPP_MEMORY_PROVIDER = "local";
+  env.WAPP_MEMORY_REMOTE_MODEL_ENABLED = "0";
+  env.LIVE_AUTO_RESUME = "0";
+  env.APP_PORT = env.APP_PORT ?? "3610";
+}
+
 const envSchema = z.object({
   ARCHIVE_DB_ADAPTER: z.literal("sqlite").default("sqlite"),
   ARCHIVE_DB_PATH: z.string().optional(),
@@ -73,7 +104,7 @@ const envSchema = z.object({
   WAPP_PERSONS_DETECTOR_TICK_INTERVAL: z.coerce.number().int().positive().default(10)
 });
 
-const parsed = envSchema.parse(process.env);
+const parsed = envSchema.parse(env);
 const workDir = parsed.WAPP_WORK_DIR;
 const memoryRootDir = parsed.WAPP_MEMORY_DIR ?? path.join(workDir, "memory");
 
@@ -148,6 +179,7 @@ export const config = {
     hintScoreThreshold: parsed.WAPP_PERSONS_HINT_THRESHOLD,
     detectorTickInterval: parsed.WAPP_PERSONS_DETECTOR_TICK_INTERVAL
   },
+  demo: demoMode,
   workDir
 };
 

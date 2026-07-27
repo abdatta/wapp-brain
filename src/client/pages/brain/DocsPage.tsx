@@ -11,6 +11,7 @@ import type {
   BrainRunProgress
 } from "../../../shared/types";
 import { brainProviderAction, getBrainOverview, getBrainRunProgress, listBrainDocs, startBrainRollupRun } from "../../api";
+import { useStatus } from "../../state/StatusContext";
 import { useToast } from "../../state/ToastContext";
 
 // The semantic pages list (semantic-rollups): existing docs AND page-eligible
@@ -56,6 +57,7 @@ export function BrainDocsPage() {
   const [view, setView] = useState<BrainDocsListView>("all");
   const [running, setRunning] = useState<BrainRunProgress | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  const demo = Boolean(useStatus().status?.demo);
   // Provider/model/effort are chosen HERE because a rollup is the most
   // expensive call the brain makes — the tier must be visible and deliberate
   // at the moment of spend, not inherited invisibly from a distant screen.
@@ -334,11 +336,11 @@ export function BrainDocsPage() {
         </div>
 
         <div className="lifecycleSweepControls">
-          <label className="lifecycleControl">
-            <span>Provider</span>
+          <label className="lifecycleControl" title={demo ? "Demo instance: model providers are disabled — extractive only." : undefined}>
+            <span>Provider{demo ? " (demo: extractive only)" : ""}</span>
             <select
               value={provider?.provider ?? "extractive"}
-              disabled={running != null || busy === "provider"}
+              disabled={demo || running != null || busy === "provider"}
               onChange={(event) => void switchProvider(event.target.value as BrainProviderName)}
             >
               <option value="extractive">extractive (no model)</option>
@@ -346,11 +348,11 @@ export function BrainDocsPage() {
               <option value="codex">codex (GPT OAuth)</option>
             </select>
           </label>
-          <label className="lifecycleControl" title={!modelBacked ? "Pick a model provider first." : undefined}>
+          <label className="lifecycleControl" title={demo ? "Demo instance: model providers are disabled." : !modelBacked ? "Pick a model provider first." : undefined}>
             <span>Model</span>
             <select
               value={provider?.model ?? modelOptions[0] ?? ""}
-              disabled={!modelBacked || running != null || busy === "model"}
+              disabled={demo || !modelBacked || running != null || busy === "model"}
               onChange={(event) => void selectModel(event.target.value)}
             >
               {(modelBacked ? modelOptions : ["—"]).map((model) => (

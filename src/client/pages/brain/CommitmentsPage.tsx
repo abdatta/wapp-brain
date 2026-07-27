@@ -35,6 +35,7 @@ import {
   listBrainLifecycleItems,
   startBrainLifecycleSweep
 } from "../../api";
+import { useStatus } from "../../state/StatusContext";
 import { useToast } from "../../state/ToastContext";
 import { LifecycleDetailModal } from "./LifecycleDetailModal";
 
@@ -191,6 +192,7 @@ export function CommitmentsPage() {
   const [groupChats, setGroupChats] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState<string | null>(null);
+  const demo = Boolean(useStatus().status?.demo);
   const [noteFor, setNoteFor] = useState<{ claimId: string; action: "fulfilled" | "dismissed" } | null>(null);
   const [note, setNote] = useState("");
   const [runProgress, setRunProgress] = useState<BrainRunProgress | null>(null);
@@ -643,17 +645,17 @@ export function CommitmentsPage() {
           citations. Failed validations leave items open — there is no fallback closure. Runs at high reasoning effort.
         </p>
         <div className="lifecycleSweepControls">
-          <label className="lifecycleControl">
-            <span>Provider</span>
-            <select value={provider?.provider ?? "extractive"} disabled={sweepRunning || busy === "provider"} onChange={(event) => void switchProvider(event.target.value as BrainProviderName)}>
+          <label className="lifecycleControl" title={demo ? "Demo instance: model providers are disabled — extractive only." : undefined}>
+            <span>Provider{demo ? " (demo: extractive only)" : ""}</span>
+            <select value={provider?.provider ?? "extractive"} disabled={demo || sweepRunning || busy === "provider"} onChange={(event) => void switchProvider(event.target.value as BrainProviderName)}>
               <option value="extractive">extractive (no model)</option>
               <option value="claude-cli">claude (WSL CLI)</option>
               <option value="codex">codex (GPT OAuth)</option>
             </select>
           </label>
-          <label className="lifecycleControl" title={!modelBacked ? "Pick a model provider first." : undefined}>
+          <label className="lifecycleControl" title={demo ? "Demo instance: model providers are disabled." : !modelBacked ? "Pick a model provider first." : undefined}>
             <span>Model</span>
-            <select value={provider?.model ?? modelOptions[0] ?? ""} disabled={!modelBacked || sweepRunning || busy === "model"} onChange={(event) => void selectModel(event.target.value)}>
+            <select value={provider?.model ?? modelOptions[0] ?? ""} disabled={demo || !modelBacked || sweepRunning || busy === "model"} onChange={(event) => void selectModel(event.target.value)}>
               {(modelBacked ? modelOptions : ["—"]).map((model) => (
                 <option key={model} value={model}>
                   {model}
