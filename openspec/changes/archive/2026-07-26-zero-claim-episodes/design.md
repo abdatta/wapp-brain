@@ -55,8 +55,19 @@ The obstacle is that an empty claims array is currently ambiguous between delibe
 
 Rollback is reverting the constant and the commit; episodes remain re-derivable in both directions.
 
+**Revised at rollout (2026-07-26), owner's decision.** Step 4's fallback sweep verified live: 67/67 resolved into declared-empty terra episodes, one call each, backlog zero, a second sweep selects nothing. The remaining 9,338 stale v5 episodes are **not** re-derived wholesale — a full re-derivation (~31M tokens at the ledger's historical 3.3k/call) would mostly re-produce identical content, because v6's terms only bite where the old ≥1-claim rule applied fabrication pressure: thin windows. Instead:
+
+- Regeneration gained a **pack-size scope** (`maxMessages`, inclusive; API + Run console with a dry-run count preview) so re-derivation can target the affected population.
+- The **≤5-message slice (2,364 episodes, ~7.8M tokens)** is re-derived now.
+- The rest stays v5 until the groundedness census (`claim-groundedness-signal`) grades precision by pack size; census evidence, not the version stamp, decides whether any larger bucket is ever worth the spend. Mixed versions are fully supported — aggregates key per version, and staleness is a lazy debt marker, not a demand.
+- The step-5 baseline is read after the scoped re-derivation, per version stamp; the v6 declaration rate before then is selection-biased (only contentless windows were v6) and is not a baseline.
+
+**Baseline recorded (2026-07-26, after the scoped run).** `gpt-5.6-terra` at v6: **917 declared-empty of 2,431 model episodes = 37.7%**, on the thin-pack population (the 67 stuck windows + the ≤5-message slice). Not comparable to a whole-archive rate — compare like-for-like when larger buckets ever re-derive. The run itself: 2,364 episodes in 2,364 calls (the retry never fired), 0 extractive, 0 quarantined, 4.30M tokens. Fabrication pressure quantified: the same windows carried 4,900 claims under v5's forced-claim terms and 2,525 under v6 — the model withdrew ~48% of the thin-pack claims once permitted to answer "nothing durable here". Whether the withdrawals and the declarations are truthful is exactly what `claim-groundedness-signal` grades next.
+
 ## Open Questions
 
-- Should the declaration be a distinct top-level field, or a reserved claim kind? A top-level field keeps the claim vocabulary clean and avoids a "claim" that cites nothing, which is why it is the default here — but a reserved kind would flow through existing storage untouched.
-- Should a declaration on a large pack (say ≥50 messages) be flagged as an `info` observation for review? It is cheap and targets the laziness risk precisely, but it is also a heuristic about a threshold nobody has measured yet.
-- Does an empty claim set need an explicit marker in storage, or is `claims.length === 0` plus the recorded reason sufficient for downstream consumers to branch on?
+All three resolved at implementation time (2026-07-25):
+
+- **Top-level field, not a reserved claim kind.** The contract gains `no_durable_claims` beside `claims`. A reserved kind would have needed an exemption from the every-claim-cites rule, weakening the citation spine to save one column. Decided: top-level.
+- **No large-pack `info` flag.** A declaration on a ≥50-message pack is exactly what the declaration *rate* and the groundedness census exist to catch; a size threshold nobody measured would recreate the anchoring-lint mistake in miniature. Decided: not now — revisit only if the census shows size-correlated laziness.
+- **No separate storage marker.** The persisted reason column (`no_durable_claims_reason`, non-null ⇔ declared) *is* the marker, and `claims.length === 0` is what downstream consumers already branch on. A malformed empty set can never reach storage — validation rejects it — so the two are equivalent by construction. One more constraint falls out of this: the declaration is valid only with a **literal** `claims: []` in the raw response. A missing, null, or mistyped claims field, or an array normalization filtered to nothing, stays a retryable error even when a reason string is present — a declaration is never inferred from a malformed payload, mechanically, not just behaviorally.

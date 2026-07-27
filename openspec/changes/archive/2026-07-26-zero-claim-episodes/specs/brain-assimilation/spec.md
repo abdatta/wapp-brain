@@ -35,6 +35,25 @@ Episodic consolidation SHALL produce structured digests conforming to extraction
 - **WHEN** packs of 30 and 150 messages are generated
 - **THEN** their prompts state claim budgets of 4 and 6 claims respectively (per the density formula), a response exceeding its budget is truncated to the budget with a warning issue, and the output-token budget scales accordingly
 
+### Requirement: Episode Regeneration
+The brain SHALL provide a regeneration path (CLI command, API route, and UI control) that selects current episodes that are extractive-generated or carry a stale extraction version, enqueues durable regeneration tasks (deduped per episode and target version), re-derives evidence packs from each episode's stored chat and time window over the closed interval, commits replacement episodes under the current contract without advancing watermarks, and marks the old episode `superseded` transactionally with the replacement. A window that yields no evidence SHALL still supersede the old episode and record an informational issue. The selection SHALL accept an optional pack-size scope — a maximum message count, inclusive — so re-derivation can target the population a contract change actually affects (thin windows) instead of the whole stale archive; the UI control SHALL preview the scoped selection's size via a spend-nothing dry run before the run starts. An unscoped run SHALL keep selecting every stale episode.
+
+#### Scenario: Stale episode regenerated and superseded
+- **WHEN** regeneration runs over an episode with a stale extraction version
+- **THEN** replacement episodes for its window commit under the current version, the old episode's status becomes `superseded`, and the chat's watermark is unchanged
+
+#### Scenario: Regeneration is resumable
+- **WHEN** a regeneration run is interrupted mid-drain
+- **THEN** completed replacements are not re-done (dedupe keys) and the remaining tasks execute on the next run
+
+#### Scenario: Extractive placeholder upgraded
+- **WHEN** regeneration runs with a model provider available over an extractive episode
+- **THEN** the replacement is model-generated and the placeholder is superseded
+
+#### Scenario: Pack-size scope narrows the selection
+- **WHEN** a regeneration run is started with a maximum message count of 5
+- **THEN** only stale episodes whose window holds at most 5 messages are selected and enqueued, the count shown before starting reflects that scope, and larger stale episodes remain regenerable later
+
 ## ADDED Requirements
 
 ### Requirement: Claimless Episodes Are Ordinary Downstream

@@ -491,6 +491,9 @@ export function startBrainRegenerate(body: {
   chatSourceId?: string | null;
   // The backfill dashboard's "sweep the fallbacks": extractive episodes only.
   onlyExtractive?: boolean;
+  // Pack-size scope: regenerate only episodes of at most this many messages —
+  // targeted re-derivation instead of the whole stale archive.
+  maxMessages?: number | null;
   // Turbo pacing (the sweep can be thousands of episodes): sliding worker pool
   // width and per-run ledger overrides, mirroring backfill.
   concurrency?: number | null;
@@ -500,6 +503,18 @@ export function startBrainRegenerate(body: {
   return request<{ ok: boolean; progress: BrainRunProgress }>("/api/brain/regenerate", {
     method: "POST",
     body: JSON.stringify(body)
+  });
+}
+
+// Scoped-count preview: same selection the run would use, spending nothing.
+export function dryRunBrainRegenerate(body: {
+  chatSourceId?: string | null;
+  onlyExtractive?: boolean;
+  maxMessages?: number | null;
+}): Promise<{ ok: boolean; dryRun: true; episodes: number }> {
+  return request<{ ok: boolean; dryRun: true; episodes: number }>("/api/brain/regenerate", {
+    method: "POST",
+    body: JSON.stringify({ ...body, dryRun: true })
   });
 }
 

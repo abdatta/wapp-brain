@@ -1727,6 +1727,11 @@ export interface BrainEpisodeInput {
   // — the truthful join for per-model fallback rates (eval harness). NULL on
   // model episodes and on no-provider extractive rows.
   attemptedModel?: string | null;
+  // No-durable-claims declaration (zero-claim-episodes): the model's short
+  // stated reason why this window holds nothing durable. Non-null ⇔ a valid
+  // claimless model episode; extractive rows and claim-bearing episodes are
+  // always null. Persisted so the assertion is auditable against the evidence.
+  noDurableClaimsReason?: string | null;
   // Regeneration commits pass false: the watermark already covers the window.
   advanceWatermark?: boolean;
   // Regeneration: mark this episode 'superseded' in the same transaction as
@@ -1755,6 +1760,9 @@ export interface BrainEpisodeRecord {
   status: "current" | "superseded" | "stale" | "compressed";
   fallbackReason: string | null;
   attemptedModel: string | null;
+  // Non-null ⇔ this model episode declared the window held nothing durable;
+  // the value is the model's stated reason, kept for audit.
+  noDurableClaimsReason: string | null;
   extractionVersion: number;
   topics: string[];
   unresolvedParticipants: string[];
@@ -2002,6 +2010,12 @@ export interface BrainModelQualityAggregate {
   attempted: number;
   fallbackRate: number | null;
   claims: number;
+  // Model episodes that committed with a declared empty claim set. The rate's
+  // denominator is modelEpisodes — an explicit "nothing here" is a legitimate
+  // way to finish early, so how often each model uses it must be a visible
+  // number, not an inference.
+  declaredEmptyEpisodes: number;
+  declaredEmptyRate: number | null;
   unanchoredWarnings: number;
   validationErrors: number;
   grades: Record<BrainClaimGradeValue, number>;

@@ -408,11 +408,14 @@ export interface ArchiveRepository {
   // Regeneration selection: current episodes that are extractive-generated or
   // carry a stale extraction version, optionally scoped to one chat.
   // onlyExtractive narrows to extractive episodes alone — the backfill
-  // dashboard's "sweep the fallbacks" action.
+  // dashboard's "sweep the fallbacks" action. maxMessageCount narrows to
+  // small packs (inclusive bound) — targeted re-derivation of the population
+  // a contract change actually affects, instead of the whole archive.
   listRegenerableBrainEpisodes(options: {
     currentVersion: number;
     chatSourceId?: string | null;
     onlyExtractive?: boolean;
+    maxMessageCount?: number | null;
     limit: number;
   }): Promise<BrainEpisodeRecord[]>;
   // Cheap count for status surfaces (no record materialization).

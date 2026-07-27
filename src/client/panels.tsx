@@ -75,6 +75,7 @@ import {
   cancelImportJob,
   cleanupTempFiles,
   detectBackupFolder,
+  dryRunBrainRegenerate,
   getBrainOverview,
   getBrainRunProgress,
   disableMemoryProvider,
@@ -851,7 +852,7 @@ function RunConsoleModal({
     strict?: boolean;
     concurrency?: number | null;
   }) => Promise<boolean>;
-  onStartRegenerate: (body: { model?: string | null }) => Promise<boolean>;
+  onStartRegenerate: (body: { model?: string | null; maxMessages?: number | null; callsPerDay?: number | null }) => Promise<boolean>;
   suggest: (query: string) => Promise<OwnerIdentitySuggestion[]>;
 }) {
   const provider = overview?.provider ?? null;
@@ -873,6 +874,11 @@ function RunConsoleModal({
   const [dailyOverride, setDailyOverride] = useState("");
   const [concurrency, setConcurrency] = useState("5");
   const [strictMode, setStrictMode] = useState(false);
+  // Regeneration pack-size scope (zero-claim-episodes migration): empty =
+  // every stale episode; a number regenerates only packs of at most N messages.
+  // The scoped count previews via the dry-run endpoint before anything spends.
+  const [regenMaxMessages, setRegenMaxMessages] = useState("");
+  const [regenScopedCount, setRegenScopedCount] = useState<number | null>(null);
   const [starting, setStarting] = useState(false);
 
   // Plain substring autocomplete (no inference), debounced; every row shows
@@ -895,6 +901,23 @@ function RunConsoleModal({
     return () => window.clearTimeout(timer);
   }, [numberInput, suggest]);
 
+  // Scoped-count preview: debounce the dry-run query so the Regenerate button
+  // shows the true selection size for the chosen pack-size bound.
+  const scopeNumber = regenMaxMessages.trim() === "" ? null : Number(regenMaxMessages);
+  const scopeValid = scopeNumber != null && Number.isInteger(scopeNumber) && scopeNumber >= 1 && scopeNumber <= 10_000;
+  useEffect(() => {
+    if (runMode !== "regenerate" || !scopeValid) {
+      setRegenScopedCount(null);
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      dryRunBrainRegenerate({ maxMessages: scopeNumber })
+        .then((response) => setRegenScopedCount(response.episodes))
+        .catch(() => setRegenScopedCount(null));
+    }, 350);
+    return () => window.clearTimeout(timer);
+  }, [runMode, scopeNumber, scopeValid]);
+
   const modelBacked = Boolean(provider && provider.provider !== "extractive");
   const modelOptions = provider && provider.provider !== "extractive" ? provider.models[provider.provider] ?? [] : [];
   const regenerable = overview?.regenerableEpisodes ?? 0;
@@ -902,7 +925,9 @@ function RunConsoleModal({
   const dailyOverrideNumber = dailyOverride.trim() === "" ? null : Number(dailyOverride);
   // The remaining-today guard validates against what the server will actually
   // enforce: the per-run daily override when given, else the configured cap.
-  const dailyCap = backfill && dailyOverrideNumber != null && Number.isInteger(dailyOverrideNumber)
+  // Regeneration accepts the same override — a bulk re-derivation (the sweep
+  // button hardcodes 10,000/day for the same reason) dwarfs the configured cap.
+  const dailyCap = (backfill || runMode === "regenerate") && dailyOverrideNumber != null && Number.isInteger(dailyOverrideNumber)
     ? dailyOverrideNumber
     : overview?.limits?.maxCallsPerDay ?? 0;
   const usedToday = overview?.usageToday.calls ?? 0;
@@ -975,7 +1000,7 @@ function RunConsoleModal({
         ? "Between 1 and 1000 calls/hour (leave empty for the configured pace)."
         : null;
   const dailyError =
-    !backfill || pacingDisabledReason != null || dailyOverrideNumber == null
+    (!backfill && runMode !== "regenerate") || pacingDisabledReason != null || dailyOverrideNumber == null
       ? null
       : !Number.isInteger(dailyOverrideNumber) || dailyOverrideNumber < 1 || dailyOverrideNumber > 10_000
         ? "Between 1 and 10,000 calls/day (leave empty for the configured ceiling)."
@@ -988,6 +1013,10 @@ function RunConsoleModal({
         ? "Between 1 and 6 workers."
         : null;
   const strictDisabledReason = !backfill ? null : !modelBacked ? "Strict mode needs a model — extractive generation has no model failures to refuse." : null;
+  const regenScopeError =
+    runMode !== "regenerate" || scopeNumber == null || scopeValid
+      ? null
+      : "Between 1 and 10,000 messages (leave empty for every stale episode).";
   const regenerateDisabledReason =
     regenerable === 0
       ? "Nothing to regenerate — every current episode is on the current contract."
@@ -1007,7 +1036,12 @@ function RunConsoleModal({
     (running ? "A run is already in progress." : null) ??
     (busy ? `Busy: ${busy}.` : null) ??
     (runMode === "regenerate"
-      ? regenerateDisabledReason
+      ? regenerateDisabledReason ??
+        regenScopeError ??
+        dailyError ??
+        (remainingToday === 0
+          ? `Daily call budget exhausted (${usedToday.toLocaleString()}/${dailyCap.toLocaleString()}). Set a daily override for this run, or wait for the ledger day to roll.`
+          : null)
       : backfill
         ? backfillChatsError ??
           callsError ??
@@ -1065,7 +1099,11 @@ function RunConsoleModal({
       }
       const started =
         runMode === "regenerate"
-          ? await onStartRegenerate({ model: provider?.model ?? null })
+          ? await onStartRegenerate({
+              model: provider?.model ?? null,
+              maxMessages: scopeValid ? scopeNumber : null,
+              ...(dailyOverrideNumber != null ? { callsPerDay: dailyOverrideNumber } : {})
+            })
           : runMode === "backfill"
             ? await onStartRun({
                 mode: modelBacked ? "model" : "extractive",
@@ -1321,17 +1359,60 @@ function RunConsoleModal({
                   <span className="fieldNote">Empty = drain everything; set ~20–30 for a confidence pass first.</span>
                 )}
               </label>
-            ) : (
+            ) : runMode === "regenerate" ? (
+              <>
               <label
-                className={`runConsoleField ${runMode === "regenerate" ? "fieldDisabled" : ""}`}
-                title={runMode === "regenerate" ? "Regeneration drains its own queue of stale episodes." : "How many backlog chats this run assimilates (newest first)."}
+                className="runConsoleField"
+                title="Regenerate only episodes whose window holds at most this many messages — the thin-pack population a contract change actually affects. Empty regenerates every stale episode."
               >
+                <span>Max messages (scope)</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={10000}
+                  placeholder="all sizes"
+                  value={regenMaxMessages}
+                  onChange={(event) => setRegenMaxMessages(event.target.value)}
+                />
+                {regenScopeError ? (
+                  <span className="fieldError">{regenScopeError}</span>
+                ) : scopeValid ? (
+                  <span className="fieldNote">
+                    {regenScopedCount != null ? `${regenScopedCount.toLocaleString()} episode(s) of ≤${scopeNumber} message(s) selected.` : "Counting…"}
+                  </span>
+                ) : (
+                  <span className="fieldNote">Empty = all {regenerable.toLocaleString()} stale episode(s); set 5 for the small-pack slice.</span>
+                )}
+              </label>
+                <label
+                  className="runConsoleField"
+                  title="Per-run replacement for the configured daily model-call cap — a bulk re-derivation dwarfs the routine ceiling (the fallback-sweep button uses 10,000)."
+                >
+                  <span>Daily calls override</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={10000}
+                    placeholder={`default ${overview?.limits?.maxCallsPerDay ?? "—"}`}
+                    value={dailyOverride}
+                    onChange={(event) => setDailyOverride(event.target.value)}
+                  />
+                  {dailyError ? (
+                    <span className="fieldError">{dailyError}</span>
+                  ) : (
+                    <span className="fieldNote">
+                      {remainingToday.toLocaleString()} of {dailyCap.toLocaleString()} daily calls left today; a scoped slice needs ~1 call per episode.
+                    </span>
+                  )}
+                </label>
+              </>
+            ) : (
+              <label className="runConsoleField" title="How many backlog chats this run assimilates (newest first).">
                 <span>Chats</span>
                 <input
                   type="number"
                   min={1}
                   max={5000}
-                  disabled={runMode === "regenerate"}
                   value={maxChats}
                   onChange={(event) => setMaxChats(event.target.value)}
                 />
@@ -1482,7 +1563,13 @@ function RunConsoleModal({
               onClick={() => void handleStart()}
             >
               {starting ? <Loader2 className="spin" size={16} /> : <Play size={16} />}
-              {runMode === "regenerate" ? `Regenerate ${regenerable.toLocaleString()}` : backfill ? "Start backfill" : "Start run"}
+              {runMode === "regenerate"
+                ? scopeValid
+                  ? `Regenerate ${regenScopedCount != null ? regenScopedCount.toLocaleString() : "…"} (≤${scopeNumber} msgs)`
+                  : `Regenerate ${regenerable.toLocaleString()}`
+                : backfill
+                  ? "Start backfill"
+                  : "Start run"}
             </button>
           </div>
         </footer>

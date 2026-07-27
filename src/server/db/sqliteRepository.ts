@@ -1484,6 +1484,9 @@ const schemaStatements = [
     run_id TEXT NULL,
     fallback_reason TEXT NULL,
     attempted_model TEXT NULL,
+    -- zero-claim-episodes: the model's stated reason a window held nothing
+    -- durable. Non-null ⇔ a declared-empty model episode.
+    no_durable_claims_reason TEXT NULL,
     extraction_version INTEGER NOT NULL,
     unresolved_participants_json TEXT NULL,
     push_name_participants_json TEXT NULL,
@@ -1919,6 +1922,12 @@ const schemaStatements = [
   `CREATE INDEX IF NOT EXISTS idx_brain_episodes_chat ON brain_episodes (chat_source_id, status, end_at_ms)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_episodes_status_end ON brain_episodes (status, end_at_ms)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_episodes_quote_stale ON brain_episodes (status, extraction_version)`,
+  // Quality-aggregate scans run on every /api/brain/status poll; the rows are
+  // fat (full markdown), so a covering index keeps the GROUP BY index-only
+  // instead of paying a ~100ms table scan per query per poll. (The partial
+  // indexes on attempted_model / no_durable_claims_reason live in
+  // migrateAdditiveColumns — those columns are migration-added.)
+  `CREATE INDEX IF NOT EXISTS idx_brain_episodes_quality ON brain_episodes (generator, model, extraction_version)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_signal_anchors_message ON brain_episode_signal_anchors (source_message_key, episode_id)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_claims_episode ON brain_claims (episode_id, sequence)`,
   `CREATE INDEX IF NOT EXISTS idx_brain_citations_claim ON brain_citations (claim_id)`,
@@ -2051,8 +2060,15 @@ export class SqliteArchiveRepository implements ArchiveRepository {
   // client refetches on every archive-updated SSE. A short TTL collapses a
   // burst of history-sync refreshes into at most one scan per interval;
   // invalidation on any brain write keeps post-run/post-merge status immediate.
+  //
+  // TTL raised 1s → 15s (measured 2026-07-26 on the 327k-message archive): the
+  // two coverage scans cost ~0.5s EACH even warm, so a 1s TTL made every UI
+  // poll a cache miss — ~1s of event-loop-blocking SQL per poll, continuously,
+  // which queued every other request seconds deep. Coverage drifts by ppm per
+  // live message, and every brain mutation still invalidates explicitly, so
+  // run progress and resets stay immediate; only idle drift waits up to 15s.
   private brainStatusCache: { at: number; value: BrainStatusSummary } | null = null;
-  private static readonly BRAIN_STATUS_TTL_MS = 1000;
+  private static readonly BRAIN_STATUS_TTL_MS = 15_000;
 
   constructor(private readonly dbPath = config.archive.sqlitePath) {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
@@ -3903,8 +3919,8 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     const insertEpisode = this.db.prepare(
       `INSERT INTO brain_episodes
        (id, chat_source_id, start_at_ms, end_at_ms, message_count, participants_json, summary, markdown, generator, model, run_id, fallback_reason, attempted_model,
-        extraction_version, unresolved_participants_json, push_name_participants_json, uninterpreted_media_count, quoted_reply_anchors_json, archive_signal_anchors_json)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        no_durable_claims_reason, extraction_version, unresolved_participants_json, push_name_participants_json, uninterpreted_media_count, quoted_reply_anchors_json, archive_signal_anchors_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     const insertClaim = this.db.prepare(
       `INSERT INTO brain_claims (id, episode_id, sequence, kind, text, event_at_ms, valid_until_ms, confidence) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
@@ -3948,6 +3964,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         episode.runId,
         episode.fallbackReason ?? null,
         episode.attemptedModel ?? null,
+        episode.noDurableClaimsReason ?? null,
         episode.extractionVersion,
         stringifyJson(episode.unresolvedParticipants ?? []),
         stringifyJson(episode.pushNameParticipants ?? []),
@@ -4138,6 +4155,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       status: row.status as BrainEpisodeRecord["status"],
       fallbackReason: (row.fallback_reason as string | null) ?? null,
       attemptedModel: (row.attempted_model as string | null) ?? null,
+      noDurableClaimsReason: (row.no_durable_claims_reason as string | null) ?? null,
       extractionVersion: Number(row.extraction_version ?? 0),
       topics: (topicsStmt.all(row.id) as Array<{ title: string }>).map((topic) => String(topic.title)),
       unresolvedParticipants: (parseJson(row.unresolved_participants_json as string | null) as string[] | null) ?? [],
@@ -4189,6 +4207,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     currentVersion: number;
     chatSourceId?: string | null;
     onlyExtractive?: boolean;
+    maxMessageCount?: number | null;
     limit: number;
   }): Promise<BrainEpisodeRecord[]> {
     const params: unknown[] = [];
@@ -4204,6 +4223,12 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     if (options.chatSourceId) {
       where += ` AND e.chat_source_id = ?`;
       params.push(options.chatSourceId);
+    }
+    // Pack-size scope: targeted re-derivation of small episodes (inclusive
+    // bound) — the population a contract change actually affects.
+    if (options.maxMessageCount != null) {
+      where += ` AND e.message_count <= ?`;
+      params.push(options.maxMessageCount);
     }
     params.push(options.limit);
     const rows = this.db
@@ -4493,6 +4518,8 @@ export class SqliteArchiveRepository implements ArchiveRepository {
           attempted: 0,
           fallbackRate: null,
           claims: 0,
+          declaredEmptyEpisodes: 0,
+          declaredEmptyRate: null,
           unanchoredWarnings: 0,
           validationErrors: 0,
           grades: { supported: 0, partial: 0, unsupported: 0, unclear: 0 },
@@ -4512,14 +4539,32 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     for (const row of modelRows) {
       bucket(row.model, Number(row.v)).modelEpisodes += Number(row.n);
     }
+    // INDEXED BY: without ANALYZE stats the planner prefers the wide
+    // idx_brain_episodes_quality and fetches fat table rows to test
+    // fallback_reason; the partial index answers this index-only.
     const fallbackRows = this.db
       .prepare(
-        `SELECT COALESCE(attempted_model, 'unknown') AS model, extraction_version AS v, COUNT(*) AS n FROM brain_episodes
+        `SELECT COALESCE(attempted_model, 'unknown') AS model, extraction_version AS v, COUNT(*) AS n
+         FROM brain_episodes INDEXED BY idx_brain_episodes_fallback_quality
          WHERE generator = 'extractive' AND fallback_reason IS NOT NULL GROUP BY COALESCE(attempted_model, 'unknown'), extraction_version`
       )
       .all() as Array<{ model: string; v: number; n: number }>;
     for (const row of fallbackRows) {
       bucket(row.model, Number(row.v)).fallbackEpisodes += Number(row.n);
+    }
+    // Declared-empty episodes: the no-durable-claims escape hatch, counted per
+    // model stamp so over-use is a visible number rather than an inference.
+    // INDEXED BY: same planner story as the fallback rows above.
+    const declaredRows = this.db
+      .prepare(
+        `SELECT model, extraction_version AS v, COUNT(*) AS n
+         FROM brain_episodes INDEXED BY idx_brain_episodes_declared
+         WHERE generator = 'model' AND model IS NOT NULL AND no_durable_claims_reason IS NOT NULL
+         GROUP BY model, extraction_version`
+      )
+      .all() as Array<{ model: string; v: number; n: number }>;
+    for (const row of declaredRows) {
+      bucket(row.model, Number(row.v)).declaredEmptyEpisodes += Number(row.n);
     }
     const claimRows = this.db
       .prepare(
@@ -4561,6 +4606,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     for (const entry of buckets.values()) {
       entry.attempted = entry.modelEpisodes + entry.fallbackEpisodes;
       entry.fallbackRate = entry.attempted > 0 ? entry.fallbackEpisodes / entry.attempted : null;
+      entry.declaredEmptyRate = entry.modelEpisodes > 0 ? entry.declaredEmptyEpisodes / entry.modelEpisodes : null;
       entry.gradedTotal = entry.grades.supported + entry.grades.partial + entry.grades.unsupported + entry.grades.unclear;
       const gradable = entry.grades.supported + entry.grades.partial + entry.grades.unsupported;
       entry.strictPrecision = gradable > 0 ? entry.grades.supported / gradable : null;
@@ -13995,7 +14041,13 @@ function migrateAdditiveColumns(db: Database.Database): void {
       column: "superseded_by_claim_id",
       ddl: "ALTER TABLE brain_claims ADD COLUMN superseded_by_claim_id TEXT NULL REFERENCES brain_claims(id) ON DELETE SET NULL"
     },
-    { table: "brain_validation_issues", column: "doc_id", ddl: "ALTER TABLE brain_validation_issues ADD COLUMN doc_id TEXT NULL" }
+    { table: "brain_validation_issues", column: "doc_id", ddl: "ALTER TABLE brain_validation_issues ADD COLUMN doc_id TEXT NULL" },
+    // zero-claim-episodes: the declared-empty marker + auditable reason.
+    {
+      table: "brain_episodes",
+      column: "no_durable_claims_reason",
+      ddl: "ALTER TABLE brain_episodes ADD COLUMN no_durable_claims_reason TEXT NULL"
+    }
   ];
   for (const addition of additions) {
     const columns = db.prepare(`SELECT name FROM pragma_table_info(?)`).all(addition.table) as Array<{ name: string }>;
@@ -14011,6 +14063,17 @@ function migrateAdditiveColumns(db: Database.Database): void {
   // Same reason: doc_id lands by ALTER above, so its index cannot live in
   // schemaStatements. Scoping run history to one page reads issues by doc.
   db.exec(`CREATE INDEX IF NOT EXISTS idx_brain_issues_doc ON brain_validation_issues (doc_id) WHERE doc_id IS NOT NULL`);
+  // Same reason again (attempted_model / no_durable_claims_reason land by ALTER
+  // above): partial covering indexes so the per-poll quality-aggregate GROUP
+  // BYs never scan the markdown-fat episode table.
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_brain_episodes_fallback_quality ON brain_episodes (attempted_model, extraction_version)
+     WHERE generator = 'extractive' AND fallback_reason IS NOT NULL`
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_brain_episodes_declared ON brain_episodes (model, extraction_version)
+     WHERE generator = 'model' AND no_durable_claims_reason IS NOT NULL`
+  );
 }
 
 // Signal capture originally stored one winning source on each canonical row.

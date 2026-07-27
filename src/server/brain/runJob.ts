@@ -103,6 +103,11 @@ export interface BrainRunRequest {
   // Regeneration scope: only extractive episodes — the backfill dashboard's
   // "sweep the fallbacks" action (skips stale-but-model episodes).
   regenerateOnlyExtractive?: boolean;
+  // Regeneration scope: only episodes whose pack holds at most this many
+  // messages (inclusive). Targeted re-derivation — pay the model spend where a
+  // contract change actually bites (thin windows) instead of over the whole
+  // archive; the groundedness census decides whether the rest ever needs it.
+  regenerateMaxMessages?: number | null;
   // Historical backfill (historical-backfill H1): produce the full uncovered
   // work-list through the idempotent catch-up audit, then drain it as episode
   // tasks under this run's pacing. Resume = start another backfill run.
@@ -401,6 +406,7 @@ async function executeRegenerateRun(
       currentVersion: EXTRACTION_VERSION,
       chatSourceId: request.chatSourceId ?? null,
       onlyExtractive: request.regenerateOnlyExtractive ?? false,
+      maxMessageCount: request.regenerateMaxMessages ?? null,
       limit: 10_000
     });
     await repository.enqueueBrainTasks(

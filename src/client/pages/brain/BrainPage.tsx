@@ -477,7 +477,7 @@ export function BrainPage() {
     }
   }
 
-  async function handleStartBrainRegenerate(body: { model?: string | null }): Promise<boolean> {
+  async function handleStartBrainRegenerate(body: { model?: string | null; maxMessages?: number | null; callsPerDay?: number | null }): Promise<boolean> {
     setError(null);
     try {
       const response = await startBrainRegenerate(body);

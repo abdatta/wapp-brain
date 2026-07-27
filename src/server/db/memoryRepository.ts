@@ -4336,6 +4336,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       status: "current",
       fallbackReason: episode.fallbackReason ?? null,
       attemptedModel: episode.attemptedModel ?? null,
+      noDurableClaimsReason: episode.noDurableClaimsReason ?? null,
       extractionVersion: episode.extractionVersion,
       topics,
       unresolvedParticipants: episode.unresolvedParticipants ?? [],
@@ -4402,6 +4403,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     currentVersion: number;
     chatSourceId?: string | null;
     onlyExtractive?: boolean;
+    maxMessageCount?: number | null;
     limit: number;
   }): Promise<BrainEpisodeRecord[]> {
     return structuredClone(
@@ -4413,6 +4415,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
             : episode.generator === "extractive" || episode.extractionVersion < options.currentVersion
         )
         .filter((episode) => !options.chatSourceId || episode.chatSourceId === options.chatSourceId)
+        .filter((episode) => options.maxMessageCount == null || episode.messageCount <= options.maxMessageCount)
         .sort((a, b) => b.endAtMs - a.endAtMs)
         .slice(0, options.limit)
     );
@@ -7507,6 +7510,8 @@ export class MemoryArchiveRepository implements ArchiveRepository {
           attempted: 0,
           fallbackRate: null,
           claims: 0,
+          declaredEmptyEpisodes: 0,
+          declaredEmptyRate: null,
           unanchoredWarnings: 0,
           validationErrors: 0,
           grades: { supported: 0, partial: 0, unsupported: 0, unclear: 0 },
@@ -7534,6 +7539,9 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       if (episode.generator === "model") {
         entry.modelEpisodes += 1;
         entry.claims += episode.claims.length;
+        if (episode.noDurableClaimsReason != null) {
+          entry.declaredEmptyEpisodes += 1;
+        }
       } else {
         entry.fallbackEpisodes += 1;
       }
@@ -7560,6 +7568,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     for (const entry of buckets.values()) {
       entry.attempted = entry.modelEpisodes + entry.fallbackEpisodes;
       entry.fallbackRate = entry.attempted > 0 ? entry.fallbackEpisodes / entry.attempted : null;
+      entry.declaredEmptyRate = entry.modelEpisodes > 0 ? entry.declaredEmptyEpisodes / entry.modelEpisodes : null;
       entry.gradedTotal = entry.grades.supported + entry.grades.partial + entry.grades.unsupported + entry.grades.unclear;
       const gradable = entry.grades.supported + entry.grades.partial + entry.grades.unsupported;
       entry.strictPrecision = gradable > 0 ? entry.grades.supported / gradable : null;

@@ -934,11 +934,15 @@ app.post("/api/brain/regenerate", async (req, res) => {
     const { EXTRACTION_VERSION } = await import("./brain/episodes");
     const chatSourceId = typeof req.body?.chatSourceId === "string" ? req.body.chatSourceId : null;
     const onlyExtractive = req.body?.onlyExtractive === true;
+    // Pack-size scope: targeted re-derivation of small episodes only.
+    // Explicit null/omitted = unscoped (Number(null) is 0, so guard first).
+    const maxMessages = req.body?.maxMessages != null ? clampNumber(req.body.maxMessages, 1, 10_000, 0) || null : null;
     if (req.body?.dryRun) {
       const stale = await repository.listRegenerableBrainEpisodes({
         currentVersion: EXTRACTION_VERSION,
         chatSourceId,
         onlyExtractive,
+        maxMessageCount: maxMessages,
         limit: 10_000
       });
       res.json({ ok: true, dryRun: true, episodes: stale.length });
@@ -957,6 +961,7 @@ app.post("/api/brain/regenerate", async (req, res) => {
         chatSourceId,
         regenerate: true,
         regenerateOnlyExtractive: onlyExtractive,
+        regenerateMaxMessages: maxMessages,
         concurrency: req.body?.concurrency != null ? clampNumber(req.body?.concurrency, 1, 6, 5) : null,
         callsPerHour: callsPerHour > 0 ? callsPerHour : null,
         callsPerDay: callsPerDay > 0 ? callsPerDay : null

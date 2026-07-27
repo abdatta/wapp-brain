@@ -433,6 +433,7 @@ export function BrainEvalPage() {
                   <th>v</th>
                   <th title="Model episodes committed / attempts that fell back to extractive">episodes</th>
                   <th title="Fallbacks over attempts">fallback</th>
+                  <th title="Episodes the model declared held nothing durable, over its committed model episodes — the no-durable-claims escape hatch, measured">no-claims</th>
                   <th title="supported / (supported + partial + unsupported)">precision</th>
                   <th title="supported · partial · unsupported · can't-judge">grades</th>
                   <th title="Anchoring-lint warnings over committed claims">unanchored</th>
@@ -449,6 +450,7 @@ export function BrainEvalPage() {
                       {aggregate.fallbackEpisodes > 0 ? ` (+${aggregate.fallbackEpisodes} fell back)` : ""}
                     </td>
                     <td>{aggregate.attempted > 0 ? `${percent(aggregate.fallbackRate)} of ${aggregate.attempted}` : "—"}</td>
+                    <td>{aggregate.modelEpisodes > 0 ? `${percent(aggregate.declaredEmptyRate)} of ${aggregate.modelEpisodes}` : "—"}</td>
                     <td>{aggregate.strictPrecision == null ? "— (no grades)" : `${percent(aggregate.strictPrecision)} of ${aggregate.grades.supported + aggregate.grades.partial + aggregate.grades.unsupported}`}</td>
                     <td>
                       {aggregate.grades.supported} · {aggregate.grades.partial} · {aggregate.grades.unsupported} ·{" "}

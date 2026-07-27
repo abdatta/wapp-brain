@@ -224,7 +224,7 @@ describe("contract v2: multi-error retry and structural failures (7.2, 7.3)", ()
         expect(issues.some((issue) => issue.code === "claim_cap_truncated" && issue.severity === "warning")).toBe(true);
         // The prompt states the density budget.
         const prompt = await readFile(capturePath, "utf8");
-        expect(prompt).toContain("2-4 claims");
+        expect(prompt).toContain("Up to 4 claims");
       }
     );
   });
