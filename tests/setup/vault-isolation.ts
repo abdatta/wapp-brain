@@ -25,6 +25,12 @@ Object.assign(config.brain, {
   rootDir: path.join(vaultRoot, "brain"),
   providerConfigPath: path.join(vaultRoot, "brain", "provider.json")
 });
+// The media store matters for the same reason: status excision is the first code
+// path that UNLINKS content-addressed blobs, so an un-isolated test could delete
+// real archived media — the one class of data the project must never lose.
+Object.assign(config.media, {
+  rootDir: path.join(vaultRoot, "media")
+});
 Object.assign(config.memory, {
   rootDir: path.join(vaultRoot, "memory"),
   pagesDir: path.join(vaultRoot, "memory", "pages"),

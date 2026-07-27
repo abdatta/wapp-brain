@@ -39,7 +39,8 @@ export function ChatList({
           <input value={chatSearch} onChange={(event) => onSearchChange(event.target.value)} placeholder="Search chats" />
         </div>
         <div className="segmented">
-          {["all", "dm", "group", "broadcast", "status"].map((type) => (
+          {/* No `status` filter: WhatsApp Status is not a chat and never enters the archive. */}
+          {["all", "dm", "group", "broadcast"].map((type) => (
             <button key={type} className={chatType === type ? "active" : ""} onClick={() => onTypeChange(type)} type="button">
               {type}
             </button>

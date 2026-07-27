@@ -19,6 +19,7 @@
     "wa-contacts": "tsx src/server/cli.ts wa-contacts",
     "import": "tsx src/server/cli.ts import",
     "unknown-report": "tsx src/server/cli.ts unknown-report",
+    "excise-status": "tsx src/server/cli.ts excise-status",
     "search:reindex": "tsx src/server/cli.ts search-reindex",
     "brain:provider": "tsx src/server/cli.ts brain-provider",
     "brain:status": "tsx src/server/cli.ts brain-status",

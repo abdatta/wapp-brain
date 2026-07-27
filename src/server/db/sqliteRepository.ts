@@ -7,6 +7,7 @@ import type {
   ArchiveSignalKind,
   ArchiveSignalAnchor,
   BrainBackfillDbStats,
+  StatusExcisionReport,
   BrainBackfillModelSpend,
   BrainChatBacklogItem,
   BrainClaimEntityRecord,
@@ -183,6 +184,7 @@ import { SEARCH_HIGHLIGHT_END, SEARCH_HIGHLIGHT_START } from "../../shared/types
 import { config } from "../config";
 import { baselineFromStatus } from "../live/baseline";
 import { messageIdFromKey, messageKey } from "../identity/keys";
+import { MediaBlobStore } from "../media/blobStore";
 import { applyMentionLabels, appliedMentionLabels, extractMentionDigits, mentionJidCandidates } from "../identity/mentions";
 import { mergeInteractionMetadata } from "./interactions";
 import { buildMessageEditTimeline, summarizeStructuredSignals, summarizeSystemEvents } from "./signalSummary";
@@ -2662,7 +2664,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       params.push(options.direction);
     }
     if (!options.includeNoise) {
-      where.push(visibleExchangePredicate("m"));
+      where.push(visibleExchangePredicate("m", this.statusChatId()));
     }
     const whereSql = where.join(" AND ");
     // Exact archive-wide match count per attempted tier (same predicate, no
@@ -3077,7 +3079,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
          LEFT JOIN brain_chat_watermarks w ON w.chat_source_id = ch.source_chat_id
          JOIN messages m ON m.chat_id = ch.id
          WHERE ${watermarkPendingPredicate("m", "w")}
-           AND ${visibleExchangePredicate("m")}
+           AND ${visibleExchangePredicate("m", this.statusChatId())}
            ${chatClause}
          GROUP BY ch.id
          HAVING COUNT(m.id) >= ?
@@ -3724,7 +3726,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
          FROM messages m
          JOIN chats ch ON ch.id = m.chat_id
          LEFT JOIN brain_chat_watermarks w ON w.chat_source_id = ch.source_chat_id
-         WHERE ${visibleExchangePredicate("m")}`
+         WHERE ${visibleExchangePredicate("m", this.statusChatId())}`
       )
       .get() as { total: number; assimilated: number };
     const chatsWithBacklog = this.db
@@ -3735,7 +3737,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
            LEFT JOIN brain_chat_watermarks w ON w.chat_source_id = ch.source_chat_id
            JOIN messages m ON m.chat_id = ch.id
            WHERE ${watermarkPendingPredicate("m", "w")}
-             AND ${visibleExchangePredicate("m")}
+             AND ${visibleExchangePredicate("m", this.statusChatId())}
            GROUP BY ch.id
          )`
       )
@@ -3910,6 +3912,178 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     transaction();
     this.invalidateBrainStatusCache();
     return { episodeIds, watermarks };
+  }
+
+  // WhatsApp Status is not a chat: this permanently removes every trace of it.
+  // The only operation in the system that deletes archive-layer data, and the
+  // only caller licensed to unlink content-addressed blobs. Idempotent — a
+  // second run finds no chat row and reports zeros.
+  // Rowid of the status chat, or null when the archive holds none (the state
+  // after excision). Cheap enough — an indexed lookup over 4k chats — to resolve
+  // per query build rather than cache, which keeps it immune to staleness.
+  private statusChatId(): number | null {
+    const row = this.db
+      .prepare(`SELECT id FROM chats WHERE source_chat_id = ? OR chat_type = 'status' LIMIT 1`)
+      .get(STATUS_CHAT_SOURCE_ID) as { id: number } | undefined;
+    return row ? Number(row.id) : null;
+  }
+
+  async exciseStatusBroadcast(options?: { dryRun?: boolean }): Promise<StatusExcisionReport> {
+    const dryRun = options?.dryRun === true;
+    const empty: StatusExcisionReport = {
+      dryRun,
+      chatId: null,
+      rowsByTable: [],
+      totalRows: 0,
+      blobsDeleted: 0,
+      blobsMissing: 0,
+      blobsSharedKept: 0,
+      bytesReclaimed: 0,
+      blobErrors: [],
+      brainEpisodesRemoved: 0,
+      brainWatermarksRemoved: 0,
+      brainEpisodeIdsRemoved: []
+    };
+    const chat = this.db
+      .prepare(`SELECT id FROM chats WHERE source_chat_id = ? OR chat_type = 'status' LIMIT 1`)
+      .get(STATUS_CHAT_SOURCE_ID) as { id: number } | undefined;
+    if (!chat) {
+      return empty;
+    }
+    const chatId = Number(chat.id);
+
+    // Survivor check BEFORE any delete: a content hash a real chat also
+    // references must keep its blob (identical media forwarded into a real chat
+    // shares one file). Rows carrying no sha256 fall back to storage_path.
+    const blobCandidates = this.db
+      .prepare(
+        `SELECT DISTINCT storage_path, sha256, byte_size
+         FROM media_assets
+         WHERE chat_source_id = ? AND storage_path IS NOT NULL`
+      )
+      .all(STATUS_CHAT_SOURCE_ID) as Array<{ storage_path: string; sha256: string | null; byte_size: number | null }>;
+    const survivorReferenced = this.db
+      .prepare(
+        `SELECT DISTINCT storage_path, sha256
+         FROM media_assets
+         WHERE chat_source_id != ? AND storage_path IS NOT NULL`
+      )
+      .all(STATUS_CHAT_SOURCE_ID) as Array<{ storage_path: string; sha256: string | null }>;
+    const survivingHashes = new Set(survivorReferenced.map((row) => row.sha256).filter((sha): sha is string => Boolean(sha)));
+    const survivingPaths = new Set(survivorReferenced.map((row) => row.storage_path));
+    const deletable = blobCandidates.filter(
+      (row) => !(row.sha256 && survivingHashes.has(row.sha256)) && !survivingPaths.has(row.storage_path)
+    );
+    const blobsSharedKept = blobCandidates.length - deletable.length;
+
+    // Chat-keyed tables in deletion order. `messages` last of the message-keyed
+    // set: its FTS index is trigger-maintained, so its delete also clears
+    // messages_fts in the same transaction.
+    const byChatSourceId = [
+      "media_download_queue",
+      "media_assets",
+      "message_link_previews",
+      "message_secrets",
+      "retained_encrypted_payloads",
+      "live_message_updates",
+      "live_event_receipts",
+      "live_gap_windows",
+      "live_chat_checkpoints",
+      "chat_metadata_history",
+      "engagement_aggregates",
+      "identity_number_changes",
+      "brain_validation_issues",
+      "brain_claim_grades"
+    ];
+    const rowsByTable: Array<{ table: string; rows: number }> = [];
+
+    if (dryRun) {
+      for (const table of byChatSourceId) {
+        rowsByTable.push({
+          table,
+          rows: Number((this.db.prepare(`SELECT COUNT(*) c FROM ${table} WHERE chat_source_id = ?`).get(STATUS_CHAT_SOURCE_ID) as { c: number }).c)
+        });
+      }
+      for (const table of ["chat_participants", "messages"]) {
+        rowsByTable.push({
+          table,
+          rows: Number((this.db.prepare(`SELECT COUNT(*) c FROM ${table} WHERE chat_id = ?`).get(chatId) as { c: number }).c)
+        });
+      }
+      rowsByTable.push({ table: "chats", rows: 1 });
+      const episodeIds = (
+        this.db.prepare(`SELECT id FROM brain_episodes WHERE chat_source_id = ?`).all(STATUS_CHAT_SOURCE_ID) as Array<{ id: string }>
+      ).map((row) => row.id);
+      const watermarks = Number(
+        (this.db.prepare(`SELECT COUNT(*) c FROM brain_chat_watermarks WHERE chat_source_id = ?`).get(STATUS_CHAT_SOURCE_ID) as { c: number }).c
+      );
+      return {
+        ...empty,
+        chatId,
+        rowsByTable,
+        totalRows: rowsByTable.reduce((sum, entry) => sum + entry.rows, 0),
+        blobsDeleted: deletable.length,
+        blobsSharedKept,
+        bytesReclaimed: deletable.reduce((sum, row) => sum + Number(row.byte_size ?? 0), 0),
+        brainEpisodesRemoved: episodeIds.length,
+        brainWatermarksRemoved: watermarks,
+        brainEpisodeIdsRemoved: episodeIds
+      };
+    }
+
+    const transaction = this.db.transaction(() => {
+      for (const table of byChatSourceId) {
+        const result = this.db.prepare(`DELETE FROM ${table} WHERE chat_source_id = ?`).run(STATUS_CHAT_SOURCE_ID);
+        rowsByTable.push({ table, rows: result.changes });
+      }
+      for (const table of ["chat_participants", "messages"]) {
+        const result = this.db.prepare(`DELETE FROM ${table} WHERE chat_id = ?`).run(chatId);
+        rowsByTable.push({ table, rows: result.changes });
+      }
+      rowsByTable.push({ table: "chats", rows: this.db.prepare(`DELETE FROM chats WHERE id = ?`).run(chatId).changes });
+    });
+    transaction();
+
+    // Brain tier last: its own transaction-safe primitive, already chat-scoped.
+    const brain = await this.resetBrainDerivedData({ chatSourceId: STATUS_CHAT_SOURCE_ID });
+
+    // Filesystem is not transactional, so blobs go after the rows commit: a
+    // leftover file is a harmless orphan, whereas a deleted file with a live row
+    // would break media serving.
+    const store = new MediaBlobStore();
+    let blobsDeleted = 0;
+    let blobsMissing = 0;
+    let bytesReclaimed = 0;
+    const blobErrors: Array<{ storagePath: string; error: string }> = [];
+    for (const row of deletable) {
+      try {
+        const freed = await store.deleteBlob(row.storage_path);
+        if (freed > 0) {
+          blobsDeleted += 1;
+          bytesReclaimed += freed;
+        } else {
+          blobsMissing += 1;
+        }
+      } catch (error) {
+        blobErrors.push({ storagePath: row.storage_path, error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+
+    this.invalidateBrainStatusCache();
+    return {
+      dryRun: false,
+      chatId,
+      rowsByTable,
+      totalRows: rowsByTable.reduce((sum, entry) => sum + entry.rows, 0),
+      blobsDeleted,
+      blobsMissing,
+      blobsSharedKept,
+      bytesReclaimed,
+      blobErrors,
+      brainEpisodesRemoved: brain.episodeIds.length,
+      brainWatermarksRemoved: brain.watermarks,
+      brainEpisodeIdsRemoved: brain.episodeIds
+    };
   }
 
   async commitBrainEpisode(episode: BrainEpisodeInput): Promise<BrainEpisodeRecord> {
@@ -9596,7 +9770,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
                 c.id AS chatId, c.source_chat_id AS chatSourceId, c.chat_type AS chatType,
                 NULLIF(TRIM(COALESCE(c.display_name, '')), '') AS chatLabel
          FROM messages m JOIN chats c ON c.id = m.chat_id
-         WHERE m.sender_source_jid = ? AND ${visibleExchangePredicate("m")}
+         WHERE m.sender_source_jid = ? AND ${visibleExchangePredicate("m", this.statusChatId())}
          ORDER BY m.timestamp_ms DESC, m.id DESC LIMIT ?`
       )
       .all(canonical, Math.max(1, limit)) as Array<{
@@ -11637,11 +11811,11 @@ export class SqliteArchiveRepository implements ArchiveRepository {
            participant_count = (SELECT COUNT(*) FROM chat_participants WHERE chat_participants.chat_id = chats.id),
            last_message_at_ms = (
              SELECT MAX(timestamp_ms) FROM messages
-             WHERE messages.chat_id = chats.id AND ${visibleExchangePredicate("messages")}
+             WHERE messages.chat_id = chats.id AND ${visibleExchangePredicate("messages", this.statusChatId())}
            ),
            last_message_at = (
              SELECT sent_at FROM messages
-             WHERE messages.chat_id = chats.id AND ${visibleExchangePredicate("messages")}
+             WHERE messages.chat_id = chats.id AND ${visibleExchangePredicate("messages", this.statusChatId())}
              ORDER BY timestamp_ms DESC, id DESC
              LIMIT 1
            )`;
@@ -12917,7 +13091,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         SELECT 1
         FROM messages visible_messages
         WHERE visible_messages.chat_id = chats.id
-          AND ${visibleExchangePredicate("visible_messages")}
+          AND ${visibleExchangePredicate("visible_messages", this.statusChatId())}
       )`);
     }
     params.push(options.limit, options.offset);
@@ -13346,7 +13520,11 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     chatSourceIds?: string[];
     limit: number;
   }): Promise<MemoryEvidenceMessage[]> {
+    const statusChatId = this.statusChatId();
     const where = ["m.timestamp_ms IS NOT NULL"];
+    if (statusChatId != null) {
+      where.push(`m.chat_id != ${statusChatId}`);
+    }
     const params: unknown[] = [];
     if (options.startAtMs != null) {
       where.push("m.timestamp_ms >= ?");
@@ -14797,8 +14975,22 @@ const WATERMARK_CURSOR_UPSERT = `INSERT INTO brain_chat_watermarks (chat_source_
      last_episode_at = excluded.last_episode_at,
      updated_at = excluded.updated_at`;
 
-function visibleExchangePredicate(alias: string): string {
-  return `${alias}.message_type NOT IN ('system', 'status', 'reaction', 'encrypted_update')
+// WhatsApp Status is not a chat. Keyed on the chat's identity (`status@broadcast`
+// / `chat_type = 'status'`) rather than on `message_type`, which live status posts
+// never carry.
+export const STATUS_CHAT_SOURCE_ID = "status@broadcast";
+
+// Resolved to the status chat's rowid so the guard is a bare integer compare, and
+// emitted only when such a chat exists — which, after excision, it never does.
+// A correlated NOT EXISTS here doubled a 350ms hot count on the 326k-message
+// archive; this costs nothing measurable, and the id lookup itself is ~0.1ms.
+function statusChatExclusionPredicate(messageAlias: string, statusChatId: number | null): string {
+  return statusChatId == null ? "" : `${messageAlias}.chat_id != ${statusChatId} AND `;
+}
+
+function visibleExchangePredicate(alias: string, statusChatId: number | null): string {
+  return `${statusChatExclusionPredicate(alias, statusChatId)}
+          ${alias}.message_type NOT IN ('system', 'status', 'reaction', 'encrypted_update')
           AND (
             ${alias}.direction IN ('incoming', 'outgoing')
             OR NULLIF(TRIM(COALESCE(${alias}.body, '')), '') IS NOT NULL

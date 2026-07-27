@@ -15,7 +15,7 @@ import type {
   RetainedPayloadRecord
 } from "../../shared/types";
 import { messageKey } from "../identity/keys";
-import { inferChatType, normalizeJid } from "../import/jid";
+import { inferChatType, isStatusChatJid, normalizeJid } from "../import/jid";
 import type { LiveMessageEvent, LiveMessageStateUpdate } from "./types";
 
 // Receipt keys are stored as a TEXT primary key; large history chunks would
@@ -88,6 +88,12 @@ export function normalizeBaileysMessage(message: BaileysLikeMessage, sourceTable
   const chatSourceId = message.key?.remoteJid ?? null;
   const sourceMessageId = message.key?.id ?? null;
   if (!chatSourceId || !sourceMessageId) {
+    return null;
+  }
+  // WhatsApp Status is not a chat. baileysClient drops these at the event boundary;
+  // this is the backstop that keeps every other normalize entry point safe, and it
+  // also suppresses the chat/contact rows eventFromMessages would otherwise mint.
+  if (isStatusChatJid(chatSourceId)) {
     return null;
   }
   const content = unwrapMessageContent(message.message);
@@ -282,7 +288,7 @@ function targetedUpdate(
   occurredAtMs: number | null,
   metadata: Record<string, unknown> | null
 ): LiveMessageStateUpdate | null {
-  if (!targetKey.remoteJid || !targetKey.id) {
+  if (!targetKey.remoteJid || !targetKey.id || isStatusChatJid(targetKey.remoteJid)) {
     return null;
   }
   const sourceMessageKey = messageKey(targetKey.remoteJid, targetKey.id);
@@ -553,9 +559,16 @@ export async function normalizeBaileysMessagesWithJidResolver(
   sourceTable: string,
   resolveJid: LiveJidResolver
 ): Promise<LiveMessageEvent> {
-  const resolved = await Promise.all(messages.map((message) => resolveMessageJids(message, resolveJid)));
-  const normalized = resolved
-    .map((message, index) => normalizeBaileysMessage(message, sourceTable, message.key?.id ?? String(index)))
+  const allResolved = await Promise.all(messages.map((message) => resolveMessageJids(message, resolveJid)));
+  // Status is dropped as a whole item — message, secret, retained payload, media
+  // descriptor, link preview, and archive signals alike — keeping each item paired
+  // with its raw counterpart so a mixed batch still processes its real chats.
+  const items = allResolved
+    .map((message, index) => ({ message, raw: messages[index], index }))
+    .filter((item) => !isStatusChatJid(item.message.key?.remoteJid ?? null));
+  const resolved = items.map((item) => item.message);
+  const normalized = items
+    .map((item) => normalizeBaileysMessage(item.message, sourceTable, item.message.key?.id ?? String(item.index)))
     .filter((message): message is MessageRecord => Boolean(message));
   const updates = resolved
     .map((message) => updateFromBaileysMessage(message))
@@ -565,24 +578,22 @@ export async function normalizeBaileysMessagesWithJidResolver(
     .filter((secret): secret is MessageSecretRecord => Boolean(secret));
   // Storage keys use canonical jids; the raw pre-resolution actor rides along
   // because decryption binds the exact jid strings the sender used.
-  const retainedPayloads = resolved
-    .map((message, index) =>
-      retainedPayloadFromBaileysMessage(message, messages[index]?.key?.participant ?? messages[index]?.participant ?? null)
-    )
+  const retainedPayloads = items
+    .map((item) => retainedPayloadFromBaileysMessage(item.message, item.raw?.key?.participant ?? item.raw?.participant ?? null))
     .filter((payload): payload is RetainedPayloadRecord => Boolean(payload));
   // Media linkage uses canonical identities; the raw message rides along so
   // a re-upload request can reference the exact key the platform delivered.
-  const mediaDescriptors = resolved
-    .map((message, index) => capturedMediaFromBaileysMessage(message, messages[index]))
+  const mediaDescriptors = items
+    .map((item) => capturedMediaFromBaileysMessage(item.message, item.raw))
     .filter((capture): capture is CapturedMediaDescriptor => Boolean(capture));
   const linkPreviews = resolved
     .map((message) => capturedLinkPreviewFromBaileysMessage(message))
     .filter((preview): preview is CapturedLinkPreview => Boolean(preview));
   const archiveSignals: ArchiveSignalBatch = {};
-  for (let index = 0; index < resolved.length; index += 1) {
-    const record = normalizeBaileysMessage(resolved[index], sourceTable, resolved[index].key?.id ?? String(index));
+  for (const item of items) {
+    const record = normalizeBaileysMessage(item.message, sourceTable, item.message.key?.id ?? String(item.index));
     if (record) {
-      appendArchiveSignals(archiveSignals, archiveSignalsFromLiveMessage(record, resolved[index]));
+      appendArchiveSignals(archiveSignals, archiveSignalsFromLiveMessage(record, item.message));
     }
   }
   return {
@@ -952,7 +963,7 @@ export async function normalizeBaileysChatsWithJidResolver(
 }
 
 export function normalizeDeleteUpdate(key: { remoteJid?: string | null; id?: string | null; participant?: string | null; fromMe?: boolean | null }): LiveMessageStateUpdate | null {
-  if (!key.remoteJid || !key.id) {
+  if (!key.remoteJid || !key.id || isStatusChatJid(key.remoteJid)) {
     return null;
   }
   const sourceMessageKey = messageKey(key.remoteJid, key.id);
@@ -1047,7 +1058,7 @@ export async function normalizeBaileysReactionsWithJidResolver(
   const updates: LiveMessageStateUpdate[] = [];
   for (const item of reactions) {
     const chatSourceId = await resolveCanonicalJid(item.key?.remoteJid, resolveJid);
-    if (!chatSourceId || !item.key?.id) {
+    if (!chatSourceId || !item.key?.id || isStatusChatJid(chatSourceId)) {
       continue;
     }
     const sourceMessageKey = messageKey(chatSourceId, item.key.id);
@@ -1073,7 +1084,7 @@ export async function normalizeBaileysReceiptsWithJidResolver(
   const updates: LiveMessageStateUpdate[] = [];
   for (const item of receipts) {
     const chatSourceId = await resolveCanonicalJid(item.key?.remoteJid, resolveJid);
-    if (!chatSourceId || !item.key?.id) {
+    if (!chatSourceId || !item.key?.id || isStatusChatJid(chatSourceId)) {
       continue;
     }
     const sourceMessageKey = messageKey(chatSourceId, item.key.id);
@@ -1292,7 +1303,7 @@ async function normalizeBaileysContactWithJidResolver(contact: BaileysLikeContac
 
 async function normalizeBaileysChatWithJidResolver(chat: BaileysLikeChat, resolveJid: LiveJidResolver): Promise<ChatRecord | null> {
   const jid = await resolveCanonicalJid(chat.id, resolveJid);
-  if (!jid) {
+  if (!jid || isStatusChatJid(jid)) {
     return null;
   }
   const timestampMs = timestampToMs(chat.conversationTimestamp ?? chat.lastMessageRecvTimestamp);

@@ -14,7 +14,7 @@ import type {
   QuotedMessageSnapshot
   ,VCardProperty
 } from "../../shared/types";
-import { inferChatType, isMaskedNumberLabel, normalizeJid, phoneFromJid } from "./jid";
+import { inferChatType, isMaskedNumberLabel, isStatusChatJid, normalizeJid, phoneFromJid } from "./jid";
 import { boolish, directionFromFromMe, isMediaMessageType, messageTypeFromCode, normalizeTimestampMs } from "./messageTypes";
 import {
   columnsFor,
@@ -135,6 +135,9 @@ export interface ParsedWhatsAppSource {
   getEditRekeys: () => Array<{ chatSourceId: string; staleMessageId: string; canonicalMessageId: string }>;
   getParticipants: () => ParticipantRecord[];
   getSkippedRows: () => number;
+  // WhatsApp Status is not a chat: status rows are skipped rather than imported,
+  // and reported as a diagnostic so a skipped count is never mistaken for data loss.
+  getSkippedStatusRows: () => number;
   schemaReport: Record<string, string[]>;
   supported: boolean;
   messageCountEstimate: number | null;
@@ -152,6 +155,7 @@ export function parseWhatsAppSource(
   const contactMap = new Map<string, ContactRecord>();
   const participantMap = new Map<string, ParticipantRecord>();
   let skippedRows = 0;
+  let skippedStatusRows = 0;
 
   const jidMap = buildJidMap(msgstoreDb, msgInspection);
   const chatRowJidMap = buildChatRowJidMap(msgstoreDb, msgInspection, jidMap);
@@ -171,7 +175,11 @@ export function parseWhatsAppSource(
     rawMetadata: { source: "synthetic-self" }
   });
 
-  const chats = readChats(msgstoreDb, msgInspection, jidMap, chatRowJidMap, contactMap, warnings);
+  // WhatsApp Status is not a chat — it never enters the archive from any path,
+  // including a future backup import (today's archives carry no status rows here).
+  const chats = readChats(msgstoreDb, msgInspection, jidMap, chatRowJidMap, contactMap, warnings).filter(
+    (chat) => !isStatusChatJid(chat.jid ?? chat.sourceChatId)
+  );
   if (chats.length === 0) {
     warnings.push({
       severity: "warning",
@@ -212,7 +220,20 @@ export function parseWhatsAppSource(
         : iterateModernMessages(msgstoreDb, msgInspection, jidMap, chatRowJidMap, contactMap, participantMap, warnings, sourceFingerprint ?? null, sidecars, () => {
             skippedRows += 1;
           })) {
+        if (isStatusChatJid(message.chatSourceId)) {
+          skippedStatusRows += 1;
+          continue;
+        }
         yield message;
+      }
+      if (skippedStatusRows > 0) {
+        warnings.push({
+          severity: "info",
+          code: "STATUS_ROWS_SKIPPED",
+          entityType: "message",
+          message: "WhatsApp Status posts were skipped: Status is not a chat and is never archived.",
+          context: { skippedStatusRows }
+        });
       }
     },
     iterateAddOnUpdates: function* () {
@@ -238,7 +259,7 @@ export function parseWhatsAppSource(
         const edit = sidecars.edits.get(Number(row.row_id));
         const messageId = edit?.originalKeyId ?? stringOrNull(row.key_id);
         const secret = row.secret;
-        if (!chatJid || !messageId || !(secret instanceof Buffer) || secret.length === 0) {
+        if (!chatJid || !messageId || !(secret instanceof Buffer) || secret.length === 0 || isStatusChatJid(chatJid)) {
           continue;
         }
         yield { chatSourceId: chatJid, sourceMessageId: messageId, secret, source: "backup" };
@@ -267,7 +288,7 @@ export function parseWhatsAppSource(
           continue;
         }
         const chatJid = chatRowJidMap.get(Number(row.chat_row_id));
-        if (!chatJid) {
+        if (!chatJid || isStatusChatJid(chatJid)) {
           continue;
         }
         // Media links target the message's canonical identity — the original
@@ -314,6 +335,7 @@ export function parseWhatsAppSource(
     },
     getParticipants: () => [...participantMap.values()],
     getSkippedRows: () => skippedRows,
+    getSkippedStatusRows: () => skippedStatusRows,
     schemaReport: tableColumnNames(msgInspection),
     messageCountEstimate,
     mediaRefCountEstimate: adapter === "modern" ? sidecars.media.size : 0

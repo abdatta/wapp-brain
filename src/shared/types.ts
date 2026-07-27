@@ -2151,6 +2151,32 @@ export interface BrainBackfillStatus {
 
 // Repository-level rollups behind BrainBackfillStatus (the server layer folds
 // in run progress and the derived rate/ETA/warning semantics).
+// Report from the one-time WhatsApp Status excision. Deliberately verbose: this
+// is the only operation in the system that destroys archive-layer data, so what
+// it removed (or would remove, under dryRun) must be visible and checkable.
+export interface StatusExcisionReport {
+  dryRun: boolean;
+  // Present only when a status chat existed; null means there was nothing to do.
+  chatId: number | null;
+  // Per-table row counts, in deletion order. Zero-row tables are still listed so
+  // the sweep's coverage is legible rather than implied.
+  rowsByTable: Array<{ table: string; rows: number }>;
+  totalRows: number;
+  blobsDeleted: number;
+  blobsMissing: number;
+  // Content-addressed hashes a surviving non-status asset also references: kept.
+  blobsSharedKept: number;
+  bytesReclaimed: number;
+  // Unlink failures, reported rather than thrown: the DB rows are already gone,
+  // so a stuck file is a recoverable orphan, not a failed excision.
+  blobErrors: Array<{ storagePath: string; error: string }>;
+  brainEpisodesRemoved: number;
+  brainWatermarksRemoved: number;
+  // Ids of the removed episodes, so the caller can delete their projected vault
+  // files — the vault is a pure projection and has no other cleanup trigger.
+  brainEpisodeIdsRemoved: string[];
+}
+
 export interface BrainBackfillDbStats {
   totalVisibleMessages: number;
   assimilatedVisibleMessages: number;

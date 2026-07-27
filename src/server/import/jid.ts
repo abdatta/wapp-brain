@@ -49,6 +49,21 @@ export function inferChatType(jid: string | null | undefined): ChatType {
   return "unknown";
 }
 
+export const STATUS_BROADCAST_JID = "status@broadcast";
+
+/**
+ * WhatsApp Status is not a chat. Every exclusion in the system keys on this identity check
+ * rather than on `message_type`, because live status posts carry ordinary content types
+ * (`image`/`video`/`text`) and only the backup importer ever emitted `message_type = 'status'`.
+ */
+export function isStatusChatJid(jid: string | null | undefined): boolean {
+  if (!jid) {
+    return false;
+  }
+  const canonical = normalizeJid(jid);
+  return canonical?.toLowerCase() === STATUS_BROADCAST_JID;
+}
+
 export function phoneFromJid(jid: string | null | undefined): string | null {
   if (!jid) {
     return null;

@@ -1174,6 +1174,39 @@ app.post("/api/brain/reset", async (req, res) => {
   }
 });
 
+// One-time excision of WhatsApp Status — the single sanctioned deletion of
+// archive-layer data. `dryRun: true` reports exactly what would go without
+// touching anything, so the destructive run is always previewable first.
+app.post("/api/maintenance/excise-status", async (req, res) => {
+  try {
+    const { getBrainRunProgress } = await import("./brain/runJob");
+    if (getBrainRunProgress().state === "running") {
+      res.status(409).json({ error: "A brain run is in progress; wait for it to finish before excising status." });
+      return;
+    }
+    const dryRun = req.body?.dryRun === true;
+    const started = Date.now();
+    const report = await repository.exciseStatusBroadcast({ dryRun });
+    // The vault is a pure projection: its status episode files have no other
+    // cleanup trigger, so they go with the rows (never on a dry run).
+    let filesRemoved = 0;
+    if (!dryRun && report.brainEpisodeIdsRemoved.length > 0) {
+      const { deleteProjectedEpisodeFiles } = await import("./brain/episodes");
+      filesRemoved = deleteProjectedEpisodeFiles(report.brainEpisodeIdsRemoved);
+    }
+    console.log(
+      `[maintenance] excise-status${dryRun ? " (dry run)" : ""}: ${report.totalRows} row(s), ${report.blobsDeleted} blob(s), ` +
+        `${(report.bytesReclaimed / 1024 / 1024).toFixed(1)} MB, ${report.brainEpisodesRemoved} episode(s), ${filesRemoved} file(s) in ${Date.now() - started}ms`
+    );
+    if (!dryRun && report.totalRows > 0) {
+      broadcastArchiveChanged({ source: "manual", chatSourceIds: [], messageCount: 0, contactCount: 0 });
+    }
+    res.json({ ok: true, ...report, filesRemoved });
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
 // --- Knowledge graph (knowledge-graph-foundation) ---
 // Read surfaces + the two deterministic maintenance jobs. Zero model calls on
 // every path here; rebuild/recompute are chunked and yield, so the server

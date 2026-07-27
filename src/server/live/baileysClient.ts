@@ -6,6 +6,7 @@ import type { MediaDownloadQueueRecord } from "../../shared/types";
 import { config } from "../config";
 import { configuredTraceRecorder } from "../diagnostics/traceRecorder";
 import { downloadQueuedMedia } from "../media/downloader";
+import { isStatusChatJid } from "../import/jid";
 import { assertLiveDependencySafe } from "./dependency";
 import {
   normalizeBaileysChatsWithJidResolver,
@@ -31,6 +32,16 @@ import type {
 } from "./types";
 
 type Handler<T> = (value: T) => void | Promise<void>;
+
+/**
+ * WhatsApp Status is not a chat: drop its items out of a platform batch at the
+ * event boundary, before media descriptors are captured, and let the rest of the
+ * batch through untouched. Keyed on chat identity, never on message type — live
+ * status posts arrive as ordinary `image`/`video`/`text` content.
+ */
+function withoutStatusItems<T extends { key?: { remoteJid?: string | null } | null }>(items: readonly T[]): T[] {
+  return items.filter((item) => !isStatusChatJid(item?.key?.remoteJid ?? null));
+}
 
 interface BaileysClientOptions {
   authDir: string;
@@ -147,7 +158,11 @@ export class BaileysLiveWhatsAppClient implements LiveWhatsAppClient {
     });
     on("messages.upsert", async (event: { type?: string; messages?: unknown[] }) => {
       await configuredTraceRecorder?.record("baileys.raw_event", { name: "messages.upsert", event });
-      const normalized = await normalizeBaileysMessagesWithJidResolver((event.messages ?? []) as any[], "wa-web:messages.upsert", resolveLiveJid);
+      const normalized = await normalizeBaileysMessagesWithJidResolver(
+        withoutStatusItems((event.messages ?? []) as any[]),
+        "wa-web:messages.upsert",
+        resolveLiveJid
+      );
       normalized.mode = event.type === "append" ? "append" : "notify";
       await configuredTraceRecorder?.record("baileys.normalized_event", { name: "messages.upsert", event: normalized });
       await this.emitEvent(normalized);
@@ -160,7 +175,11 @@ export class BaileysLiveWhatsAppClient implements LiveWhatsAppClient {
     }) => {
       await configuredTraceRecorder?.record("baileys.raw_event", { name: "messaging-history.set", event });
       await storeLidPnMappings(socket, event.lidPnMappings);
-      const normalized = await normalizeBaileysMessagesWithJidResolver((event.messages ?? []) as any[], "wa-web:history-sync", resolveLiveJid);
+      const normalized = await normalizeBaileysMessagesWithJidResolver(
+        withoutStatusItems((event.messages ?? []) as any[]),
+        "wa-web:history-sync",
+        resolveLiveJid
+      );
       const contacts = await normalizeBaileysContactsWithJidResolver(((event as { contacts?: unknown[] }).contacts ?? []) as any[], "contacts.upsert", resolveLiveJid);
       const chats = await normalizeBaileysChatsWithJidResolver(((event as { chats?: unknown[] }).chats ?? []) as any[], "chats.upsert", resolveLiveJid);
       normalized.contacts = mergeBySourceJid(normalized.contacts ?? [], contacts.contacts ?? []);

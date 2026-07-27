@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { createWriteStream, existsSync, type WriteStream } from "node:fs";
 import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
+import type { StatusExcisionReport } from "../shared/types";
 import { cleanupSensitiveWorkDirs } from "./cleanup";
 import { config } from "./config";
 import { archiveAdapterLabel, createArchiveRepository, initializeArchiveDatabase } from "./db/archive";
@@ -642,6 +643,67 @@ async function main(): Promise<void> {
       );
     } finally {
       await repository.close?.();
+    }
+    return;
+  }
+
+  // One-time excision of WhatsApp Status. Destructive and irreversible, so it
+  // defaults to a dry run: `--apply` is required to actually delete. Delegates
+  // over HTTP when the local server is up — better-sqlite3 is a single writer,
+  // and a second process on the DB while the server runs is the hazard here.
+  if (command === "excise-status") {
+    const apply = args.apply === true;
+    const { localServerListening } = await import("./brain/eval");
+    const serverBase = `http://${config.app.host}:${config.app.port}`;
+    const report = (await localServerListening(serverBase))
+      ? await (async () => {
+          console.log(`Local server is up — delegating to ${serverBase} so the single DB writer stays in the server process.`);
+          const response = await fetch(`${serverBase}/api/maintenance/excise-status`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ dryRun: !apply })
+          });
+          const payload = await response.json();
+          if (!response.ok) {
+            throw new Error(payload?.error ?? `Excision failed with HTTP ${response.status}`);
+          }
+          return payload as StatusExcisionReport & { filesRemoved?: number };
+        })()
+      : await (async () => {
+          const repository = createArchiveRepository();
+          try {
+            const result = await repository.exciseStatusBroadcast({ dryRun: !apply });
+            let filesRemoved = 0;
+            if (apply && result.brainEpisodeIdsRemoved.length > 0) {
+              const { deleteProjectedEpisodeFiles } = await import("./brain/episodes");
+              filesRemoved = deleteProjectedEpisodeFiles(result.brainEpisodeIdsRemoved);
+            }
+            return { ...result, filesRemoved };
+          } finally {
+            await repository.close?.();
+          }
+        })();
+
+    if (report.chatId == null && report.totalRows === 0) {
+      console.log("No status@broadcast data found — nothing to excise.");
+      return;
+    }
+    console.log(apply ? "\nExcised WhatsApp Status:" : "\nDRY RUN — nothing was deleted. Re-run with --apply to execute.\n");
+    for (const entry of report.rowsByTable.filter((row) => row.rows > 0)) {
+      console.log(`  ${entry.table.padEnd(28)} ${entry.rows}`);
+    }
+    console.log(`  ${"TOTAL rows".padEnd(28)} ${report.totalRows}`);
+    console.log(
+      `\n  blobs: ${report.blobsDeleted} ${apply ? "deleted" : "would be deleted"}, ${report.blobsSharedKept} kept (shared with a real chat)` +
+        `${report.blobsMissing ? `, ${report.blobsMissing} already missing` : ""}`
+    );
+    console.log(`  bytes reclaimed: ${(report.bytesReclaimed / 1024 / 1024).toFixed(1)} MB`);
+    console.log(`  brain: ${report.brainEpisodesRemoved} episode(s), ${report.brainWatermarksRemoved} watermark(s), ${report.filesRemoved ?? 0} projected file(s)`);
+    if (report.blobErrors.length > 0) {
+      console.log(`\n  ${report.blobErrors.length} blob(s) could not be unlinked (rows are already gone; these are orphans):`);
+      for (const failure of report.blobErrors.slice(0, 10)) {
+        console.log(`    ${failure.storagePath}: ${failure.error}`);
+      }
     }
     return;
   }
@@ -1551,6 +1613,7 @@ function printHelp(): void {
   tsx src/server/cli.ts brain-graph [stats|rebuild|recompute|entity|unresolved] [--jid <jid>] [--name <name>] [--node <id>]
   tsx src/server/cli.ts brain-graph neighborhood [--jid|--name|--node <anchor>] [--depth 1|2] [--kinds a,b] [--since <ms>] [--until <ms>] [--min-salience <n>] [--include-dormant] [--max-nodes <n>] [--max-edges <n>]
   tsx src/server/cli.ts brain-backfill [start|status|cancel] [--rate <calls/hour>] [--daily <calls/day>] [--max-calls N] [--max-tokens N] [--max-chats N] [--concurrency 1-6] [--strict] [--extractive] [--provider codex|claude-cli] [--model <model>]
+  tsx src/server/cli.ts excise-status [--apply]
   tsx src/server/cli.ts set-contact-name --jid <sourceJid> --name "<display name>"
   tsx src/server/cli.ts persons-scan [--connect-only]
   tsx src/server/cli.ts memory-status
@@ -1570,6 +1633,7 @@ Notes:
   - inspect reports schema compatibility and counts without message bodies.
   - wa-contacts decrypts only the contacts sidecar and lists which contacts have a resolved name and which don't.
   - live-* commands are explicit opt-in and store auth/session state only under .wapp-brain/live.
+  - excise-status permanently deletes all WhatsApp Status data (Status is not a chat). It dry-runs by default; --apply executes and cannot be undone.
   - memory-* commands write private generated Markdown, sidecars, and provider session state under .wapp-brain/memory by default.
   - Use --keep-decrypted only if you intentionally want decrypted databases left in the local work directory.
   - cleanup removes app-managed decrypted working files and import staging files.`);

@@ -10,7 +10,8 @@ import { config } from "../config";
 // stored once and a stored path can never be guessed from chat metadata.
 // Writes are atomic (temp file + rename): an interrupted write never registers
 // as a stored asset. Blobs are effectively never deleted (retention across
-// revoke is a requirement), so no reference counting is needed.
+// revoke is a requirement) — the single exception is WhatsApp Status excision,
+// which reference-counts by sha256 before unlinking (see deleteBlob).
 
 export interface StoredBlob {
   sha256: string;
@@ -102,6 +103,21 @@ export class MediaBlobStore {
     } finally {
       await rm(tempPath, { force: true }).catch(() => undefined);
     }
+  }
+
+  // The one sanctioned exception to "blobs are never deleted": WhatsApp Status
+  // excision. Because the store is content-addressed, the CALLER must prove no
+  // surviving asset row references this hash — see exciseStatusBroadcast, which
+  // computes the survivor set before deleting any row. Returns the bytes freed
+  // (0 when the file was already gone, which keeps a re-run idempotent).
+  async deleteBlob(storagePath: string): Promise<number> {
+    const absolute = this.absolutePath(storagePath);
+    const existing = await this.stat(storagePath);
+    if (!existing) {
+      return 0;
+    }
+    await rm(absolute, { force: true });
+    return existing.byteSize;
   }
 }
 

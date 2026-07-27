@@ -6,6 +6,7 @@ import type {
   ArchiveSignalBatch,
   ArchiveSignalObservation,
   BrainBackfillDbStats,
+  StatusExcisionReport,
   BrainBackfillModelSpend,
   BrainChatBacklogItem,
   BrainClaimGradeRecord,
@@ -218,7 +219,7 @@ import {
 } from "../brain/lifecycle";
 import { resolveNeighborhoodParams, shapeNeighborhood, type NeighborhoodWalk } from "../brain/graphQuery";
 import { episodeFileBase } from "../brain/vaultNames";
-import { isMaskedNumberLabel, normalizeJid, phoneFromJid, resolveDisplayLabel } from "../import/jid";
+import { isMaskedNumberLabel, isStatusChatJid, normalizeJid, phoneFromJid, resolveDisplayLabel } from "../import/jid";
 import { normalizeOwnerSelfInput } from "../identity/ownerSelf";
 import { disambiguateLabels } from "../persons/disambiguate";
 import { personDisplayLabelFromMembers } from "../persons/label";
@@ -3733,6 +3734,9 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       if (scope && chat.sourceChatId !== scope) {
         continue;
       }
+      if (isStatusChatJid(chat.sourceChatId) || chat.chatType === "status") {
+        continue;
+      }
       const watermark = this.brainWatermarks.get(chat.sourceChatId);
       const pendingMessages = [...this.messages.values()].filter(
         (message) =>
@@ -4300,6 +4304,65 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       this.claimSupersededBy.clear();
     }
     return { episodeIds, watermarks };
+  }
+
+  // In-memory mirror of the SQLite excision: same report shape, same idempotence.
+  // There is no blob store here, so the blob counters stay zero by construction.
+  async exciseStatusBroadcast(options?: { dryRun?: boolean }): Promise<StatusExcisionReport> {
+    const dryRun = options?.dryRun === true;
+    const chat = [...this.chats.values()].find(
+      (candidate) => isStatusChatJid(candidate.sourceChatId) || candidate.chatType === "status"
+    );
+    const base: StatusExcisionReport = {
+      dryRun,
+      chatId: null,
+      rowsByTable: [],
+      totalRows: 0,
+      blobsDeleted: 0,
+      blobsMissing: 0,
+      blobsSharedKept: 0,
+      bytesReclaimed: 0,
+      blobErrors: [],
+      brainEpisodesRemoved: 0,
+      brainWatermarksRemoved: 0,
+      brainEpisodeIdsRemoved: []
+    };
+    if (!chat) {
+      return base;
+    }
+    const statusMessages = [...this.messages.values()].filter((message) => isStatusChatJid(message.chatSourceId));
+    const episodeIds = [...this.brainEpisodes.values()]
+      .filter((episode) => isStatusChatJid(episode.chatSourceId))
+      .map((episode) => episode.id);
+    const rowsByTable = [
+      { table: "messages", rows: statusMessages.length },
+      { table: "chats", rows: 1 }
+    ];
+    if (dryRun) {
+      return {
+        ...base,
+        chatId: null,
+        rowsByTable,
+        totalRows: rowsByTable.reduce((sum, entry) => sum + entry.rows, 0),
+        brainEpisodesRemoved: episodeIds.length,
+        brainWatermarksRemoved: this.brainWatermarks.has(chat.sourceChatId) ? 1 : 0,
+        brainEpisodeIdsRemoved: episodeIds
+      };
+    }
+    for (const message of statusMessages) {
+      this.messages.delete(message.sourceMessageKey);
+    }
+    this.chats.delete(chat.sourceChatId);
+    const brain = await this.resetBrainDerivedData({ chatSourceId: chat.sourceChatId });
+    return {
+      ...base,
+      chatId: null,
+      rowsByTable,
+      totalRows: rowsByTable.reduce((sum, entry) => sum + entry.rows, 0),
+      brainEpisodesRemoved: brain.episodeIds.length,
+      brainWatermarksRemoved: brain.watermarks,
+      brainEpisodeIdsRemoved: brain.episodeIds
+    };
   }
 
   async commitBrainEpisode(episode: BrainEpisodeInput): Promise<BrainEpisodeRecord> {
@@ -7889,6 +7952,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
   }): Promise<MemoryEvidenceMessage[]> {
     const chatSet = options.chatSourceIds?.length ? new Set(options.chatSourceIds) : null;
     const evidence = [...this.messages.values()]
+      .filter((message) => !isStatusChatJid(message.chatSourceId))
       .filter((message) => message.timestampMs != null)
       .filter((message) => options.startAtMs == null || (message.timestampMs ?? 0) >= options.startAtMs)
       .filter((message) => options.endAtMs == null || (message.timestampMs ?? 0) <= options.endAtMs)
@@ -8213,6 +8277,11 @@ function displayPhoneFromJid(jid: string | null | undefined): string | null {
 // Mirrors the SQLite visibleExchangePredicate: what a user would recognize as
 // conversation, driving the default search noise filter.
 function isVisibleExchangeMessage(message: MessageRecord): boolean {
+  // WhatsApp Status is not a chat: excluded by identity, because live status posts
+  // arrive as ordinary content types and never as `message_type = 'status'`.
+  if (isStatusChatJid(message.chatSourceId)) {
+    return false;
+  }
   if (["system", "status", "reaction", "encrypted_update"].includes(message.messageType)) {
     return false;
   }

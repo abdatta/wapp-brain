@@ -3,6 +3,7 @@ import type {
   ChatMetadataHistoryRecord,
   EngagementAggregateRecord,
   BrainBackfillDbStats,
+  StatusExcisionReport,
   BrainChatBacklogItem,
   BrainClaimGradeRecord,
   BrainClaimGradeValue,
@@ -383,6 +384,12 @@ export interface ArchiveRepository {
   // optionally for one chat. Raw messages are untouched; the next run
   // re-assimilates from scratch. Returns removed episode ids for file cleanup.
   resetBrainDerivedData(options?: { chatSourceId?: string | null }): Promise<{ episodeIds: string[]; watermarks: number }>;
+  // One-time, idempotent excision of WhatsApp Status. The single sanctioned
+  // deletion of archive-layer data: Status is not a chat. `dryRun` reports the
+  // exact same shape while changing nothing, so the destructive run is always
+  // previewable first. Blob unlinks are reference-counted by sha256 — a hash a
+  // real chat also references is reported as `blobsSharedKept`, never deleted.
+  exciseStatusBroadcast(options?: { dryRun?: boolean }): Promise<StatusExcisionReport>;
   commitBrainEpisode(episode: BrainEpisodeInput): Promise<BrainEpisodeRecord>;
   // Lean projection read: just what projectEpisodeFile needs, for CURRENT
   // episodes. The vault is a pure projection of stored markdown, so this makes
