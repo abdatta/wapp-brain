@@ -6,6 +6,7 @@ import type {
   BrainLifecycleCounts,
   BrainMutedSummary,
   BrainProviderName,
+  BrainQualitySummary,
   MemoryCitationResolution,
   MemoryQueryResult
 } from "../../../shared/types";
@@ -16,6 +17,7 @@ import {
   enableCodexMemoryProvider,
   getBrainBackfillStatus,
   getBrainGraphStats,
+  getBrainQuality,
   getOwnerIdentitySuggestions,
   listBrainLifecycleItems,
   listMutedChats,
@@ -423,9 +425,29 @@ export function BrainPage() {
   const { status, refreshStatus, brainOverview, setBrainOverview, refreshBrainOverview, brainRun, setBrainRun } = useStatus();
   const [busy, setBusy] = useState<string | null>(null);
   const [consoleOpen, setConsoleOpen] = useState(false);
+  // Quality aggregates are full-population reads, so they ride their own
+  // request instead of the shell's poll. They also move only when the BRAIN
+  // moves — not when messages arrive — so the refresh signal is run state, not
+  // archive traffic. Refreshing them on every archive event would rebuild the
+  // poll storm this split exists to remove.
+  const [quality, setQuality] = useState<BrainQualitySummary | null>(null);
+  const refreshQuality = useCallback(() => {
+    void getBrainQuality()
+      .then(setQuality)
+      .catch(() => undefined);
+  }, []);
   const [memoryQuery, setMemoryQuery] = useState("");
   const [memoryResult, setMemoryResult] = useState<MemoryQueryResult | null>(null);
   const [memoryCitation, setMemoryCitation] = useState<MemoryCitationResolution | null>(null);
+
+  useEffect(refreshQuality, [refreshQuality]);
+  // A finished run is the one event that can change every number here.
+  const runState = brainRun?.state ?? null;
+  useEffect(() => {
+    if (runState != null && runState !== "running") {
+      refreshQuality();
+    }
+  }, [runState, refreshQuality]);
 
   async function handleBrainProviderAction(body: {
     action: "enable" | "disable" | "probe" | "set-model";
@@ -541,6 +563,9 @@ export function BrainPage() {
       const result = await resetBrainData();
       setNotice(`Brain reset: ${result.episodesRemoved} episode(s) and ${result.filesRemoved} file(s) removed; coverage back to zero.`);
       void refreshBrainOverview();
+      // A reset zeroes every quality aggregate too — it is the other event
+      // besides a finished run that moves them.
+      refreshQuality();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not reset brain data.");
     }
@@ -624,6 +649,7 @@ export function BrainPage() {
     <div className="brainPage">
       <BrainPanel
         overview={brainOverview}
+        quality={quality}
         run={brainRun}
         busy={busy}
         onOpenConsole={() => setConsoleOpen(true)}
@@ -633,6 +659,7 @@ export function BrainPage() {
       {consoleOpen && (
         <RunConsoleModal
           overview={brainOverview}
+          quality={quality}
           busy={busy}
           running={brainRun?.state === "running"}
           onClose={() => setConsoleOpen(false)}

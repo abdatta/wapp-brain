@@ -44,6 +44,7 @@ import type {
   ArchiveChangeEvent,
   BackupDetectionManifest,
   BrainOverview,
+  BrainQualitySummary,
   BrainProviderName,
   BrainRunProgress,
   ChatListItem,
@@ -647,6 +648,7 @@ function RunProgressCard({ run, stopping, onStop }: { run: BrainRunProgress; sto
 // control (opt-in, model choice, probe) — manual-first, everything from the UI.
 function BrainPanel({
   overview,
+  quality,
   run,
   busy,
   onOpenConsole,
@@ -654,6 +656,9 @@ function BrainPanel({
   onStop
 }: {
   overview: BrainOverview | null;
+  // Fetched separately from the polled overview and on its own cadence, so a
+  // slow aggregate shimmers in place instead of delaying the whole panel.
+  quality: BrainQualitySummary | null;
   run: BrainRunProgress | null;
   busy: string | null;
   // Run configuration (identity, mode, provider, budgets) lives in the run
@@ -668,8 +673,10 @@ function BrainPanel({
   const [stopRequested, setStopRequested] = useState(false);
   const provider = overview?.provider;
   // Until the first status answer arrives, values are UNKNOWN — render
-  // shimmers, never placeholder zeros that read as data.
+  // shimmers, never placeholder zeros that read as data. Quality answers
+  // separately, so it shimmers on its own clock and never gates the rest.
   const loading = !overview;
+  const qualityLoading = !quality;
   const runDue = Boolean(overview?.scheduler.runDue);
   const running = run?.state === "running";
   // A finished (or freshly started) run clears the optimistic "stopping" latch.
@@ -700,53 +707,64 @@ function BrainPanel({
               value={((overview?.totalVisibleMessages ?? 0) - (overview?.assimilatedVisibleMessages ?? 0)).toLocaleString()}
             />
             <Metric label="Calls today" loading={loading} value={overview?.usageToday.calls.toLocaleString() ?? "0"} />
-            {overview?.validationIssues && overview.validationIssues.error + overview.validationIssues.warning > 0 && (
-              <Metric
-                label="Quality flags"
-                value={`${overview.validationIssues.error + overview.validationIssues.warning}`}
-              />
-            )}
-            {(overview?.mediaGaps?.length ?? 0) > 0 && (
-              <div
-                className="metric"
-                title={`Where unavailable media hurt an inference (the demand stat for building media interpretation): ${overview!.mediaGaps!
-                  .map((gap) => `${gap.modality} ${gap.impact}: ${gap.count}`)
-                  .join(", ")}`}
-              >
-                <span>Media gaps</span>
-                <strong>{overview!.mediaGaps!.reduce((sum, gap) => sum + gap.count, 0)}</strong>
-              </div>
-            )}
-            {(overview?.resolutionDebt?.episodesWithUnresolved ?? 0) > 0 && (
-              <div
-                className="metric"
-                title={`Episodes still referring to people by number. Saving these contacts repairs old episodes and search with no model call — highest payoff first: ${overview!.resolutionDebt!.topIdentities
-                  .map((identity) => `${identity.label} (${identity.messageCount.toLocaleString()} msgs, ${identity.episodeCount} ep)`)
-                  .join(", ")}`}
-              >
-                <span>Unresolved people</span>
-                <strong>{overview!.resolutionDebt!.distinctIdentities.toLocaleString()}</strong>
-              </div>
+            {/* The quality slots arrive on their own request. Their labels are
+                known before their values are, so they shimmer in place rather
+                than popping in — and a zero one then drops out, as before. */}
+            {qualityLoading ? (
+              <>
+                <Metric label="Quality flags" loading value="" />
+                <Metric label="Media gaps" loading value="" />
+                <Metric label="Unresolved people" loading value="" />
+              </>
+            ) : (
+              <>
+                {quality!.validationIssues.error + quality!.validationIssues.warning > 0 && (
+                  <Metric label="Quality flags" value={`${quality!.validationIssues.error + quality!.validationIssues.warning}`} />
+                )}
+                {quality!.mediaGaps.length > 0 && (
+                  <div
+                    className="metric"
+                    title={`Where unavailable media hurt an inference (the demand stat for building media interpretation): ${quality!.mediaGaps
+                      .map((gap) => `${gap.modality} ${gap.impact}: ${gap.count}`)
+                      .join(", ")}`}
+                  >
+                    <span>Media gaps</span>
+                    <strong>{quality!.mediaGaps.reduce((sum, gap) => sum + gap.count, 0)}</strong>
+                  </div>
+                )}
+                {quality!.resolutionDebt.episodesWithUnresolved > 0 && (
+                  <div
+                    className="metric"
+                    title={`Episodes still referring to people by number. Saving these contacts repairs old episodes and search with no model call — highest payoff first: ${quality!.resolutionDebt.topIdentities
+                      .map((identity) => `${identity.label} (${identity.messageCount.toLocaleString()} msgs, ${identity.episodeCount} ep)`)
+                      .join(", ")}`}
+                  >
+                    <span>Unresolved people</span>
+                    <strong>{quality!.resolutionDebt.distinctIdentities.toLocaleString()}</strong>
+                  </div>
+                )}
+              </>
             )}
           </div>
-          {(overview?.resolutionDebt?.episodesWithUnresolved ?? 0) > 0 && (
+          {qualityLoading && <span className="metricSkeleton lineSkeleton" aria-label="Quality detail loading" />}
+          {!qualityLoading && quality!.resolutionDebt.episodesWithUnresolved > 0 && (
             <div className="brainHint">
-              {overview!.resolutionDebt!.episodesWithUnresolved.toLocaleString()} episode
-              {overview!.resolutionDebt!.episodesWithUnresolved === 1 ? "" : "s"} involve unresolved participants (
-              {overview!.resolutionDebt!.distinctIdentities.toLocaleString()} distinct number
-              {overview!.resolutionDebt!.distinctIdentities === 1 ? "" : "s"}). Save the top contact
-              {overview!.resolutionDebt!.topIdentities.length === 1 ? "" : "s"} to repair the most — with no model call:{" "}
-              {overview!.resolutionDebt!.topIdentities
+              {quality!.resolutionDebt.episodesWithUnresolved.toLocaleString()} episode
+              {quality!.resolutionDebt.episodesWithUnresolved === 1 ? "" : "s"} involve unresolved participants (
+              {quality!.resolutionDebt.distinctIdentities.toLocaleString()} distinct number
+              {quality!.resolutionDebt.distinctIdentities === 1 ? "" : "s"}). Save the top contact
+              {quality!.resolutionDebt.topIdentities.length === 1 ? "" : "s"} to repair the most — with no model call:{" "}
+              {quality!.resolutionDebt.topIdentities
                 .slice(0, 3)
                 .map((identity) => `${identity.label} (${identity.messageCount.toLocaleString()})`)
                 .join(", ")}
               .
             </div>
           )}
-          {(overview?.modelQuality?.some((aggregate) => aggregate.attempted > 0) ?? false) && (
+          {!qualityLoading && quality!.modelQuality.some((aggregate) => aggregate.attempted > 0) && (
             <div className="brainHint">
               Model quality:{" "}
-              {overview!.modelQuality!
+              {quality!.modelQuality
                 .filter((aggregate) => aggregate.attempted > 0)
                 .map(
                   (aggregate) =>
@@ -847,6 +865,7 @@ function selfWarningLabel(label: string | null | undefined, ownerName: string): 
 
 function RunConsoleModal({
   overview,
+  quality,
   busy,
   running,
   onClose,
@@ -857,6 +876,9 @@ function RunConsoleModal({
   suggest
 }: {
   overview: BrainOverview | null;
+  // The regenerate mode's queue size and contract version: off the poll path,
+  // so the console renders immediately and this line fills in when it lands.
+  quality: BrainQualitySummary | null;
   busy: string | null;
   running: boolean;
   onClose: () => void;
@@ -947,7 +969,7 @@ function RunConsoleModal({
 
   const modelBacked = Boolean(provider && provider.provider !== "extractive");
   const modelOptions = provider && provider.provider !== "extractive" ? provider.models[provider.provider] ?? [] : [];
-  const regenerable = overview?.regenerableEpisodes ?? 0;
+  const regenerable = quality?.regenerableEpisodes ?? 0;
   const backfill = runMode === "backfill";
   const dailyOverrideNumber = dailyOverride.trim() === "" ? null : Number(dailyOverride);
   // The remaining-today guard validates against what the server will actually
@@ -1044,8 +1066,12 @@ function RunConsoleModal({
     runMode !== "regenerate" || scopeNumber == null || scopeValid
       ? null
       : "Between 1 and 10,000 messages (leave empty for every stale episode).";
-  const regenerateDisabledReason =
-    regenerable === 0
+  // The queue size now arrives on its own request, so "not counted yet" must
+  // not be reported as "nothing to regenerate" — an unknown that reads as zero
+  // would disable the mode with a reason that is simply false.
+  const regenerateDisabledReason = !quality
+    ? "Counting episodes below the current contract…"
+    : regenerable === 0
       ? "Nothing to regenerate — every current episode is on the current contract."
       : !modelBacked
         ? "Regeneration needs a model provider — an extractive re-run would downgrade model episodes."
@@ -1300,7 +1326,11 @@ function RunConsoleModal({
               />
               <span>Regenerate stale</span>
               <small>
-                {regenerable.toLocaleString()} episode(s) below v{overview?.extractionVersion ?? "?"}
+                {quality ? (
+                  `${regenerable.toLocaleString()} episode(s) below v${quality.extractionVersion}`
+                ) : (
+                  <span className="metricSkeleton lineSkeleton short" aria-label="Regenerable episode count loading" />
+                )}
               </small>
             </label>
           </div>

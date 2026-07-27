@@ -24,6 +24,7 @@ import type {
   BrainGraphNodeSuggestion,
   BrainModelQualityAggregate,
   BrainOverview,
+  BrainQualitySummary,
   BrainProviderName,
   BrainProviderStatus,
   BrainRunEffects,
@@ -514,8 +515,15 @@ export function startSearchReindex(): Promise<{ ok: boolean; reindex: SearchRein
   return request<{ ok: boolean; reindex: SearchReindexProgress }>("/api/search/reindex", { method: "POST", body: "{}" });
 }
 
+// The hot poll: what the shell renders, refreshed on every archive change.
 export function getBrainOverview(): Promise<BrainOverview> {
   return request<BrainOverview>("/api/brain/status");
+}
+
+// The cold dashboard: full-population quality aggregates, fetched only by the
+// surface that displays them so navigating elsewhere never pays for them.
+export function getBrainQuality(): Promise<BrainQualitySummary> {
+  return request<BrainQualitySummary>("/api/brain/quality");
 }
 
 export function startBrainRun(body: {

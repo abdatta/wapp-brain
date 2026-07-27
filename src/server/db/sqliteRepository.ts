@@ -273,6 +273,9 @@ const IDENTITY_VERSION = "2";
 const LEGACY_ARCHIVE_MESSAGE =
   "This archive predates canonical identity keys. Run a Clear-and-replace import of your latest backup (or delete the archive file and run init-db), then re-pair live sync.";
 const SQLITE_IN_QUERY_BATCH_SIZE = 500;
+// A closure candidate before its sender label is resolved — the shape the
+// producers emit and the existence pass never needs to finish.
+type RawLifecycleCandidate = Omit<BrainLifecycleCandidate, "senderLabel">;
 const ARCHIVE_TABLES = [
   "import_runs",
   "identity_links",
@@ -7608,20 +7611,33 @@ export class SqliteArchiveRepository implements ArchiveRepository {
   // rather than three queries per node. Measured on the real archive (2.2k
   // open nodes, 43k reactions, 326k messages): the per-node form took minutes
   // and blocked the event loop; this form answers in well under a second.
-  private bulkLifecycleCandidatesTx(
-    inputs: Array<{ claimId: string; chatSourceId: string; sinceMs: number }>
-  ): Map<string, BrainLifecycleCandidate[]> {
-    const result = new Map<string, BrainLifecycleCandidate[]>();
+  // Per-claim scope invariance (relied on by listBrainLifecycleItems, which
+  // runs this for one PAGE rather than the whole open set): producers (a) and
+  // (b) are keyed on `c.claim_id IN (batch)`, so they see only their own
+  // claim's rows either way. Producer (c) shares a per-chat recency pool, and
+  // narrowing the input set can only RAISE that chat's `minSince` floor — which
+  // removes pool entries strictly below the floor, i.e. below every remaining
+  // node's own `sinceMs`, which the per-node loop already skips. The 300-cap
+  // takes the highest-ts entries, and those are identical in both pools. So a
+  // claim's candidate list does not depend on who it was queried alongside.
+  private collectLifecycleCandidatesTx(
+    inputs: Array<{ claimId: string; chatSourceId: string; sinceMs: number }>,
+    // "existence" stops at the first candidate per claim: the sweep_due chip
+    // asks `candidateCount > 0`, never for the number.
+    mode: "full" | "existence" = "full"
+  ): Map<string, RawLifecycleCandidate[]> {
+    const rawByClaim = new Map<string, RawLifecycleCandidate[]>();
     if (inputs.length === 0) {
-      return result;
+      return rawByClaim;
     }
     const sinceByClaim = new Map(inputs.map((input) => [input.claimId, input.sinceMs]));
-    type RawCandidate = Omit<BrainLifecycleCandidate, "senderLabel">;
-    const rawByClaim = new Map<string, RawCandidate[]>();
     const seenByClaim = new Map<string, Set<string>>();
-    const push = (claimId: string, candidate: RawCandidate) => {
+    const push = (claimId: string, candidate: RawLifecycleCandidate) => {
       const since = sinceByClaim.get(claimId);
       if (since == null || candidate.timestampMs == null || candidate.timestampMs <= since) {
+        return;
+      }
+      if (mode === "existence" && rawByClaim.has(claimId)) {
         return;
       }
       const dedupeKey = `${candidate.kind}:${candidate.claimId ?? candidate.sourceMessageKey}`;
@@ -7642,14 +7658,26 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       const batch = claimIds.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
       const placeholders = batch.map(() => "?").join(",");
       // (a) Reactions on the claims' cited messages — the WhatsApp-native ack.
+      //
+      // INDEXED BY on BOTH sides, and both are load-bearing. Left alone, the
+      // planner reads `lmu.applied = 1` as the selective term and drives from
+      // live_message_updates (44.6k rows, 44.6k of them applied) once per
+      // id-batch, probing citations per row: measured 137ms per batch × 11
+      // batches on the real archive. Pinning only the citations side is far
+      // WORSE — it keeps that drive order and tests 500 claim ids per lmu row,
+      // measured at 20s. Pinning both restores
+      //   SEARCH c (claim_id=?) → SEARCH lmu (source_message_key=?)
+      // against the partial reaction index this table has precisely for it:
+      // 137ms → 7ms per batch, same 1,065 rows.
       for (const row of this.db
         .prepare(
           `SELECT c.claim_id AS claimId, lmu.source_message_key AS key,
                   json_extract(lmu.metadata_json, '$.emoji') AS emoji,
                   json_extract(lmu.metadata_json, '$.reactorJid') AS reactorJid,
                   lmu.occurred_at_ms AS ts
-           FROM brain_citations c
-           JOIN live_message_updates lmu ON lmu.source_message_key = c.source_message_key AND lmu.update_type = 'reaction'
+           FROM brain_citations c INDEXED BY idx_brain_citations_claim
+           JOIN live_message_updates lmu INDEXED BY idx_live_updates_reaction_key
+             ON lmu.source_message_key = c.source_message_key AND lmu.update_type = 'reaction'
            WHERE c.claim_id IN (${placeholders})
              AND lmu.applied = 1 AND lmu.occurred_at_ms IS NOT NULL
              AND json_extract(lmu.metadata_json, '$.emoji') IS NOT NULL
@@ -7699,9 +7727,15 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     // pairs / 50s on the real archive. Instead: per-chat recent postdating
     // claims + their entities in bulk, matched per node in JS with the same
     // recency-cap semantics.
+    //
+    // This is the most expensive producer, so in existence mode it runs only
+    // for the claims (a) and (b) left unanswered — a claim already known to
+    // have a candidate cannot learn anything from a second one.
+    const pendingInputs = mode === "existence" ? inputs.filter((input) => !rawByClaim.has(input.claimId)) : inputs;
+    const pendingIds = pendingInputs.map((input) => input.claimId);
     const ownEntitiesByClaim = new Map<string, { jids: Set<string>; names: Set<string> }>();
-    for (let index = 0; index < claimIds.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
-      const batch = claimIds.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+    for (let index = 0; index < pendingIds.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = pendingIds.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
       const placeholders = batch.map(() => "?").join(",");
       for (const row of this.db
         .prepare(`SELECT claim_id AS claimId, jid, LOWER(TRIM(name)) AS name FROM brain_claim_entities WHERE claim_id IN (${placeholders})`)
@@ -7717,7 +7751,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     }
     const minSinceByChat = new Map<string, number>();
     const inputsByChat = new Map<string, Array<{ claimId: string; sinceMs: number }>>();
-    for (const input of inputs) {
+    for (const input of pendingInputs) {
       if (!input.chatSourceId) {
         continue;
       }
@@ -7731,7 +7765,10 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       inputsByChat.set(input.chatSourceId, list);
     }
     const chats = [...inputsByChat.keys()];
-    type RecentClaim = { claimId: string; text: string; ts: number; chat: string };
+    // No `c.text` here: the pool is every current model claim in these chats
+    // (21,734 rows on the real archive) and only the handful that actually
+    // MATCH a lifecycle node ever needs its text, fetched by id further down.
+    type RecentClaim = { claimId: string; ts: number; chat: string };
     const recentByChat = new Map<string, RecentClaim[]>();
     const RECENT_PER_CHAT = 300;
     for (let index = 0; index < chats.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
@@ -7742,7 +7779,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
           // The closure sweep SPENDS model calls on these candidates, and a
           // partially-muted chat must not offer evidence from its muted range
           // as a reason to close an unmuted commitment.
-          `SELECT c.id AS claimId, c.text AS text, MAX(ct.timestamp_ms) AS ts, e.chat_source_id AS chat
+          `SELECT c.id AS claimId, MAX(ct.timestamp_ms) AS ts, e.chat_source_id AS chat
            FROM brain_claims c
            JOIN brain_episodes e ON e.id = c.episode_id
            JOIN brain_citations ct ON ct.claim_id = c.id
@@ -7845,6 +7882,9 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         }
       }
     }
+    // Texts for exactly the matched claims (existence mode matches at most one
+    // per node, so this stays tiny there too).
+    const matchedTexts = mode === "existence" ? new Map<string, string>() : this.bulkClaimTextsTx(matchedIds);
     for (const entry of matched) {
       const cite = latestCite.get(entry.other.claimId);
       if (!cite) {
@@ -7856,13 +7896,23 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         sourceMessageKey: cite.key,
         timestampMs: entry.other.ts,
         senderJid: sender,
-        text: entry.other.text,
+        text: matchedTexts.get(entry.other.claimId) ?? "",
         claimId: entry.other.claimId
       });
     }
-    // Rank, cap, then resolve labels for exactly the kept candidates.
+    return rawByClaim;
+  }
+
+  // Full candidate lists: rank, cap, then resolve labels for exactly the kept
+  // candidates. Callers that render candidates (the detail modal) or need the
+  // exact per-item count use this.
+  private bulkLifecycleCandidatesTx(
+    inputs: Array<{ claimId: string; chatSourceId: string; sinceMs: number }>
+  ): Map<string, BrainLifecycleCandidate[]> {
+    const result = new Map<string, BrainLifecycleCandidate[]>();
+    const rawByClaim = this.collectLifecycleCandidatesTx(inputs, "full");
     const priority: Record<BrainLifecycleCandidate["kind"], number> = { reaction: 0, reply: 1, claim: 2 };
-    const keptByClaim = new Map<string, RawCandidate[]>();
+    const keptByClaim = new Map<string, RawLifecycleCandidate[]>();
     const actorJids = new Set<string>();
     for (const [claimId, list] of rawByClaim) {
       list.sort((a, b) => priority[a.kind] - priority[b.kind] || (b.timestampMs ?? 0) - (a.timestampMs ?? 0));
@@ -7882,6 +7932,14 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       );
     }
     return result;
+  }
+
+  // "Does this claim have ANY postdating candidate" for many claims — the
+  // sweep_due chip's real question. Stops at the first hit per claim and skips
+  // ranking, capping and label resolution entirely, because a boolean cannot
+  // be changed by any of them.
+  private lifecycleClaimsWithCandidatesTx(inputs: Array<{ claimId: string; chatSourceId: string; sinceMs: number }>): Set<string> {
+    return new Set(this.collectLifecycleCandidatesTx(inputs, "existence").keys());
   }
 
   // Re-project one claim's lifecycle state onto its graph node: payload status
@@ -8260,28 +8318,49 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     );
     const eventsByClaim = this.loadLifecycleEventsTx(claimIds);
     const anchorByClaim = this.bulkLifecycleAnchorsTx(claimIds);
-    // One bulk candidate pass for every OPEN node (set queries, not per-node).
-    const candidateInputs: Array<{ claimId: string; chatSourceId: string; sinceMs: number }> = [];
+    type CandidateInput = { claimId: string; chatSourceId: string; sinceMs: number };
+    const openInputs: CandidateInput[] = [];
+    // The sweep_due chip is `candidateCount > 0 || duePassedSinceReview`. The
+    // right-hand side is decided by the fold and the due date, both already in
+    // hand — so a node it settles needs NO candidate query at all. On the real
+    // archive that is 5,022 of 5,721 open nodes, leaving 699 to ask about.
+    const undecidedInputs: CandidateInput[] = [];
+    const duePassedByClaim = new Map<string, boolean>();
     const foldByClaim = new Map<string, LifecycleFold>();
+    // Parsed once here and reused by the row loop below.
+    const payloads: Array<ReturnType<typeof parseGraphPayload>> = [];
     for (let index = 0; index < claimIds.length; index += 1) {
       const claimId = claimIds[index]!;
       const fold = foldLifecycleEvents(eventsByClaim.get(claimId) ?? []);
       foldByClaim.set(claimId, fold);
+      const payload = parseGraphPayload(rows[index]!.payload_json);
+      payloads.push(payload);
       if (fold.status === "open") {
-        candidateInputs.push({
+        const input: CandidateInput = {
           claimId,
           chatSourceId: rows[index]!.chat_scope ?? "",
           sinceMs: Math.max(anchorByClaim.get(claimId) ?? 0, fold.lastReviewedAtMs ?? 0)
-        });
+        };
+        openInputs.push(input);
+        const dueMs = typeof payload?.dueMs === "number" ? (payload.dueMs as number) : null;
+        const duePassed = dueMs != null && dueMs < asOfMs && (fold.lastReviewedAtMs == null || fold.lastReviewedAtMs < dueMs);
+        duePassedByClaim.set(claimId, duePassed);
+        if (!duePassed) {
+          undecidedInputs.push(input);
+        }
       }
     }
-    const candidatesByClaim = this.bulkLifecycleCandidatesTx(candidateInputs);
+    // `evidence_desc` ranks BY the candidate count, so it alone must know every
+    // count before it can choose a page; every other view needs only the
+    // boolean here, plus exact counts for the returned rows (hydrated below).
+    const rankedByCandidates = (options.sort ?? "smart") === "evidence_desc";
+    const fullCandidates = rankedByCandidates ? this.bulkLifecycleCandidatesTx(openInputs) : null;
+    const claimsWithCandidates = fullCandidates
+      ? new Set(fullCandidates.keys())
+      : this.lifecycleClaimsWithCandidatesTx(undecidedInputs);
     const holderLabels = this.bulkLifecycleLabelsTx(
-      rows
-        .map((row) => parseGraphPayload(row.payload_json)?.holderJid)
-        .filter((jid): jid is string => typeof jid === "string")
+      payloads.map((payload) => payload?.holderJid).filter((jid): jid is string => typeof jid === "string")
     );
-    const claimTextStmt = this.db.prepare(`SELECT text FROM brain_claims WHERE id = ?`);
     const counts = { open: 0, overdue: 0, stale: 0, fulfilled: 0, dismissed: 0, sweepDue: 0, orphanedEvents: 0 };
     // Group facets: item counts per source chat within the status+kind scope,
     // BEFORE flag/hide/include/exclude — a stable picker for the group filter.
@@ -8292,7 +8371,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       const row = rows[index]!;
       const claimId = claimIds[index]!;
       const fold = foldByClaim.get(claimId)!;
-      const payload = parseGraphPayload(row.payload_json);
+      const payload = payloads[index]!;
       const anchorMs = anchorByClaim.get(claimId) ?? null;
       const dueMs = typeof payload?.dueMs === "number" ? (payload.dueMs as number) : null;
       const flags = computeLifecycleFlags({
@@ -8304,15 +8383,18 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         asOfMs,
         staleDays
       });
-      let candidateCount = 0;
+      // Exact for `evidence_desc` (which sorts by it); otherwise filled in for
+      // the returned page only, after the limit applies.
+      let candidateCount = fullCandidates?.get(claimId)?.length ?? 0;
       let sweepDue = false;
       if (fold.status === "open") {
         counts.open += 1;
         if (flags.overdue) counts.overdue += 1;
         if (flags.stale) counts.stale += 1;
-        candidateCount = candidatesByClaim.get(claimId)?.length ?? 0;
-        const duePassedSinceReview = dueMs != null && dueMs < asOfMs && (fold.lastReviewedAtMs == null || fold.lastReviewedAtMs < dueMs);
-        sweepDue = candidateCount > 0 || duePassedSinceReview;
+        // Identical to `candidateCount > 0 || duePassedSinceReview`: the
+        // existence set is queried for exactly the claims the due-date test
+        // left undecided, so an omitted claim is one already known sweep-due.
+        sweepDue = claimsWithCandidates.has(claimId) || (duePassedByClaim.get(claimId) ?? false);
         if (sweepDue) {
           counts.sweepDue += 1;
         }
@@ -8348,7 +8430,11 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       if (includeChats && !includeChats.has(chatKey)) continue;
       if (excludeChats && excludeChats.has(chatKey)) continue;
       const holderJid = typeof payload?.holderJid === "string" ? (payload.holderJid as string) : null;
-      const claimRow = claimTextStmt.get(claimId) as { text: string } | undefined;
+      // Detail that only the RETURNED rows need — the claim's text and the
+      // resolving event's citation views — is deferred past the sort and the
+      // limit below. `text` carries the node-title fallback until then, and
+      // `cites` starts empty; neither participates in ordering, so deferring
+      // them cannot change which rows come back.
       let resolution: BrainLifecycleResolutionView | null = null;
       if (fold.resolvingEvent) {
         resolution = {
@@ -8357,7 +8443,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
           atMs: fold.resolvedAtMs ?? fold.resolvingEvent.createdAtMs,
           note: fold.resolvingEvent.note,
           model: fold.resolvingEvent.model,
-          cites: this.lifecycleCiteViewsTx(fold.resolvingEvent)
+          cites: []
         };
       }
       items.push({
@@ -8365,7 +8451,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         slug: row.slug,
         kind: row.kind as "commitment" | "question",
         claimId,
-        text: claimRow?.text ?? row.title ?? "",
+        text: row.title ?? "",
         chatSourceId: row.chat_scope ?? "",
         chatDisplayName: row.chatDisplayName?.trim() || null,
         holderJid,
@@ -8395,7 +8481,56 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       .map(([chatSourceId, count]) => ({ chatSourceId, chatDisplayName: facetLabel.get(chatSourceId) ?? null, count }))
       .sort((a, b) => b.count - a.count || (a.chatDisplayName ?? a.chatSourceId).localeCompare(b.chatDisplayName ?? b.chatSourceId))
       .slice(0, 300);
-    return { items: items.slice(0, limit), counts, chatFacets, asOfMs, staleDays };
+    // Now — and only now — the page is known, so per-row detail is fetched for
+    // it alone. The claim texts were an N+1 over everything in scope (5,673
+    // point reads to render 200 on the real archive); one keyed batch covers
+    // the page instead, which is what makes `limit` mean something.
+    const page = items.slice(0, limit);
+    const claimTexts = this.bulkClaimTextsTx(page.map((item) => item.claimId));
+    // Exact candidate counts for the page. Safe to scope: a claim's candidate
+    // list does not depend on who it was queried alongside (see
+    // collectLifecycleCandidatesTx), so these are the same numbers the
+    // whole-population pass produced — just not paid for 5,721 rows to show 200.
+    const pageCandidates = fullCandidates
+      ? null
+      : this.bulkLifecycleCandidatesTx(
+          page
+            .filter((item) => item.status === "open")
+            .map((item) => ({
+              claimId: item.claimId,
+              chatSourceId: item.chatSourceId,
+              sinceMs: Math.max(anchorByClaim.get(item.claimId) ?? 0, foldByClaim.get(item.claimId)?.lastReviewedAtMs ?? 0)
+            }))
+        );
+    for (const item of page) {
+      item.text = claimTexts.get(item.claimId) ?? item.text;
+      if (pageCandidates) {
+        item.candidateCount = pageCandidates.get(item.claimId)?.length ?? 0;
+      }
+      const resolvingEvent = foldByClaim.get(item.claimId)?.resolvingEvent;
+      if (item.resolution && resolvingEvent) {
+        item.resolution.cites = this.lifecycleCiteViewsTx(resolvingEvent);
+      }
+    }
+    return { items: page, counts, chatFacets, asOfMs, staleDays };
+  }
+
+  // Claim texts for a known set of ids, in id-batches. Callers that render a
+  // page use this instead of a per-row point read.
+  private bulkClaimTextsTx(claimIds: string[]): Map<string, string> {
+    const texts = new Map<string, string>();
+    for (let index = 0; index < claimIds.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = claimIds.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      if (batch.length === 0) {
+        continue;
+      }
+      for (const row of this.db
+        .prepare(`SELECT id, text FROM brain_claims WHERE id IN (${batch.map(() => "?").join(",")})`)
+        .all(...batch) as Array<{ id: string; text: string }>) {
+        texts.set(row.id, row.text);
+      }
+    }
+    return texts;
   }
 
   // Full context for one lifecycle item (the detail modal): the item, the

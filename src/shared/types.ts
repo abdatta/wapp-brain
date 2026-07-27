@@ -1687,24 +1687,35 @@ export interface BrainStatusSummary {
   activeRun: BrainRunSummary | null;
 }
 
-// The /api/brain/status response: repository status + provider + scheduler,
-// plus contract-v2 quality surfaces attached by the server layer.
+// The /api/brain/status response: repository status + provider + scheduler.
+// This is the HOT POLL — the app shell refreshes it on every archive change,
+// from every surface, so it carries only what the shell renders. Dashboard
+// aggregates that a user reads occasionally live on BrainQualitySummary
+// instead; computing them here made navigating anywhere in the app pay for
+// numbers nobody was looking at.
 export interface BrainOverview extends BrainStatusSummary {
   provider: BrainProviderStatus;
   scheduler: BrainSchedulerStatus;
-  extractionVersion?: number;
+}
+
+// The /api/brain/quality response: the COLD DASHBOARD half of the old status
+// payload. Requested by the brain surface on its own cadence, never by the
+// shell — every field here is a full-population aggregate over the brain
+// tables, and none of them changes what the shell can draw.
+export interface BrainQualitySummary {
+  extractionVersion: number;
   // Current episodes that are extractive-generated or carry a stale
   // extraction version — the `brain regenerate` queue size.
-  regenerableEpisodes?: number;
-  validationIssues?: BrainValidationIssueSummary;
+  regenerableEpisodes: number;
+  validationIssues: BrainValidationIssueSummary;
   // The D13 media-demand stat: gap counts split by modality and impact.
-  mediaGaps?: BrainMediaGapSummary[];
+  mediaGaps: BrainMediaGapSummary[];
   // Identity late-resolution debt: episodes whose participants are still
   // labelled by a number, ranked so the highest-value contact saves surface.
-  resolutionDebt?: BrainResolutionDebtSummary;
+  resolutionDebt: BrainResolutionDebtSummary;
   // Eval harness free interim signal: per-(model, extraction_version) quality
   // rollup — fallback rates render even before any manual grades exist.
-  modelQuality?: BrainModelQualityAggregate[];
+  modelQuality: BrainModelQualityAggregate[];
 }
 
 // One unresolved identity in the resolution-debt surface: how much brain content

@@ -424,7 +424,7 @@ The brain SHALL project committed episodes and their claims as Obsidian-compatib
 - **THEN** the edit does not alter brain state and is overwritten on next projection
 
 ### Requirement: Non-Blocking Operation
-All brain work SHALL run in bounded batches with event-loop yields, report progress for any operation over one second via job objects and server-sent events, respect the recovery-tick pass ordering so live sync is never starved, and never touch the WhatsApp socket.
+All brain work SHALL run in bounded batches with event-loop yields, report progress for any operation over one second via job objects and server-sent events, respect the recovery-tick pass ordering so live sync is never starved, and never touch the WhatsApp socket. The same discipline SHALL extend to brain READS: an endpoint polled by the application shell SHALL answer within a stated latency budget at real archive scale, and a derived aggregate that cannot meet that budget SHALL be served off the poll path rather than making every navigation pay for it. Read cost SHALL be measured against a realistic archive rather than assumed from a query's apparent simplicity.
 
 #### Scenario: Nightly run during live sync
 - **WHEN** a consolidation run executes while live messages are arriving
@@ -433,6 +433,10 @@ All brain work SHALL run in bounded batches with event-loop yields, report progr
 #### Scenario: Failures are never silent
 - **WHEN** any brain job fails, is interrupted, or is blocked
 - **THEN** the state and a privacy-safe reason surface in the brain status UI, remain discoverable after page reloads and server restarts, and are mirrored as counts-and-durations-only lines in the server console
+
+#### Scenario: A polled read stays within budget as the archive grows
+- **WHEN** the shell polls brain status against an archive of hundreds of thousands of messages
+- **THEN** the response arrives within its stated budget, and any aggregate that would exceed it is served by a separate, separately-cadenced endpoint instead
 
 ### Requirement: Identity Merge Reconciles Derived Brain State
 When an identity merge collapses a chat or sender from one JID form to its canonical form, the merge SHALL reconcile the derived brain state in the same transaction with deterministic statements and no model call: episodes SHALL move to the surviving chat source id, citations SHALL be rekeyed through the stable message rowid anchor (repointing any citation whose message row was collapsed onto the surviving row), the surviving chat's watermark cursor SHALL be the greater of the two chats' `(timestamp, rowid)` cursors, and pending tasks referencing the pre-merge chat SHALL be dropped (or rekeyed) so the drain never re-covers an orphaned window. Merges SHALL NOT strand watermarks or tasks under the dead identity, produce duplicate re-assimilation, or leave citations pointing at stale message keys.

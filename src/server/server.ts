@@ -905,19 +905,39 @@ app.get("/api/search/status", async (_req, res) => {
 // Brain substrate status: watermark coverage, task queue, budget ledger,
 // provider health, and run-dueness in one call — the operator dashboard for
 // "is the brain keeping itself updated" under manual-first control.
+//
+// THE HOT POLL. The shell refreshes this from every surface on every archive
+// change, so its cost is the floor for navigating anywhere in the app. Nothing
+// is computed here that the shell does not render: getBrainStatus() rides its
+// own TTL cache, and dueness is derived from the status already in hand. The
+// five dashboard aggregates that used to hang off this route (measured at
+// ~620ms of UNCACHED work per request on a 327k-message archive, all of it
+// outside that cache) moved to /api/brain/quality — a value nobody is looking
+// at should not be computed, and no TTL makes a hot/cold conflation correct.
 app.get("/api/brain/status", async (_req, res) => {
   try {
     const { getBrainProviderStatus } = await import("./brain/provider");
     const { schedulerStatusFromSummary } = await import("./brain/scheduler");
-    const { EXTRACTION_VERSION } = await import("./brain/episodes");
     const status = await repository.getBrainStatus();
     res.json({
       ...status,
       provider: getBrainProviderStatus(),
       // Dueness derived from the status we already computed — no extra scan, so
       // this stays a fast, UI-pollable endpoint.
-      scheduler: schedulerStatusFromSummary(status),
-      // Contract v2 quality surfaces: all cheap indexed counts.
+      scheduler: schedulerStatusFromSummary(status)
+    });
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+// The COLD DASHBOARD half: contract-v2 quality surfaces, requested by the brain
+// page on its own cadence. Every entry here is a full-population aggregate, so
+// this route is deliberately NOT on the poll path — see /api/brain/status.
+app.get("/api/brain/quality", async (_req, res) => {
+  try {
+    const { EXTRACTION_VERSION } = await import("./brain/episodes");
+    res.json({
       extractionVersion: EXTRACTION_VERSION,
       regenerableEpisodes: await repository.countRegenerableBrainEpisodes(EXTRACTION_VERSION),
       validationIssues: await repository.getBrainValidationIssueSummary(),
@@ -926,8 +946,7 @@ app.get("/api/brain/status", async (_req, res) => {
       // Identity late-resolution debt: episodes still referring to people by
       // number, ranked so the highest-value contact saves surface first.
       resolutionDebt: await repository.getBrainResolutionDebt({ limit: 8 }),
-      // Eval harness free interim signal: per-model fallback/precision rollup
-      // (cheap GROUP BYs over small brain tables).
+      // Eval harness free interim signal: per-model fallback/precision rollup.
       modelQuality: await repository.getBrainModelQualityAggregates()
     });
   } catch (error) {
