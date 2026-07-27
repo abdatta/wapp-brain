@@ -429,6 +429,17 @@ export function BrainDocsPage() {
                 </Link>{" "}
                 <span className="chip">{KIND_LABEL[item.kind]}</span>{" "}
                 {item.status === "merged" && <span className="chip">merged</span>}
+                {/* Hybrid pages render normally — some of what fed them is now
+                    muted, and their muted-source links route to /brain/muted. */}
+                {item.mutedState === "hybrid" && (
+                  <Link
+                    to="/brain/muted"
+                    className="chip docMutedHybrid"
+                    title="Some of the claims that fed this page come from a muted chat. The page still reads normally; its muted sources live in the muted-items view."
+                  >
+                    some sources muted
+                  </Link>
+                )}
                 {item.revision != null ? (
                   <span className="brainHint">
                     rev {item.revision} · rolled {formatDay(item.lastRollupAtMs)}

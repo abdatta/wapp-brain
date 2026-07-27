@@ -10,6 +10,7 @@ const SearchPage = lazy(() => import("./pages/search/SearchPage").then((m) => ({
 const BrainPage = lazy(() => import("./pages/brain/BrainPage").then((m) => ({ default: m.BrainPage })));
 const BrainEvalPage = lazy(() => import("./pages/brain/BrainEvalPage").then((m) => ({ default: m.BrainEvalPage })));
 const CommitmentsPage = lazy(() => import("./pages/brain/CommitmentsPage").then((m) => ({ default: m.CommitmentsPage })));
+const BrainMutedPage = lazy(() => import("./pages/brain/MutedPage").then((m) => ({ default: m.MutedPage })));
 const BrainDocsPage = lazy(() => import("./pages/brain/DocsPage").then((m) => ({ default: m.BrainDocsPage })));
 const BrainDocPage = lazy(() => import("./pages/brain/DocPage").then((m) => ({ default: m.BrainDocPage })));
 const BrainRunsPage = lazy(() => import("./pages/brain/RunsPage").then((m) => ({ default: m.BrainRunsPage })));
@@ -34,12 +35,19 @@ export function AppRoutes() {
     <Routes>
       <Route element={<AppShell />}>
         <Route index element={<Navigate to="/chats" replace />} />
-        <Route path="chats" element={<ChatsPage />} />
-        <Route path="chats/:id" element={<ChatsPage />} />
+        {/* ONE route, optional param — not two entries rendering the same
+            component. Two entries are distinct positions in the route tree, so
+            navigating `/chats` → `/chats/:id` unmounted and remounted the page
+            and threw away all of its filter state: the search box, the type
+            filter, the event-only toggle, the muted fold, and the loaded list
+            (which is why an opened chat then resolved as "Unresolved contact" —
+            it was no longer in the list to look up). */}
+        <Route path="chats/:id?" element={<ChatsPage />} />
         <Route path="search" element={<SearchPage />} />
         <Route path="brain" element={<BrainPage />} />
         <Route path="brain/eval" element={<BrainEvalPage />} />
         <Route path="brain/commitments" element={<CommitmentsPage />} />
+        <Route path="brain/muted" element={<BrainMutedPage />} />
         <Route path="brain/pages" element={<BrainDocsPage />} />
         <Route path="brain/pages/:docId" element={<BrainDocPage />} />
         <Route path="brain/runs" element={<BrainRunsPage />} />

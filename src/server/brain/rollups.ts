@@ -694,6 +694,9 @@ export interface DocRenderClaimMeta {
   episodeFile: string | null;
   // 1-based claim position inside its episode (the ^claim-N anchor).
   episodeClaimIndex: number | null;
+  // This claim traces to a muted range. Its episode file is NOT in the vault,
+  // so a wikilink to it would dangle — the renderer marks the source instead.
+  muted?: boolean;
   citationKeys: string[];
 }
 
@@ -761,6 +764,14 @@ export function renderDocMarkdown(context: DocRenderContext, sections: BrainDocS
         const meta = context.claimMeta.get(claimId);
         if (!meta || !meta.exists) {
           cites.push("`(claim removed)`");
+          continue;
+        }
+        // A muted source's episode file is not projected, so linking to it
+        // would leave a dangling wikilink in the vault. Name the state instead
+        // — the page is a hybrid and keeps rendering; only this source is out
+        // of view until the chat is unmuted.
+        if (meta.muted) {
+          cites.push("`(muted source)`");
           continue;
         }
         if (meta.episodeFile && meta.episodeClaimIndex != null) {

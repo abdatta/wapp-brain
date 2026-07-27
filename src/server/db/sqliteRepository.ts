@@ -10,6 +10,12 @@ import type {
   StatusExcisionReport,
   BrainBackfillModelSpend,
   BrainChatBacklogItem,
+  BrainDocMutedState,
+  BrainMuteOrigin,
+  BrainMutedChatItem,
+  BrainMutedListResponse,
+  ChatMuteState,
+  MuteInterval,
   BrainClaimEntityRecord,
   BrainClaimGradeRecord,
   BrainClaimGradeValue,
@@ -95,6 +101,7 @@ import type {
   BrainValidationIssueSummary,
   CapturedLinkPreview,
   ChatListItem,
+  ChatType,
   ChatListOptions,
   ChatRecord,
   ChatMetadataHistoryRecord,
@@ -257,6 +264,7 @@ import {
   type TierPlan
 } from "../search/relaxation";
 import type { ArchiveRepository, ArchiveRestorePoint } from "./repository";
+import { mergeMuteIntervals, truncateMuteIntervals, type MuteIntervalValue } from "./muteIntervals";
 
 const TOOL_VERSION = "0.1.0";
 // Bumped when identity keying changes incompatibly; archives with data written
@@ -1446,6 +1454,25 @@ const schemaStatements = [
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   )`,
 
+  // Per-chat mute ranges: `[start_ms, end_ms)` with NULL end meaning "still
+  // muted". Kept canonical (non-overlapping, merged) by muteChat/unmuteChat, so
+  // every consumer can answer "was this timestamp muted?" with one range lookup.
+  // A zero-length row (start = end) is a TOMBSTONE: it records that this chat's
+  // mute state was deliberately chosen, which is how the channel-default hook
+  // distinguishes "never seen" from "the user unmuted this channel" and refuses
+  // to resurrect the default. Like brain_claim_grades this is user INTENT, not
+  // derived data — excluded from resetBrainDerivedData and from the archive
+  // wipe/restore table lists so mutes outlive a brain reset or a re-import.
+  `CREATE TABLE IF NOT EXISTS brain_mute_intervals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_source_id TEXT NOT NULL,
+    start_ms INTEGER NOT NULL,
+    end_ms INTEGER NULL,
+    origin TEXT NOT NULL DEFAULT 'user' CHECK (origin IN ('user','channel-default')),
+    created_at_ms INTEGER NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_brain_mute_intervals_chat ON brain_mute_intervals (chat_source_id, start_ms)`,
+
   // Durable work queue (cloned from media_download_queue semantics): unique
   // dedupe keys make enqueues idempotent; claim/backoff/priority make
   // interruption free — the next tick re-claims stale work.
@@ -1754,6 +1781,11 @@ const schemaStatements = [
   // ('<kind>:<slug>' — the node's immutable slug is the projection/URL
   // currency). current_revision_id has no FK on purpose (write-order: the
   // revision row lands first, then the pointer flips).
+  // `muted_state` is the ONE materialized mute classification in the system.
+  // Page lists render constantly and the doc tier records only fed claim ids, so
+  // resolving provenance per render is the N+1 shape that wedges the live
+  // server; mute changes are rare and rollups already touch the row, so the
+  // classification is recomputed on those transitions instead.
   `CREATE TABLE IF NOT EXISTS brain_docs (
     doc_id TEXT PRIMARY KEY,
     kind TEXT NOT NULL CHECK (kind IN ('entity','topic','chat')),
@@ -1763,6 +1795,9 @@ const schemaStatements = [
     merged_into TEXT NULL,
     current_revision_id INTEGER NULL,
     last_rollup_at_ms INTEGER NULL,
+    muted_state TEXT NOT NULL DEFAULT 'clean' CHECK (muted_state IN ('clean','hybrid','muted')),
+    muted_claim_count INTEGER NOT NULL DEFAULT 0,
+    fed_claim_count INTEGER NOT NULL DEFAULT 0,
     created_at_ms INTEGER NOT NULL
   )`,
 
@@ -3078,7 +3113,8 @@ export class SqliteArchiveRepository implements ArchiveRepository {
          FROM chats ch
          LEFT JOIN brain_chat_watermarks w ON w.chat_source_id = ch.source_chat_id
          JOIN messages m ON m.chat_id = ch.id
-         WHERE ${watermarkPendingPredicate("m", "w")}
+         WHERE ${this.mutedMessageExclusionClause("m", "ch")}
+           ${watermarkPendingPredicate("m", "w")}
            AND ${visibleExchangePredicate("m", this.statusChatId())}
            ${chatClause}
          GROUP BY ch.id
@@ -3127,6 +3163,512 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     const throughId = this.boundaryRowidForChat(canonical, throughMs);
     this.db.prepare(WATERMARK_CURSOR_UPSERT).run(canonical, throughMs, throughId, currentIso(), currentIso());
     this.invalidateBrainStatusCache();
+  }
+
+  // --- Chat brain muting ---
+
+  // Non-tombstone ranges only: zero-length rows carry no mute semantics, they
+  // only record that this chat's state was deliberately chosen.
+  private readMuteIntervalsTx(chatSourceId: string): MuteIntervalValue[] {
+    return (
+      this.db
+        .prepare(
+          `SELECT start_ms, end_ms, origin FROM brain_mute_intervals
+           WHERE chat_source_id = ? AND (end_ms IS NULL OR end_ms > start_ms)
+           ORDER BY start_ms`
+        )
+        .all(chatSourceId) as Array<{ start_ms: number; end_ms: number | null; origin: string }>
+    ).map((row) => ({
+      startMs: Number(row.start_ms),
+      endMs: row.end_ms == null ? null : Number(row.end_ms),
+      origin: row.origin as BrainMuteOrigin
+    }));
+  }
+
+  // Replaces a chat's whole interval set with an already-canonical one. Writing
+  // the set wholesale is what keeps "canonical" an invariant of storage rather
+  // than a property each caller has to preserve. An empty set still writes a
+  // tombstone so the chat never looks untouched to the channel-default hook.
+  private writeMuteIntervalsTx(
+    chatSourceId: string,
+    intervals: MuteIntervalValue[],
+    tombstoneAtMs: number
+  ): void {
+    const nowMs = Date.now();
+    this.db.prepare(`DELETE FROM brain_mute_intervals WHERE chat_source_id = ?`).run(chatSourceId);
+    const insert = this.db.prepare(
+      `INSERT INTO brain_mute_intervals (chat_source_id, start_ms, end_ms, origin, created_at_ms) VALUES (?, ?, ?, ?, ?)`
+    );
+    if (intervals.length === 0) {
+      insert.run(chatSourceId, tombstoneAtMs, tombstoneAtMs, "user", nowMs);
+      return;
+    }
+    for (const interval of intervals) {
+      insert.run(chatSourceId, interval.startMs, interval.endMs, interval.origin, nowMs);
+    }
+  }
+
+  private muteStateFromIntervals(chatSourceId: string, intervals: MuteIntervalValue[]): ChatMuteState {
+    const open = intervals.find((interval) => interval.endMs == null) ?? null;
+    return {
+      chatSourceId,
+      intervals: intervals.map((interval) => ({ ...interval })) as MuteInterval[],
+      muted: open != null,
+      mutedSinceMs: open ? open.startMs : null,
+      origin: open ? open.origin : null
+    };
+  }
+
+  async muteChat(chatSourceId: string, options?: { fromMs?: number; origin?: BrainMuteOrigin }): Promise<ChatMuteState> {
+    const canonical = this.canonicalJid(chatSourceId) ?? chatSourceId;
+    const fromMs = Math.max(0, Math.trunc(options?.fromMs ?? Date.now()));
+    const origin = options?.origin ?? "user";
+    let intervals: MuteIntervalValue[] = [];
+    this.db.transaction(() => {
+      intervals = mergeMuteIntervals(this.readMuteIntervalsTx(canonical), fromMs, origin);
+      this.writeMuteIntervalsTx(canonical, intervals, fromMs);
+      // A task queued a moment before the mute would otherwise still run. The
+      // evidence predicate is the real backstop, but dropping the task keeps
+      // the queue honest about what the brain intends to do.
+      this.db.prepare(`DELETE FROM brain_tasks WHERE chat_source_id = ? AND status = 'pending'`).run(canonical);
+      this.afterMuteChangeTx();
+    })();
+    return this.muteStateFromIntervals(canonical, intervals);
+  }
+
+  async unmuteChat(chatSourceId: string, options?: { fromMs?: number }): Promise<ChatMuteState> {
+    const canonical = this.canonicalJid(chatSourceId) ?? chatSourceId;
+    const fromMs = Math.max(0, Math.trunc(options?.fromMs ?? Date.now()));
+    let intervals: MuteIntervalValue[] = [];
+    this.db.transaction(() => {
+      intervals = truncateMuteIntervals(this.readMuteIntervalsTx(canonical), fromMs);
+      this.writeMuteIntervalsTx(canonical, intervals, fromMs);
+      this.afterMuteChangeTx();
+    })();
+    return this.muteStateFromIntervals(canonical, intervals);
+  }
+
+  async getChatMuteState(chatSourceId: string): Promise<ChatMuteState> {
+    const canonical = this.canonicalJid(chatSourceId) ?? chatSourceId;
+    return this.muteStateFromIntervals(canonical, this.readMuteIntervalsTx(canonical));
+  }
+
+  async listFullyMutedChatSourceIds(): Promise<string[]> {
+    return [...this.mutePlan().fullyMutedChatSourceIds];
+  }
+
+  // Every mute transition invalidates the same three things: the cached status
+  // aggregate, the cached plan the predicates compile from, and the materialized
+  // per-doc classification (whose affected docs also become due, so the normal
+  // rollup cadence drains muted prose without a forced re-roll).
+  private afterMuteChangeTx(): void {
+    this.mutePlanCache = null;
+    this.mutedGraphNodeCache = null;
+    this.invalidateBrainStatusCache();
+    this.recomputeDocMutedStatesTx();
+  }
+
+  // Compiled once per query-building call, not per row. The interval table is
+  // tiny (one row per muted chat in practice), so this is a single indexed scan
+  // plus a rowid resolve; the cache exists because getBrainStatus alone builds
+  // the predicate several times per refresh under the UI's poll cadence.
+  private mutePlanCache: MutePlan | null = null;
+
+  private mutePlan(): MutePlan {
+    if (this.mutePlanCache) {
+      return this.mutePlanCache;
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT mi.chat_source_id, mi.start_ms, mi.end_ms, ch.id AS chat_id
+         FROM brain_mute_intervals mi
+         LEFT JOIN chats ch ON ch.source_chat_id = mi.chat_source_id
+         WHERE mi.end_ms IS NULL OR mi.end_ms > mi.start_ms
+         ORDER BY mi.chat_source_id, mi.start_ms`
+      )
+      .all() as Array<{ chat_source_id: string; start_ms: number; end_ms: number | null; chat_id: number | null }>;
+    const plan: MutePlan = { fullyMutedChatIds: [], fullyMutedChatSourceIds: [], partial: [] };
+    const fullyMuted = new Set(
+      rows.filter((row) => row.end_ms == null && Number(row.start_ms) <= 0).map((row) => row.chat_source_id)
+    );
+    for (const chatSourceId of fullyMuted) {
+      plan.fullyMutedChatSourceIds.push(chatSourceId);
+      const chatId = rows.find((row) => row.chat_source_id === chatSourceId)?.chat_id;
+      if (chatId != null) {
+        plan.fullyMutedChatIds.push(Number(chatId));
+      }
+    }
+    for (const row of rows) {
+      if (fullyMuted.has(row.chat_source_id)) continue;
+      plan.partial.push({
+        chatId: row.chat_id == null ? null : Number(row.chat_id),
+        chatSourceId: row.chat_source_id,
+        startMs: Number(row.start_ms),
+        endMs: row.end_ms == null ? null : Number(row.end_ms)
+      });
+    }
+    this.mutePlanCache = plan;
+    return plan;
+  }
+
+  // Bare boolean expression ("" when nothing is muted). Pass the query's chats
+  // alias whenever it has one — see mutedMessageExclusionPredicate for why the
+  // query plan depends on it.
+  private mutedMessageExclusion(alias: string, chatAlias?: string): string {
+    return mutedMessageExclusionPredicate(alias, this.mutePlan(), chatAlias);
+  }
+
+  // Same predicate as a spliceable `… AND ` prefix.
+  private mutedMessageExclusionClause(alias: string, chatAlias?: string): string {
+    return andPrefix(this.mutedMessageExclusion(alias, chatAlias));
+  }
+
+  private mutedEpisodeExclusionClause(alias: string): string {
+    return andPrefix(this.mutedEpisodeExclusion(alias));
+  }
+
+  // Keeps a lifecycle row array and its parallel claim-id array in lockstep
+  // while dropping (or, for the muted view, keeping only) muted items. This runs
+  // BEFORE any counting or faceting, because hidden means invisible everywhere —
+  // a muted commitment must not inflate an "open" count it can never be clicked
+  // from. This is the `excludeChats` idea generalized onto the shared predicate.
+  private partitionMutedLifecycleRows<T>(rows: T[], claimIds: string[], onlyMuted: boolean): { rows: T[]; claimIds: string[] } {
+    if (!onlyMuted && planIsEmpty(this.mutePlan())) {
+      return { rows, claimIds };
+    }
+    const muted = this.mutedClaimIdsTx(claimIds);
+    if (!onlyMuted && muted.size === 0) {
+      return { rows, claimIds };
+    }
+    const keptRows: T[] = [];
+    const keptClaimIds: string[] = [];
+    for (let index = 0; index < claimIds.length; index += 1) {
+      if (muted.has(claimIds[index]!) !== onlyMuted) continue;
+      keptRows.push(rows[index]!);
+      keptClaimIds.push(claimIds[index]!);
+    }
+    return { rows: keptRows, claimIds: keptClaimIds };
+  }
+
+  // Graph nodes obey the exclusively-vs-hybrid rule: a node hides only when
+  // EVERY claim supporting it is muted. A person who appears in both a muted
+  // group and a live DM stays visible — only the muted evidence disappears from
+  // their page. Chat-scope nodes of a fully muted chat are the cheap shortcut:
+  // they can have no other support by construction.
+  //
+  // Two bulk queries for the whole graph, cached with the compiled plan, so no
+  // node-listing surface ever pays a per-node provenance lookup.
+  private mutedGraphNodeCache: Set<string> | null = null;
+
+  private mutedGraphNodeIds(): Set<string> {
+    if (this.mutedGraphNodeCache) {
+      return this.mutedGraphNodeCache;
+    }
+    const plan = this.mutePlan();
+    const hidden = new Set<string>();
+    if (planIsEmpty(plan)) {
+      this.mutedGraphNodeCache = hidden;
+      return hidden;
+    }
+    const inclusion = mutedEpisodeInclusionPredicate("e", plan);
+    for (const row of this.db
+      .prepare(
+        `SELECT nc.node_id AS nodeId
+         FROM brain_node_claims nc
+         JOIN brain_claims c ON c.id = nc.claim_id
+         JOIN brain_episodes e ON e.id = c.episode_id
+         GROUP BY nc.node_id
+         HAVING SUM(CASE WHEN ${inclusion} THEN 0 ELSE 1 END) = 0`
+      )
+      .all() as Array<{ nodeId: string }>) {
+      hidden.add(String(row.nodeId));
+    }
+    if (plan.fullyMutedChatSourceIds.length > 0) {
+      for (const row of this.db
+        .prepare(
+          `SELECT id FROM brain_nodes WHERE chat_scope IN (${plan.fullyMutedChatSourceIds.map(sqlQuote).join(",")})`
+        )
+        .all() as Array<{ id: string }>) {
+        hidden.add(String(row.id));
+      }
+    }
+    this.mutedGraphNodeCache = hidden;
+    return hidden;
+  }
+
+  // Bare expression ("" when nothing is hidden) for node-listing queries.
+  private mutedGraphNodeExclusion(alias: string): string {
+    const hidden = this.mutedGraphNodeIds();
+    return hidden.size === 0 ? "" : `${alias}.id NOT IN (${[...hidden].map(sqlQuote).join(",")})`;
+  }
+
+  private mutedGraphNodeExclusionClause(alias: string): string {
+    return andPrefix(this.mutedGraphNodeExclusion(alias));
+  }
+
+  // Validation issues are anchored to an episode when one exists and to a chat
+  // otherwise. A hidden episode's issue would be a quality complaint about
+  // prose the user cannot open, so it hides with its episode; an episode-less
+  // issue hides only when its whole chat is muted. Expects `alias` on
+  // brain_validation_issues (columns `episode_id`, `chat_source_id`).
+  private mutedValidationIssueExclusion(alias: string): string {
+    const plan = this.mutePlan();
+    if (planIsEmpty(plan)) {
+      return "";
+    }
+    const parts = [
+      `NOT EXISTS (SELECT 1 FROM brain_episodes vie WHERE vie.id = ${alias}.episode_id
+         AND ${mutedEpisodeInclusionPredicate("vie", plan)})`
+    ];
+    if (plan.fullyMutedChatSourceIds.length > 0) {
+      parts.push(
+        `(${alias}.episode_id IS NOT NULL
+           OR ${alias}.chat_source_id IS NULL
+           OR ${alias}.chat_source_id NOT IN (${plan.fullyMutedChatSourceIds.map(sqlQuote).join(",")}))`
+      );
+    }
+    return parts.join(" AND ");
+  }
+
+  // An edge is hidden when EITHER endpoint is hidden — an edge to an invisible
+  // node is unreachable anyway, and counting it would contradict the node stats.
+  private mutedGraphEdgeExclusion(alias: string): string {
+    const hidden = this.mutedGraphNodeIds();
+    if (hidden.size === 0) {
+      return "";
+    }
+    const list = [...hidden].map(sqlQuote).join(",");
+    return `${alias}.src_node_id NOT IN (${list}) AND ${alias}.dst_node_id NOT IN (${list})`;
+  }
+
+  private mutedGraphEdgeExclusionClause(alias: string): string {
+    return andPrefix(this.mutedGraphEdgeExclusion(alias));
+  }
+
+  // Which of these claims trace to a muted episode. One set query for a whole
+  // page of items — the per-node shape is what wedges the live archive.
+  private mutedClaimIdsTx(claimIds: string[]): Set<string> {
+    const muted = new Set<string>();
+    if (claimIds.length === 0 || planIsEmpty(this.mutePlan())) {
+      return muted;
+    }
+    const inclusion = mutedEpisodeInclusionPredicate("e", this.mutePlan());
+    for (let index = 0; index < claimIds.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
+      const batch = claimIds.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
+      const rows = this.db
+        .prepare(
+          `SELECT c.id FROM brain_claims c
+           JOIN brain_episodes e ON e.id = c.episode_id
+           WHERE c.id IN (${batch.map(() => "?").join(",")}) AND ${inclusion}`
+        )
+        .all(...batch) as Array<{ id: string }>;
+      for (const row of rows) {
+        muted.add(String(row.id));
+      }
+    }
+    return muted;
+  }
+
+  // Recompute the materialized per-doc classification for every doc, in bulk.
+  // Claim provenance is resolved through the CURRENT revision's fed-claim audit
+  // (what the rollup was actually offered), which is the only per-doc record of
+  // where a page's prose came from. Docs with no revision stay 'clean' — there
+  // is no prose to be muted yet.
+  private recomputeDocMutedStatesTx(): number {
+    const plan = this.mutePlan();
+    const inclusion = mutedEpisodeInclusionPredicate("e", plan);
+    const result = this.db
+      .prepare(
+        `WITH fed AS (
+           SELECT d.doc_id AS doc_id, je.value AS claim_id
+           FROM brain_docs d
+           JOIN brain_doc_revisions r ON r.id = d.current_revision_id
+           JOIN json_each(r.fed_claim_ids_json) je
+         ),
+         classified AS (
+           SELECT fed.doc_id AS doc_id,
+                  COUNT(*) AS fed_count,
+                  COALESCE(SUM(CASE WHEN e.id IS NOT NULL AND ${inclusion} THEN 1 ELSE 0 END), 0) AS muted_count
+           FROM fed
+           LEFT JOIN brain_claims c ON c.id = fed.claim_id
+           LEFT JOIN brain_episodes e ON e.id = c.episode_id
+           GROUP BY fed.doc_id
+         )
+         UPDATE brain_docs SET
+           fed_claim_count = classified.fed_count,
+           muted_claim_count = classified.muted_count,
+           muted_state = CASE
+             WHEN classified.muted_count = 0 THEN 'clean'
+             WHEN classified.muted_count >= classified.fed_count THEN 'muted'
+             ELSE 'hybrid' END
+         FROM classified
+         WHERE brain_docs.doc_id = classified.doc_id
+           AND (brain_docs.fed_claim_count != classified.fed_count
+                OR brain_docs.muted_claim_count != classified.muted_count)`
+      )
+      .run();
+    // A doc whose prose now cites muted material must be re-rolled eventually;
+    // marking it due lets the NORMAL rollup cadence drain it, with no forced
+    // immediate spend. Dueness is derived, so touching the rollup stamp is what
+    // "mark due" means here.
+    if (result.changes > 0) {
+      this.db.prepare(`UPDATE brain_docs SET last_rollup_at_ms = NULL WHERE muted_state != 'clean' AND muted_claim_count > 0`).run();
+    }
+    return result.changes;
+  }
+
+  async recomputeDocMutedStates(): Promise<{ docsUpdated: number }> {
+    let docsUpdated = 0;
+    this.db.transaction(() => {
+      this.mutePlanCache = null;
+      docsUpdated = this.recomputeDocMutedStatesTx();
+    })();
+    this.invalidateBrainStatusCache();
+    return { docsUpdated };
+  }
+
+  // The muted-items view. Six bulk aggregates regardless of how many chats are
+  // muted — the per-chat loop shape dies on the real archive.
+  async listMutedChats(): Promise<BrainMutedListResponse> {
+    const plan = this.mutePlan();
+    const open = (
+      this.db
+        .prepare(
+          `SELECT mi.chat_source_id, mi.start_ms, mi.origin,
+                  ch.id AS chat_id, NULLIF(TRIM(COALESCE(ch.display_name, '')), '') AS display_name,
+                  ch.chat_type, ch.message_count
+           FROM brain_mute_intervals mi
+           LEFT JOIN chats ch ON ch.source_chat_id = mi.chat_source_id
+           WHERE mi.end_ms IS NULL
+           ORDER BY mi.start_ms DESC, mi.chat_source_id`
+        )
+        .all() as Array<{
+        chat_source_id: string;
+        start_ms: number;
+        origin: string;
+        chat_id: number | null;
+        display_name: string | null;
+        chat_type: string | null;
+        message_count: number | null;
+      }>
+    ).filter((row) => row.chat_id != null);
+    if (open.length === 0) {
+      return { items: [], summary: { mutedChats: 0, piledUpMessages: 0, piledUpMedia: 0, hiddenEpisodes: 0 } };
+    }
+    const chatIds = open.map((row) => Number(row.chat_id));
+    const sourceIds = open.map((row) => row.chat_source_id);
+    const idList = chatIds.join(",");
+    const sourceList = sourceIds.map(sqlQuote).join(",");
+
+    // Piled up = visible messages inside the OPEN muted range that the brain
+    // never got to (past its frozen watermark). Derived, never a counter.
+    const piled = new Map<string, { messages: number; media: number }>();
+    for (const row of this.db
+      .prepare(
+        `SELECT ch.source_chat_id AS chat_source_id,
+                COUNT(m.id) AS messages,
+                COALESCE(SUM(CASE WHEN m.has_media = 1 THEN 1 ELSE 0 END), 0) AS media
+         FROM chats ch
+         JOIN brain_mute_intervals mi ON mi.chat_source_id = ch.source_chat_id AND mi.end_ms IS NULL
+         LEFT JOIN brain_chat_watermarks w ON w.chat_source_id = ch.source_chat_id
+         JOIN messages m ON m.chat_id = ch.id
+         WHERE ch.id IN (${idList})
+           AND COALESCE(m.timestamp_ms, 0) >= mi.start_ms
+           AND ${watermarkPendingPredicate("m", "w")}
+           AND ${visibleExchangePredicate("m", this.statusChatId())}
+         GROUP BY ch.id`
+      )
+      .all() as Array<{ chat_source_id: string; messages: number; media: number }>) {
+      piled.set(row.chat_source_id, { messages: Number(row.messages), media: Number(row.media) });
+    }
+
+    const inclusion = mutedEpisodeInclusionPredicate("e", plan);
+    const hiddenEpisodes = new Map<string, number>();
+    const hiddenClaims = new Map<string, number>();
+    for (const row of this.db
+      .prepare(
+        `SELECT e.chat_source_id AS chat_source_id,
+                COUNT(DISTINCT e.id) AS episodes,
+                COUNT(c.id) AS claims
+         FROM brain_episodes e
+         LEFT JOIN brain_claims c ON c.episode_id = e.id
+         WHERE e.chat_source_id IN (${sourceList}) AND ${inclusion}
+         GROUP BY e.chat_source_id`
+      )
+      .all() as Array<{ chat_source_id: string; episodes: number; claims: number }>) {
+      hiddenEpisodes.set(row.chat_source_id, Number(row.episodes));
+      hiddenClaims.set(row.chat_source_id, Number(row.claims));
+    }
+
+    // Commitments/questions are graph nodes keyed `<kind>:<claimId>`; a hidden
+    // one is a node whose backing claim traces to a muted episode.
+    const hiddenCommitments = new Map<string, number>();
+    for (const row of this.db
+      .prepare(
+        `SELECT e.chat_source_id AS chat_source_id, COUNT(*) AS items
+         FROM brain_nodes n
+         JOIN brain_claims c ON c.id = SUBSTR(n.natural_key, INSTR(n.natural_key, ':') + 1)
+         JOIN brain_episodes e ON e.id = c.episode_id
+         WHERE n.kind IN ('commitment','question') AND n.status != 'merged'
+           AND e.chat_source_id IN (${sourceList}) AND ${inclusion}
+         GROUP BY e.chat_source_id`
+      )
+      .all() as Array<{ chat_source_id: string; items: number }>) {
+      hiddenCommitments.set(row.chat_source_id, Number(row.items));
+    }
+
+    // Pages are cross-chat by construction, so a fully-muted page is attributed
+    // to every muted chat that fed it — the honest answer to "what did muting
+    // this chat hide?" without pretending pages have one owner.
+    const hiddenDocs = new Map<string, number>();
+    for (const row of this.db
+      .prepare(
+        `SELECT e.chat_source_id AS chat_source_id, COUNT(DISTINCT d.doc_id) AS docs
+         FROM brain_docs d
+         JOIN brain_doc_revisions r ON r.id = d.current_revision_id
+         JOIN json_each(r.fed_claim_ids_json) je
+         JOIN brain_claims c ON c.id = je.value
+         JOIN brain_episodes e ON e.id = c.episode_id
+         WHERE d.muted_state = 'muted' AND e.chat_source_id IN (${sourceList}) AND ${inclusion}
+         GROUP BY e.chat_source_id`
+      )
+      .all() as Array<{ chat_source_id: string; docs: number }>) {
+      hiddenDocs.set(row.chat_source_id, Number(row.docs));
+    }
+
+    const items: BrainMutedChatItem[] = open.map((row) => ({
+      chatSourceId: row.chat_source_id,
+      chatDisplayName: row.display_name?.trim() || null,
+      chatType: (row.chat_type ?? "unknown") as BrainMutedChatItem["chatType"],
+      mutedSinceMs: Number(row.start_ms),
+      origin: row.origin as BrainMuteOrigin,
+      archivedMessages: Number(row.message_count ?? 0),
+      piledUpMessages: piled.get(row.chat_source_id)?.messages ?? 0,
+      piledUpMedia: piled.get(row.chat_source_id)?.media ?? 0,
+      hiddenEpisodes: hiddenEpisodes.get(row.chat_source_id) ?? 0,
+      hiddenClaims: hiddenClaims.get(row.chat_source_id) ?? 0,
+      hiddenCommitments: hiddenCommitments.get(row.chat_source_id) ?? 0,
+      hiddenDocs: hiddenDocs.get(row.chat_source_id) ?? 0
+    }));
+    return {
+      items,
+      summary: {
+        mutedChats: items.length,
+        piledUpMessages: items.reduce((sum, item) => sum + item.piledUpMessages, 0),
+        piledUpMedia: items.reduce((sum, item) => sum + item.piledUpMedia, 0),
+        hiddenEpisodes: items.reduce((sum, item) => sum + item.hiddenEpisodes, 0)
+      }
+    };
+  }
+
+  private mutedEpisodeExclusion(alias: string): string {
+    return mutedEpisodeExclusionPredicate(alias, this.mutePlan());
+  }
+
+  // A chat is fully muted when one open range starts at or before the beginning
+  // of time — the shape every channel default and "entire history" mute takes.
+  private fullyMutedChatSourceIds(): Set<string> {
+    return new Set(this.mutePlan().fullyMutedChatSourceIds);
   }
 
   async enqueueBrainTasks(tasks: BrainTaskInput[]): Promise<number> {
@@ -3710,6 +4252,10 @@ export class SqliteArchiveRepository implements ArchiveRepository {
 
   private invalidateBrainStatusCache(): void {
     this.brainStatusCache = null;
+    // The hidden-node set is derived from claims and episodes, so it goes stale
+    // on exactly the same events. Riding the existing brain-mutation signal is
+    // what keeps it from drifting after a commit, regeneration, or reset.
+    this.mutedGraphNodeCache = null;
   }
 
   async getBrainStatus(): Promise<BrainStatusSummary> {
@@ -3719,6 +4265,9 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     }
     // Assimilated is DERIVED as total − pending from the one shared predicate,
     // so coverage can never disagree with the backlog at the tie boundary.
+    // Muted-range messages leave the universe entirely — neither pending nor
+    // assimilated — so a muted backlog is never presented as permanent debt and
+    // coverage can still reach 100%.
     const coverage = this.db
       .prepare(
         `SELECT COUNT(*) AS total,
@@ -3726,7 +4275,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
          FROM messages m
          JOIN chats ch ON ch.id = m.chat_id
          LEFT JOIN brain_chat_watermarks w ON w.chat_source_id = ch.source_chat_id
-         WHERE ${visibleExchangePredicate("m", this.statusChatId())}`
+         WHERE ${this.mutedMessageExclusionClause("m", "ch")}${visibleExchangePredicate("m", this.statusChatId())}`
       )
       .get() as { total: number; assimilated: number };
     const chatsWithBacklog = this.db
@@ -3736,7 +4285,8 @@ export class SqliteArchiveRepository implements ArchiveRepository {
            FROM chats ch
            LEFT JOIN brain_chat_watermarks w ON w.chat_source_id = ch.source_chat_id
            JOIN messages m ON m.chat_id = ch.id
-           WHERE ${watermarkPendingPredicate("m", "w")}
+           WHERE ${this.mutedMessageExclusionClause("m", "ch")}
+             ${watermarkPendingPredicate("m", "w")}
              AND ${visibleExchangePredicate("m", this.statusChatId())}
            GROUP BY ch.id
          )`
@@ -4229,7 +4779,14 @@ export class SqliteArchiveRepository implements ArchiveRepository {
   async listBrainEpisodeProjections(options?: {
     limit?: number;
     offset?: number;
+    chatSourceId?: string | null;
+    onlyMuted?: boolean;
   }): Promise<Array<{ id: string; chatSourceId: string; chatDisplayName: string | null; startAtMs: number; markdown: string }>> {
+    const chat = options?.chatSourceId ? this.canonicalJid(options.chatSourceId) ?? options.chatSourceId : null;
+    const params: unknown[] = chat ? [chat, options?.limit ?? 1000, options?.offset ?? 0] : [options?.limit ?? 1000, options?.offset ?? 0];
+    const muteFilter = options?.onlyMuted
+      ? `${mutedEpisodeInclusionPredicate("e", this.mutePlan())} AND `
+      : this.mutedEpisodeExclusionClause("e");
     return (
       this.db
         .prepare(
@@ -4237,10 +4794,11 @@ export class SqliteArchiveRepository implements ArchiveRepository {
                   e.start_at_ms AS startAtMs, e.markdown AS markdown
            FROM brain_episodes e
            LEFT JOIN chats c ON c.source_chat_id = e.chat_source_id
-           WHERE e.status = 'current' AND e.markdown <> ''
+           WHERE ${muteFilter}e.status = 'current' AND e.markdown <> ''
+             ${chat ? "AND e.chat_source_id = ?" : ""}
            ORDER BY e.start_at_ms ASC, e.id ASC LIMIT ? OFFSET ?`
         )
-        .all(options?.limit ?? 1000, options?.offset ?? 0) as Array<{
+        .all(...params) as Array<{
         id: string;
         chatSourceId: string;
         chatDisplayName: string | null;
@@ -4260,13 +4818,25 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     status?: BrainEpisodeRecord["status"];
     generator?: BrainEpisodeGenerator;
     endAtOrBeforeMs?: number;
+    // The muted-items view drills into exactly what muting hid.
+    onlyMuted?: boolean;
     limit: number;
   }): Promise<BrainEpisodeRecord[]> {
     const clauses: string[] = [];
     const params: unknown[] = [];
     if (options.episodeId) {
+      // Fetch-by-id is a direct reference, not a listing (commit paths read
+      // back the episode they just wrote, and the muted view links to detail),
+      // so the mute filter does not apply to it.
       clauses.push("e.id = ?");
       params.push(options.episodeId);
+    } else if (options.onlyMuted) {
+      clauses.push(mutedEpisodeInclusionPredicate("e", this.mutePlan()));
+    } else {
+      const exclusion = this.mutedEpisodeExclusion("e");
+      if (exclusion) {
+        clauses.push(exclusion);
+      }
     }
     if (options.chatSourceId) {
       clauses.push("e.chat_source_id = ?");
@@ -4387,7 +4957,11 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     const params: unknown[] = [];
     // onlyExtractive is the backfill "sweep the fallbacks" scope: placeholders
     // alone, not stale-but-model episodes.
-    let where = `WHERE e.status = 'current' AND `;
+    //
+    // Regeneration SPENDS model calls, so the mute predicate belongs here as
+    // much as in forward selection: re-deriving a muted chat's episodes is
+    // exactly the budget the user muted it to stop.
+    let where = `WHERE ${this.mutedEpisodeExclusionClause("e")}e.status = 'current' AND `;
     if (options.onlyExtractive) {
       where += `e.generator = 'extractive'`;
     } else {
@@ -4432,10 +5006,14 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     this.invalidateBrainStatusCache();
   }
 
+  // The count the UI offers as "regenerate these" must match what regeneration
+  // would actually select, or the button lies about the work and the spend.
   async countRegenerableBrainEpisodes(currentVersion: number): Promise<number> {
     const row = this.db
       .prepare(
-        `SELECT COUNT(*) AS n FROM brain_episodes WHERE status = 'current' AND (generator = 'extractive' OR extraction_version < ?)`
+        `SELECT COUNT(*) AS n FROM brain_episodes e
+         WHERE ${this.mutedEpisodeExclusionClause("e")}e.status = 'current'
+           AND (e.generator = 'extractive' OR e.extraction_version < ?)`
       )
       .get(currentVersion) as { n: number };
     return Number(row.n);
@@ -4527,8 +5105,12 @@ export class SqliteArchiveRepository implements ArchiveRepository {
   // Deterministic stratified grading sample (design E5): current model-episode
   // claims only, per model stamp, ungraded first, claim-UUID order (a stable
   // unbiased shuffle — UUIDs are already uniform-random).
+  // The SAMPLER stops offering muted claims, but existing `brain_claim_grades`
+  // stay untouched and keep counting in the aggregates: grades are user-authored
+  // ground truth, deliberately reset-proof, and muting is not a retraction.
   async listClaimsForGrading(options: { perModel: number; includeGraded?: boolean }): Promise<BrainGradingSample> {
     const perModel = Math.max(1, Math.floor(options.perModel));
+    const mutedWhere = whereClause(this.mutedEpisodeExclusion("e"));
     const totals = this.db
       .prepare(
         `SELECT e.model AS model,
@@ -4537,6 +5119,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
          FROM brain_claims c
          JOIN brain_episodes e ON e.id = c.episode_id AND e.status = 'current' AND e.generator = 'model'
          LEFT JOIN brain_claim_grades g ON g.claim_id = c.id
+         ${mutedWhere}
          GROUP BY e.model
          ORDER BY e.model`
       )
@@ -4551,6 +5134,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
          JOIN brain_episodes e ON e.id = c.episode_id AND e.status = 'current' AND e.generator = 'model'
          LEFT JOIN brain_claim_grades g ON g.claim_id = c.id
          LEFT JOIN chats ch ON ch.source_chat_id = e.chat_source_id
+         ${mutedWhere}
          ORDER BY e.model ASC, CASE WHEN g.claim_id IS NULL THEN 0 ELSE 1 END ASC, c.id ASC`
       )
       .all() as Array<Record<string, unknown>>;
@@ -4797,7 +5381,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         `SELECT g.modality, g.impact, COUNT(*) AS n
          FROM brain_media_gaps g
          JOIN brain_episodes e ON e.id = g.episode_id
-         WHERE e.status = 'current'
+         WHERE ${this.mutedEpisodeExclusionClause("e")}e.status = 'current'
          GROUP BY g.modality, g.impact
          ORDER BY n DESC`
       )
@@ -4819,7 +5403,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
          FROM brain_episodes e
          JOIN brain_media_gaps g ON g.episode_id = e.id AND g.impact = ?
          LEFT JOIN chats ch ON ch.source_chat_id = e.chat_source_id
-         WHERE e.status = 'current'
+         WHERE ${this.mutedEpisodeExclusionClause("e")}e.status = 'current'
          ORDER BY e.end_at_ms DESC
          LIMIT ?`
       )
@@ -4859,20 +5443,23 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     limit?: number;
   }): Promise<BrainValidationIssueRecord[]> {
     const params: unknown[] = [];
-    let where = "";
+    // An explicit episodeId is a direct reference (the muted view links to it),
+    // so it resolves like any fetch-by-id; the browse cases hide muted issues.
+    let scope = "";
     if (options?.episodeId) {
-      where = "WHERE episode_id = ?";
+      scope = "vi.episode_id = ?";
       params.push(options.episodeId);
     } else if (options?.docId) {
-      where = "WHERE doc_id = ?";
+      scope = "vi.doc_id = ?";
       params.push(options.docId);
     } else if (options?.runId) {
-      where = "WHERE run_id = ?";
+      scope = "vi.run_id = ?";
       params.push(options.runId);
     }
+    const where = whereClause(scope, options?.episodeId ? "" : this.mutedValidationIssueExclusion("vi"));
     params.push(options?.limit ?? 100);
     const rows = this.db
-      .prepare(`SELECT * FROM brain_validation_issues ${where} ORDER BY id DESC LIMIT ?`)
+      .prepare(`SELECT vi.* FROM brain_validation_issues vi ${where} ORDER BY vi.id DESC LIMIT ?`)
       .all(...params) as Array<Record<string, unknown>>;
     return rows.map((row) => ({
       id: Number(row.id),
@@ -4890,7 +5477,11 @@ export class SqliteArchiveRepository implements ArchiveRepository {
 
   async getBrainValidationIssueSummary(): Promise<BrainValidationIssueSummary> {
     const rows = this.db
-      .prepare(`SELECT severity, COUNT(*) AS n FROM brain_validation_issues GROUP BY severity`)
+      .prepare(
+        `SELECT vi.severity, COUNT(*) AS n FROM brain_validation_issues vi
+         ${whereClause(this.mutedValidationIssueExclusion("vi"))}
+         GROUP BY vi.severity`
+      )
       .all() as Array<{ severity: string; n: number }>;
     const summary: BrainValidationIssueSummary = { error: 0, warning: 0, info: 0 };
     for (const row of rows) {
@@ -4904,22 +5495,36 @@ export class SqliteArchiveRepository implements ArchiveRepository {
   async listBrainTopicVocabulary(chatSourceId: string, limit: number): Promise<string[]> {
     // This chat's topics by usage first, then global by usage — deterministic,
     // $0 "nearest" until the graph provides a better ranking.
+    //
+    // Vocabulary crosses chat boundaries (it is offered to OTHER chats'
+    // prompts), which is exactly how a muted chat's subject matter would leak
+    // back into the brain. A topic survives only while some non-muted episode
+    // still supports it; one whose every supporting episode is muted drops out.
+    const episodeExclusion = this.mutedEpisodeExclusionClause("e");
     const chatTopics = this.db
       .prepare(
         `SELECT t.title, COUNT(*) AS n
          FROM brain_episode_topics et
          JOIN brain_topics t ON t.id = et.topic_id
          JOIN brain_episodes e ON e.id = et.episode_id
-         WHERE e.chat_source_id = ?
+         WHERE ${episodeExclusion}e.chat_source_id = ?
          GROUP BY t.id ORDER BY n DESC, t.title ASC LIMIT ?`
       )
       .all(chatSourceId, limit) as Array<{ title: string }>;
+    // The muted test moves into the JOIN so the LEFT JOINs still emit topics
+    // with no episode links at all (a scoped brain reset leaves those behind,
+    // and the pre-mute behaviour offered them). HAVING then drops only topics
+    // that HAVE support and whose every supporting episode is muted.
+    const mutedEpisodeJoin = this.mutedEpisodeExclusion("e");
     const globalTopics = this.db
       .prepare(
-        `SELECT t.title, COUNT(et.episode_id) AS n
+        `SELECT t.title, COUNT(e.id) AS n
          FROM brain_topics t
          LEFT JOIN brain_episode_topics et ON et.topic_id = t.id
-         GROUP BY t.id ORDER BY n DESC, t.title ASC LIMIT ?`
+         LEFT JOIN brain_episodes e ON e.id = et.episode_id${mutedEpisodeJoin ? ` AND ${mutedEpisodeJoin}` : ""}
+         GROUP BY t.id
+         HAVING COUNT(et.episode_id) = 0 OR COUNT(e.id) > 0
+         ORDER BY n DESC, t.title ASC LIMIT ?`
       )
       .all(limit) as Array<{ title: string }>;
     const seen = new Set<string>();
@@ -5866,6 +6471,13 @@ export class SqliteArchiveRepository implements ArchiveRepository {
   // number-change succession, engagement factor). Zero model calls.
   async syncBrainGraphSignals(): Promise<BrainGraphSyncResult> {
     const result: BrainGraphSyncResult = { participationEdges: 0, vcardMentionEdges: 0, numberChangeAliases: 0, engagementFactors: 0 };
+    // This producer bypasses episodes entirely — it materializes nodes and edges
+    // straight from raw signals — so the episode/evidence predicates never see
+    // it. Without these guards a muted chat would still mint chat and person
+    // nodes and membership edges. Membership and number-change signals are
+    // filtered by chat identity (a fully muted chat contributes nothing);
+    // vcard mentions are filtered per message, since they carry a timestamp.
+    const fullyMuted = this.fullyMutedChatSourceIds();
     const periods = this.db
       .prepare(
         `SELECT period_key AS periodKey, group_source_id AS groupSourceId, participant_jid AS participantJid,
@@ -5885,6 +6497,9 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       this.db.transaction(() => {
         for (const period of batch) {
           const group = this.canonicalJid(period.groupSourceId) ?? period.groupSourceId;
+          if (fullyMuted.has(group)) {
+            continue;
+          }
           const participant = this.canonicalJid(period.participantJid) ?? period.participantJid;
           const chatId = this.ensureGraphNodeTx({
             naturalKey: chatNaturalKey(group),
@@ -5930,7 +6545,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
                 m.sender_source_jid AS senderJid, m.timestamp_ms AS timestampMs
          FROM message_vcards v
          JOIN messages m ON m.source_message_key = v.source_message_key
-         WHERE v.resolved_jid IS NOT NULL`
+         WHERE ${this.mutedMessageExclusionClause("m")}v.resolved_jid IS NOT NULL`
       )
       .all() as Array<{
       messageKey: string;
@@ -5991,12 +6606,20 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       await new Promise((resolve) => setImmediate(resolve));
     }
     const numberChanges = this.db
-      .prepare(`SELECT event_key AS eventKey, old_jid AS oldJid, new_jid AS newJid, observed_at_ms AS observedAtMs FROM identity_number_changes`)
-      .all() as Array<{ eventKey: string; oldJid: string; newJid: string; observedAtMs: number | null }>;
+      .prepare(
+        `SELECT event_key AS eventKey, old_jid AS oldJid, new_jid AS newJid, observed_at_ms AS observedAtMs,
+                chat_source_id AS chatSourceId
+         FROM identity_number_changes`
+      )
+      .all() as Array<{ eventKey: string; oldJid: string; newJid: string; observedAtMs: number | null; chatSourceId: string | null }>;
     for (let index = 0; index < numberChanges.length; index += SQLITE_IN_QUERY_BATCH_SIZE) {
       const batch = numberChanges.slice(index, index + SQLITE_IN_QUERY_BATCH_SIZE);
       this.db.transaction(() => {
         for (const change of batch) {
+          const observedIn = change.chatSourceId ? this.canonicalJid(change.chatSourceId) ?? change.chatSourceId : null;
+          if (observedIn && fullyMuted.has(observedIn)) {
+            continue;
+          }
           const oldJid = this.canonicalJid(change.oldJid) ?? change.oldJid;
           const newJid = this.canonicalJid(change.newJid) ?? change.newJid;
           if (oldJid === newJid) {
@@ -6207,22 +6830,32 @@ export class SqliteArchiveRepository implements ArchiveRepository {
   }
 
   async getBrainGraphStats(): Promise<BrainGraphStats> {
+    // Counts must agree with what the surfaces actually render, so the hidden
+    // nodes (and any edge touching one) are excluded here too.
+    const nodeWhere = whereClause(this.mutedGraphNodeExclusion("n"));
+    const edgeWhere = whereClause(this.mutedGraphEdgeExclusion("ed"));
     const nodesByKind: Partial<Record<BrainGraphNodeKind, number>> = {};
-    for (const row of this.db.prepare(`SELECT kind, COUNT(*) AS count FROM brain_nodes GROUP BY kind`).all() as Array<{
+    for (const row of this.db
+      .prepare(`SELECT n.kind AS kind, COUNT(*) AS count FROM brain_nodes n ${nodeWhere} GROUP BY n.kind`)
+      .all() as Array<{
       kind: BrainGraphNodeKind;
       count: number;
     }>) {
       nodesByKind[row.kind] = Number(row.count);
     }
     const nodesByStatus: Partial<Record<BrainGraphNodeStatus, number>> = {};
-    for (const row of this.db.prepare(`SELECT status, COUNT(*) AS count FROM brain_nodes GROUP BY status`).all() as Array<{
+    for (const row of this.db
+      .prepare(`SELECT n.status AS status, COUNT(*) AS count FROM brain_nodes n ${nodeWhere} GROUP BY n.status`)
+      .all() as Array<{
       status: BrainGraphNodeStatus;
       count: number;
     }>) {
       nodesByStatus[row.status] = Number(row.count);
     }
     const edgesByKind: Partial<Record<BrainGraphEdgeKind, number>> = {};
-    for (const row of this.db.prepare(`SELECT kind, COUNT(*) AS count FROM brain_edges GROUP BY kind`).all() as Array<{
+    for (const row of this.db
+      .prepare(`SELECT ed.kind AS kind, COUNT(*) AS count FROM brain_edges ed ${edgeWhere} GROUP BY ed.kind`)
+      .all() as Array<{
       kind: BrainGraphEdgeKind;
       count: number;
     }>) {
@@ -6232,15 +6865,32 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       | { value: string }
       | undefined;
     return {
-      nodeCount: Number((this.db.prepare(`SELECT COUNT(*) AS count FROM brain_nodes`).get() as { count: number }).count),
-      edgeCount: Number((this.db.prepare(`SELECT COUNT(*) AS count FROM brain_edges`).get() as { count: number }).count),
-      evidenceCount: Number((this.db.prepare(`SELECT COUNT(*) AS count FROM brain_edge_evidence`).get() as { count: number }).count),
+      nodeCount: Number(
+        (this.db.prepare(`SELECT COUNT(*) AS count FROM brain_nodes n ${nodeWhere}`).get() as { count: number }).count
+      ),
+      edgeCount: Number(
+        (this.db.prepare(`SELECT COUNT(*) AS count FROM brain_edges ed ${edgeWhere}`).get() as { count: number }).count
+      ),
+      evidenceCount: Number(
+        (
+          this.db
+            .prepare(
+              `SELECT COUNT(*) AS count FROM brain_edge_evidence ev JOIN brain_edges ed ON ed.id = ev.edge_id ${edgeWhere}`
+            )
+            .get() as { count: number }
+        ).count
+      ),
       nodesByKind,
       nodesByStatus,
       edgesByKind,
       unresolvedPersonNodes: Number(
         (
-          this.db.prepare(`SELECT COUNT(*) AS count FROM brain_nodes WHERE kind = 'person' AND jid IS NULL AND status != 'merged'`).get() as {
+          this.db
+            .prepare(
+              `SELECT COUNT(*) AS count FROM brain_nodes n
+               WHERE ${this.mutedGraphNodeExclusionClause("n")}n.kind = 'person' AND n.jid IS NULL AND n.status != 'merged'`
+            )
+            .get() as {
             count: number;
           }
         ).count
@@ -6249,8 +6899,9 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         (
           this.db
             .prepare(
-              `SELECT COUNT(*) AS count FROM brain_nodes
-               WHERE kind IN ('commitment','question') AND status != 'merged' AND json_extract(payload_json, '$.status') = 'open'`
+              `SELECT COUNT(*) AS count FROM brain_nodes n
+               WHERE ${this.mutedGraphNodeExclusionClause("n")}n.kind IN ('commitment','question')
+                 AND n.status != 'merged' AND json_extract(n.payload_json, '$.status') = 'open'`
             )
             .get() as { count: number }
         ).count
@@ -6295,6 +6946,8 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     return row.title?.trim() || row.slug;
   }
 
+  // Entity lookup returns null for a hidden node: a page whose every supporting
+  // claim is muted must not resolve from search, links, or a guessed id.
   async getBrainGraphEntity(query: { nodeId?: string; jid?: string; name?: string }): Promise<BrainGraphEntityView | null> {
     const selectById = this.db.prepare(`SELECT * FROM brain_nodes WHERE id = ?`);
     const selectByKey = this.db.prepare(`SELECT * FROM brain_nodes WHERE natural_key = ?`);
@@ -6364,7 +7017,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
          JOIN brain_claims c ON c.id = nc.claim_id
          JOIN brain_episodes e ON e.id = c.episode_id
          LEFT JOIN chats ch ON ch.source_chat_id = e.chat_source_id
-         WHERE nc.node_id IN (${placeholders}) AND e.status = 'current'`
+         WHERE ${this.mutedEpisodeExclusionClause("e")}nc.node_id IN (${placeholders}) AND e.status = 'current'`
       )
       .all(...nodeIds) as Array<{
       nodeId: string;
@@ -6518,7 +7171,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
           .get(norm) as GraphNodeRow | undefined;
       }
     }
-    if (!row || row.status === "merged") {
+    if (!row || row.status === "merged" || this.mutedGraphNodeIds().has(row.id)) {
       return null;
     }
     return { row, redirected };
@@ -6549,7 +7202,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         `SELECT n.* FROM brain_nodes n
          LEFT JOIN contacts c ON c.source_jid = n.jid
          LEFT JOIN chats ch ON ch.source_chat_id = n.chat_scope
-         WHERE n.status != 'merged'
+         WHERE ${this.mutedGraphNodeExclusionClause("n")}n.status != 'merged'
            AND n.kind NOT IN ('commitment', 'question', 'event', 'fact')
            AND (
              (n.kind = 'person'
@@ -6572,7 +7225,10 @@ export class SqliteArchiveRepository implements ArchiveRepository {
   async getBrainGraphNeighborhood(params: BrainGraphNeighborhoodParams): Promise<BrainGraphNeighborhoodView | null> {
     const resolved = resolveNeighborhoodParams(params);
     const anchor = this.resolveGraphAnchor(params);
-    if (!anchor) {
+    // A hidden anchor reads as "no such entity" — the walk also refuses to
+    // traverse INTO hidden nodes, so they can never act as invisible bridges
+    // between two visible ones.
+    if (!anchor || this.mutedGraphNodeIds().has(anchor.row.id)) {
       return null;
     }
     const anchorId = anchor.row.id;
@@ -6595,7 +7251,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         JOIN brain_edges e ON (e.src_node_id = r.node_id OR e.dst_node_id = r.node_id)
         JOIN brain_nodes n ON n.id = (CASE WHEN e.src_node_id = r.node_id THEN e.dst_node_id ELSE e.src_node_id END)
         WHERE r.hop < ?
-          AND n.status IN (${statusPlaceholders})
+          AND ${this.mutedGraphNodeExclusionClause("n")}n.status IN (${statusPlaceholders})
           AND n.salience >= ?${kindClause}${sinceClause}${untilClause}
       )
       SELECT n2.*, MIN(r.hop) AS __hop
@@ -6710,9 +7366,33 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         ? { id: row.id, kind: row.kind, label: this.graphLabelForNodeRow(row), jid: row.jid }
         : { id: nodeId, kind: "other", label: nodeId, jid: null };
     };
+    // A hybrid edge — both endpoints visible — can still carry evidence from a
+    // muted episode. Claim-backed evidence is filtered through its episode;
+    // signal-derived evidence (no claim) is filtered by its source message.
+    // Both are LEFT JOINs, so the `IS NULL` arms keep evidence of the other kind.
+    const mutedEpisode = mutedEpisodeInclusionPredicate("e", this.mutePlan());
+    const mutedMessage = this.mutedMessageExclusion("m");
+    const evidenceWhere = whereClause(
+      "ev.edge_id = ?",
+      planIsEmpty(this.mutePlan()) ? "" : `(e.id IS NULL OR NOT ${mutedEpisode})`,
+      mutedMessage ? `(m.id IS NULL OR ${mutedMessage})` : ""
+    );
     const evidenceRows = this.db
-      .prepare(`SELECT claim_id, source_message_key, source_ref, observed_at_ms FROM brain_edge_evidence WHERE edge_id = ? ORDER BY observed_at_ms DESC, evidence_key ASC`)
-      .all(edge.id) as Array<{ claim_id: string | null; source_message_key: string | null; source_ref: string | null; observed_at_ms: number | null }>;
+      .prepare(
+        `SELECT ev.claim_id, ev.source_message_key, ev.source_ref, ev.observed_at_ms
+           FROM brain_edge_evidence ev
+           LEFT JOIN brain_claims c ON c.id = ev.claim_id
+           LEFT JOIN brain_episodes e ON e.id = c.episode_id
+           LEFT JOIN messages m ON m.source_message_key = ev.source_message_key
+           ${evidenceWhere}
+           ORDER BY ev.observed_at_ms DESC, ev.evidence_key ASC`
+      )
+      .all(edge.id) as Array<{
+      claim_id: string | null;
+      source_message_key: string | null;
+      source_ref: string | null;
+      observed_at_ms: number | null;
+    }>;
     const claimStmt = this.db.prepare(`SELECT kind, text FROM brain_claims WHERE id = ?`);
     const claimCitesStmt = this.db.prepare(
       `SELECT bc.source_message_key, bc.source_chat_id, bc.message_id, bc.sender_source_jid, bc.timestamp_ms, ch.id AS chat_numeric_id
@@ -6790,7 +7470,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
                 (SELECT COUNT(*) FROM brain_node_claims nc WHERE nc.node_id = n.id) AS claimCount
          FROM brain_nodes n
          LEFT JOIN chats ch ON ch.source_chat_id = n.chat_scope
-         WHERE n.kind = 'person' AND n.jid IS NULL AND n.status != 'merged'
+         WHERE ${this.mutedGraphNodeExclusionClause("n")}n.kind = 'person' AND n.jid IS NULL AND n.status != 'merged'
          ORDER BY n.salience DESC, claimCount DESC, n.last_seen_at_ms DESC
          LIMIT ?`
       )
@@ -7059,11 +7739,15 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       const placeholders = batch.map(() => "?").join(",");
       for (const row of this.db
         .prepare(
+          // The closure sweep SPENDS model calls on these candidates, and a
+          // partially-muted chat must not offer evidence from its muted range
+          // as a reason to close an unmuted commitment.
           `SELECT c.id AS claimId, c.text AS text, MAX(ct.timestamp_ms) AS ts, e.chat_source_id AS chat
            FROM brain_claims c
            JOIN brain_episodes e ON e.id = c.episode_id
            JOIN brain_citations ct ON ct.claim_id = c.id
-           WHERE e.status = 'current' AND e.generator = 'model' AND e.chat_source_id IN (${placeholders})
+           WHERE ${this.mutedEpisodeExclusionClause("e")}e.status = 'current' AND e.generator = 'model'
+             AND e.chat_source_id IN (${placeholders})
            GROUP BY c.id
            HAVING MAX(ct.timestamp_ms) IS NOT NULL`
         )
@@ -7533,6 +8217,8 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       // means no restriction. Canonicalized against identity merges.
       includeChats?: string[];
       excludeChats?: string[];
+      // The muted-items view drills into exactly what muting hid.
+      onlyMuted?: boolean;
       sort?: BrainLifecycleSort;
       limit?: number;
     } = {}
@@ -7560,14 +8246,18 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       clauses.push(`n.chat_scope = ?`);
       params.push(this.canonicalJid(options.chatSourceId) ?? options.chatSourceId);
     }
-    const rows = this.db
+    const allRows = this.db
       .prepare(
         `SELECT n.*, ch.display_name AS chatDisplayName FROM brain_nodes n
          LEFT JOIN chats ch ON ch.source_chat_id = n.chat_scope
          WHERE ${clauses.join(" AND ")}`
       )
       .all(...params) as Array<GraphNodeRow & { chatDisplayName: string | null }>;
-    const claimIds = rows.map((row) => row.natural_key.slice(row.natural_key.indexOf(":") + 1));
+    const { rows, claimIds } = this.partitionMutedLifecycleRows(
+      allRows,
+      allRows.map((row) => row.natural_key.slice(row.natural_key.indexOf(":") + 1)),
+      options.onlyMuted === true
+    );
     const eventsByClaim = this.loadLifecycleEventsTx(claimIds);
     const anchorByClaim = this.bulkLifecycleAnchorsTx(claimIds);
     // One bulk candidate pass for every OPEN node (set queries, not per-node).
@@ -7814,14 +8504,20 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       clauses.push(`n.chat_scope = ?`);
       params.push(this.canonicalJid(options.chatSourceId) ?? options.chatSourceId);
     }
-    const rows = this.db
+    const allRows = this.db
       .prepare(
         `SELECT n.*, ch.display_name AS chatDisplayName FROM brain_nodes n
          LEFT JOIN chats ch ON ch.source_chat_id = n.chat_scope
          WHERE ${clauses.join(" AND ")}`
       )
       .all(...params) as Array<GraphNodeRow & { chatDisplayName: string | null }>;
-    const claimIds = rows.map((row) => row.natural_key.slice(row.natural_key.indexOf(":") + 1));
+    // The sweep SPENDS model calls reviewing items, so muted commitments must
+    // drop out here too — not just from the read surface.
+    const { rows, claimIds } = this.partitionMutedLifecycleRows(
+      allRows,
+      allRows.map((row) => row.natural_key.slice(row.natural_key.indexOf(":") + 1)),
+      false
+    );
     const eventsByClaim = this.loadLifecycleEventsTx(claimIds);
     const anchorByClaim = this.bulkLifecycleAnchorsTx(claimIds);
     const foldByClaim = new Map<string, LifecycleFold>();
@@ -7970,27 +8666,42 @@ export class SqliteArchiveRepository implements ArchiveRepository {
   // nodes carry no claim links); chat docs read the chat's episodes directly.
   // Filters (current episode, model generator, not superseded) apply in the
   // hydration join — this method only resolves SCOPE.
+  // Every rollup's scope excludes muted claims, which is how muted prose drains
+  // out of pages over time: the page is marked due by the mute, and its next
+  // NORMAL dueness-driven rollup simply is not offered the muted material. No
+  // forced re-roll, no deletion.
   private docScopeClaimIdsTx(kind: BrainDocKind, row: GraphNodeRow): string[] {
+    const notMuted = (claimIds: string[]): string[] => {
+      if (planIsEmpty(this.mutePlan())) {
+        return claimIds;
+      }
+      const muted = this.mutedClaimIdsTx(claimIds);
+      return muted.size === 0 ? claimIds : claimIds.filter((claimId) => !muted.has(claimId));
+    };
     if (kind === "entity") {
       const nodeIds = this.docScopeNodeIdsTx(row);
       const placeholders = nodeIds.map(() => "?").join(",");
-      return (
-        this.db
-          .prepare(`SELECT DISTINCT claim_id AS claimId FROM brain_node_claims WHERE node_id IN (${placeholders})`)
-          .all(...nodeIds) as Array<{ claimId: string }>
-      ).map((entry) => entry.claimId);
+      return notMuted(
+        (
+          this.db
+            .prepare(`SELECT DISTINCT claim_id AS claimId FROM brain_node_claims WHERE node_id IN (${placeholders})`)
+            .all(...nodeIds) as Array<{ claimId: string }>
+        ).map((entry) => entry.claimId)
+      );
     }
     if (kind === "topic") {
-      return (
-        this.db
-          .prepare(
-            `SELECT DISTINCT ev.claim_id AS claimId
-             FROM brain_edges e
-             JOIN brain_edge_evidence ev ON ev.edge_id = e.id AND ev.claim_id IS NOT NULL
-             WHERE e.kind = 'about' AND (e.dst_node_id = ? OR e.src_node_id = ?)`
-          )
-          .all(row.id, row.id) as Array<{ claimId: string }>
-      ).map((entry) => entry.claimId);
+      return notMuted(
+        (
+          this.db
+            .prepare(
+              `SELECT DISTINCT ev.claim_id AS claimId
+               FROM brain_edges e
+               JOIN brain_edge_evidence ev ON ev.edge_id = e.id AND ev.claim_id IS NOT NULL
+               WHERE e.kind = 'about' AND (e.dst_node_id = ? OR e.src_node_id = ?)`
+            )
+            .all(row.id, row.id) as Array<{ claimId: string }>
+        ).map((entry) => entry.claimId)
+      );
     }
     const chatSourceId = row.chat_scope ?? (row.natural_key.startsWith("chat:") ? row.natural_key.slice(5) : null);
     if (!chatSourceId) {
@@ -7999,7 +8710,8 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     return (
       this.db
         .prepare(
-          `SELECT c.id AS claimId FROM brain_claims c JOIN brain_episodes e ON e.id = c.episode_id WHERE e.chat_source_id = ?`
+          `SELECT c.id AS claimId FROM brain_claims c JOIN brain_episodes e ON e.id = c.episode_id
+           WHERE ${this.mutedEpisodeExclusionClause("e")}e.chat_source_id = ?`
         )
         .all(chatSourceId) as Array<{ claimId: string }>
     ).map((entry) => entry.claimId);
@@ -8178,6 +8890,9 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       mergedInto: row.merged_into,
       currentRevisionId: row.current_revision_id,
       lastRollupAtMs: row.last_rollup_at_ms,
+      mutedState: (row.muted_state ?? "clean") as BrainDocMutedState,
+      mutedClaimCount: Number(row.muted_claim_count ?? 0),
+      fedClaimCount: Number(row.fed_claim_count ?? 0),
       createdAtMs: row.created_at_ms
     };
   }
@@ -8622,6 +9337,10 @@ export class SqliteArchiveRepository implements ArchiveRepository {
   private docCandidateRowsTx(): Array<{ nodeId: string; claimCount: number }> {
     const floor = rollupMinClaims();
     const results = new Map<string, number>();
+    // A candidate's claim count decides whether it clears the rollup floor and
+    // is offered as a page worth spending on. Muted claims must not pad it, or
+    // the user is offered a rollup with less real material than advertised.
+    const notMuted = andPrefix(this.mutedEpisodeExclusion("e"));
     const entityRows = this.db
       .prepare(
         `SELECT nc.node_id AS nodeId, COUNT(DISTINCT nc.claim_id) AS claimCount
@@ -8630,7 +9349,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
          JOIN brain_claims c ON c.id = nc.claim_id AND c.superseded_by_claim_id IS NULL
          JOIN brain_episodes e ON e.id = c.episode_id AND e.status = 'current' AND e.generator = 'model'
          LEFT JOIN brain_docs d ON d.node_id = nc.node_id
-         WHERE d.doc_id IS NULL
+         WHERE ${notMuted}d.doc_id IS NULL
          GROUP BY nc.node_id HAVING COUNT(DISTINCT nc.claim_id) >= ?`
       )
       .all(floor) as Array<{ nodeId: string; claimCount: number }>;
@@ -8643,7 +9362,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
          JOIN brain_claims c ON c.id = ev.claim_id AND c.superseded_by_claim_id IS NULL
          JOIN brain_episodes e ON e.id = c.episode_id AND e.status = 'current' AND e.generator = 'model'
          LEFT JOIN brain_docs d ON d.node_id = eg.dst_node_id
-         WHERE eg.kind = 'about' AND d.doc_id IS NULL
+         WHERE ${notMuted}eg.kind = 'about' AND d.doc_id IS NULL
          GROUP BY eg.dst_node_id HAVING COUNT(DISTINCT ev.claim_id) >= ?`
       )
       .all(floor) as Array<{ nodeId: string; claimCount: number }>;
@@ -8654,7 +9373,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
          JOIN brain_episodes e ON e.chat_source_id = n.chat_scope AND e.status = 'current' AND e.generator = 'model'
          JOIN brain_claims c ON c.episode_id = e.id AND c.superseded_by_claim_id IS NULL
          LEFT JOIN brain_docs d ON d.node_id = n.id
-         WHERE n.kind = 'chat' AND n.status = 'active' AND d.doc_id IS NULL
+         WHERE ${notMuted}n.kind = 'chat' AND n.status = 'active' AND d.doc_id IS NULL
          GROUP BY n.id HAVING COUNT(c.id) >= ?`
       )
       .all(floor) as Array<{ nodeId: string; claimCount: number }>;
@@ -8692,7 +9411,13 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     return out;
   }
 
-  async listBrainDocs(options?: { kind?: BrainDocKind; view?: BrainDocsListView; limit?: number }): Promise<BrainDocsListResponse> {
+  async listBrainDocs(options?: {
+    kind?: BrainDocKind;
+    view?: BrainDocsListView;
+    // The muted-items view lists exactly the pages muting hid.
+    onlyMuted?: boolean;
+    limit?: number;
+  }): Promise<BrainDocsListResponse> {
     const asOfMs = Date.now();
     const items: BrainDocListItem[] = [];
     const issueCounts = new Map<string, number>(
@@ -8702,7 +9427,12 @@ export class SqliteArchiveRepository implements ArchiveRepository {
           .all() as Array<{ docId: string; n: number }>
       ).map((row) => [row.docId, Number(row.n)])
     );
-    const docRows = this.db.prepare(`SELECT * FROM brain_docs`).all() as BrainDocRow[];
+    // 'hybrid' pages stay on normal surfaces — they still carry real
+    // non-muted material; only their muted-source links redirect. Only
+    // exclusively-muted pages disappear.
+    const docRows = (this.db.prepare(`SELECT * FROM brain_docs`).all() as BrainDocRow[]).filter((row) =>
+      options?.onlyMuted ? row.muted_state === "muted" : row.muted_state !== "muted"
+    );
     for (const docRow of docRows) {
       const nodeRow = docRow.node_id
         ? (this.db.prepare(`SELECT * FROM brain_nodes WHERE id = ?`).get(docRow.node_id) as GraphNodeRow | undefined)
@@ -8729,14 +9459,18 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         dueReasons: dueness.dueReasons,
         salience: Number(nodeRow?.salience ?? 0),
         openLifecycleItems: dueness.openItems,
-        issueCount: issueCounts.get(docRow.doc_id) ?? 0
+        issueCount: issueCounts.get(docRow.doc_id) ?? 0,
+        mutedState: (docRow.muted_state ?? "clean") as BrainDocMutedState
       });
     }
-    const candidates = this.docCandidateRowsTx();
+    // Candidates are nodes without a page yet, so none of them can be a muted
+    // PAGE; the muted view lists pages only. Hidden nodes still drop out.
+    const candidates = options?.onlyMuted ? [] : this.docCandidateRowsTx();
+    const hiddenNodes = this.mutedGraphNodeIds();
     let candidateCount = 0;
     for (const candidate of candidates) {
       const nodeRow = this.db.prepare(`SELECT * FROM brain_nodes WHERE id = ?`).get(candidate.nodeId) as GraphNodeRow | undefined;
-      if (!nodeRow) {
+      if (!nodeRow || hiddenNodes.has(nodeRow.id)) {
         continue;
       }
       const kind = this.docKindForNodeRow(nodeRow);
@@ -8752,6 +9486,8 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         title: this.graphLabelForNodeRow(nodeRow),
         status: "active",
         mergedInto: null,
+        // A candidate has no revision, so no prose exists to be muted yet.
+        mutedState: "clean",
         revision: null,
         lastRollupAtMs: null,
         eligibleClaims: candidate.claimCount,
@@ -8822,8 +9558,12 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       const placeholders = batch.map(() => "?").join(",");
       const rows = this.db
         .prepare(
+          // `muted` travels with the claim so a hybrid page can discriminate
+          // per source: the page renders, but this citation points at material
+          // the rest of the app is hiding.
           `SELECT c.id AS id, c.sequence AS sequence, e.id AS episodeId, e.status AS episodeStatus,
-                  e.start_at_ms AS startAtMs, e.chat_source_id AS chatSourceId, ch.display_name AS chatDisplayName
+                  e.start_at_ms AS startAtMs, e.chat_source_id AS chatSourceId, ch.display_name AS chatDisplayName,
+                  ${mutedEpisodeInclusionPredicate("e", this.mutePlan())} AS muted
            FROM brain_claims c
            JOIN brain_episodes e ON e.id = c.episode_id
            LEFT JOIN chats ch ON ch.source_chat_id = e.chat_source_id
@@ -8837,6 +9577,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
         startAtMs: number;
         chatSourceId: string;
         chatDisplayName: string | null;
+        muted: number;
       }>;
       for (const row of rows) {
         // Must match the projected file name exactly or the wikilink dangles —
@@ -8854,6 +9595,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
           // sequence is 1-based at commit (index + 1) and the episode markdown
           // anchors are ^claim-<1-based position> — they line up exactly.
           episodeClaimIndex: Number(row.sequence),
+          muted: Number(row.muted) === 1,
           citationKeys: []
         });
       }
@@ -8963,6 +9705,9 @@ export class SqliteArchiveRepository implements ArchiveRepository {
             slug: resolved.row.slug,
             status: "active",
             merged_into: null,
+            muted_state: "clean",
+            muted_claim_count: 0,
+            fed_claim_count: 0,
             current_revision_id: null,
             last_rollup_at_ms: null,
             created_at_ms: Date.now()
@@ -8979,6 +9724,9 @@ export class SqliteArchiveRepository implements ArchiveRepository {
             mergedInto: null,
             currentRevisionId: null,
             lastRollupAtMs: null,
+            mutedState: "clean",
+            mutedClaimCount: 0,
+            fedClaimCount: 0,
             createdAtMs: Date.now()
           },
           title: this.graphLabelForNodeRow(resolved.row),
@@ -9018,6 +9766,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
               return {
                 claimId,
                 exists: meta?.exists ?? false,
+                muted: meta?.muted === true,
                 episodeId: meta?.episodeId ?? null,
                 citations: (meta?.citationKeys ?? []).map((key) => {
                   const message = messageStmt.get(key) as { messageId: number; chatId: number; ts: number | null } | undefined;
@@ -9087,7 +9836,13 @@ export class SqliteArchiveRepository implements ArchiveRepository {
   // Everything the deterministic projector needs, for every projectable doc.
   async listBrainDocsForProjection(): Promise<Array<{ context: DocRenderContext; sections: BrainDocSection[] }>> {
     const out: Array<{ context: DocRenderContext; sections: BrainDocSection[] }> = [];
-    const docRows = this.db.prepare(`SELECT * FROM brain_docs`).all() as BrainDocRow[];
+    // The vault excludes muted material rather than shadowing it into a
+    // subfolder: the vault is a pure projection, so unmuting plus reprojection
+    // restores the files with nothing to migrate. Hybrid pages still project —
+    // they render normally everywhere.
+    const docRows = (this.db.prepare(`SELECT * FROM brain_docs`).all() as BrainDocRow[]).filter(
+      (row) => row.muted_state !== "muted"
+    );
     for (const docRow of docRows) {
       const nodeRow = docRow.node_id
         ? (this.db.prepare(`SELECT * FROM brain_nodes WHERE id = ?`).get(docRow.node_id) as GraphNodeRow | undefined)
@@ -9147,7 +9902,8 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       .prepare(
         `SELECT n.*, d.doc_id AS docId FROM brain_nodes n
          LEFT JOIN brain_docs d ON d.node_id = n.id
-         WHERE n.status = 'active' AND n.kind IN ('person','topic','org','chat','project')
+         WHERE ${this.mutedGraphNodeExclusionClause("n")}n.status = 'active'
+           AND n.kind IN ('person','topic','org','chat','project')
          ORDER BY n.salience DESC LIMIT 10`
       )
       .all() as Array<GraphNodeRow & { docId: string | null }>;
@@ -10113,13 +10869,18 @@ export class SqliteArchiveRepository implements ArchiveRepository {
   async listCoCitedIdentityPairs(
     options: { minEpisodes?: number; limit?: number } = {}
   ): Promise<Array<{ jidA: string; jidB: string; episodes: number }>> {
+    // Person co-citation bypasses episodes as a read path, so it joins through
+    // to the episode explicitly: a suggestion must never be evidenced by a
+    // conversation the user muted.
     return this.db
       .prepare(
         `SELECT a.jid AS jidA, b.jid AS jidB, COUNT(DISTINCT cl.episode_id) AS episodes
          FROM brain_claim_entities a
          JOIN brain_claim_entities b ON b.claim_id = a.claim_id AND b.jid > a.jid
          JOIN brain_claims cl ON cl.id = a.claim_id
-         WHERE a.jid IS NOT NULL AND b.jid IS NOT NULL AND a.kind = 'person' AND b.kind = 'person'
+         JOIN brain_episodes e ON e.id = cl.episode_id
+         WHERE ${this.mutedEpisodeExclusionClause("e")}
+           a.jid IS NOT NULL AND b.jid IS NOT NULL AND a.kind = 'person' AND b.kind = 'person'
          GROUP BY a.jid, b.jid
          HAVING COUNT(DISTINCT cl.episode_id) >= ?
          ORDER BY episodes DESC
@@ -10524,8 +11285,13 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     const limit = options?.limit ?? 8;
     const debt = this.db
       .prepare(
-        `SELECT unresolved_participants_json FROM brain_episodes
-         WHERE status = 'current' AND unresolved_participants_json IS NOT NULL AND unresolved_participants_json <> '[]'`
+        // A muted chat must not generate identity-resolution debt: asking the
+        // user to save a contact so hidden episodes read better is busywork.
+        // (The mechanical repair path stays unfiltered — it costs nothing and
+        // keeps stored prose correct for when the chat is unmuted.)
+        `SELECT e.unresolved_participants_json FROM brain_episodes e
+         WHERE ${this.mutedEpisodeExclusionClause("e")}e.status = 'current'
+           AND e.unresolved_participants_json IS NOT NULL AND e.unresolved_participants_json <> '[]'`
       )
       .all() as Array<{ unresolved_participants_json: string }>;
     const episodeCountByJid = new Map<string, number>();
@@ -10945,6 +11711,12 @@ export class SqliteArchiveRepository implements ArchiveRepository {
           currentIso()
         );
       }
+      // A channel first seen here arrives already muted, before any brain pass
+      // can select it. New chat rowids also invalidate the compiled plan.
+      if (ensureChannelMuteDefaults(this.db) > 0) {
+        this.invalidateBrainStatusCache();
+      }
+      this.mutePlanCache = null;
     });
     transaction();
 
@@ -13067,9 +13839,32 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     return row?.sent_at ?? null;
   }
 
+  async getChatSourceIdById(chatId: number): Promise<string | null> {
+    const row = this.db.prepare(`SELECT source_chat_id FROM chats WHERE id = ?`).get(chatId) as
+      | { source_chat_id: string }
+      | undefined;
+    return row?.source_chat_id ?? null;
+  }
+
+  async getChatIdentity(chatSourceId: string): Promise<{ displayName: string | null; chatType: ChatType } | null> {
+    const canonical = this.canonicalJid(chatSourceId) ?? chatSourceId;
+    const row = this.db
+      .prepare(
+        `SELECT NULLIF(TRIM(COALESCE(display_name, '')), '') AS display_name, chat_type FROM chats WHERE source_chat_id = ?`
+      )
+      .get(canonical) as { display_name: string | null; chat_type: string } | undefined;
+    return row ? { displayName: row.display_name, chatType: row.chat_type as ChatType } : null;
+  }
+
   async listChats(options: ChatListOptions): Promise<ChatListItem[]> {
     const where: string[] = [];
     const params: unknown[] = [];
+    // An explicit id lookup answers for exactly those chats and ignores the
+    // browsing filters — it is a direct reference, not a listing.
+    if (options.ids && options.ids.length > 0) {
+      where.push(`id IN (${options.ids.map(() => "?").join(",")})`);
+      params.push(...options.ids);
+    }
     if (options.search) {
       // Users search what they see: phone-fallback labels ("+1555...") must
       // match jids by their digits.
@@ -13086,7 +13881,7 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       where.push("chat_type = ?");
       params.push(options.type);
     }
-    if (!options.includeEventOnly) {
+    if (!options.includeEventOnly && !options.ids?.length) {
       where.push(`EXISTS (
         SELECT 1
         FROM messages visible_messages
@@ -13094,17 +13889,30 @@ export class SqliteArchiveRepository implements ArchiveRepository {
           AND ${visibleExchangePredicate("visible_messages", this.statusChatId())}
       )`);
     }
+    // Mute is a BRAIN filter, never an archive one: this narrows which chats the
+    // list shows when the user asks for muted/unmuted, and changes nothing about
+    // what a chat contains or how its messages read.
+    if (options.muted != null && !options.ids?.length) {
+      where.push(
+        `${options.muted ? "EXISTS" : "NOT EXISTS"} (
+          SELECT 1 FROM brain_mute_intervals mi
+          WHERE mi.chat_source_id = chats.source_chat_id AND mi.end_ms IS NULL
+        )`
+      );
+    }
     params.push(options.limit, options.offset);
     const rows = this.db
       .prepare(
         `SELECT id, source_chat_id, jid, NULLIF(TRIM(COALESCE(display_name, '')), '') AS display_name, chat_type,
-                message_count, participant_count, last_message_at
+                message_count, participant_count, last_message_at,
+                (SELECT mi.origin FROM brain_mute_intervals mi
+                 WHERE mi.chat_source_id = chats.source_chat_id AND mi.end_ms IS NULL LIMIT 1) AS mute_origin
          FROM chats
          ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
          ORDER BY last_message_at_ms IS NULL, last_message_at_ms DESC, display_name ASC
          LIMIT ? OFFSET ?`
       )
-      .all(...params) as SqliteChatRow[];
+      .all(...params) as Array<SqliteChatRow & { mute_origin: string | null }>;
     const items: ChatListItem[] = rows.map((row) => ({
       id: Number(row.id),
       sourceChatId: row.source_chat_id,
@@ -13115,7 +13923,9 @@ export class SqliteArchiveRepository implements ArchiveRepository {
       chatType: row.chat_type as ChatListItem["chatType"],
       messageCount: Number(row.message_count ?? 0),
       participantCount: Number(row.participant_count ?? 0),
-      lastMessageAt: row.last_message_at ?? null
+      lastMessageAt: row.last_message_at ?? null,
+      muted: row.mute_origin != null,
+      mutedOrigin: (row.mute_origin as BrainMuteOrigin | null) ?? null
     }));
     // Same-name persons must be visually distinct wherever they co-occur:
     // disambiguate DM titles across the page (group subjects are not person
@@ -13524,6 +14334,15 @@ export class SqliteArchiveRepository implements ArchiveRepository {
     const where = ["m.timestamp_ms IS NOT NULL"];
     if (statusChatId != null) {
       where.push(`m.chat_id != ${statusChatId}`);
+    }
+    // The single choke point for what the brain is allowed to read: this feeds
+    // both episode evidence packs and memory (REM) consolidation, so muted
+    // messages are unreachable to every generator through one guard. It is also
+    // the backstop for the task race — a task that started just before a mute
+    // finds no evidence here and commits nothing.
+    const mutedExclusion = this.mutedMessageExclusion("m", "chats");
+    if (mutedExclusion) {
+      where.push(mutedExclusion);
     }
     const params: unknown[] = [];
     if (options.startAtMs != null) {
@@ -14032,6 +14851,7 @@ function ensureSchema(db: Database.Database): void {
   db.exec(schemaStatements.join(";\n"));
   migrateAdditiveColumns(db);
   migrateArchiveSignalTables(db);
+  ensureChannelMuteDefaults(db);
   backfillBrainEpisodeSignalAnchors(db);
   ensureSearchSchema(db);
   // Drop the removed view-once recovery queue if a prior build created it. It
@@ -14192,6 +15012,28 @@ function migratePersonLinkEventActions(db: Database.Database): void {
   })();
 }
 
+// Channels are born muted: a WhatsApp Channel is broadcast subscription feed,
+// not a conversation the brain should spend on. The rule is a standing one, so
+// it runs at startup (covering every channel already in the archive) and again
+// on chat upsert (covering any channel first seen later) — the user never runs
+// a seeding step.
+//
+// "Has no rows AT ALL" is the deliberate test, and the reason unmute leaves a
+// tombstone: once the user has expressed an opinion about a channel, this hook
+// must never overwrite it.
+export function ensureChannelMuteDefaults(db: Database.Database): number {
+  const result = db
+    .prepare(
+      `INSERT INTO brain_mute_intervals (chat_source_id, start_ms, end_ms, origin, created_at_ms)
+       SELECT ch.source_chat_id, 0, NULL, 'channel-default', ?
+       FROM chats ch
+       WHERE ch.chat_type = 'community'
+         AND NOT EXISTS (SELECT 1 FROM brain_mute_intervals mi WHERE mi.chat_source_id = ch.source_chat_id)`
+    )
+    .run(Date.now());
+  return result.changes;
+}
+
 function migrateAdditiveColumns(db: Database.Database): void {
   const additions: Array<{ table: string; column: string; ddl: string }> = [
     { table: "chats", column: "platform_recency_ms", ddl: "ALTER TABLE chats ADD COLUMN platform_recency_ms INTEGER NULL" },
@@ -14225,7 +15067,18 @@ function migrateAdditiveColumns(db: Database.Database): void {
       table: "brain_episodes",
       column: "no_durable_claims_reason",
       ddl: "ALTER TABLE brain_episodes ADD COLUMN no_durable_claims_reason TEXT NULL"
-    }
+    },
+    // mute-chats-from-brain: the materialized per-doc mute classification. Every
+    // existing doc migrates in as 'clean' with zero counts, which is exactly
+    // right while no mute interval exists — the classifier corrects it on the
+    // first mute transition or rollup.
+    {
+      table: "brain_docs",
+      column: "muted_state",
+      ddl: "ALTER TABLE brain_docs ADD COLUMN muted_state TEXT NOT NULL DEFAULT 'clean'"
+    },
+    { table: "brain_docs", column: "muted_claim_count", ddl: "ALTER TABLE brain_docs ADD COLUMN muted_claim_count INTEGER NOT NULL DEFAULT 0" },
+    { table: "brain_docs", column: "fed_claim_count", ddl: "ALTER TABLE brain_docs ADD COLUMN fed_claim_count INTEGER NOT NULL DEFAULT 0" }
   ];
   for (const addition of additions) {
     const columns = db.prepare(`SELECT name FROM pragma_table_info(?)`).all(addition.table) as Array<{ name: string }>;
@@ -14988,6 +15841,115 @@ function statusChatExclusionPredicate(messageAlias: string, statusChatId: number
   return statusChatId == null ? "" : `${messageAlias}.chat_id != ${statusChatId} AND `;
 }
 
+// --- Chat brain muting ---
+// The mute set is stored canonically, so evaluating it is pure range logic.
+// Ranges are half-open `[startMs, endMs)`; a NULL end means still muted. A
+// zero-length row (start === end) is a tombstone and is INERT under this
+// convention for free — no timestamp can satisfy `t >= s AND t < s` — which is
+// why no predicate anywhere needs to special-case it.
+
+// A chat muted open-ended from the beginning of time needs no timestamp
+// arithmetic at all: it collapses to a chat-identity exclusion, the same cheap
+// integer compare the status guard uses. This is the common case (every
+// channel, every "entire history" mute), so the expensive per-range form below
+// only ever materializes for genuinely partial histories.
+interface MutePlan {
+  fullyMutedChatIds: number[];
+  fullyMutedChatSourceIds: string[];
+  partial: Array<{ chatId: number | null; chatSourceId: string; startMs: number; endMs: number | null }>;
+}
+
+const EMPTY_MUTE_PLAN: MutePlan = { fullyMutedChatIds: [], fullyMutedChatSourceIds: [], partial: [] };
+
+function sqlQuote(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+// Excludes messages that fall inside a muted range. Returns a bare boolean
+// expression, or "" when nothing is muted.
+//
+// TWO shapes matter here, both measured on the 326k-message archive:
+//
+//  1. Chat identity is keyed on the CHATS alias whenever the query has one.
+//     Naming `messages.chat_id` in a NOT IN list makes SQLite abandon the
+//     `SCAN chats → SEARCH messages USING INDEX (chat_id=?)` plan for a full
+//     `SCAN messages` plus a temp B-tree GROUP BY — 90ms → 626ms on the chat
+//     backlog. Keying the same test on `chats.id` keeps the indexed plan.
+//
+//  2. Partial ranges sit behind a single guard IN. Emitting one NOT clause per
+//     range makes every one of the 326k rows evaluate every range; guarding
+//     them means only rows actually in a partially-muted chat pay for the
+//     timestamp arithmetic. Together: 626ms → 145ms (baseline 90ms).
+//
+// `chatAlias` is optional only because a couple of message-keyed queries have
+// no chats join; they fall back to `chat_id` and simply do not get shape 1.
+function mutedMessageExclusionPredicate(alias: string, plan: MutePlan, chatAlias?: string): string {
+  const chatId = chatAlias ? `${chatAlias}.id` : `${alias}.chat_id`;
+  const parts: string[] = [];
+  if (plan.fullyMutedChatIds.length > 0) {
+    parts.push(`${chatId} NOT IN (${plan.fullyMutedChatIds.join(",")})`);
+  }
+  const partial = plan.partial.filter((range) => range.chatId != null);
+  if (partial.length > 0) {
+    const ranges = partial.map((range) => {
+      const upper = range.endMs == null ? "" : ` AND COALESCE(${alias}.timestamp_ms, 0) < ${range.endMs}`;
+      return `(${chatId} = ${range.chatId} AND COALESCE(${alias}.timestamp_ms, 0) >= ${range.startMs}${upper})`;
+    });
+    parts.push(`(${chatId} NOT IN (${partial.map((range) => range.chatId).join(",")}) OR NOT (${ranges.join(" OR ")}))`);
+  }
+  return parts.join(" AND ");
+}
+
+// `expr AND ` or "" — for splicing into a WHERE that already has clauses.
+function andPrefix(expression: string): string {
+  return expression ? `${expression} AND ` : "";
+}
+
+// A complete `WHERE …` (or "" when every part is empty), so a query whose only
+// condition is an optional predicate needs no `1 = 1` filler.
+function whereClause(...parts: Array<string | null | undefined>): string {
+  const kept = parts.filter((part): part is string => Boolean(part && part.trim()));
+  return kept.length > 0 ? `WHERE ${kept.join(" AND ")}` : "";
+}
+
+// Excludes episodes (and, through their joins, claims/commitments/graph
+// evidence) whose span touches a muted range. ANY overlap counts: a
+// boundary-straddling episode hides rather than being re-sliced, which keeps
+// mute instantly reversible. Expects an alias carrying `chat_source_id`,
+// `start_at_ms`, and `end_at_ms`.
+function mutedEpisodeExclusionPredicate(alias: string, plan: MutePlan): string {
+  const parts: string[] = [];
+  if (plan.fullyMutedChatSourceIds.length > 0) {
+    parts.push(`${alias}.chat_source_id NOT IN (${plan.fullyMutedChatSourceIds.map(sqlQuote).join(",")})`);
+  }
+  for (const range of plan.partial) {
+    // [s,e] overlaps [a,b) iff s < b AND e >= a.
+    const upper = range.endMs == null ? "" : ` AND ${alias}.start_at_ms < ${range.endMs}`;
+    parts.push(`NOT (${alias}.chat_source_id = ${sqlQuote(range.chatSourceId)} AND ${alias}.end_at_ms >= ${range.startMs}${upper})`);
+  }
+  return parts.join(" AND ");
+}
+
+// The positive form of the episode predicate — the exact logical negation of
+// the exclusion above — for the places that need to COUNT muted artifacts
+// rather than hide them (the doc classifier, the muted-items view). Returns a
+// standalone boolean expression, or "0" when nothing is muted.
+function mutedEpisodeInclusionPredicate(alias: string, plan: MutePlan): string {
+  const parts: string[] = [];
+  if (plan.fullyMutedChatSourceIds.length > 0) {
+    parts.push(`${alias}.chat_source_id IN (${plan.fullyMutedChatSourceIds.map(sqlQuote).join(",")})`);
+  }
+  for (const range of plan.partial) {
+    const upper = range.endMs == null ? "" : ` AND ${alias}.start_at_ms < ${range.endMs}`;
+    parts.push(`(${alias}.chat_source_id = ${sqlQuote(range.chatSourceId)} AND ${alias}.end_at_ms >= ${range.startMs}${upper})`);
+  }
+  return parts.length > 0 ? `(${parts.join(" OR ")})` : "0";
+}
+
+function planIsEmpty(plan: MutePlan): boolean {
+  return plan.fullyMutedChatIds.length === 0 && plan.fullyMutedChatSourceIds.length === 0 && plan.partial.length === 0;
+}
+
 function visibleExchangePredicate(alias: string, statusChatId: number | null): string {
   return `${statusChatExclusionPredicate(alias, statusChatId)}
           ${alias}.message_type NOT IN ('system', 'status', 'reaction', 'encrypted_update')
@@ -15063,6 +16025,9 @@ interface BrainDocRow {
   merged_into: string | null;
   current_revision_id: number | null;
   last_rollup_at_ms: number | null;
+  muted_state: BrainDocMutedState | null;
+  muted_claim_count: number | null;
+  fed_claim_count: number | null;
   created_at_ms: number;
 }
 

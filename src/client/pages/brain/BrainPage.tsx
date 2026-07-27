@@ -4,6 +4,7 @@ import type {
   BrainBackfillStatus,
   BrainGraphStats,
   BrainLifecycleCounts,
+  BrainMutedSummary,
   BrainProviderName,
   MemoryCitationResolution,
   MemoryQueryResult
@@ -17,6 +18,7 @@ import {
   getBrainGraphStats,
   getOwnerIdentitySuggestions,
   listBrainLifecycleItems,
+  listMutedChats,
   queryMemory,
   rebuildBrainGraph,
   recomputeBrainGraph,
@@ -42,6 +44,7 @@ function BrainGraphSection({ running }: { running: boolean }) {
   const [lifecycleCounts, setLifecycleCounts] = useState<BrainLifecycleCounts | null>(null);
   const [graphBusy, setGraphBusy] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [muted, setMuted] = useState<BrainMutedSummary | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -56,6 +59,12 @@ function BrainGraphSection({ running }: { running: boolean }) {
       setLifecycleCounts((await listBrainLifecycleItems({ status: "open", limit: 1 })).counts);
     } catch {
       setLifecycleCounts(null);
+    }
+    // Muted accumulation should be noticeable without visiting the view.
+    try {
+      setMuted((await listMutedChats()).summary);
+    } catch {
+      setMuted(null);
     }
   }, []);
 
@@ -201,6 +210,16 @@ function BrainGraphSection({ running }: { running: boolean }) {
             </Link>
             <Link className="miniButton" to="/brain/commitments" title="Review open commitments/questions, close them manually, or run the closure sweep">
               Commitments
+            </Link>
+            <Link
+              className="miniButton"
+              to="/brain/muted"
+              title="Chats the brain is not reading. They keep archiving everything; their brain artifacts are hidden, not deleted, and return on unmute."
+            >
+              Muted
+              {muted && muted.mutedChats > 0 ? (
+                <> · {muted.mutedChats.toLocaleString()} chats, {muted.piledUpMessages.toLocaleString()} msgs piled up</>
+              ) : null}
             </Link>
             <Link
               className="miniButton"

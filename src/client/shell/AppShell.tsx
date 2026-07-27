@@ -5,6 +5,7 @@ import { PairingModal } from "../panels";
 import { routeStateKey } from "../lib/routeState";
 import { useStatus } from "../state/StatusContext";
 import { useToast } from "../state/ToastContext";
+import { MuteProgressPill } from "./MuteProgressPill";
 import { NavRail } from "./NavRail";
 import { OnboardingBanner } from "./OnboardingBanner";
 import { RouteErrorBoundary } from "./RouteErrorBoundary";
@@ -53,6 +54,7 @@ export function AppShell() {
         </div>
         <NavRail />
         <div className="topActions">
+          <MuteProgressPill />
           {demo && (
             <span className="demoBadge" title={`Synthetic demo data — the real workspace is untouched.${status?.demoWorkspacePath ? ` Workspace: ${status.demoWorkspacePath}` : ""}`}>
               <FlaskConical size={16} />

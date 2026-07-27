@@ -31,6 +31,29 @@ Build a trustworthy local archive of the user's WhatsApp messages, then layer se
 - Inspect real SQLite schemas defensively instead of assuming one WhatsApp version.
 - Use synthetic fixtures for tests; never commit real WhatsApp data.
 
+## UI Design Language
+
+These are defaults, not suggestions. A new surface that breaks one needs a stated reason.
+
+- **Every loading state is a shimmer skeleton, never a "Loading…" string or a bare spinner.**
+  The skeleton must occupy the *same box* as the loaded content — same border, radius, padding,
+  and gaps — so nothing shifts when data arrives. Reuse `SkeletonRows`/`SkeletonMessages` from
+  `thread.tsx` where the shape fits; otherwise write a per-surface skeleton alongside the
+  component's CSS and drive it from the shared `shimmer` keyframe. Show it on first load *and*
+  on refetches that change what the list means (a filter change), but not on in-place updates
+  the user just triggered — a skeleton flash there reads as data loss.
+- **Unknown is never zero.** While a value is loading, shimmer it; never render `0`, `—`, or an
+  empty chart that a reader could mistake for a real measurement.
+- **Never render a raw identifier as a name.** A NULL display name is an explicit state
+  ("Unnamed group", "Unnamed channel", "Unresolved contact") — see `chatDisplayLabel`. JIDs,
+  node ids, and doc ids are plumbing and do not belong in a heading.
+- **No raw JSON in the UI**, and inferred values must be visually distinguishable from
+  authoritative ones, with their freshness stated.
+- **Anything that can take ~1s or more shows progress and never blocks the event loop.** Failures
+  surface in the UI *and* the server console — never silently.
+- **Counts are clickable or they are noise.** A number the user cannot open is a dead end once a
+  list runs to hundreds of rows.
+
 ## Docs
 
 - `docs/README.md` - wiki index.

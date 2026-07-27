@@ -30,8 +30,12 @@ import type {
   BrainRunListItem,
   BrainRunProgress,
   BrainRunSummary,
+  BrainEpisodeRecord,
+  BrainMuteProgress,
+  BrainMutedListResponse,
   ChatListItem,
   ChatListOptions,
+  ChatMuteState,
   ImportJobSummary,
   ImportMode,
   ImportRequest,
@@ -358,9 +362,83 @@ export function listChats(params: Partial<ChatListOptions>): Promise<ChatListIte
   if (params.search) query.set("search", params.search);
   if (params.type) query.set("type", params.type);
   if (params.includeEventOnly) query.set("includeEventOnly", "true");
+  if (params.muted != null) query.set("muted", String(params.muted));
+  if (params.ids?.length) query.set("ids", params.ids.join(","));
   query.set("limit", String(params.limit ?? 60));
   query.set("offset", String(params.offset ?? 0));
   return request<ChatListItem[]>(`/api/chats?${query}`);
+}
+
+// Resolve one chat regardless of the browsing filters. The open chat's header
+// must not degrade to "Unresolved contact" because a filter stopped including
+// it — or because it was deep-linked before any list loaded.
+export async function getChatById(chatId: number): Promise<ChatListItem | null> {
+  const [chat] = await listChats({ ids: [chatId], limit: 1, offset: 0 });
+  return chat ?? null;
+}
+
+// --- Chat brain muting (mute-chats-from-brain) ---
+// Muting stops BRAIN processing only — the chat keeps archiving every message
+// and media blob, and reads identically in the chats UI and search. All
+// filtering happens server-side; nothing here decides what is hidden.
+
+// Mute state is durable the moment these return, but the vault reconcile runs
+// behind them. This event lets the shell's progress indicator react on the
+// action rather than on its next poll, so the user always sees an
+// acknowledgement — polling alone would miss jobs that finish in ~100ms.
+export const MUTE_CHANGED_EVENT = "wapp:mute-changed";
+
+function announceMuteChange(): void {
+  window.dispatchEvent(new CustomEvent(MUTE_CHANGED_EVENT));
+}
+
+// The route accepts either the numeric chat id the chat surfaces hold or the
+// canonical JID the brain surfaces hold, so neither caller has to translate.
+// `fromMs` omitted means "from now"; "epoch" is the entire-history preset.
+export async function muteChat(chat: number | string, fromMs?: number | "epoch"): Promise<ChatMuteState> {
+  const state = await request<ChatMuteState>(`/api/chats/${encodeURIComponent(String(chat))}/mute`, {
+    method: "POST",
+    body: JSON.stringify(fromMs == null ? {} : { fromMs })
+  });
+  announceMuteChange();
+  return state;
+}
+
+export async function unmuteChat(chat: number | string, fromMs?: number | "epoch"): Promise<ChatMuteState> {
+  const state = await request<ChatMuteState>(`/api/chats/${encodeURIComponent(String(chat))}/unmute`, {
+    method: "POST",
+    body: JSON.stringify(fromMs == null ? {} : { fromMs })
+  });
+  announceMuteChange();
+  return state;
+}
+
+export function getChatMuteState(chat: number | string): Promise<ChatMuteState> {
+  return request<ChatMuteState>(`/api/chats/${encodeURIComponent(String(chat))}/mute`);
+}
+
+// Every muted chat with what muting is saving (piled-up since the frozen
+// watermark) and what it hid — all derived server-side, never stored counters.
+export function listMutedChats(): Promise<BrainMutedListResponse> {
+  return request<BrainMutedListResponse>("/api/brain/muted");
+}
+
+// Cheap enough to poll: it reads in-process queue state, touching no tables.
+export function getMuteProgress(): Promise<BrainMuteProgress> {
+  return request<BrainMuteProgress>("/api/brain/mute/progress");
+}
+
+// Episodes for a chat. `onlyMuted` inverts the hiding so the muted-items view
+// can show exactly what muting hid.
+export function listBrainEpisodes(
+  params: { chatSourceId?: string | null; onlyMuted?: boolean; limit?: number } = {}
+): Promise<BrainEpisodeRecord[]> {
+  const query = new URLSearchParams();
+  if (params.chatSourceId) query.set("chatSourceId", params.chatSourceId);
+  if (params.onlyMuted) query.set("onlyMuted", "true");
+  if (params.limit != null) query.set("limit", String(params.limit));
+  const suffix = query.toString();
+  return request<BrainEpisodeRecord[]>(`/api/brain/episodes${suffix ? `?${suffix}` : ""}`);
 }
 
 // Local loopback media URLs (used directly as img/video/audio sources).
@@ -555,6 +633,7 @@ export function listBrainLifecycleItems(params: {
   excludeChats?: string[];
   sort?: BrainLifecycleSort;
   chatSourceId?: string | null;
+  onlyMuted?: boolean;
   limit?: number;
 } = {}): Promise<BrainLifecycleListResponse> {
   const query = new URLSearchParams();
@@ -565,6 +644,7 @@ export function listBrainLifecycleItems(params: {
   if (params.hideFulfilled) query.set("hideFulfilled", "true");
   if (params.hideDismissed) query.set("hideDismissed", "true");
   if (params.dueUpcoming) query.set("dueUpcoming", "true");
+  if (params.onlyMuted) query.set("onlyMuted", "true");
   if (params.kind) query.set("kind", params.kind);
   if (params.includeChats && params.includeChats.length > 0) query.set("includeChats", params.includeChats.join(","));
   if (params.excludeChats && params.excludeChats.length > 0) query.set("excludeChats", params.excludeChats.join(","));
@@ -613,11 +693,12 @@ export function startBrainLifecycleSweep(body: {
 // Docs list: existing docs AND page-eligible nodes without a doc yet, with
 // deterministic dueness and counts computed server-side.
 export function listBrainDocs(
-  params: { kind?: "entity" | "topic" | "chat"; view?: BrainDocsListView; limit?: number } = {}
+  params: { kind?: "entity" | "topic" | "chat"; view?: BrainDocsListView; onlyMuted?: boolean; limit?: number } = {}
 ): Promise<BrainDocsListResponse> {
   const query = new URLSearchParams();
   if (params.kind) query.set("kind", params.kind);
   if (params.view && params.view !== "all") query.set("view", params.view);
+  if (params.onlyMuted) query.set("onlyMuted", "true");
   if (params.limit != null) query.set("limit", String(params.limit));
   const suffix = query.toString();
   return request<BrainDocsListResponse>(`/api/brain/docs${suffix ? `?${suffix}` : ""}`);

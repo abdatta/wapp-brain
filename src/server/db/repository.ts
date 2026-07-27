@@ -5,6 +5,9 @@ import type {
   BrainBackfillDbStats,
   StatusExcisionReport,
   BrainChatBacklogItem,
+  BrainMuteOrigin,
+  BrainMutedListResponse,
+  ChatMuteState,
   BrainClaimGradeRecord,
   BrainClaimGradeValue,
   BrainDocCommitResult,
@@ -59,6 +62,7 @@ import type {
   BrainValidationIssueSummary,
   CapturedLinkPreview,
   ChatListItem,
+  ChatType,
   ChatRecord,
   ChatSyncStateRecord,
   ContactRecord,
@@ -252,6 +256,12 @@ export interface ArchiveRepository {
   getMessageVcardDownload(messageId: number, cardIndex: number): Promise<{ content: string; fileName: string; constructed: boolean } | null>;
   getLiveStatus(): Promise<LiveMaintainerStatusSummary>;
   listChats(options: ChatListOptions): Promise<ChatListItem[]>;
+  // Rowid → canonical JID. Chat-scoped routes take the numeric id the UI holds,
+  // but everything brain-side is keyed by canonical JID.
+  getChatSourceIdById(chatId: number): Promise<string | null>;
+  // One indexed row: the label and kind a progress message needs, without
+  // paying for any aggregate.
+  getChatIdentity(chatSourceId: string): Promise<{ displayName: string | null; chatType: ChatType } | null>;
   listMessages(
     chatId: number,
     options: { limit: number; offset: number; sender?: string; query?: string; order?: "asc" | "desc" }
@@ -315,6 +325,24 @@ export interface ArchiveRepository {
   // never the full-archive aggregation.
   getBrainChatBacklog(options: { limit: number; minPending?: number; chatSourceId?: string | null }): Promise<BrainChatBacklogItem[]>;
   advanceBrainWatermark(chatSourceId: string, throughMs: number): Promise<void>;
+  // --- Chat brain muting ---
+  // Mute affects brain processing and presentation only: ingestion, media
+  // download, FTS, the chats UI, and message search never consult it. Both
+  // operations keep the stored interval set canonical and are safe to repeat.
+  // `fromMs` may lie in the past; 0 means the chat's entire history.
+  muteChat(chatSourceId: string, options?: { fromMs?: number; origin?: BrainMuteOrigin }): Promise<ChatMuteState>;
+  // Truncates or removes every muted range at or beyond `fromMs`, leaving a
+  // tombstone so a channel default is never resurrected.
+  unmuteChat(chatSourceId: string, options?: { fromMs?: number }): Promise<ChatMuteState>;
+  getChatMuteState(chatSourceId: string): Promise<ChatMuteState>;
+  // Chats muted open-endedly across their whole history — the cheap guard for
+  // producers that only need "is this chat off-limits entirely?" and must not
+  // pay for the full muted-items aggregation.
+  listFullyMutedChatSourceIds(): Promise<string[]>;
+  listMutedChats(): Promise<BrainMutedListResponse>;
+  // Rebuilds every doc's materialized muted classification. Transition-driven
+  // recompute keeps this current; this is the repair path.
+  recomputeDocMutedStates(): Promise<{ docsUpdated: number }>;
   enqueueBrainTasks(tasks: BrainTaskInput[]): Promise<number>;
   // Optional kind filter: a regenerate run drains only its own task kind while
   // the auto pass claims everything due.
@@ -399,6 +427,12 @@ export interface ArchiveRepository {
   listBrainEpisodeProjections(options?: {
     limit?: number;
     offset?: number;
+    // Scopes the read to one chat, so a mute change reconciles only the files it
+    // can possibly have affected instead of the whole vault.
+    chatSourceId?: string | null;
+    // Inverts the mute filter: the files a mute must REMOVE, named by the same
+    // function that wrote them.
+    onlyMuted?: boolean;
   }): Promise<Array<{ id: string; chatSourceId: string; chatDisplayName: string | null; startAtMs: number; markdown: string }>>;
   // Rendered markdown references committed claim ids, so it lands post-commit.
   updateBrainEpisodeMarkdown(episodeId: string, markdown: string): Promise<void>;
@@ -410,6 +444,9 @@ export interface ArchiveRepository {
     status?: BrainEpisodeRecord["status"];
     generator?: BrainEpisodeGenerator;
     endAtOrBeforeMs?: number;
+    // Muted episodes are hidden from every listing (fetch-by-id still resolves);
+    // this inverts the filter for the muted-items view's drill-in.
+    onlyMuted?: boolean;
     limit: number;
   }): Promise<BrainEpisodeRecord[]>;
   // Regeneration selection: current episodes that are extractive-generated or
@@ -540,6 +577,9 @@ export interface ArchiveRepository {
     // Group filter: show only these source chats, or hide these.
     includeChats?: string[];
     excludeChats?: string[];
+    // Muted items are hidden from every normal view; this inverts the filter so
+    // the muted-items view can drill into exactly what muting hid.
+    onlyMuted?: boolean;
     // 'smart' keeps the pinned default ordering; the rest are explicit sorts.
     sort?: BrainLifecycleSort;
     limit?: number;
@@ -593,7 +633,14 @@ export interface ArchiveRepository {
   rollbackBrainDoc(docId: string, toRevision?: number | null): Promise<BrainDocDetail | null>;
   // Docs list: existing docs AND page-eligible nodes without a doc yet, with
   // deterministic dueness reasons and counts. Meaning lives server-side.
-  listBrainDocs(options?: { kind?: BrainDocKind; view?: BrainDocsListView; limit?: number }): Promise<BrainDocsListResponse>;
+  // Exclusively-muted pages are hidden from every normal surface; `onlyMuted`
+  // inverts that so the muted-items view can list exactly what muting hid.
+  listBrainDocs(options?: {
+    kind?: BrainDocKind;
+    view?: BrainDocsListView;
+    onlyMuted?: boolean;
+    limit?: number;
+  }): Promise<BrainDocsListResponse>;
   // One doc resolved for display: rendered markdown + structured sections with
   // thread coordinates, revision history, issues, dueness. Follows merged
   // redirects (a merged doc answers with its survivor, flagged redirected).

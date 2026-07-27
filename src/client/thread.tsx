@@ -1304,11 +1304,21 @@ function SkeletonMessages() {
   );
 }
 
-function chatDisplayLabel(chat: ChatListItem): string {
+// NULL display name means unresolved, and the UI must say so rather than fall
+// back to a raw identifier. WhatsApp Channels almost never carry a name in the
+// archive — a subscription the user never opened records only its JID — so
+// "Unnamed channel" is the honest label, not a defect to paper over.
+function chatDisplayLabel(chat: Pick<ChatListItem, "displayName" | "chatType">): string {
   if (chat.displayName) {
     return chat.displayName;
   }
-  return chat.chatType === "group" ? "Unnamed group" : "Unresolved contact";
+  if (chat.chatType === "group") {
+    return "Unnamed group";
+  }
+  if (chat.chatType === "community") {
+    return "Unnamed channel";
+  }
+  return "Unresolved contact";
 }
 
 function isNearBottom(list: HTMLDivElement | null): boolean {

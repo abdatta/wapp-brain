@@ -132,8 +132,14 @@ export async function enqueueEpisodeTasksForChats(
   chats: BrainChatBacklogItem[],
   nowMs: number = Date.now()
 ): Promise<number> {
+  // Defense in depth. A muted chat already reports zero pending work, so it
+  // never reaches here through the backlog; this refuses a caller that assembled
+  // its own list (or raced a mute) before any task is minted.
+  // Only FULLY muted chats are refused outright: a chat muted from a date still
+  // has legitimate pre-mute history the brain should finish.
+  const muted = new Set(await repository.listFullyMutedChatSourceIds());
   const tasks = chats
-    .filter((chat) => chat.pendingVisibleMessages > 0 && chat.newestVisibleMs != null)
+    .filter((chat) => chat.pendingVisibleMessages > 0 && chat.newestVisibleMs != null && !muted.has(chat.chatSourceId))
     .map((chat) => ({
       kind: "episode" as const,
       chatSourceId: chat.chatSourceId,

@@ -112,6 +112,66 @@ export async function projectBrainDocs(
   return { written, unchanged, removed };
 }
 
+// Reconcile ONE chat's episode files after its mute state changed. A mute
+// affects a single chat, so rebuilding the whole 9.4k-file vault for it is both
+// wasteful and — because each file is a synchronous read+write — the thing that
+// pins the event loop and makes every other request hang.
+//
+// Yields every 50 files rather than every 500-item batch: a batch of 500
+// synchronous Windows file writes is itself a multi-second block.
+export async function reprojectChatEpisodes(
+  repository: ArchiveRepository,
+  chatSourceId: string,
+  onProgress?: (done: number, total: number) => void
+): Promise<{ written: number; removed: number }> {
+  const { projectEpisodeFile } = await import("./episodes");
+  // What SHOULD exist for this chat now (the mute predicate already applied).
+  const projectable = await repository.listBrainEpisodeProjections({ chatSourceId, limit: 100_000 });
+  const keep = new Set(projectable.map((episode) => `${episodeFileBase(episode)}.md`));
+  let written = 0;
+  let removed = 0;
+  const total = projectable.length;
+
+  for (let index = 0; index < projectable.length; index += 1) {
+    const episode = projectable[index]!;
+    const filePath = path.join(config.brain.rootDir, "episodes", `${episodeFileBase(episode)}.md`);
+    let unchanged = false;
+    if (fs.existsSync(filePath)) {
+      try {
+        unchanged = fs.readFileSync(filePath, "utf8") === episode.markdown;
+      } catch {
+        // Unreadable: fall through and rewrite.
+      }
+    }
+    if (!unchanged) {
+      projectEpisodeFile({ ...episode } as Parameters<typeof projectEpisodeFile>[0]);
+      written += 1;
+    }
+    if (index % 50 === 49) {
+      onProgress?.(index + 1, total);
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  }
+
+  // What this chat WOULD project if it were not muted — the exact set of files
+  // a mute must remove. Derived from the same naming function as the write, so
+  // it stays correct across renames, and read through the lean projection query
+  // rather than the full episode hydrator (which issues per-episode queries for
+  // claims, citations, entities and topics — thousands of round-trips for a
+  // chat this size, and most of the cost of the first version).
+  const hidden = await repository.listBrainEpisodeProjections({ chatSourceId, onlyMuted: true, limit: 100_000 });
+  for (const episode of hidden) {
+    const fileName = `${episodeFileBase(episode)}.md`;
+    if (keep.has(fileName)) continue;
+    const filePath = path.join(config.brain.rootDir, "episodes", fileName);
+    if (fs.existsSync(filePath)) {
+      fs.rmSync(filePath, { force: true });
+      removed += 1;
+    }
+  }
+  return { written, removed };
+}
+
 // Re-project every current episode from its stored markdown. The vault is a
 // pure projection, so a wiped episodes/ directory is always fully recoverable
 // from the database — no model calls, no re-derivation. Batched so a 9k-episode
@@ -168,7 +228,7 @@ export async function projectBrainOverview(repository: ArchiveRepository, provid
 // Idempotent and byte-stable — a second run writes nothing.
 export async function rebuildBrainProjection(
   repository: ArchiveRepository,
-  options?: { includeEpisodes?: boolean; onProgress?: (written: number) => void }
+  options?: { includeEpisodes?: boolean; includeOverview?: boolean; onProgress?: (written: number) => void }
 ): Promise<{ written: number; unchanged: number; removed: number; episodesWritten: number }> {
   // Episodes are part of the vault too — a rebuild must be able to restore
   // them, not just pages (they were the surface a wiped episodes/ dir lost).
@@ -207,7 +267,14 @@ export async function rebuildBrainProjection(
     }
   }
   const result = await projectBrainDocs(repository);
-  await projectBrainOverview(repository);
+  // The overview is a whole-archive digest whose inputs (coverage, lifecycle
+  // counts) are the most expensive reads in the app — several seconds on the
+  // real archive. It is deterministic and refreshed after every run, so a mute
+  // change skips it rather than making the user wait for a file they did not
+  // ask about.
+  if (options?.includeOverview !== false) {
+    await projectBrainOverview(repository);
+  }
   return {
     written: result.written,
     unchanged: result.unchanged,

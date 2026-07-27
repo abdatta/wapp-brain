@@ -9,6 +9,11 @@ import type {
   StatusExcisionReport,
   BrainBackfillModelSpend,
   BrainChatBacklogItem,
+  BrainDocMutedState,
+  BrainMuteOrigin,
+  BrainMutedChatItem,
+  BrainMutedListResponse,
+  ChatMuteState,
   BrainClaimGradeRecord,
   BrainClaimGradeValue,
   BrainConflictPair,
@@ -90,6 +95,7 @@ import type {
   BrainValidationIssueSummary,
   CapturedLinkPreview,
   ChatListItem,
+  ChatType,
   ChatListOptions,
   ChatRecord,
   ChatMetadataHistoryRecord,
@@ -220,6 +226,15 @@ import {
 import { resolveNeighborhoodParams, shapeNeighborhood, type NeighborhoodWalk } from "../brain/graphQuery";
 import { episodeFileBase } from "../brain/vaultNames";
 import { isMaskedNumberLabel, isStatusChatJid, normalizeJid, phoneFromJid, resolveDisplayLabel } from "../import/jid";
+import {
+  activeMuteIntervals,
+  isFullyMuted,
+  isMutedAt,
+  mergeMuteIntervals,
+  spanOverlapsMute,
+  truncateMuteIntervals,
+  type MuteIntervalValue
+} from "./muteIntervals";
 import { normalizeOwnerSelfInput } from "../identity/ownerSelf";
 import { disambiguateLabels } from "../persons/disambiguate";
 import { personDisplayLabelFromMembers } from "../persons/label";
@@ -377,6 +392,10 @@ export class MemoryArchiveRepository implements ArchiveRepository {
   // claim id, exactly like brain_lifecycle_events + cites in SQLite.
   private lifecycleEvents: BrainLifecycleEventRecord[] = [];
   private lifecycleEventSeq = 1;
+  // Chat brain muting (mirror of brain_mute_intervals). Tombstones are stored
+  // here too — "has an entry at all" is what stops the channel default from
+  // resurrecting after an explicit unmute.
+  private brainMuteIntervals = new Map<string, MuteIntervalValue[]>();
   // Semantic consolidation (mirror of brain_docs / brain_doc_revisions /
   // brain_doc_revision_claims + the claims supersession projection column).
   private brainDocs = new Map<string, BrainDocRecord>();
@@ -2077,6 +2096,9 @@ export class MemoryArchiveRepository implements ArchiveRepository {
         lastMessageAt: existing?.lastMessageAt ?? null
       });
     }
+    // A channel first seen here arrives already muted, before any brain pass
+    // can select it.
+    this.ensureChannelMuteDefaults();
     return new Map([...this.chats].map(([sourceChatId, chat]) => [sourceChatId, chat.id]));
   }
 
@@ -3214,31 +3236,52 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     return best ? `possibly the same as ${this.resolveCurrentLabelForJid(best.otherJid) ?? best.otherJid} — unconfirmed` : null;
   }
 
+  async getChatSourceIdById(chatId: number): Promise<string | null> {
+    return [...this.chats.values()].find((chat) => chat.id === chatId)?.sourceChatId ?? null;
+  }
+
+  async getChatIdentity(chatSourceId: string): Promise<{ displayName: string | null; chatType: ChatType } | null> {
+    const chat = this.chats.get(this.canonicalJid(chatSourceId) ?? chatSourceId);
+    return chat ? { displayName: chat.displayName?.trim() || null, chatType: chat.chatType } : null;
+  }
+
   async listChats(options: ChatListOptions): Promise<ChatListItem[]> {
     const search = options.search?.toLowerCase();
     const searchDigits = search ? search.replace(/\D/g, "") : "";
+    // An explicit id lookup is a direct reference, not a listing: it answers for
+    // exactly those chats and ignores every browsing filter.
+    const idSet = options.ids && options.ids.length > 0 ? new Set(options.ids) : null;
     const items: ChatListItem[] = [...this.chats.values()]
+      .filter((chat) => !idSet || idSet.has(chat.id))
       .filter(
         (chat) =>
+          !!idSet ||
           !search ||
           chat.displayName?.toLowerCase().includes(search) ||
           chat.jid.toLowerCase().includes(search) ||
           (searchDigits.length >= 4 && chat.jid.includes(searchDigits))
       )
-      .filter((chat) => !options.type || options.type === "all" || chat.chatType === options.type)
-      .filter((chat) => options.includeEventOnly || this.hasVisibleExchange(chat.sourceChatId))
+      .filter((chat) => !!idSet || !options.type || options.type === "all" || chat.chatType === options.type)
+      .filter((chat) => !!idSet || options.includeEventOnly || this.hasVisibleExchange(chat.sourceChatId))
+      // Mute is a BRAIN filter, never an archive one.
+      .filter((chat) => !!idSet || options.muted == null || this.muteStateFor(chat.sourceChatId).muted === options.muted)
       .sort((a, b) => (b.lastMessageAt ?? "").localeCompare(a.lastMessageAt ?? ""))
       .slice(options.offset, options.offset + options.limit)
-      .map((chat) => ({
-        id: chat.id,
-        sourceChatId: chat.sourceChatId,
-        jid: chat.jid,
-        displayName: chat.displayName?.trim() && chat.displayName !== chat.jid ? chat.displayName : displayPhoneFromJid(chat.jid),
-        chatType: chat.chatType,
-        messageCount: chat.messageCount,
-        participantCount: chat.participantCount,
-        lastMessageAt: chat.lastMessageAt
-      }));
+      .map((chat) => {
+        const mute = this.muteStateFor(chat.sourceChatId);
+        return {
+          id: chat.id,
+          sourceChatId: chat.sourceChatId,
+          jid: chat.jid,
+          displayName: chat.displayName?.trim() && chat.displayName !== chat.jid ? chat.displayName : displayPhoneFromJid(chat.jid),
+          chatType: chat.chatType,
+          messageCount: chat.messageCount,
+          participantCount: chat.participantCount,
+          lastMessageAt: chat.lastMessageAt,
+          muted: mute.muted,
+          mutedOrigin: mute.origin
+        };
+      });
     const isIdentityChat = (item: ChatListItem): boolean => item.chatType === "dm" || item.chatType === "unknown";
     const adjusted = this.disambiguateEntryLabels(
       items.map((item) => (isIdentityChat(item) ? { label: item.displayName, jid: item.sourceChatId } : { label: null, jid: null }))
@@ -3741,6 +3784,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       const pendingMessages = [...this.messages.values()].filter(
         (message) =>
           message.chatSourceId === chat.sourceChatId &&
+          !this.isMessageMuted(message) &&
           isVisibleExchangeMessage(message) &&
           this.isMessagePending(message, chat.sourceChatId)
       );
@@ -3770,6 +3814,184 @@ export class MemoryArchiveRepository implements ArchiveRepository {
         ? { assimilatedThroughMs: throughMs, assimilatedThroughId: throughId }
         : { assimilatedThroughMs: existing.assimilatedThroughMs, assimilatedThroughId: existing.assimilatedThroughId };
     this.brainWatermarks.set(chatSourceId, { ...next, lastEpisodeAt: new Date().toISOString() });
+  }
+
+  // --- Chat brain muting (mirror) ---
+  // The interval algebra itself is imported, not re-implemented, so this mirror
+  // cannot drift from SQLite on semantics.
+
+  private activeIntervalsFor(chatSourceId: string): MuteIntervalValue[] {
+    return activeMuteIntervals(this.brainMuteIntervals.get(chatSourceId) ?? []);
+  }
+
+  private muteStateFor(chatSourceId: string): ChatMuteState {
+    const intervals = this.activeIntervalsFor(chatSourceId);
+    const open = intervals.find((interval) => interval.endMs == null) ?? null;
+    return {
+      chatSourceId,
+      intervals: intervals.map((interval) => ({ ...interval })),
+      muted: open != null,
+      mutedSinceMs: open ? open.startMs : null,
+      origin: open ? open.origin : null
+    };
+  }
+
+  // True when this message falls inside a muted range — the in-memory twin of
+  // mutedMessageExclusionPredicate.
+  private isMessageMuted(message: { chatSourceId: string; timestampMs?: number | null }): boolean {
+    return isMutedAt(this.activeIntervalsFor(message.chatSourceId), message.timestampMs ?? 0);
+  }
+
+  // True when this episode's span touches a muted range (any overlap).
+  private isEpisodeMuted(episode: { chatSourceId: string; startAtMs: number; endAtMs: number }): boolean {
+    return spanOverlapsMute(this.activeIntervalsFor(episode.chatSourceId), episode.startAtMs, episode.endAtMs);
+  }
+
+  // Claims hang off their episode here (there is no separate claim map), so a
+  // claim is muted exactly when its owning episode is.
+  private episodeForClaim(claimId: string): BrainEpisodeRecord | null {
+    for (const episode of this.brainEpisodes.values()) {
+      if (episode.claims.some((claim) => claim.id === claimId)) {
+        return episode;
+      }
+    }
+    return null;
+  }
+
+  private isClaimMuted(claimId: string): boolean {
+    const episode = this.episodeForClaim(claimId);
+    return episode ? this.isEpisodeMuted(episode) : false;
+  }
+
+  // An empty result still writes a tombstone, so the chat never looks untouched
+  // to the channel-default rule.
+  private writeMuteIntervals(chatSourceId: string, intervals: MuteIntervalValue[], tombstoneAtMs: number): void {
+    this.brainMuteIntervals.set(
+      chatSourceId,
+      intervals.length > 0 ? intervals : [{ startMs: tombstoneAtMs, endMs: tombstoneAtMs, origin: "user" }]
+    );
+  }
+
+  async muteChat(chatSourceId: string, options?: { fromMs?: number; origin?: BrainMuteOrigin }): Promise<ChatMuteState> {
+    const canonical = this.canonicalJid(chatSourceId) ?? chatSourceId;
+    const fromMs = Math.max(0, Math.trunc(options?.fromMs ?? Date.now()));
+    const merged = mergeMuteIntervals(this.activeIntervalsFor(canonical), fromMs, options?.origin ?? "user");
+    this.writeMuteIntervals(canonical, merged, fromMs);
+    // Drop queued work for a chat the brain is no longer allowed to read.
+    for (const [key, task] of [...this.brainTasks.entries()]) {
+      if (task.chatSourceId === canonical && task.status === "pending") {
+        this.brainTasks.delete(key);
+      }
+    }
+    this.recomputeDocMutedStatesSync();
+    return this.muteStateFor(canonical);
+  }
+
+  async unmuteChat(chatSourceId: string, options?: { fromMs?: number }): Promise<ChatMuteState> {
+    const canonical = this.canonicalJid(chatSourceId) ?? chatSourceId;
+    const fromMs = Math.max(0, Math.trunc(options?.fromMs ?? Date.now()));
+    this.writeMuteIntervals(canonical, truncateMuteIntervals(this.activeIntervalsFor(canonical), fromMs), fromMs);
+    this.recomputeDocMutedStatesSync();
+    return this.muteStateFor(canonical);
+  }
+
+  async getChatMuteState(chatSourceId: string): Promise<ChatMuteState> {
+    return this.muteStateFor(this.canonicalJid(chatSourceId) ?? chatSourceId);
+  }
+
+  async listFullyMutedChatSourceIds(): Promise<string[]> {
+    return [...this.brainMuteIntervals.keys()].filter((chatSourceId) => isFullyMuted(this.activeIntervalsFor(chatSourceId)));
+  }
+
+  // Channels are born muted; "no entry at all" is the test, so an explicit
+  // unmute (which leaves a tombstone) is never overwritten.
+  private ensureChannelMuteDefaults(): void {
+    for (const chat of this.chats.values()) {
+      if (chat.chatType === "community" && !this.brainMuteIntervals.has(chat.sourceChatId)) {
+        this.brainMuteIntervals.set(chat.sourceChatId, [{ startMs: 0, endMs: null, origin: "channel-default" }]);
+      }
+    }
+  }
+
+  private recomputeDocMutedStatesSync(): number {
+    let updated = 0;
+    for (const doc of this.brainDocs.values()) {
+      const revision = doc.currentRevisionId == null ? null : this.brainDocRevisions.get(doc.currentRevisionId);
+      const fed = revision?.fedClaimIds ?? [];
+      const mutedCount = fed.filter((claimId) => this.isClaimMuted(claimId)).length;
+      const state: BrainDocMutedState = mutedCount === 0 ? "clean" : mutedCount >= fed.length ? "muted" : "hybrid";
+      if (doc.mutedState !== state || doc.mutedClaimCount !== mutedCount || doc.fedClaimCount !== fed.length) {
+        updated += 1;
+        // Muted-fed prose becomes due so the NORMAL rollup cadence drains it.
+        this.brainDocs.set(doc.docId, {
+          ...doc,
+          mutedState: state,
+          mutedClaimCount: mutedCount,
+          fedClaimCount: fed.length,
+          lastRollupAtMs: state === "clean" ? doc.lastRollupAtMs : null
+        });
+      }
+    }
+    return updated;
+  }
+
+  async recomputeDocMutedStates(): Promise<{ docsUpdated: number }> {
+    return { docsUpdated: this.recomputeDocMutedStatesSync() };
+  }
+
+  async listMutedChats(): Promise<BrainMutedListResponse> {
+    const items: BrainMutedChatItem[] = [];
+    for (const chat of this.chats.values()) {
+      const state = this.muteStateFor(chat.sourceChatId);
+      if (!state.muted || state.mutedSinceMs == null) continue;
+      const sinceMs = state.mutedSinceMs;
+      const piled = [...this.messages.values()].filter(
+        (message) =>
+          message.chatSourceId === chat.sourceChatId &&
+          (message.timestampMs ?? 0) >= sinceMs &&
+          isVisibleExchangeMessage(message) &&
+          this.isMessagePending(message, chat.sourceChatId)
+      );
+      const episodes = [...this.brainEpisodes.values()].filter(
+        (episode) => episode.chatSourceId === chat.sourceChatId && this.isEpisodeMuted(episode)
+      );
+      const claimIds = new Set(episodes.flatMap((episode) => episode.claims.map((claim) => claim.id)));
+      const commitments = [...this.graphNodes.values()].filter(
+        (node) =>
+          (node.kind === "commitment" || node.kind === "question") &&
+          node.status !== "merged" &&
+          claimIds.has(node.naturalKey.slice(node.naturalKey.indexOf(":") + 1))
+      );
+      const docs = [...this.brainDocs.values()].filter((doc) => {
+        if (doc.mutedState !== "muted" || doc.currentRevisionId == null) return false;
+        const revision = this.brainDocRevisions.get(doc.currentRevisionId);
+        return (revision?.fedClaimIds ?? []).some((claimId) => claimIds.has(claimId));
+      });
+      items.push({
+        chatSourceId: chat.sourceChatId,
+        chatDisplayName: chat.displayName ?? null,
+        chatType: chat.chatType,
+        mutedSinceMs: sinceMs,
+        origin: state.origin ?? "user",
+        archivedMessages: chat.messageCount,
+        piledUpMessages: piled.length,
+        piledUpMedia: piled.filter((message) => message.hasMedia).length,
+        hiddenEpisodes: episodes.length,
+        hiddenClaims: claimIds.size,
+        hiddenCommitments: commitments.length,
+        hiddenDocs: docs.length
+      });
+    }
+    items.sort((a, b) => b.mutedSinceMs - a.mutedSinceMs);
+    return {
+      items,
+      summary: {
+        mutedChats: items.length,
+        piledUpMessages: items.reduce((sum, item) => sum + item.piledUpMessages, 0),
+        piledUpMedia: items.reduce((sum, item) => sum + item.piledUpMedia, 0),
+        hiddenEpisodes: items.reduce((sum, item) => sum + item.hiddenEpisodes, 0)
+      }
+    };
   }
 
   async enqueueBrainTasks(tasks: BrainTaskInput[]): Promise<number> {
@@ -4175,7 +4397,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
   }
 
   async getBrainStatus(): Promise<BrainStatusSummary> {
-    const visible = [...this.messages.values()].filter((message) => isVisibleExchangeMessage(message));
+    const visible = [...this.messages.values()].filter((message) => !this.isMessageMuted(message) && isVisibleExchangeMessage(message));
     // Assimilated is total − pending from the one shared predicate.
     const assimilated = visible.filter((message) => !this.isMessagePending(message, message.chatSourceId));
     const backlog = await this.getBrainChatBacklog({ limit: 8 });
@@ -4197,7 +4419,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
   }
 
   async getBrainBackfillStats(): Promise<BrainBackfillDbStats> {
-    const visible = [...this.messages.values()].filter((message) => isVisibleExchangeMessage(message));
+    const visible = [...this.messages.values()].filter((message) => !this.isMessageMuted(message) && isVisibleExchangeMessage(message));
     const pending = visible.filter((message) => this.isMessagePending(message, message.chatSourceId));
     const episodeTasks = [...this.brainTasks.values()].filter((task) => task.kind === "episode");
     const current = [...this.brainEpisodes.values()].filter((episode) => episode.status === "current");
@@ -4472,6 +4694,8 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     return structuredClone(
       [...this.brainEpisodes.values()]
         .filter((episode) => episode.status === "current")
+        // Regeneration spends model calls; a muted chat must never be selected.
+        .filter((episode) => !this.isEpisodeMuted(episode))
         .filter((episode) =>
           options.onlyExtractive
             ? episode.generator === "extractive"
@@ -4500,7 +4724,10 @@ export class MemoryArchiveRepository implements ArchiveRepository {
 
   async countRegenerableBrainEpisodes(currentVersion: number): Promise<number> {
     return [...this.brainEpisodes.values()].filter(
-      (episode) => episode.status === "current" && (episode.generator === "extractive" || episode.extractionVersion < currentVersion)
+      (episode) =>
+        episode.status === "current" &&
+        !this.isEpisodeMuted(episode) &&
+        (episode.generator === "extractive" || episode.extractionVersion < currentVersion)
     ).length;
   }
 
@@ -5045,6 +5272,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       chatSourceId?: string | null;
       includeChats?: string[];
       excludeChats?: string[];
+      onlyMuted?: boolean;
       sort?: BrainLifecycleSort;
       limit?: number;
     } = {}
@@ -5077,6 +5305,10 @@ export class MemoryArchiveRepository implements ArchiveRepository {
         continue;
       }
       const claimId = node.naturalKey.slice(node.naturalKey.indexOf(":") + 1);
+      // Hidden means invisible: muted items drop out before any count or facet.
+      if (this.isClaimMuted(claimId) !== (options.onlyMuted === true)) {
+        continue;
+      }
       const fold = foldLifecycleEvents(this.memLifecycleEventsForClaim(claimId));
       const { anchorMs, anchorKeys } = this.memLifecycleAnchor(claimId);
       const dueMs = typeof node.payload?.dueMs === "number" ? (node.payload.dueMs as number) : null;
@@ -5462,6 +5694,9 @@ export class MemoryArchiveRepository implements ArchiveRepository {
         mergedInto: null,
         currentRevisionId: null,
         lastRollupAtMs: null,
+        mutedState: "clean",
+        mutedClaimCount: 0,
+        fedClaimCount: 0,
         createdAtMs: now
       };
       this.brainDocs.set(input.docId, doc);
@@ -5601,6 +5836,9 @@ export class MemoryArchiveRepository implements ArchiveRepository {
         mergedInto: null,
         currentRevisionId: null,
         lastRollupAtMs: null,
+        mutedState: "clean",
+        mutedClaimCount: 0,
+        fedClaimCount: 0,
         createdAtMs: now
       });
     }
@@ -5774,7 +6012,12 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     return { due: reasons.length > 0, dueReasons: reasons, eligibleClaims, newClaims, openItems };
   }
 
-  async listBrainDocs(options?: { kind?: BrainDocKind; view?: BrainDocsListView; limit?: number }): Promise<BrainDocsListResponse> {
+  async listBrainDocs(options?: {
+    kind?: BrainDocKind;
+    view?: BrainDocsListView;
+    onlyMuted?: boolean;
+    limit?: number;
+  }): Promise<BrainDocsListResponse> {
     const asOfMs = Date.now();
     const items: BrainDocListItem[] = [];
     const issueCounts = new Map<string, number>();
@@ -5784,6 +6027,10 @@ export class MemoryArchiveRepository implements ArchiveRepository {
       }
     }
     for (const doc of this.brainDocs.values()) {
+      // Hybrid pages stay on normal surfaces; only exclusively-muted ones hide.
+      if (options?.onlyMuted ? doc.mutedState !== "muted" : doc.mutedState === "muted") {
+        continue;
+      }
       const node = doc.nodeId ? this.graphNodes.get(doc.nodeId) : undefined;
       const dueness = this.memDocDueness(doc, node);
       const currentRevision = doc.currentRevisionId ? this.brainDocRevisions.get(doc.currentRevisionId) : undefined;
@@ -5803,7 +6050,8 @@ export class MemoryArchiveRepository implements ArchiveRepository {
         dueReasons: dueness.dueReasons,
         salience: node?.salience ?? 0,
         openLifecycleItems: dueness.openItems,
-        issueCount: issueCounts.get(doc.docId) ?? 0
+        issueCount: issueCounts.get(doc.docId) ?? 0,
+        mutedState: doc.mutedState
       });
     }
     // Candidates: page-eligible nodes without a doc, person-deduped.
@@ -5853,7 +6101,9 @@ export class MemoryArchiveRepository implements ArchiveRepository {
         dueReasons: ["never_rolled"],
         salience: candidate.node.salience,
         openLifecycleItems: 0,
-        issueCount: 0
+        issueCount: 0,
+        // A candidate has no revision, so no prose exists to be muted yet.
+        mutedState: "clean"
       });
     }
     let filtered = items;
@@ -6016,6 +6266,9 @@ export class MemoryArchiveRepository implements ArchiveRepository {
           mergedInto: null,
           currentRevisionId: null,
           lastRollupAtMs: null,
+          mutedState: "clean",
+          mutedClaimCount: 0,
+          fedClaimCount: 0,
           createdAtMs: Date.now()
         };
         const dueness = this.memDocDueness(synthetic, resolved.node);
@@ -7738,9 +7991,15 @@ export class MemoryArchiveRepository implements ArchiveRepository {
   async listBrainEpisodeProjections(options?: {
     limit?: number;
     offset?: number;
+    chatSourceId?: string | null;
+    onlyMuted?: boolean;
   }): Promise<Array<{ id: string; chatSourceId: string; chatDisplayName: string | null; startAtMs: number; markdown: string }>> {
+    const chat = options?.chatSourceId ? this.canonicalJid(options.chatSourceId) ?? options.chatSourceId : null;
     return [...this.brainEpisodes.values()]
       .filter((episode) => episode.status === "current" && episode.markdown !== "")
+      // The vault excludes muted material — the SQLite side does this in SQL.
+      .filter((episode) => this.isEpisodeMuted(episode) === (options?.onlyMuted === true))
+      .filter((episode) => !chat || episode.chatSourceId === chat)
       .sort((a, b) => a.startAtMs - b.startAtMs || (a.id < b.id ? -1 : 1))
       .slice(options?.offset ?? 0, (options?.offset ?? 0) + (options?.limit ?? 1000))
       .map((episode) => ({
@@ -7766,11 +8025,15 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     status?: BrainEpisodeRecord["status"];
     generator?: BrainEpisodeGenerator;
     endAtOrBeforeMs?: number;
+    onlyMuted?: boolean;
     limit: number;
   }): Promise<BrainEpisodeRecord[]> {
     return structuredClone(
       [...this.brainEpisodes.values()]
         .filter((episode) => !options.episodeId || episode.id === options.episodeId)
+        // Fetch-by-id is a direct reference, not a listing, so the mute filter
+        // does not apply to it.
+        .filter((episode) => (options.episodeId ? true : this.isEpisodeMuted(episode) === (options.onlyMuted === true)))
         .filter((episode) => !options.chatSourceId || episode.chatSourceId === options.chatSourceId)
         .filter((episode) => !options.status || episode.status === options.status)
         .filter((episode) => !options.generator || episode.generator === options.generator)
@@ -7953,6 +8216,7 @@ export class MemoryArchiveRepository implements ArchiveRepository {
     const chatSet = options.chatSourceIds?.length ? new Set(options.chatSourceIds) : null;
     const evidence = [...this.messages.values()]
       .filter((message) => !isStatusChatJid(message.chatSourceId))
+      .filter((message) => !this.isMessageMuted(message))
       .filter((message) => message.timestampMs != null)
       .filter((message) => options.startAtMs == null || (message.timestampMs ?? 0) >= options.startAtMs)
       .filter((message) => options.endAtMs == null || (message.timestampMs ?? 0) <= options.endAtMs)

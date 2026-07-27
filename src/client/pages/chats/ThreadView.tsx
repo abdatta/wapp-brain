@@ -6,6 +6,7 @@ import { getMessageContext, listMessages } from "../../api";
 import { buildChatDeepLink, parseAnchorParam } from "../../lib/deepLinks";
 import { useArchiveEvents } from "../../state/StatusContext";
 import { useToast } from "../../state/ToastContext";
+import { MuteControl } from "./MuteControl";
 import {
   EmptyState,
   MediaGridBubble,
@@ -218,9 +219,12 @@ export function ThreadView({ chat }: { chat: ChatListItem }) {
             )}
           </p>
         </div>
-        <div className="threadSearch">
-          <Search size={16} />
-          <input value={messageQuery} onChange={(event) => setMessageQuery(event.target.value)} placeholder="Search messages" />
+        <div className="threadHeaderActions">
+          <MuteControl chat={chat} />
+          <div className="threadSearch">
+            <Search size={16} />
+            <input value={messageQuery} onChange={(event) => setMessageQuery(event.target.value)} placeholder="Search messages" />
+          </div>
         </div>
       </div>
 

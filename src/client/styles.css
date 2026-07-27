@@ -2984,7 +2984,13 @@ button.fileButton:disabled {
     flex-direction: column;
   }
 
-  .threadSearch {
+  .threadSearch,
+  .threadHeaderActions .threadSearch {
+    flex: 1 1 auto;
+  }
+
+  /* Stacked header: the actions row still stays one line, full width. */
+  .threadHeaderActions {
     flex: 1 1 auto;
   }
 
@@ -6099,4 +6105,366 @@ button.fileButton:disabled {
   gap: 8px;
   align-items: center;
   font-size: 13px;
+}
+
+/* --- Chat brain muting (mute-chats-from-brain) ---------------------------- */
+/* Muting is a BRAIN filter, never an archive one, so its affordances stay
+   quiet: a small glyph in the chat list, a link-weight control in the thread
+   header. Nothing here should read like WhatsApp's notification mute. */
+.mutedGlyph {
+  display: inline-flex;
+  vertical-align: -2px;
+  margin-right: 6px;
+  color: #9ba6a2;
+}
+
+/* One row, always. This never wraps: the mute control is a fixed-width icon
+   button and the search box absorbs the remaining space, so a long chat title
+   shrinks the search rather than pushing the control onto a second line. */
+.threadHeaderActions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+.threadHeaderActions .threadSearch {
+  flex: 1 1 260px;
+  min-width: 140px;
+}
+/* The title must yield first — it can ellipsize, the controls cannot. */
+.threadHeader > div:first-child {
+  min-width: 0;
+}
+.threadHeader h2 {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.muteControl {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+/* Icon-only while unmuted so a header the user reads constantly stays calm;
+   an amber pill once muted, so the state is legible without hovering. Sized to
+   match the search box beside it, which is what keeps the row single-line. */
+.muteTrigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 40px;
+  padding: 0 11px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.04);
+  color: #9ba6a2;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+.muteTrigger:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.2);
+  color: #dfe8e4;
+}
+.muteTrigger:focus-visible {
+  outline: 2px solid rgba(125, 224, 178, 0.55);
+  outline-offset: 1px;
+}
+.muteTrigger:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.muteTrigger.isMuted {
+  border-color: rgba(232, 195, 122, 0.34);
+  background: rgba(232, 195, 122, 0.12);
+  color: #e8c37a;
+}
+.muteTrigger.isMuted:hover:not(:disabled) {
+  background: rgba(232, 195, 122, 0.18);
+  border-color: rgba(232, 195, 122, 0.5);
+  color: #f2d599;
+}
+
+.mutePopover {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 8px);
+  z-index: 30;
+  width: 320px;
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: #12171a;
+  box-shadow: 0 20px 48px rgba(0, 0, 0, 0.55);
+}
+.mutePopoverHead h4 {
+  margin: 0 0 4px;
+  font-size: 13.5px;
+  color: #dfe8e4;
+}
+.mutePopoverHead p {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: #9ba6a2;
+}
+
+.muteOptions {
+  display: grid;
+  gap: 6px;
+}
+/* Each preset states what it does underneath its name — the difference between
+   'from now' and 'entire history' is the whole decision, and a bare label makes
+   the user guess. */
+.muteOption {
+  display: grid;
+  gap: 2px;
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.03);
+  color: inherit;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+.muteOption:hover:not(:disabled) {
+  background: rgba(125, 224, 178, 0.08);
+  border-color: rgba(125, 224, 178, 0.34);
+}
+.muteOption:focus-visible {
+  outline: 2px solid rgba(125, 224, 178, 0.55);
+  outline-offset: 1px;
+}
+.muteOption:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.muteOptionLabel {
+  font-size: 13px;
+  font-weight: 600;
+  color: #dfe8e4;
+}
+.muteOptionHint {
+  font-size: 11.5px;
+  color: #8d9894;
+}
+
+.muteCustom {
+  display: grid;
+  gap: 6px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+.muteCustom label {
+  font-size: 11.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #8d9894;
+}
+.muteCustomRow {
+  display: flex;
+  gap: 8px;
+}
+.muteCustomRow input[type="date"] {
+  flex: 1;
+  min-width: 0;
+  height: 32px;
+  padding: 0 8px;
+  border-radius: 7px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.05);
+  color: inherit;
+  font-size: 12.5px;
+}
+.muteCustomRow button {
+  height: 32px;
+  padding: 0 14px;
+  border-radius: 7px;
+  border: 1px solid rgba(125, 224, 178, 0.3);
+  background: rgba(125, 224, 178, 0.12);
+  color: #7de0b2;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.muteCustomRow button:hover:not(:disabled) {
+  background: rgba(125, 224, 178, 0.2);
+}
+.muteCustomRow button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* The muted-items view's drill-in: what muting hid, still fully stored. */
+.mutedDrill {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.mutedDrill h4 {
+  margin: 12px 0 6px;
+  font-size: 12.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #9ba6a2;
+}
+
+.mutedDrillList {
+  margin: 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 5px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.mutedDrillDate {
+  color: #9ba6a2;
+  font-size: 12px;
+  margin-right: 6px;
+}
+
+/* Hybrid pages render normally; this marks the ones with muted sources so the
+   distinction is visible without opening the page. */
+.docMutedHybrid {
+  color: #e8c37a;
+}
+
+/* Muted-list loading shimmer. Matches the loaded .evalCard box (same border,
+   radius, padding) so nothing shifts when the data lands — see the loading-state
+   rule in AGENTS.md. */
+.mutedSkeletonCard {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.mutedSkel {
+  border-radius: 6px;
+  background: linear-gradient(90deg, #171b20, #232a33, #171b20);
+  background-size: 220% 100%;
+  animation: shimmer 1.3s linear infinite;
+}
+.mutedSkelTitle {
+  height: 19px;
+  width: 42%;
+}
+.mutedSkelChips {
+  display: flex;
+  gap: 8px;
+}
+.mutedSkelChip {
+  height: 22px;
+  width: 116px;
+  border-radius: 999px;
+}
+.mutedSkelText {
+  height: 15px;
+  width: 78%;
+}
+.mutedSkelAction {
+  height: 30px;
+  width: 62%;
+  border-radius: 8px;
+}
+
+/* --- Mute progress pill (app shell) --------------------------------------- */
+/* Muting returns instantly; the vault reconcile runs behind it. Without a
+   visible "working" signal the app reads as frozen, which is exactly the bug
+   this replaces. Quiet when idle, never a blocking overlay. */
+.mutePill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 34px;
+  padding: 0 11px;
+  border-radius: 8px;
+  border: 1px solid rgba(232, 195, 122, 0.3);
+  background: rgba(232, 195, 122, 0.12);
+  color: #e8c37a;
+  font-size: 12.5px;
+  font-weight: 600;
+  text-decoration: none;
+  max-width: 320px;
+}
+.mutePill:hover {
+  background: rgba(232, 195, 122, 0.2);
+}
+.mutePillText {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mutePillCount {
+  flex: 0 0 auto;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.3);
+  font-variant-numeric: tabular-nums;
+  font-size: 11.5px;
+}
+.mutePill.isDone {
+  border-color: rgba(125, 224, 178, 0.32);
+  background: rgba(125, 224, 178, 0.12);
+  color: #7de0b2;
+}
+
+/* --- Muted fold row (chat list) ------------------------------------------- */
+/* Folds muted chats behind one row at the top of the list, the way WhatsApp
+   folds archived ones: one click away, never competing with live chats. */
+.mutedFoldRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  padding: 11px 14px;
+  margin-bottom: 6px;
+  border: 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  background: transparent;
+  color: #9ba6a2;
+  font-size: 13px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+.mutedFoldRow:hover {
+  background: rgba(255, 255, 255, 0.05);
+  color: #dfe8e4;
+}
+.mutedFoldRow.active {
+  background: rgba(232, 195, 122, 0.1);
+  color: #e8c37a;
+}
+.mutedFoldMain {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.mutedFoldMain span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mutedFoldCount {
+  flex: 0 0 auto;
+  min-width: 22px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.09);
+  color: #9ba6a2;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
 }

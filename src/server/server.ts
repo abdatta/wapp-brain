@@ -804,6 +804,10 @@ app.get("/api/chats", async (req, res) => {
         search: stringQuery(req.query.search),
         type: stringQuery(req.query.type),
         includeEventOnly: booleanQuery(req.query.includeEventOnly),
+        muted: booleanQuery(req.query.muted),
+        ids: csvQuery(req.query.ids)
+          ?.map((value) => Number(value))
+          .filter((value) => Number.isInteger(value)),
         limit,
         offset
       })
@@ -1141,12 +1145,205 @@ app.get("/api/brain/episodes", async (req, res) => {
     res.json(
       await repository.listBrainEpisodes({
         chatSourceId: stringQuery(req.query.chatSourceId) ?? null,
+        onlyMuted: booleanQuery(req.query.onlyMuted),
         limit: clampNumber(req.query.limit, 1, 100, 20)
       })
     );
   } catch (error) {
     res.status(400).json({ error: publicErrorMessage(error) });
   }
+});
+
+// --- Chat brain muting -----------------------------------------------------
+// Mute stops BRAIN processing and presentation only. Ingestion, media download,
+// FTS, the chats UI, and message search are untouched — a muted chat keeps
+// archiving everything. Filtering is server-side so every consumer (UI, CLI,
+// future MCP/retrieval) inherits identical semantics with no client logic.
+
+// `fromMs` may be in the past; "epoch" is the entire-history preset.
+function muteFromMs(value: unknown): number | undefined {
+  if (value === "epoch") return 0;
+  if (typeof value === "number" && Number.isFinite(value)) return Math.max(0, Math.trunc(value));
+  return undefined;
+}
+
+// The UI holds numeric chat ids; the CLI and tests find JIDs more natural.
+// Accept either.
+async function chatSourceIdForParam(id: string): Promise<string | null> {
+  const numeric = Number(id);
+  return Number.isInteger(numeric) ? repository.getChatSourceIdById(numeric) : id;
+}
+
+// A human label for the progress pill — the user should see the chat's name,
+// never a JID. Falls back to the kind, matching the client's unresolved states.
+async function chatLabelFor(chatSourceId: string): Promise<string> {
+  try {
+    const identity = await repository.getChatIdentity(chatSourceId);
+    if (identity?.displayName) return identity.displayName;
+    if (identity?.chatType === "community") return "Unnamed channel";
+    if (identity?.chatType === "group") return "Unnamed group";
+  } catch {
+    // A label is cosmetic; never let it fail the action.
+  }
+  return "this chat";
+}
+
+app.post("/api/chats/:id/mute", async (req, res) => {
+  try {
+    const chatSourceId = await chatSourceIdForParam(String(req.params.id));
+    if (!chatSourceId) {
+      res.status(404).json({ error: "No such chat." });
+      return;
+    }
+    const state = await repository.muteChat(chatSourceId, { fromMs: muteFromMs(req.body?.fromMs) });
+    // Respond as soon as the state is durable; the vault catches up behind the
+    // observable queue so the UI is never blocked on file I/O.
+    enqueueMuteReprojection(chatSourceId, await chatLabelFor(chatSourceId), "mute");
+    res.json(state);
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+app.post("/api/chats/:id/unmute", async (req, res) => {
+  try {
+    const chatSourceId = await chatSourceIdForParam(String(req.params.id));
+    if (!chatSourceId) {
+      res.status(404).json({ error: "No such chat." });
+      return;
+    }
+    const state = await repository.unmuteChat(chatSourceId, { fromMs: muteFromMs(req.body?.fromMs) });
+    enqueueMuteReprojection(chatSourceId, await chatLabelFor(chatSourceId), "unmute");
+    res.json(state);
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+app.get("/api/chats/:id/mute", async (req, res) => {
+  try {
+    const chatSourceId = await chatSourceIdForParam(String(req.params.id));
+    if (!chatSourceId) {
+      res.status(404).json({ error: "No such chat." });
+      return;
+    }
+    res.json(await repository.getChatMuteState(chatSourceId));
+  } catch (error) {
+    res.status(400).json({ error: publicErrorMessage(error) });
+  }
+});
+
+app.get("/api/brain/muted", async (_req, res) => {
+  try {
+    res.json(await repository.listMutedChats());
+  } catch (error) {
+    res.status(500).json({ error: publicErrorMessage(error) });
+  }
+});
+
+// The vault is a pure projection, so a mute change is reconciled by
+// reprojecting: muted files disappear, unmuted ones come back, nothing to
+// migrate. Two rules make this safe to do on a live server:
+//
+//   1. SCOPED. A mute affects one chat, so only that chat's episode files are
+//      reconciled. The first version rebuilt the whole vault — 9,400
+//      synchronous file reads/writes — which pinned the event loop and left
+//      every other request hanging until it finished.
+//   2. SERIAL, with progress. Jobs queue rather than interleave (they all
+//      touch the same directory), and the queue is observable so the UI can
+//      say "1/3" instead of appearing frozen.
+interface MuteJob {
+  id: number;
+  chatSourceId: string;
+  label: string;
+  action: "mute" | "unmute";
+}
+
+const muteQueue: MuteJob[] = [];
+let muteActive: MuteJob | null = null;
+let muteJobSeq = 0;
+let muteBatchTotal = 0;
+let muteBatchDone = 0;
+let muteDraining = false;
+// Sticky so the UI can show a completion beat rather than the pill vanishing.
+let muteLastFinishedAt: number | null = null;
+
+function muteProgressSnapshot(): {
+  active: { chatSourceId: string; label: string; action: "mute" | "unmute" } | null;
+  pending: number;
+  done: number;
+  total: number;
+  finishedAtMs: number | null;
+} {
+  return {
+    active: muteActive ? { chatSourceId: muteActive.chatSourceId, label: muteActive.label, action: muteActive.action } : null,
+    pending: muteQueue.length,
+    done: muteBatchDone,
+    total: muteBatchTotal,
+    finishedAtMs: muteActive == null && muteQueue.length === 0 ? muteLastFinishedAt : null
+  };
+}
+
+function enqueueMuteReprojection(chatSourceId: string, label: string, action: "mute" | "unmute"): void {
+  // Re-queuing the same chat is pointless: the reconcile reads current state,
+  // so one pass after the last change is always correct.
+  if (muteActive?.chatSourceId !== chatSourceId && !muteQueue.some((job) => job.chatSourceId === chatSourceId)) {
+    muteQueue.push({ id: ++muteJobSeq, chatSourceId, label, action });
+    muteBatchTotal += 1;
+  }
+  void drainMuteQueue();
+}
+
+async function drainMuteQueue(): Promise<void> {
+  if (muteDraining) {
+    return;
+  }
+  muteDraining = true;
+  try {
+    while (muteQueue.length > 0) {
+      muteActive = muteQueue.shift()!;
+      const started = Date.now();
+      try {
+        const { reprojectChatEpisodes, rebuildBrainProjection } = await import("./brain/projection");
+        console.log(`[mute] reconciling vault for ${muteActive.label} (${muteActive.action})…`);
+        const episodes = await reprojectChatEpisodes(repository, muteActive.chatSourceId);
+        // Pages are cross-chat by construction, so they cannot be scoped to one
+        // chat — but they are bounded by doc count, not by message volume, and
+        // the doc-only rebuild is what sweeps a page that just became hidden.
+        const docs = await rebuildBrainProjection(repository, { includeEpisodes: false, includeOverview: false });
+        console.log(
+          `[mute] ${muteActive.label}: ${episodes.written} episode file(s) written, ${episodes.removed} removed; ` +
+            `${docs.written} page(s) written, ${docs.removed} removed (${Date.now() - started}ms).`
+        );
+        broadcastArchiveChanged({ source: "manual", chatSourceIds: [muteActive.chatSourceId], messageCount: 0, contactCount: 0 });
+      } catch (error) {
+        // Failures must be visible, never silent. The vault is rebuildable at
+        // any time with `npm run brain:docs project`.
+        console.error(
+          `[mute] vault reconcile FAILED for ${muteActive.label}:`,
+          error instanceof Error ? error.message : error
+        );
+      } finally {
+        muteBatchDone += 1;
+        muteActive = null;
+      }
+      // Give the event loop a clear turn between jobs so a long queue never
+      // starves ordinary requests.
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    muteLastFinishedAt = Date.now();
+  } finally {
+    muteDraining = false;
+    // The batch is over; the next mute starts counting from 1 again.
+    if (muteQueue.length === 0 && muteActive == null) {
+      muteBatchTotal = 0;
+      muteBatchDone = 0;
+    }
+  }
+}
+
+app.get("/api/brain/mute/progress", (_req, res) => {
+  res.json(muteProgressSnapshot());
 });
 
 // Reset derived brain data (episodes/claims/citations/watermarks + projected
@@ -1392,6 +1589,7 @@ app.get("/api/brain/lifecycle", async (req, res) => {
         kind: kindRaw === "commitment" || kindRaw === "question" ? kindRaw : undefined,
         includeChats: csvQuery(req.query.includeChats),
         excludeChats: csvQuery(req.query.excludeChats),
+        onlyMuted: booleanQuery(req.query.onlyMuted),
         sort: sortRaw && sorts.includes(sortRaw) ? (sortRaw as BrainLifecycleSort) : undefined,
         chatSourceId: stringQuery(req.query.chatSourceId) ?? null,
         limit: clampNumber(req.query.limit, 1, 500, 200)
@@ -1497,6 +1695,7 @@ app.get("/api/brain/docs", async (req, res) => {
     const response = await repository.listBrainDocs({
       kind,
       view,
+      onlyMuted: booleanQuery(req.query.onlyMuted),
       limit: clampNumber(req.query.limit, 1, 2000, 200)
     });
     res.json(response);

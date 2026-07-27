@@ -988,6 +988,10 @@ export interface ChatListItem {
   // ("possibly the same as … — unconfirmed"). Never influences claims,
   // evidence, or search — those paths do not read suggestions.
   unconfirmedHint?: string | null;
+  // Muted from BRAIN processing only. The chat still archives every message and
+  // media blob and reads identically in the chats UI and search.
+  muted?: boolean;
+  mutedOrigin?: BrainMuteOrigin | null;
 }
 
 export interface ChatListOptions {
@@ -996,6 +1000,12 @@ export interface ChatListOptions {
   offset: number;
   type?: string;
   includeEventOnly?: boolean;
+  // Resolve specific chats by rowid, ignoring every other filter. The open
+  // chat's header must not degrade to an unresolved placeholder just because a
+  // list filter no longer includes it.
+  ids?: number[];
+  // Tri-state: undefined = no filter, true = only muted, false = only unmuted.
+  muted?: boolean;
 }
 
 // Server-side interpretation of a message whose body cannot speak for itself:
@@ -1419,6 +1429,76 @@ export interface BrainChatBacklogItem {
   lastEpisodeAt: string | null;
   pendingVisibleMessages: number;
   newestVisibleMs: number | null;
+}
+
+// --- Chat brain muting ---
+// A mute is a set of `[startMs, endMs)` ranges per chat. `endMs === null` means
+// the range is still open, i.e. the chat is muted right now. The stored set is
+// always canonical (non-overlapping, merged), so any timestamp resolves to
+// muted/not-muted by a single range lookup. A zero-length range (start === end)
+// is a tombstone marking "mute state was deliberately chosen here" — it keeps
+// the channel default from resurrecting after an explicit unmute.
+export type BrainMuteOrigin = "user" | "channel-default";
+
+export interface MuteInterval {
+  startMs: number;
+  endMs: number | null;
+  origin: BrainMuteOrigin;
+}
+
+export interface ChatMuteState {
+  chatSourceId: string;
+  intervals: MuteInterval[];
+  // True when an open range exists — the chat is muted as of now.
+  muted: boolean;
+  mutedSinceMs: number | null;
+  origin: BrainMuteOrigin | null;
+}
+
+// One row of the muted-items view. Every count is DERIVED at read time (from
+// the frozen watermark and the message store), never a stored counter.
+export interface BrainMutedChatItem {
+  chatSourceId: string;
+  chatDisplayName: string | null;
+  chatType: ChatType;
+  mutedSinceMs: number;
+  origin: BrainMuteOrigin;
+  // Everything the chat has ever archived. Most subscribed channels are empty
+  // stubs — showing this is what distinguishes "nothing to hide" from "hidden".
+  archivedMessages: number;
+  // Accumulated since the brain's watermark froze — what muting is saving.
+  piledUpMessages: number;
+  piledUpMedia: number;
+  // Artifacts hidden by this mute; still fully stored, restored on unmute.
+  hiddenEpisodes: number;
+  hiddenClaims: number;
+  hiddenCommitments: number;
+  hiddenDocs: number;
+}
+
+// Brain-page badge: enough to notice accumulation without opening the view.
+export interface BrainMutedSummary {
+  mutedChats: number;
+  piledUpMessages: number;
+  piledUpMedia: number;
+  hiddenEpisodes: number;
+}
+
+export interface BrainMutedListResponse {
+  items: BrainMutedChatItem[];
+  summary: BrainMutedSummary;
+}
+
+// Vault reconciliation runs behind the mute response, so the UI needs a way to
+// say "still working" — and, when several mutes are queued, which one of how
+// many. `finishedAtMs` is set only once the queue drains, so the indicator can
+// show a completion beat instead of vanishing mid-glance.
+export interface BrainMuteProgress {
+  active: { chatSourceId: string; label: string; action: "mute" | "unmute" } | null;
+  pending: number;
+  done: number;
+  total: number;
+  finishedAtMs: number | null;
 }
 
 export interface BrainRunSummary {
@@ -3072,6 +3152,11 @@ export interface BrainDocRevisionRecord {
   createdAtMs: number;
 }
 
+// How a page relates to muted material: 'clean' = no muted source, 'hybrid' =
+// fed by both (renders normally, muted-source links redirect to the muted view),
+// 'muted' = every fed claim traces to a muted range (hides from normal surfaces).
+export type BrainDocMutedState = "clean" | "hybrid" | "muted";
+
 export interface BrainDocRecord {
   docId: string;
   kind: BrainDocKind;
@@ -3081,6 +3166,9 @@ export interface BrainDocRecord {
   mergedInto: string | null;
   currentRevisionId: number | null;
   lastRollupAtMs: number | null;
+  mutedState: BrainDocMutedState;
+  mutedClaimCount: number;
+  fedClaimCount: number;
   createdAtMs: number;
 }
 
@@ -3107,6 +3195,9 @@ export interface BrainDocListItem {
   salience: number;
   openLifecycleItems: number;
   issueCount: number;
+  // 'hybrid' rows render normally but flag that some sources are muted;
+  // 'muted' rows appear only in the muted-items view.
+  mutedState: BrainDocMutedState;
 }
 
 // Every count chip on the docs list is a view you can actually open — a count
@@ -3132,6 +3223,10 @@ export interface BrainDocStatementView {
     claimId: string;
     // Dead refs render honestly (claim deleted upstream since this revision).
     exists: boolean;
+    // This source traces to a muted range. The page still renders (it is a
+    // hybrid), but this citation must route to the muted-items view rather
+    // than to an episode the rest of the app is hiding.
+    muted?: boolean;
     episodeId: string | null;
     citations: Array<{
       sourceMessageKey: string;
